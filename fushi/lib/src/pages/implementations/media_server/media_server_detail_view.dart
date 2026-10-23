@@ -1,11 +1,21 @@
 import 'dart:async';
 
+import 'package:flutter_riverpod/flutter_riverpod.dart' show ProviderScope;
 import 'package:material_ui/material_ui.dart';
 import 'package:fushi/src/focus/fushi_focus_controller.dart';
 import 'package:fushi/src/media/collections/collection_detail_layout.dart';
 import 'package:fushi/src/media/detail/media_detail_kit.dart';
 import 'package:fushi/src/media/video/cover_ui/portrait_cover_image.dart';
 import 'package:fushi/src/media/video/media_server/media_server_browser.dart';
+import 'package:fushi/src/models/app_model.dart' show appProvider;
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/media/video/video_watched_marks.dart';
+import 'package:fushi/src/sync/remote_video_client.dart'
+    show RemoteVideoPlayedMark;
+import 'package:fushi/src/sync/remote_library_cache.dart'
+    show remoteLibraryCacheProvider;
+import 'package:fushi/src/sync/jellyfin_video_client.dart'
+    show JellyfinVideoClient;
 import 'package:fushi/src/pages/implementations/media_server/media_server_session.dart';
 import 'package:fushi/src/pages/implementations/media_server/media_server_widgets.dart';
 import 'package:fushi/src/utils/components/fushi_floating_chrome.dart'
@@ -86,6 +96,56 @@ class _MediaServerDetailViewState extends State<MediaServerDetailView>
   int _episodeEpoch = 0;
 
   MediaServerBrowser get _browser => widget.session.browser;
+
+  /// 「加入媒体库」只对 Jellyfin / Emby 开放（其它服务器没有对应的清单来源）。
+  String? get _librarySourceId => switch (_browser) {
+    final JellyfinVideoClient c => c.remoteLibrarySourceId,
+    _ => null,
+  };
+
+  PreferencesRepository get _prefs =>
+      ProviderScope.containerOf(context, listen: false).read(appProvider).prefsRepo;
+
+  bool get _inLibrary {
+    final String? sourceId = _librarySourceId;
+    return sourceId != null &&
+        _prefs.jellyfinLibraryItemIds(sourceId).contains(widget.item.id);
+  }
+
+  Future<void> _toggleLibrary() async {
+    final String? sourceId = _librarySourceId;
+    if (sourceId == null) return;
+    final Map<String, int> items = Map<String, int>.of(
+      _prefs.jellyfinLibraryItems(sourceId),
+    );
+    if (items.remove(widget.item.id) == null) {
+      items[widget.item.id] = DateTime.now().millisecondsSinceEpoch;
+    }
+    // 先作废这台服务器的清单缓存，再写偏好：视频页 / 首页收到偏好变更后
+    // 重取到的是新范围，不是 TTL 内的旧清单。
+    ProviderScope.containerOf(
+      context,
+      listen: false,
+    ).read(remoteLibraryCacheProvider).invalidateSource(sourceId);
+    await _prefs.setJellyfinLibraryItems(sourceId, items);
+    if (mounted) setState(() {});
+  }
+
+  Widget? _buildLibraryAction() {
+    if (_librarySourceId == null) return null;
+    final bool added = _inLibrary;
+    return MediaDetailSecondaryButton(
+      buttonKey: ValueKey<String>(
+        added ? 'media-server-library-remove' : 'media-server-library-add',
+      ),
+      icon: FushiIcons.libraryAdd,
+      label: added
+          ? t.video_online_library_remove
+          : t.video_online_library_add,
+      selected: added,
+      onPressed: () => unawaited(_toggleLibrary()),
+    );
+  }
 
   bool get _isSeries => widget.item.type == MediaServerItemType.series;
 
@@ -285,6 +345,89 @@ class _MediaServerDetailViewState extends State<MediaServerDetailView>
     unawaited(_reloadEpisodes());
   }
 
+  /// 集行菜单（右键 / 长按）：标记已看 / 未看、标记「这一集及之前」。仅服务器支持
+  /// 「已播放」协议（Jellyfin / Emby）时出。「之前」按当前季已加载的集序算。
+  Future<void> _showEpisodeMenu(MediaServerItem episode) async {
+    final Object browser = _browser;
+    if (browser is! RemoteVideoPlayedMark) return;
+    final int index = _episodes.indexWhere(
+      (MediaServerItem e) => e.id == episode.id,
+    );
+    final _EpisodeMark? choice = await showAppDialog<_EpisodeMark>(
+      context: context,
+      builder: (BuildContext dialogContext) => FushiAlertDialog(
+        title: Text(episode.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            ListTile(
+              key: const ValueKey<String>('media-server-episode-mark-toggle'),
+              leading: FushiIcon(
+                episode.played ? FushiIcons.visibilityOff : FushiIcons.check,
+              ),
+              title: Text(
+                episode.played ? t.video_mark_unwatched : t.video_mark_watched,
+              ),
+              onTap: () => Navigator.pop(
+                dialogContext,
+                episode.played ? _EpisodeMark.unwatched : _EpisodeMark.watched,
+              ),
+            ),
+            if (index > 0)
+              ListTile(
+                key: const ValueKey<String>('media-server-episode-mark-through'),
+                leading: const FushiIcon(FushiIcons.checklist),
+                title: Text(t.video_mark_watched_through),
+                onTap: () => Navigator.pop(dialogContext, _EpisodeMark.through),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    final List<MediaServerItem> targets = switch (choice) {
+      _EpisodeMark.through => _episodes.sublist(0, index + 1),
+      _ => <MediaServerItem>[episode],
+    };
+    await _markEpisodes(
+      browser,
+      targets,
+      watched: choice != _EpisodeMark.unwatched,
+    );
+  }
+
+  Future<void> _markEpisodes(
+    RemoteVideoPlayedMark marker,
+    List<MediaServerItem> targets, {
+    required bool watched,
+  }) async {
+    final WatchedMarkResult result = await setVideosWatched(
+      db: ProviderScope.containerOf(context, listen: false)
+          .read(appProvider)
+          .database,
+      watched: watched,
+      remoteIds: <String>[for (final MediaServerItem e in targets) e.id],
+      remoteMarker: marker,
+    );
+    if (!mounted) return;
+    // 库页 / 首页读的是同一台服务器的清单缓存：作废它，下次读到新的「已播放」。
+    final String? sourceId = _librarySourceId;
+    if (sourceId != null) {
+      ProviderScope.containerOf(
+        context,
+        listen: false,
+      ).read(remoteLibraryCacheProvider).invalidateSource(sourceId);
+    }
+    FushiToast.show(
+      msg: result.hasFailures
+          ? t.video_mark_server_failed(n: result.remoteFailed)
+          : (watched ? t.video_marked_watched : t.video_marked_unwatched),
+      severity: result.hasFailures ? ToastSeverity.error : ToastSeverity.success,
+    );
+    await _refreshEpisodesInPlace();
+  }
+
   Future<void> _playEpisode(MediaServerItem episode) async {
     await widget.session.playItem(context, episode, siblings: _episodes);
     // 播放页退回来：服务器上的断点 / 已看标记变了，原地重拉（BUG-3491）。
@@ -450,6 +593,7 @@ class _MediaServerDetailViewState extends State<MediaServerDetailView>
               playButtonKey: const ValueKey<String>('media-server-detail-play'),
               onPlay: canPlay ? _playPrimary : null,
               secondaryAction: _buildDownloadAction(),
+              secondaryActions: <Widget>[?_buildLibraryAction()],
             ),
             slivers: <Widget>[
               // 版本在选集之上：剧的集清单可能很长（分页触底追加），放在后面就沉底看不见。
@@ -698,6 +842,8 @@ class _MediaServerDetailViewState extends State<MediaServerDetailView>
       current: isContinue,
       focusId: FushiFocusId('${widget.session.serverId}-episode-${episode.id}'),
       onTap: () => _playEpisode(episode),
+      onLongPress: () => unawaited(_showEpisodeMenu(episode)),
+      onSecondaryTap: () => unawaited(_showEpisodeMenu(episode)),
       leading: _MediaServerEpisodeThumb(
         image: mediaServerCoverImage(
           _browser,
@@ -713,6 +859,9 @@ class _MediaServerDetailViewState extends State<MediaServerDetailView>
     );
   }
 }
+
+/// 集行菜单的选择结果。
+enum _EpisodeMark { watched, unwatched, through }
 
 /// 集列表行首的 16:9 缩略图：封面框 + 左上角集号胶囊（续播那集 primary 实色）。
 class _MediaServerEpisodeThumb extends StatelessWidget {
