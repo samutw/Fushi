@@ -1,0 +1,63 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/sync/forwarded_mine_payload.dart';
+import 'package:fushi_engine/sync/fushi_remote_lookup_service.dart';
+import 'package:fushi_engine/sync/immersion_mine_payload.dart';
+import 'package:fushi_anki/fushi_anki.dart';
+
+void main() {
+  test('FushiRemoteMiningService is an abstract contract with mineEntry', () {
+    expect(_FakeMining(), isA<FushiRemoteMiningService>());
+  });
+}
+
+class _FakeMining implements FushiRemoteMiningService {
+  @override
+  Future<RemoteMineResult> mineEntry({
+    required Map<String, String> fields,
+    required String sentence,
+  }) async =>
+      const RemoteMineResult(result: 'success');
+
+  @override
+  Future<RemoteMineResult> mineImmersion(ImmersionMinePayload payload) async =>
+      const RemoteMineResult(result: 'success');
+
+  @override
+  Future<RemoteMineResult> mineForwarded(ForwardedMinePayload payload) async =>
+      const RemoteMineResult(result: 'success');
+
+  @override
+  Future<bool> isDuplicate({
+    required String expression,
+    required String reading,
+  }) async =>
+      false;
+
+  @override
+  Future<AnkiOpenWordOutcome> openWordInAnki({
+    required String expression,
+    required String reading,
+  }) async =>
+      AnkiOpenWordOutcome.failed;
+
+  @override
+  Future<AnkiNoteTypeDefinition?> readNoteTypeDefinition(
+          String modelName) async =>
+      null;
+
+  @override
+  Future<bool> updateNoteTypeStyling(String modelName, String css) async =>
+      false;
+
+  @override
+  Future<bool> updateNoteTypeTemplates(
+          String modelName, List<AnkiCardTemplate> templates) async =>
+      false;
+
+  @override
+  Future<bool> probeMediaMaintenance() async => false;
+
+  @override
+  Future<AnkiMediaDedupReport?> runMediaDedup({bool dryRun = true}) async =>
+      null;
+}

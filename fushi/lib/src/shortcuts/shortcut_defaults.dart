@@ -1,0 +1,700 @@
+import 'package:flutter/services.dart' hide ModifierKey;
+import 'package:fushi/src/shortcuts/input_binding.dart';
+import 'package:fushi/src/shortcuts/shortcut_action.dart';
+
+class ShortcutDefaults {
+  ShortcutDefaults._();
+
+  static Map<ShortcutAction, ShortcutBindingSet> forPlatform(
+    TargetPlatform platform,
+  ) {
+    switch (platform) {
+      case TargetPlatform.macOS:
+        return _macOS;
+      case TargetPlatform.android:
+        return _mobile;
+      case TargetPlatform.iOS:
+        return _iOS;
+      case TargetPlatform.windows:
+      case TargetPlatform.linux:
+      case TargetPlatform.fuchsia:
+        return _desktop;
+    }
+  }
+
+  static ShortcutBindingSet _kb(
+    List<InputBinding> keyboard, [
+    List<GamepadBinding> gamepad = const [],
+  ]) =>
+      ShortcutBindingSet(keyboardBindings: keyboard, gamepadBindings: gamepad);
+
+  static InputBinding _key(
+    LogicalKeyboardKey key, [
+    Set<ModifierKey> modifiers = const {},
+  ]) => InputBinding(key: key, modifiers: modifiers);
+
+  static const _gRB = GamepadBinding(GamepadButton.rb);
+  static const _gLB = GamepadBinding(GamepadButton.lb);
+  static const _gLT = GamepadBinding(GamepadButton.lt);
+  static const _gRT = GamepadBinding(GamepadButton.rt);
+  static const _gB = GamepadBinding(GamepadButton.b);
+  static const _gX = GamepadBinding(GamepadButton.x);
+  static const _gY = GamepadBinding(GamepadButton.y);
+  static const _gDpadRight = GamepadBinding(GamepadButton.dpadRight);
+  static const _gDpadLeft = GamepadBinding(GamepadButton.dpadLeft);
+  static const _gDpadUp = GamepadBinding(GamepadButton.dpadUp);
+  static const _gDpadDown = GamepadBinding(GamepadButton.dpadDown);
+  static const _gA = GamepadBinding(GamepadButton.a);
+  static const _gL3 = GamepadBinding(GamepadButton.thumbLeft);
+  static const _gR3 = GamepadBinding(GamepadButton.thumbRight);
+  // TODO-1342：视频播放器手柄映射用到的额外按钮常量。
+  static const _gStart = GamepadBinding(GamepadButton.start);
+  // 手柄字级选词查词（videoEnterCaret）：Select/View 键，video 组内此前未占用。
+  static const _gSelect = GamepadBinding(GamepadButton.select);
+
+  static final Map<ShortcutAction, ShortcutBindingSet> _desktop = {
+    ShortcutAction.readerPageForward: _kb(
+      [
+        _key(LogicalKeyboardKey.pageDown),
+        _key(LogicalKeyboardKey.arrowRight),
+        _key(LogicalKeyboardKey.arrowDown),
+        _key(LogicalKeyboardKey.space),
+      ],
+      [_gRB, _gDpadRight],
+    ),
+    ShortcutAction.readerPageBackward: _kb(
+      [
+        _key(LogicalKeyboardKey.pageUp),
+        _key(LogicalKeyboardKey.arrowLeft),
+        _key(LogicalKeyboardKey.arrowUp),
+        _key(LogicalKeyboardKey.space, {ModifierKey.shift}),
+      ],
+      [_gLB, _gDpadLeft],
+    ),
+    // 底栏开关只负责「打开/切换」底栏，键盘走 M（Esc 已让位给 readerDismissDict
+    // 的「返回」语义，见下）；手柄走 Y。Esc 不再绑这里，避免与 readerDismissDict
+    // 双绑同一键、被枚举顺序抢成「切底栏」而永远退不出书。
+    ShortcutAction.readerToggleChrome: _kb(
+      [_key(LogicalKeyboardKey.keyM)],
+      [_gY],
+    ),
+    // TODO-728：一键打开阅读器设置菜单（_showAppearanceSheet）。键盘默认 T，
+    // 在 reader co-active 组（reader+audiobook）里未被占用，避开 M / 方向 /
+    // PageUp/Down / Enter 系 / Ctrl+方向 / Ctrl+Space。手柄留空——reader 组手柄键
+    // 已被翻页/查词/句子导航占满，再绑会触发 no-shadow 守卫；用户可在设置里自绑。
+    ShortcutAction.readerOpenMenu: _kb([_key(LogicalKeyboardKey.keyT)]),
+    // TODO-1309①：一键打开阅读器「导航」界面直达 location 子页。键盘默认 Ctrl+F。
+    // reader+audiobook co-active 组内 Ctrl+F 未被占用；home 组的 homeFocusSearch 同绑
+    // Ctrl+F 但属不同 co-active 组、绝不同时激活，无 no-shadow 冲突。手柄留空（reader
+    // 组手柄键已被翻页/查词/句子导航占满，用户可自绑）。
+    ShortcutAction.readerOpenNavigation: _kb([
+      _key(LogicalKeyboardKey.keyF, {ModifierKey.ctrl}),
+    ]),
+    // 工具栏三入口：G 画廊 / I 统计 / B 有声书。reader+audiobook co-active 组内未被
+    // 占用（M 底栏、T 菜单、Ctrl+F 导航、方向 / PageUp/Down / Enter 系已占）。手柄
+    // 留空，用户可自绑。
+    ShortcutAction.readerOpenGallery: _kb([_key(LogicalKeyboardKey.keyG)]),
+    ShortcutAction.readerOpenStatistics: _kb([_key(LogicalKeyboardKey.keyI)]),
+    ShortcutAction.readerOpenAudiobook: _kb([_key(LogicalKeyboardKey.keyB)]),
+    // 停 / 续阅读统计计时：键盘默认 P（reader+audiobook co-active 组内未被占用；
+    // video 组的 P 是播放/暂停，属不同组、绝不同时激活）。手柄留空，用户可自绑。
+    ShortcutAction.readerToggleStudyClock: _kb([_key(LogicalKeyboardKey.keyP)]),
+    // 「只关词典、绝不退出」的可选专用动作：**默认空绑定**。
+    //
+    // Esc 已交给 universal 的 globalBack（一键阶梯：有词典先关词典、没词典才退书），
+    // 这里再默认绑 Esc 就会在 reader scope 先命中、把退书永久遮蔽掉——正是本次统一
+    // 之前「设置页写着退书是 Ctrl+W、实际 Esc 靠全局硬编码兜底」的那种双轨。留空
+    // 而不是删掉动作：把它绑到鼠标侧键就能「关词典但不退出」（BUG-1071 的鼠标通道
+    // 唯一消费者）。老用户若自己改过它，schema v8 迁移保留其自定义（见 registry）。
+    ShortcutAction.readerDismissDict: const ShortcutBindingSet(),
+
+    // R3 toggles furigana (gamepad-only; keyboard furigana stays in settings).
+    ShortcutAction.readerToggleFurigana: _kb([], [_gR3]),
+    // Reader lookup/card actions now live in the remappable registry instead
+    // of being only hard-wired in the page. Enter/A keep the old "activate at
+    // cursor" feel; Shift+Enter is an explicit plain lookup; Ctrl+Enter mines
+    // the top dictionary popup entry when one is visible.
+    ShortcutAction.readerLookupAtCursor: _kb(
+      [_key(LogicalKeyboardKey.enter)],
+      [GamepadBinding(GamepadButton.a)],
+    ),
+    ShortcutAction.readerShiftLookup: _kb([
+      _key(LogicalKeyboardKey.enter, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.readerCreateCardFromPopup: _kb([
+      _key(LogicalKeyboardKey.enter, {ModifierKey.ctrl}),
+    ]),
+    // TODO-700 T7：进入选字查词光标，默认手柄 A + 键盘 Enter（与旧硬编码一致 →
+    // 行为不变，只是可改键）。与 readerLookupAtCursor 同绑 A/Enter 是有意的并行
+    // 别名（前者「进光标」、后者「进光标后查词/激活」）；enter-trigger 经
+    // bindingsFor(readerEnterCaret) 谓词查询，不经 resolveKeyboard，故无枚举顺序
+    // 歧义，no-shadow 守卫已显式排除它。
+    ShortcutAction.readerEnterCaret: _kb(
+      [_key(LogicalKeyboardKey.enter)],
+      [_gA],
+    ),
+    ShortcutAction.homeTabBooks: _kb([
+      _key(LogicalKeyboardKey.digit1, {ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.homeTabDict: _kb([
+      _key(LogicalKeyboardKey.digit2, {ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.homeTabSettings: _kb([
+      _key(LogicalKeyboardKey.digit3, {ModifierKey.ctrl}),
+    ]),
+    // LT/RT cycle the three home tabs (prev/next), per the global key map.
+    // Keyboard stays on Ctrl+1/2/3 absolute jumps above.
+    ShortcutAction.homeTabPrev: _kb([], [_gLT]),
+    ShortcutAction.homeTabNext: _kb([], [_gRT]),
+    // 跳到查词页并聚焦搜索框：Ctrl+K（macOS ⌘K）。2026-10-14 前是 Ctrl+F，库页
+    // 搜索（librarySearch）接手 Ctrl+F 后让出——Ctrl+K 是浏览器 / Slack / Discord
+    // 等「快速搜索 / 跳转」的通用键，home+global 组内未被占用。老用户没改过的
+    // Ctrl+F 由 registry v14 迁移换过来。
+    ShortcutAction.homeFocusSearch: _kb(
+      [
+        _key(LogicalKeyboardKey.keyK, {ModifierKey.ctrl}),
+      ],
+      [_gY],
+    ),
+    // 库页页头搜索：Ctrl+F（macOS ⌘F）+ `/`（焦点不在输入框时）。手柄留空——home
+    // 组的 Y 已是 homeFocusSearch，库页卡片 X 是详情。
+    ShortcutAction.librarySearch: _kb([
+      _key(LogicalKeyboardKey.keyF, {ModifierKey.ctrl}),
+      _key(LogicalKeyboardKey.slash),
+    ]),
+    // 全 app 唯一的「返回上一级 / 退出当前界面」（universal scope）。
+    //
+    // 键盘 **Esc**（用户拍板：关词典 / 退书 / 退漫画 / 退视频 / 退设置页都是 Esc，
+    // 且只能有一个配置项）+ Alt+←（保留 TODO-700 T1 的旧默认，老用户肌肉记忆不破）；
+    // 手柄 B。Esc 此前是 global_navigation 里**硬编码**的一条兜底，改键改不动它；
+    // 现在它就是本动作的默认绑定，改键真的能改。
+    //
+    // 阅读器页手柄 B 仍是 audiobookPrevSentence（上一句）：reader/audiobook 先解析、
+    // universal 只在其后兜底，故 B 在书内不退书（TODO-700 约束2/4 不回归）。
+    ShortcutAction.globalBack: _kb(
+      [
+        _key(LogicalKeyboardKey.escape),
+        _key(LogicalKeyboardKey.arrowLeft, {ModifierKey.alt}),
+      ],
+      [_gB],
+    ),
+
+    // 页面滚动六件套（global scope，对所有非媒体页通用）：
+    //   整屏 PageDown / PageUp（+ 手柄 RB / LB）、单步 ↓ / ↑、到底 End / 到顶 Home。
+    // 以前键盘位留空是怕与 reader 的 PageDown 撞语义——但 reader / manga / video 三页
+    // 都在自己的 scope 先解析并消费这些键，global 只兜它们没绑的键，撞不上。
+    // home+global 是同一 co-active 组，home 没绑任何裸方向 / 翻页键，不冲突。
+    // 执行体见 page_scroll_shortcuts.dart（键盘 / 手柄 / 鼠标三通道共用）。
+    ShortcutAction.globalScrollPageDown: _kb(
+      [_key(LogicalKeyboardKey.pageDown)],
+      [_gRB],
+    ),
+    ShortcutAction.globalScrollPageUp: _kb(
+      [_key(LogicalKeyboardKey.pageUp)],
+      [_gLB],
+    ),
+    ShortcutAction.globalScrollLineDown: _kb([
+      _key(LogicalKeyboardKey.arrowDown),
+    ]),
+    ShortcutAction.globalScrollLineUp: _kb([_key(LogicalKeyboardKey.arrowUp)]),
+    ShortcutAction.globalScrollToTop: _kb([_key(LogicalKeyboardKey.home)]),
+    ShortcutAction.globalScrollToBottom: _kb([_key(LogicalKeyboardKey.end)]),
+    // TODO-1093：窗口级全屏切换默认 F11（桌面惯例）。global scope、home+global
+    // co-active 组内 F11 未被占用；手柄留空（gamepad 键在 home/global 组已被翻页/
+    // 返回占用，用户可自绑）。移动端无窗口全屏语义，执行体在移动端 no-op。
+    ShortcutAction.globalToggleFullscreen: _kb([_key(LogicalKeyboardKey.f11)]),
+    // 右键菜单的默认绑定 = 鼠标右键（DOM button 2），与改造前各处硬绑
+    // `onSecondaryTap*` 的行为逐字一致。键盘/手柄留空：菜单是**位置型**动作
+    // （要一个 globalPosition 作锚点），键盘触发没有锚点可用。
+    ShortcutAction.globalContextMenu: const ShortcutBindingSet(
+      mouseBindings: [MouseBinding(2)],
+    ),
+    // Play/pause moved off controller A → L3: on the reader page A is now
+    // "enter the char-level reading cursor" (and, once inside, "look up the word
+    // at the cursor"), which the page intercepts before the audiobook scope is
+    // consulted. Keeping A here would be a permanently shadowed binding. Keyboard
+    // stays on Ctrl+Space.
+    ShortcutAction.audiobookPlayPause: _kb(
+      [
+        _key(LogicalKeyboardKey.space, {ModifierKey.ctrl}),
+      ],
+      [_gL3],
+    ),
+    // TODO-700 T2：句子导航补手柄默认 —— X=下一句 / B=上一句（用户意图）。reader+
+    // audiobook 同组，reader scope 先解析；readerDismissDict 已不再占 B（T2 上面挪走）。
+    // 这里 B/X 落在 audiobook scope，reader scope 无 B/X 占用 → 不被遮蔽，且阅读器内 B
+    // 不退书（约束2/4）。
+    ShortcutAction.audiobookNextSentence: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowRight, {ModifierKey.ctrl}),
+      ],
+      [_gX],
+    ),
+    ShortcutAction.audiobookPrevSentence: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowLeft, {ModifierKey.ctrl}),
+      ],
+      [_gB],
+    ),
+
+    // 中键点句 → 跳到该句并播放。鼠标键是位置型动作，运行时不走
+    // _executeShortcutAction，而是 onPointerSeek 经 resolveMouse 判定后定位执行。
+    ShortcutAction.audiobookSeekToClickedSentence: const ShortcutBindingSet(
+      mouseBindings: [MouseBinding(1)],
+    ),
+    // Video player defaults (TODO-134). Mirror the previous hard-coded
+    // buildVideoPlayerShortcuts map exactly so migrating into the registry does
+    // not change any default behaviour (Never break userspace). The video page
+    // resolves only the video scope, so there is no cross-scope shadowing here.
+    // TODO-1342：视频播放器手柄映射（video 独立 co-active 组，与 reader/home 的手柄
+    // 键不同页面绝不同时激活，互不冲突；每个按钮在 video scope 内唯一归属一个动作，
+    // 由 shortcut_defaults_test 的 video no-shadow 守卫保证）。核心遥控键：
+    //   A=播放/暂停、B=退出全屏/返回、LB/RB 与 dpad 左右=快退/快进、dpad 上下=音量、
+    //   X/Y=上/下一句字幕、LT=重听当前句、RT=全屏、Start=字幕跳转列表。
+    // BUG-1995：「只关词典」的可选专用动作，**默认空绑定**（与 readerDismissDict
+    // 同形）。存在的意义是给鼠标侧键一个没有副作用的落点——绑到真实视频动作上，
+    // 浮层不可见时那个动作会照常执行。退出视频仍走 universal 的 globalBack。
+    ShortcutAction.videoDismissDict: const ShortcutBindingSet(),
+    ShortcutAction.videoTogglePlayPause: _kb(
+      [
+        _key(LogicalKeyboardKey.space),
+        _key(LogicalKeyboardKey.keyP),
+        _key(LogicalKeyboardKey.mediaPlayPause),
+      ],
+      [_gA],
+    ),
+    ShortcutAction.videoPlay: _kb([_key(LogicalKeyboardKey.mediaPlay)]),
+    ShortcutAction.videoPause: _kb([_key(LogicalKeyboardKey.mediaPause)]),
+    // Ctrl+Arrow = previous/next subtitle sentence (asbplayer style); bare
+    // arrows are time seek below.
+    ShortcutAction.videoPreviousSubtitle: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowLeft, {ModifierKey.ctrl}),
+      ],
+      [_gX],
+    ),
+    ShortcutAction.videoNextSubtitle: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowRight, {ModifierKey.ctrl}),
+      ],
+      [_gY],
+    ),
+    ShortcutAction.videoSeekBackward: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowLeft),
+        _key(LogicalKeyboardKey.keyA),
+        _key(LogicalKeyboardKey.keyJ),
+      ],
+      [_gLB, _gDpadLeft],
+    ),
+    ShortcutAction.videoSeekForward: _kb(
+      [
+        _key(LogicalKeyboardKey.arrowRight),
+        _key(LogicalKeyboardKey.keyD),
+        _key(LogicalKeyboardKey.keyI),
+        _key(LogicalKeyboardKey.keyF, {ModifierKey.shift}),
+      ],
+      [_gRB, _gDpadRight],
+    ),
+    ShortcutAction.videoToggleShaderCompare: _kb([
+      _key(LogicalKeyboardKey.keyC),
+    ]),
+    ShortcutAction.videoVolumeUp: _kb(
+      [_key(LogicalKeyboardKey.arrowUp), _key(LogicalKeyboardKey.digit0)],
+      [_gDpadUp],
+    ),
+    ShortcutAction.videoVolumeDown: _kb(
+      [_key(LogicalKeyboardKey.arrowDown), _key(LogicalKeyboardKey.digit9)],
+      [_gDpadDown],
+    ),
+    ShortcutAction.videoToggleMute: _kb([_key(LogicalKeyboardKey.keyM)]),
+    ShortcutAction.videoSpeedUp: _kb([
+      _key(LogicalKeyboardKey.bracketRight),
+      _key(LogicalKeyboardKey.equal),
+    ]),
+    ShortcutAction.videoSpeedDown: _kb([
+      _key(LogicalKeyboardKey.bracketLeft),
+      _key(LogicalKeyboardKey.minus),
+    ]),
+    ShortcutAction.videoResetSpeed: _kb([_key(LogicalKeyboardKey.backspace)]),
+    // 按住临时倍速（对齐手机长按画面）：默认裸 E——video co-active 组内空闲
+    // （A/J=快退、D/I=快进、C/S/F/M/L/B/H/R/Z/X/P 等均已占用），且在 WASD 手位旁
+    // 便于长按。键盘-only：手柄绑定退化成翻转语义（按一下开/再按恢复），默认不绑，
+    // 用户可在设置里自绑。
+    ShortcutAction.videoHoldSpeed: _kb([_key(LogicalKeyboardKey.keyE)]),
+    ShortcutAction.videoPreviousFrame: _kb([_key(LogicalKeyboardKey.comma)]),
+    ShortcutAction.videoNextFrame: _kb([_key(LogicalKeyboardKey.period)]),
+    ShortcutAction.videoScreenshot: _kb([_key(LogicalKeyboardKey.keyS)]),
+    // Shift+S：与裸 S 同指法、只多一个修饰键，"带字幕的那一版截图" 正好对应
+    // "同一个动作的加强版" 这个修饰键直觉。video co-active 组内 Shift+S 未被占用。
+    ShortcutAction.videoScreenshotSubtitled: _kb([
+      _key(LogicalKeyboardKey.keyS, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoToggleFullscreen: _kb(
+      [_key(LogicalKeyboardKey.keyF), _key(LogicalKeyboardKey.f12)],
+      [_gRT],
+    ),
+    // 小窗模式：W = window，video co-active 组内 W 此前完全空闲（全组唯一未占的
+    // 助记字母）。手柄留空——小窗是桌面/手机的窗口概念，手柄场景（电视/掌机）
+    // 用不上，用户要的话可以自绑。
+    ShortcutAction.videoToggleMiniWindow: _kb([_key(LogicalKeyboardKey.keyW)]),
+    // 小窗控件显隐：Shift+M。裸 M 是静音（video 组内已占），而阅读器 / 漫画的
+    // 「切换界面」正是裸 M（readerToggleChrome / mangaToggleChrome）——Shift+M 既
+    // 避开冲突，又留住跨页面的肌肉记忆。手柄留空，理由同 videoToggleMiniWindow。
+    ShortcutAction.videoToggleMiniChrome: _kb([
+      _key(LogicalKeyboardKey.keyM, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoToggleSubtitleList: _kb(
+      [_key(LogicalKeyboardKey.keyL)],
+      [_gStart],
+    ),
+    // BUG-1907：字幕列表内搜索。video 组里 Ctrl+F 此前完全空闲（同键的
+    // readerOpenNavigation / homeFocusSearch 属不同 co-active 组，绝不同时激活）。
+    ShortcutAction.videoSearchSubtitleList: _kb([
+      _key(LogicalKeyboardKey.keyF, {ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.videoToggleImmersiveLock: _kb([
+      _key(LogicalKeyboardKey.keyL, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoToggleSubtitleBlur: _kb([
+      _key(LogicalKeyboardKey.keyB),
+    ]),
+    ShortcutAction.videoToggleFavoriteSentence: _kb([
+      _key(LogicalKeyboardKey.keyD, {ModifierKey.ctrl}),
+    ]),
+    // 手柄/键盘字级选词查词（对齐阅读器 readerEnterCaret）：进入后 D-pad/方向键移
+    // 光标、A/Enter 查词、B/Esc 退出（激活期按键在视频页先于注册表截获）。默认
+    // Enter + Select——video 组内两个空闲位；纯手柄用户由此第一次获得视频查词入口
+    //（此前唯一非鼠标入口是 Shift+指针位置，无鼠标即失效）。
+    ShortcutAction.videoEnterCaret: _kb(
+      [_key(LogicalKeyboardKey.enter)],
+      [_gSelect],
+    ),
+    // 暂停句「整句扫词」（2026-10-09）：**默认空绑定**（键盘与手柄都留空），由用户在
+    // 快捷键设置里自配。它是有模态的 caret 查词的替代路径——不进 caret，因而浮层的
+    // 制卡 / 发音键保持可达。不设默认键的理由：键盘上常见键已被词条导航 / 制卡 / 播放
+    // 占用；手柄上 video scope 已占满（B 另属 universal 返回，L3/R3 由
+    // `video_gamepad_mapping_test` 断言保持空闲——摇杆按下键也不适合做扫词）。
+    // 「可配置即必须可执行」由 `shortcut_action_wiring_guard_test` 盯着：执行体在
+    // video_fushi_page.dart，故空绑定不是死通道。
+    ShortcutAction.videoLookupNextWord: const ShortcutBindingSet(),
+    ShortcutAction.videoLookupPrevWord: const ShortcutBindingSet(),
+    // 漫画：默认键位与 reader 同构（PageDown/右/下/空格 前进），左右方向键的最终
+    // 朝向再由 resolveMangaArrowPageTurn 按跨页方向（日漫默认 rtl）校正，所以这里
+    // 存的是**页序语义**而非物理方向。
+    //
+    // 手柄默认与 reader 翻页同构（RB/dpad右=前进、LB/dpad左=后退）：漫画页现在有
+    // 真实的手柄解析入口（`_handleGamepadButton` → resolveGamepad manga →
+    // universal，桌面轮询与 Android gameButton* 汇合同一入口），dpad 左/右再由
+    // resolveMangaDpadPageTurn 按跨页方向校正——与键盘方向键同一套页序语义。
+    // B **刻意不绑**：退出/关弹窗归 universal 的 globalBack（手柄 B 默认在
+    // universal），在 manga scope 再绑一个 B 会把两级阶梯永久遮蔽
+    // （`universal_back_test` 盯着）。此前「配过 RB/LB/dpad/B 但没有解析入口」的
+    // 死通道教训见 `shortcut_channel_wiring_guard_test`——通道与入口必须同增同减。
+    ShortcutAction.mangaPageForward: _kb(
+      [
+        _key(LogicalKeyboardKey.pageDown),
+        _key(LogicalKeyboardKey.arrowRight),
+        _key(LogicalKeyboardKey.arrowDown),
+        _key(LogicalKeyboardKey.space),
+      ],
+      [_gRB, _gDpadRight],
+    ),
+    ShortcutAction.mangaPageBackward: _kb(
+      [
+        _key(LogicalKeyboardKey.pageUp),
+        _key(LogicalKeyboardKey.arrowLeft),
+        _key(LogicalKeyboardKey.arrowUp),
+      ],
+      [_gLB, _gDpadLeft],
+    ),
+    // 「只关词典、绝不退出」（漫画版）：**默认空绑定**，理由与 readerDismissDict
+    // 完全相同——Esc 归 universal 的 globalBack 一键阶梯。
+    ShortcutAction.mangaDismissDict: const ShortcutBindingSet(),
+    // BUG-1888：切换漫画界面。键盘 M / 手柄 Y，与 readerToggleChrome 同键——两者
+    // 分属不同 scope、绝不同时激活，肌肉记忆可以跨阅读器复用。manga scope 内 M 与
+    // Y 均未被占用（翻页占的是 RB/LB/dpad 与方向/空格系）。
+    ShortcutAction.mangaToggleChrome: _kb(
+      [_key(LogicalKeyboardKey.keyM)],
+      [_gY],
+    ),
+    // 放大后平移视野：默认 Ctrl+方向键。裸方向键四个全被翻页占了
+    // （mangaPageForward/Backward 各绑两个），同 scope 内撞绑会被靠前声明者吃掉，
+    // 所以默认必须带修饰键。用户可在快捷键设置里改。
+    ShortcutAction.mangaPanUp: _kb([
+      _key(LogicalKeyboardKey.arrowUp, const <ModifierKey>{ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.mangaPanDown: _kb([
+      _key(LogicalKeyboardKey.arrowDown, const <ModifierKey>{ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.mangaPanLeft: _kb([
+      _key(LogicalKeyboardKey.arrowLeft, const <ModifierKey>{ModifierKey.ctrl}),
+    ]),
+    ShortcutAction.mangaPanRight: _kb([
+      _key(LogicalKeyboardKey.arrowRight, const <ModifierKey>{
+        ModifierKey.ctrl,
+      }),
+    ]),
+    ShortcutAction.videoReplayCurrentSubtitle: _kb(
+      [_key(LogicalKeyboardKey.keyR)],
+      [_gLT],
+    ),
+    // 重播上一句（TODO-378，BUG-287）：Shift+R，纯句子后退到上一条 cue 起点（不退化）。
+    ShortcutAction.videoReplayPreviousSubtitle: _kb([
+      _key(LogicalKeyboardKey.keyR, {ModifierKey.shift}),
+    ]),
+    // 内封章节上/下一章（TODO-424）：PageUp / PageDown。video 是独立 co-active 组，
+    // 与 reader 的 PageUp/PageDown 不冲突（不同页面绝不同时激活）。
+    ShortcutAction.videoPreviousChapter: _kb([_key(LogicalKeyboardKey.pageUp)]),
+    ShortcutAction.videoNextChapter: _kb([_key(LogicalKeyboardKey.pageDown)]),
+    // TODO-840 Part B：字幕遮蔽三态循环（不遮蔽→模糊→隐藏→…）默认 Shift+B，紧挨历史
+    // 的「切换模糊」B 键（videoToggleSubtitleBlur 仍保留），video 独立 co-active 组内
+    // 不与其它键冲突。直接「隐藏主字幕」开关默认 H（video 组内未占用）。
+    ShortcutAction.videoCycleSubtitleObscure: _kb([
+      _key(LogicalKeyboardKey.keyB, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoToggleSubtitleHide: _kb([
+      _key(LogicalKeyboardKey.keyH),
+    ]),
+    // TODO-1382：副字幕遮蔽三态循环默认 Shift+G、直接隐藏副字幕默认 Shift+H——与主字幕
+    // 对称（主 H 隐藏、副 Shift+H 隐藏；主 Shift+B 循环、副 Shift+G 循环）。video 独立
+    // co-active 组内未占用，不与其它键冲突。
+    ShortcutAction.videoCycleSecondarySubtitleObscure: _kb([
+      _key(LogicalKeyboardKey.keyG, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoToggleSecondarySubtitleHide: _kb([
+      _key(LogicalKeyboardKey.keyH, {ModifierKey.shift}),
+    ]),
+    // 字幕对轴/匹配（用户请求）：打开波形对轴放大视图默认 Shift+A（A=Align，避开裸 A 的
+    // 回退 seek）；字幕延迟 -/+ 默认 z/x（mpv 经典字幕延迟键，每次 ±100ms=mpv 0.1s）。
+    // 三键在 video co-active 组内均未占用（裸 z/x、Shift+A 都是空闲位），无冲突。键盘-only
+    // （手柄不绑，与 videoToggleMute/videoSpeedUp 同范式）。
+    ShortcutAction.videoOpenSubtitleAlign: _kb([
+      _key(LogicalKeyboardKey.keyA, {ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoSubtitleDelayDecrease: _kb([
+      _key(LogicalKeyboardKey.keyZ),
+    ]),
+    ShortcutAction.videoSubtitleDelayIncrease: _kb([
+      _key(LogicalKeyboardKey.keyX),
+    ]),
+    // asbplayer 式「字幕偏移对齐」（用户请求）：Ctrl+Shift+← 把上一句、Ctrl+Shift+→ 把
+    // 下一句字幕的起点整体平移到当前播放点（按目标 cue 求绝对偏移，与 z/x 步进微调互补）。
+    // 镜像既有 Ctrl+←/→（跳句）的手感、asbplayer 用户肌肉记忆一致；Ctrl+Shift+箭头在
+    // video co-active 组内空闲（裸箭头=seek、Ctrl+箭头=跳句、上下=音量，均不冲突）。
+    // 键盘-only（手柄不绑）。macOS 表自动把 Ctrl→Meta（见 _macOS，与 Ctrl+箭头同款）。
+    ShortcutAction.videoAlignSubtitleToPrev: _kb([
+      _key(LogicalKeyboardKey.arrowLeft, {ModifierKey.ctrl, ModifierKey.shift}),
+    ]),
+    ShortcutAction.videoAlignSubtitleToNext: _kb([
+      _key(LogicalKeyboardKey.arrowRight, {
+        ModifierKey.ctrl,
+        ModifierKey.shift,
+      }),
+    ]),
+    // TODO-700 T6：dpad 四向可绑触发键。默认各绑对应 dpad 键；键盘留空（方向焦点
+    // 移动由箭头键 / 摇杆负责，避免与各页面方向键语义重复）。执行体 = 通用方向焦点
+    // 移动（gamepadMoveFocusInDirection），见 gamepad_service._dispatchButton。
+    ShortcutAction.dpadUp: _kb([], [_gDpadUp]),
+    ShortcutAction.dpadDown: _kb([], [_gDpadDown]),
+    ShortcutAction.dpadLeft: _kb([], [_gDpadLeft]),
+    ShortcutAction.dpadRight: _kb([], [_gDpadRight]),
+    // TODO-1066：桌面「app 外全局查词」系统级触发热键，默认 Ctrl+Alt+D（与旧硬
+    // 编码一致，行为不变，只是变成可改键）。GlobalLookupController 读此绑定注册到
+    // hotkey_manager；macOS 表把 Ctrl 换成 Meta（见 _macOS）。globalExternal 是独立
+    // co-active 组，Ctrl+Alt+D 不与任何应用内页面键冲突。
+    ShortcutAction.globalExternalLookup: _kb([
+      _key(LogicalKeyboardKey.keyD, {ModifierKey.ctrl, ModifierKey.alt}),
+    ]),
+    // 用户请求：把主窗唤到前台并直接落在查词页上。默认 Ctrl+Alt+F（F = find，与
+    // 同一 scope 里已占的 Ctrl+Alt+D 相邻好记）。跟 globalExternalLookup 一样是
+    // 键盘-only：鼠标侧键 3/4 已被那条占掉，手柄在 app 外只有一条单槽派发链
+    // （GlobalExternalLookupRoute）且只认那条，给了绑定也永不触发。
+    // macOS 表自动把 Ctrl→Meta（见 _macOS）；移动端整个 globalExternal scope 返回
+    // 空绑定（见 _mobile），系统不允许第三方注册全局热键。
+    ShortcutAction.globalExternalOpenLookupPage: _kb([
+      _key(LogicalKeyboardKey.keyF, {ModifierKey.ctrl, ModifierKey.alt}),
+    ]),
+    // 查词弹窗「上/下一个词条」：默认 Alt+滚轮（Yomitan 的 Next/Previous entry 同款
+    // 手感）。裸滚轮永远滚动弹窗内容，故必须带修饰键；Alt 在 WebView 里没有默认滚轮
+    // 语义（Ctrl+滚轮是缩放、Shift+滚轮是横向滚动，都不能占）。dictionaryPopup 是独立
+    // co-active 组，与任何页面键位不冲突。
+    // 手柄默认（P2）：dpad 下/上 = 下/上一个词条。执行链有两条，缺一不可：
+    //   * GamepadService 的弹窗兜底（页面 Actions 未消费 → resolveGamepad
+    //     (dictionaryPopup) → 钩子调 JS），管的是页面**没绑**这个键的场合；
+    //   * 宿主页面在自己的上下文路由里给弹窗的那一次消费机会——视频页在
+    //     BUG-924「已绑键关浮层」之前、阅读器在 caret 之后 reader scope 之前。
+    // 只有第一条时，dpad 上下 / X / Y 在 video 和 reader+audiobook scope 全都已被
+    // 占用（音量 / 上下条字幕 / 上下句 / 收起书页 chrome），页面先消费 ⇒ 这四个弹窗
+    // 默认绑定在两个最主要的宿主里结构性不可达（设置里能配、按了没反应）。
+    // 唯一有意让位的是阅读器 caret 激活期的 dpad 四向：方向键移动字级光标去选词，
+    // 是查词的操作方式本身，不能让给词条翻页。
+    ShortcutAction.popupNextEntry: const ShortcutBindingSet(
+      wheelBindings: <WheelBinding>[
+        WheelBinding(WheelDirection.down, modifiers: {ModifierKey.alt}),
+      ],
+      gamepadBindings: <GamepadBinding>[_gDpadDown],
+    ),
+    ShortcutAction.popupPrevEntry: const ShortcutBindingSet(
+      wheelBindings: <WheelBinding>[
+        WheelBinding(WheelDirection.up, modifiers: {ModifierKey.alt}),
+      ],
+      gamepadBindings: <GamepadBinding>[_gDpadUp],
+    ),
+    // 制卡（= 点弹窗里的「＋」）。默认 Ctrl+Enter，与阅读器既有的
+    // readerCreateCardFromPopup 同键：两者是同一件事在不同焦点归属下的两条执行路径，
+    // 键位若不一致，用户在阅读器和在 app 外查词窗就得记两个键。dictionaryPopup 是独立
+    // co-active 组，与任何页面键位都不冲突（阅读器那条同键绑定在 reader 组，两组永不
+    // 同时解析，no-shadow 守卫只扫同组）。
+    ShortcutAction.popupMineEntry: ShortcutBindingSet(
+      keyboardBindings: <InputBinding>[
+        _key(LogicalKeyboardKey.enter, {ModifierKey.ctrl}),
+      ],
+      // 手柄 X = 制卡（P2，Dart 侧弹窗兜底派发）。reader 的 X=书签、video 的
+      // X=上一句在各自页面先命中——弹窗可见时它们仍优先，这是「页面专属键优先」
+      // 的既定哲学；漫画/首页词典/独立查词页没占 X，弹窗制卡直达。
+      gamepadBindings: const <GamepadBinding>[_gX],
+    ),
+    // 发音（P2 新增）：默认只有手柄 Y——键盘/鼠标用户点按钮已经够近，而手柄用户
+    // 此前没有任何非光标模式的发音入口。执行体是点第一个可见词条的发音按钮
+    // （fushiPopupPlayFirstAudio，与制卡同一「点按钮不另起桥」纪律）。
+    ShortcutAction.popupPlayAudio: const ShortcutBindingSet(
+      gamepadBindings: <GamepadBinding>[_gY],
+    ),
+  };
+
+  /// BUG-2948：桌面默认里在 macOS 上**被系统先截走**、app 永远收不到的键，换成
+  /// macOS 上空闲的同义键（只换键盘通道，手柄 / 鼠标照桌面默认）。
+  /// * 有声书播放 / 暂停：桌面 Ctrl+Space 经 Ctrl→Meta 换成 Cmd+Space = Spotlight；
+  ///   Ctrl+Space 本身又是 macOS「切换输入法」（日语学习者必开）。Option+Space 空闲。
+  /// * 窗口全屏：F11 是 macOS「显示桌面」，且笔记本 F 行默认是媒体键。Ctrl+Cmd+F 是
+  ///   macOS 标准全屏键（Runner 菜单「Enter Full Screen」同键，Flutter 先拿到并消费）。
+  /// 老用户没改过的旧默认由 `FushiShortcutRegistry` 的 v13 迁移换过来。
+  static final Map<ShortcutAction, List<InputBinding>> _macOSKeyboardOverrides =
+      <ShortcutAction, List<InputBinding>>{
+        ShortcutAction.audiobookPlayPause: <InputBinding>[
+          _key(LogicalKeyboardKey.space, {ModifierKey.alt}),
+        ],
+        ShortcutAction.globalToggleFullscreen: <InputBinding>[
+          _key(LogicalKeyboardKey.keyF, {ModifierKey.ctrl, ModifierKey.meta}),
+        ],
+      };
+
+  static final Map<ShortcutAction, ShortcutBindingSet> _macOS = {
+    for (final entry in _desktop.entries)
+      entry.key: ShortcutBindingSet(
+        keyboardBindings:
+            _macOSKeyboardOverrides[entry.key] ??
+            entry.value.keyboardBindings
+                .map((b) {
+                  // app 外全局查词热键**不做** Ctrl→Meta：⌘⌥D 是 macOS 系统级「打开/关闭
+                  // Dock 隐藏」快捷键，系统热键先于应用的 RegisterEventHotKey 处理，
+                  // 应用永远收不到。Ctrl⌥D 在 macOS 上空闲，保持与 Windows 同键。
+                  if (entry.key == ShortcutAction.globalExternalLookup) {
+                    return b;
+                  }
+                  if (b.modifiers.contains(ModifierKey.ctrl)) {
+                    final newMods = Set<ModifierKey>.of(b.modifiers)
+                      ..remove(ModifierKey.ctrl)
+                      ..add(ModifierKey.meta);
+                    return InputBinding(key: b.key, modifiers: newMods);
+                  }
+                  return b;
+                })
+                .toList(growable: false),
+        gamepadBindings: entry.value.gamepadBindings,
+        mouseBindings: entry.value.mouseBindings,
+        // 滚轮绑定的修饰键不做 Ctrl→Meta 替换：Alt+滚轮在 macOS 上同样空闲，而
+        // Ctrl+滚轮在 macOS 是系统缩放，替换过去反而撞系统手势。
+        wheelBindings: entry.value.wheelBindings,
+      ),
+  };
+
+  static final Map<ShortcutAction, ShortcutBindingSet> _mobile = {
+    for (final action in ShortcutAction.values)
+      action: () {
+        final desktop = _desktop[action]!;
+        switch (action.scope) {
+          case ShortcutScope.reader:
+          case ShortcutScope.video:
+          case ShortcutScope.manga:
+            return ShortcutBindingSet(
+              keyboardBindings: desktop.keyboardBindings,
+              gamepadBindings: desktop.gamepadBindings,
+            );
+          case ShortcutScope.audiobook:
+            return ShortcutBindingSet(
+              gamepadBindings: desktop.gamepadBindings,
+              // Android 可接鼠标，保留中键 seek 绑定（移动端无害）。
+              mouseBindings: desktop.mouseBindings,
+            );
+          // 库页搜索（2026-10-14 用户拍板）：平板 / 手机接外接键盘时库页搜索仍要
+          // 能用 Ctrl+F（iPad ⌘F，见 [_iOS]）与 `/`，所以它单独保留键盘绑定。只放
+          // 开这一条、不放开整个 home 组：home 组其余键（Ctrl+数字跳页签、Ctrl+K
+          // 跳查词搜索…）在移动端没有对应的心智与可见入口，放开会让外接键盘上的
+          // 组合键被首页悄悄吃掉。它的执行体是库页外壳的 FushiHeaderSearchKeys，
+          // 不经 home 页派发，裸 `/` 在输入框里照常放行给输入框，软键盘不受影响。
+          case ShortcutScope.home when action == ShortcutAction.librarySearch:
+            return ShortcutBindingSet(
+              keyboardBindings: desktop.keyboardBindings,
+              gamepadBindings: desktop.gamepadBindings,
+              mouseBindings: desktop.mouseBindings,
+            );
+          case ShortcutScope.home:
+          case ShortcutScope.global:
+          case ShortcutScope.gamepad:
+            return ShortcutBindingSet(
+              gamepadBindings: desktop.gamepadBindings,
+              // Android 可接鼠标（平板 / DeX / 桌面模式），与 audiobook 的中键
+              // seek 同档保留鼠标绑定。丢掉它会让 globalContextMenu 在移动端解析
+              // 不到——接了鼠标的 Android 上右键菜单会**整个消失**（改造前
+              // `onSecondaryTap` 在 Android 一样有效）。没有鼠标的设备上永不触发。
+              mouseBindings: desktop.mouseBindings,
+            );
+          // universal（「返回上一级」）与 reader/video/manga 同档：键盘绑定在移动端
+          // 也保留。移动端主路径是系统返回手势 / 手柄 B，但外接键盘（平板 / DeX /
+          // Android 桌面模式）上 Esc 同样该退一层——这三个媒体 scope 早就是这么做的，
+          // 「返回」没有理由更弱。没有外接键盘的设备上它永不触发，无害。
+          case ShortcutScope.universal:
+            return ShortcutBindingSet(
+              keyboardBindings: desktop.keyboardBindings,
+              gamepadBindings: desktop.gamepadBindings,
+            );
+          // TODO-1066：移动端「app 外查词」= 纯系统 PROCESS_TEXT / 分享 / 悬浮球
+          // 触发，操作系统不允许第三方注册系统级文本选择热键，故此 scope 在移动端
+          // 无任何 app 内绑定（设置页对该 scope 显示系统级说明文案，不渲染可改键行）。
+          case ShortcutScope.globalExternal:
+            return const ShortcutBindingSet();
+          // 查词弹窗的词条导航是纯滚轮通道：Android 可接鼠标（平板 / DeX / 桌面
+          // 模式），滚轮事件同样到达弹窗 WebView 的 popup.js，故移动端保留桌面的
+          // Alt+滚轮默认；没有鼠标的设备上它永不触发，无害。
+          // 制卡键（popupMineEntry）刻意不进移动端：它的 JS 判定只对**桌面 app 外**的
+          // 裸 WebView2 查词窗启用（in-app 宿主注入 null，由 Dart 派发），而移动端的两个
+          // 弹窗宿主（Android 悬浮词典 / 独立查词页）都是 Flutter 宿主、没有 Dart 侧接线，
+          // 给了绑定也永不触发——「设置里能配、按了没反应」比没有这个选项更糟。
+          // 与 globalExternal 在移动端返回空绑定同理。
+          // 手柄绑定（P2）移动端保留：Android 的手柄键经页面 Actions →
+          // 全局 wrapper 的弹窗兜底同样走 Dart 派发，与桌面同一条链。
+          case ShortcutScope.dictionaryPopup:
+            return ShortcutBindingSet(
+              wheelBindings: desktop.wheelBindings,
+              gamepadBindings: desktop.gamepadBindings,
+            );
+        }
+      }(),
+  };
+
+  /// iOS / iPadOS：与 Android 同一份移动端默认，只有保留了键盘绑定的库页搜索
+  /// 按 Apple 惯例换成 ⌘F（与 macOS 同键；`/` 不变）。
+  static final Map<ShortcutAction, ShortcutBindingSet> _iOS = {
+    for (final entry in _mobile.entries)
+      entry.key: entry.key == ShortcutAction.librarySearch
+          ? ShortcutBindingSet(
+              keyboardBindings:
+                  _macOS[ShortcutAction.librarySearch]!.keyboardBindings,
+              gamepadBindings: entry.value.gamepadBindings,
+              mouseBindings: entry.value.mouseBindings,
+            )
+          : entry.value,
+  };
+}

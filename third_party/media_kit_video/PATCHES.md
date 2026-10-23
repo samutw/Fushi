@@ -1,0 +1,935 @@
+# Hibiki patches
+
+This package vendors `media_kit_video` 2.0.1 (unchanged from pub.dev except for
+the patches below) so Hibiki can carry fixes that are not yet upstream.
+
+## BUG-235: seek bar `onPointerUp` use-after-dispose crash
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`,
+`MaterialDesktopSeekBarState`.
+
+Upstream `onPointerUp()` (and `onPointerMove()`) unconditionally call
+`controller(context).player.seek(...)`. `controller(context)` is
+`VideoStateInheritedWidget.of(context)`, which dereferences `State.context`.
+
+When the controls subtree is torn down while a seek-bar drag is in progress —
+which Hibiki does on fullscreen enter/exit and on episode switch via
+`VideoControlsFocusGate` (`fushi/lib/.../video_hibiki_page.dart`) — the pointer
+release lands on a disposed `State`, and `context` is null. The crash users hit:
+
+```text
+FlutterError: Null check operator used on a null value
+  at MaterialDesktopSeekBarState.onPointerUp (material_desktop.dart:987)
+```
+
+The State already guards `setState` with `if (mounted)`, but the two pointer
+handlers that dereference `controller(context)` had no such guard. The patch
+adds `if (!mounted) return;` to the top of both `onPointerUp()` and
+`onPointerMove()`, matching the existing `mounted` guard style. `onPointerDown()`
+only calls `setState` (already guarded), so it is left unchanged.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`.
+
+## BUG-566: mobile seek bar use-after-dispose (mirror of BUG-235)
+
+`lib/media_kit_video_controls/src/controls/material.dart`,
+`MaterialSeekBarState`.
+
+The *mobile* controls have the exact same defect BUG-235 fixed on desktop:
+`onPointerMove()` and `onPointerUp()` unconditionally call
+`controller(context).player.seek(...)`, dereferencing `State.context` with no
+`mounted` guard. Hibiki tears down the controls subtree on fullscreen
+enter/exit and episode switch (`VideoControlsFocusGate`), so a drag released
+right then lands on a disposed `State` (`context` is null) and crashes with
+`Null check operator used on a null value`; the seek is lost either way.
+
+The patch adds `if (!mounted) return;` to the top of both handlers, mirroring
+the BUG-235 desktop patch and the State's existing `if (mounted)` setState
+guard. `onPointerDown()` and the `onPan*` handlers only call `setState`
+(already guarded) / widget callbacks and do not dereference `context`, so they
+are left unchanged — same as desktop.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`.
+
+## TODO-364: publish real controls visibility (`visibilityNotifier`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` and
+`lib/media_kit_video_controls/src/controls/material.dart`, both the theme data
+classes (`MaterialDesktopVideoControlsThemeData` /
+`MaterialVideoControlsThemeData`) and their control States.
+
+Hibiki disables the built-in `SubtitleView` and renders its own subtitle overlay
+that dodges the bottom controls bar. Upstream keeps the controls' `visible` state
+(and its auto-hide `Timer`) private in the control State and exposes no callback,
+notifier, or public API. Hibiki used to keep a *separate* mirror of visibility
+with its own timer; the two timers drifted out of phase and the subtitle dodge
+reversed direction under concurrent input (e.g. the bar animating up/down while
+the user also taps / keys). Users reported "the subtitle goes up/down the wrong
+way when I do something while the seek bar appears/disappears".
+
+The patch adds an optional `final ValueNotifier<bool>? visibilityNotifier;` to
+both theme data classes (wired through their constructors and `copyWith`), and a
+`void _publishVisibility()` helper in each control State that pushes the State's
+real `visible` into that notifier after **every** `visible` mutation
+(onHover / onEnter / onExit / onTap / mount timer / seek-end timer). The initial
+(mount) visibility is published via `addPostFrameCallback` to avoid re-entering a
+host listener's `setState` during `didChangeDependencies`. When no notifier is
+injected the behaviour is identical to pub.dev (no publishing).
+
+Hibiki injects one notifier through both control themes and derives its subtitle
+dodge from that single source of truth (`_mediaKitControlsVisible` →
+`_applyControlsVisibilityFromMediaKit` in `video_hibiki_page.dart`), deleting its
+old mirror + second timer.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_visibility_notifier_guard_test.dart`.
+
+## TODO-1059: restart auto-hide timer on host signal (`restartHideTimerSignal`)
+
+`lib/media_kit_video_controls/src/controls/material.dart` only, both the theme
+data class (`MaterialVideoControlsThemeData`) and the mobile control State
+(`_MaterialVideoControlsState`).
+
+On mobile the controls' auto-hide `Timer` is only reset by a full-screen tap
+(`onTap`) or a seek gesture. Pressing the bottom button-bar buttons (play /
+skip-forward / skip-back) runs each button's own `onPressed` and never resets
+the timer, so the controls vanish `controlsHoverDuration` after the last tap
+even while the user is still pressing a button — the finger then lands on the
+video underneath and mis-triggers a play/pause (users reported "the menu keeps
+auto-hiding while I press the fast-forward/back buttons").
+
+The patch adds an optional `final Listenable? restartHideTimerSignal;` to
+`MaterialVideoControlsThemeData` (wired through its constructor and `copyWith`).
+The mobile State subscribes to it in `didChangeDependencies` (re-binding when
+the theme's listenable identity changes) and detaches in `dispose`. On fire, the
+new `void _restartHideTimer()` — only while already `visible` — cancels and
+reschedules the hide `Timer` for another `controlsHoverDuration`, mirroring the
+visible-branch reset in `onTap` but **without** toggling visibility (a press on a
+visible button keeps the controls up; it never un-hides them). When no signal is
+injected the behaviour is identical to pub.dev.
+
+Hibiki injects one `ChangeNotifier` (`_RestartHideTimerSignal`) through the
+mobile controls theme (`restartHideTimerSignal:` in `_mobileControlsTheme`) and
+pokes it from the bottom button presses via `_pokeControlsVisible()` (which, on
+mobile, now fires this signal instead of the desktop synthetic-hover path — see
+`controls_visibility.part.dart`).
+
+Source-guard test: `fushi/test/third_party/media_kit_video_restart_hide_timer_guard_test.dart`.
+
+## TODO-565: notify host on user seek-bar interaction (`onSeekStart`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` and
+`lib/media_kit_video_controls/src/controls/material.dart`, both the theme data
+classes (`MaterialDesktopVideoControlsThemeData` /
+`MaterialVideoControlsThemeData`) and the seek-bar wiring in their control
+States.
+
+The subtitle list lets the user tap a row to jump to that cue
+(`VideoPlayerController.skipToCue`). The jump seek lands a little before the cue
+(BUG-259 pre-roll), so the controller keeps a short-lived "active jump target"
+snapshot + in-flight grace window to snap the highlight to the tapped row until
+the seek truly lands (TODO-565). Every Hibiki-initiated seek funnels through
+`VideoPlayerController.seekMs`, which clears that snapshot first — *except* the
+progress (seek) bar, which drives `controller(context).player.seek(...)` directly
+inside media_kit and bypasses `seekMs`. If the user drags the bar to an earlier
+cue *during* that grace window, the next tick reads the new (earlier) position,
+the grace is not yet exhausted, and the stale target snaps the highlight back to
+the originally tapped row for ~2s.
+
+Upstream's seek bar exposes no host-level seek hook; its internal
+`onSeekStart`/`onSeekEnd` are hard-wired to the controls' auto-hide timer and are
+not surfaced through the theme. The patch adds an optional
+`final void Function()? onSeekStart;` to both theme data classes (wired through
+their constructors and `copyWith`), and merges `_theme(context).onSeekStart?.call()`
+into the existing internal `onSeekStart` callback of each seek bar
+(`MaterialSeekBar` / `MaterialDesktopSeekBar`). When no callback is injected the
+behaviour is identical to pub.dev.
+
+Hibiki injects `() => controller.clearSeekTargetSnap()` through both control
+themes (`_desktopControlsTheme` / `_mobileControlsTheme` in
+`video_hibiki_page.dart`), so starting a progress-bar drag invalidates the jump
+snapshot just like every other seek entry point.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`.
+
+## BUG-796 follow-up: surface the committed seek target on drag/tap (`onSeekEnd(Duration)`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` and
+`material.dart`, both theme data classes and the seek-bar States.
+
+Every Hibiki-initiated seek funnels through `VideoPlayerController.seekMs`, which
+(BUG-796) authoritatively re-syncs the bottom subtitle to the destination and
+suppresses the *lagging* post-seek `player.state.position` (media_kit doesn't
+update position synchronously with `seek`, and while **paused** it stays at the
+old position for a long time — the 125ms cue tick then keeps re-affirming the
+*old* subtitle, so seeking to a silent gap leaves the previous subtitle stuck on
+screen). The progress (seek) bar drives `controller(context).player.seek(...)`
+directly inside media_kit and bypasses `seekMs`, so it never got that protection.
+
+Upstream's seek bar's internal `onSeekEnd` is a `VoidCallback` wired only to the
+controls' auto-hide timer, and carries no target. The patch:
+
+- adds an optional `final void Function(Duration)? onSeekEnd;` to both theme data
+  classes (wired through their constructors and `copyWith`);
+- **retypes** each seek bar's internal `onSeekEnd` from `VoidCallback?` to
+  `void Function(Duration)?` and passes the committed target `duration * slider`
+  at the `onPointerUp` seek-commit;
+- merges `_theme(context).onSeekEnd?.call(target)` into that seek bar's internal
+  `onSeekEnd` callback (alongside the existing auto-hide-timer logic).
+
+When no callback is injected the behaviour is identical to pub.dev. Hibiki injects
+`(Duration target) => controller.notifyExternalSeek(target.inMilliseconds)` through
+**both** control themes (`_desktopControlsTheme` / `_mobileControlsTheme` in
+`video_hibiki_page.dart`). `notifyExternalSeek` applies the same in-flight
+protection as `seekMs` (authoritative cue re-sync + suppress the lagging position)
+**without** re-issuing `player.seek` (the bar already sought). Only the commit
+(pointer-up / tap) notifies; intermediate drag-move seeks do not.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`
+(group `BUG-796 follow-up: seek-bar onSeekEnd(target) patch survives re-vendor`).
+
+## BUG-2731: swipe / double-tap seeks also report their target (`onSeekEnd`)
+
+`lib/media_kit_video_controls/src/controls/material.dart`, `onHorizontalDragEnd`
+and the two double-tap seek indicators' `onSubmitted`.
+
+These three commit points call `controller(context).player.seek(...)` directly, so
+the host never learned where playback was headed. On a remote stream a seek
+re-buffers for seconds while `player.state.position` still reports the **old**
+position; the host's interconnect auto-quality then read that buffering as a
+network stall, downgraded, and reopened the stream at the stale position — the
+swipe was silently undone ("滑动一下会变成没滑动"). Each commit point now calls
+`_theme(context).onSeekEnd?.call(target)` right before `player.seek`, exactly like
+the seek bars, so the host's `notifyExternalSeek` records the in-flight target.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`
+(group `BUG-2731: swipe / double-tap seeks report onSeekEnd(target)`).
+
+## BUG-2731 follow-up: relative seeks measure from the pending target (`relativeSeekBasePosition`)
+
+`lib/media_kit_video_controls/src/controls/material.dart`, new theme field
+`MaterialVideoControlsThemeData.relativeSeekBasePosition` (+ `copyWith`) and the
+state helper `_relativeSeekBase(context)`, used by `onHorizontalDragUpdate`
+(both the `horizontalSeekResolver` `position:` argument and the upstream
+fallback formula), `onHorizontalDragEnd`, and the two double-tap indicators'
+`onSubmitted`.
+
+Upstream computes every relative seek as `player.state.position ± delta`. On a
+remote stream the first seek re-buffers for seconds while `state.position`
+still reports the pre-seek value, so a second swipe / double-tap during that
+window lands at "old position + delta2" and the first displacement is lost
+(the user-visible form: the HUD keeps showing ±0:00 and only small nudges seem
+to work). The host returns its in-flight seek target when one is pending (Hibiki
+wires `VideoPlayerController.resumePositionMs`), else the live position. Null
+keeps upstream behaviour.
+
+One drag measures from one base: `onHorizontalDragUpdate` snapshots
+`_relativeSeekBase` into `_swipeBase` on the drag's first event and
+`_currentSwipeBase` reads that snapshot until `onHorizontalDragEnd` clears it,
+so the HUD / preview never jumps mid-drag when the host's in-flight target lands
+or clears. `MaterialSeekBar` gained `deltaBase`; the swipe-preview seek bar adds
+its delta to that same base instead of `player.state.position`.
+
+Committed seeks also hand their `player.seek` future to the host through the new
+theme field `onSeekDispatched` (both `material.dart` and `material_desktop.dart`):
+the mobile `_dispatchSeek` helper (swipe end + both double-tap indicators) and
+both seek bars' `onPointerUp`. `Player.seek` first waits on the player's internal
+lock and video-controller initialisation before issuing `mpv_command_async`;
+the old content keeps playing meanwhile, so the host only starts counting
+"playing, not buffering, advancing" as "the seek is over" after that future
+completes.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`
+(group `BUG-2731 follow-up: relative seeks measure from the pending target`).
+
+## BUG-374: play/pause on `onTap` (arena-respecting), not `onTapDown`
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`,
+the central play/pause `GestureDetector` and the side-rail buttons.
+
+Upstream binds `controller(context).player.playOrPause()` to `onTapDown`, which
+fires the instant a pointer goes down — *before* the gesture arena resolves. In
+Hibiki the video surface sits under ancestor gesture detectors and overlay
+buttons; tapping the *edge* of a control button let the ancestor's `onTapDown`
+fire play/pause too, so users hit a button edge and the video paused/played
+underneath (TODO-663).
+
+The patch moves `playOrPause()` to `onTap` (which only fires for the detector
+that wins the gesture arena, so a button that claims the tap suppresses the
+pass-through), and degrades `onTapDown` to only record a `_playPauseTapEligible`
+flag (preserving the seek-bar-region geometry checks). The same change is applied
+to the side-rail play/pause buttons on both `material_desktop.dart` and
+`material.dart`. Normal "tap the video area to pause" still works — it just waits
+one arena resolution (imperceptible).
+
+Source-guard test: `fushi/test/pages/video_play_pause_tap_arena_guard_test.dart`.
+
+## TODO-669: surface seek-bar hover position (`onHoverPosition`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`, the desktop
+theme data class (`MaterialDesktopVideoControlsThemeData`) and the desktop seek
+bar (`MaterialDesktopSeekBar` / `MaterialDesktopSeekBarState`).
+
+Hibiki adds a progress-bar hover thumbnail preview (TODO-669): hovering the seek
+bar pops a thumbnail of the frame at that time. media_kit already computes the
+hover fraction internally — `MaterialDesktopSeekBarState.onHover`/`onEnter` do
+`percent = e.localPosition.dx / constraints.maxWidth` (the track inner width
+*after* `seekBarMargin`, so it is the authoritative fraction of the track) — but
+it keeps that fraction private (only used to paint its own hover highlight) and
+exposes no host-level hover hook or tooltip callback.
+
+The patch adds an optional `final void Function(double? fraction)?
+onHoverPosition;` to `MaterialDesktopVideoControlsThemeData` (wired through its
+constructor and `copyWith`) and to the `MaterialDesktopSeekBar` widget. The
+theme's callback is forwarded into the seek-bar widget at its single construction
+site, and `MaterialDesktopSeekBarState` calls `widget.onHoverPosition?.call(...)`
+with the clamped fraction in `onHover`/`onEnter` and with `null` in `onExit`.
+Because the fraction comes straight from the seek bar's own coordinate space, the
+host never re-derives the 16px margin. When no callback is injected the behaviour
+is identical to pub.dev.
+
+Hibiki injects `onHoverPosition: _onSeekBarHover` only through the **desktop**
+control theme (`_desktopControlsTheme` in `video_hibiki_page.dart`); the mobile
+theme deliberately does not (touch has no hover), keeping mobile behaviour
+unchanged.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`.
+
+## TODO-916: show controls on `onTap` (arena-respecting), not `Listener.onPointerDown`
+
+`lib/media_kit_video_controls/src/controls/material.dart` (mobile controls only),
+the central gesture stack of `MaterialVideoControlsState`.
+
+Upstream wraps the controls' central fill in a raw
+`Listener(onPointerDown: ... => onTap())`, so *any* pointer-down toggled the
+control bar **synchronously, before the gesture arena resolved**. Hibiki layers a
+self-implemented long-press speed-up (`onLongPressStart` on an ancestor
+`GestureDetector`) and a Flutter subtitle overlay that dodges the bottom bar.
+Because the long-press recognizer needs ~500ms to win, the initial down of a
+press-and-hold always fired `onTap()` first: the control bar flashed in, started
+its 2s auto-hide, then collapsed once the long-press began — the "control bar
+flashes once before disappearing" symptom (TODO-916 ②). The same premature
+toggle also shoved the subtitle box up via its 200ms dodge animation *mid-tap*,
+so a tap aimed at a subtitle character landed on a now-moved RenderBox and missed,
+which is why subtitle word lookup "needs a pause and several taps" (TODO-916 ④
+amplifier).
+
+The patch removes the `Listener`/`_handlePointerDown` wiring and binds the
+existing `onTap()` to the central `GestureDetector.onTap:` instead. `onTap` only
+fires for the detector that wins the arena, so a long-press or double-tap
+suppresses it and the controls no longer flash. `_tapPosition` (used by
+double-tap-seek segment checks) is preserved and now also recorded on `onTapDown`
+in addition to `onDoubleTapDown`. `playAndPauseOnTap`, the subtitle
+`shiftSubtitle`/`unshiftSubtitle` dodge, and the `visibilityNotifier` push are all
+unchanged — single tap still toggles the controls, just one arena resolution later
+(imperceptible). Desktop `material_desktop.dart` is untouched (it already toggles
+via `MouseRegion.onHover`, never on pointer-down).
+
+Source-guard test: `fushi/test/third_party/media_kit_video_controls_tap_arena_guard_test.dart`.
+
+## TODO-1097: remove desktop drag-to-adjust-volume gesture
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`,
+`_MaterialDesktopVideoControlsState.build`, the central `GestureDetector`.
+
+Upstream binds `GestureDetector.onPanUpdate` (gated by `modifyVolumeOnScroll`)
+so that holding the left mouse button and dragging vertically over the video
+changes the volume by `e.delta.dy`. Hibiki users found this accidental: any
+click-and-drag on the video surface silently jumped the volume. TODO-1097 asks
+to drop only the drag behavior on Windows/desktop while keeping every other
+gesture.
+
+The patch removes the `onPanUpdate` handler entirely (leaving the sibling
+`onTap` play/pause, `onTapDown` play/pause eligibility, and `onTapUp`
+double-press fullscreen untouched). The scroll-wheel volume path
+(`Listener.onPointerSignal` → `PointerScrollEvent`, also gated by
+`modifyVolumeOnScroll`, ~30 lines above) is intentionally **kept** — users did
+not complain about the wheel and it is a separate, deliberate feature. Mobile
+touch gestures (`material.dart`) and the long-press temporary speed-up
+(`speed.part.dart`, a `LongPress` gesture family) are unrelated to `onPanUpdate`
+and untouched.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_desktop_drag_volume_guard_test.dart`.
+
+## TODO-1243: quantize controls playback position (integrated-GPU 100% load)
+
+`lib/media_kit_video_controls/src/controls/extensions/duration.dart`
+(`kPositionUiThrottleStep` + `DurationExtension.floorTo`), and the four
+`player.stream.position` listeners in
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`
+(`MaterialDesktopSeekBarState`, `MaterialDesktopPositionIndicatorState`) and
+`lib/media_kit_video_controls/src/controls/material.dart`
+(`MaterialSeekBarState`, `MaterialPositionIndicatorState`).
+
+Users on integrated GPUs (`gpu0`) reported the raster thread pinned at 100%
+whenever the playback-controls overlay is shown (TODO-1119/1201/1203 family:
+the black-flicker under high GPU load). Root cause: libmpv publishes `time-pos`
+at the *video frame rate*, so `player.stream.position` emits ~60/s. Both the
+seek bar and the `mm:ss` position clock subscribe to it and `setState` on every
+emit, so while the overlay is visible the seek bar fill re-rasters (and the
+surrounding controls picture re-paints) ~60x/s — layered on top of the video
+texture the compositor already redraws every frame. On an integrated GPU that
+saturates raster.
+
+The patch quantizes the displayed position to `kPositionUiThrottleStep`
+(200 ms) via `Duration.floorTo` and skips `setState` when the quantized value is
+unchanged, so the controls rebuild at ~5 fps instead of ~60 fps. 200 ms divides
+1000 ms evenly, so the `mm:ss` clock text is byte-identical (the floor stays
+inside the same whole second); the seek bar fill advances in 200 ms steps, which
+is imperceptible and standard for a scrubber. Seeking is untouched — the drag
+path uses the pointer-derived `slider`, and the quantized `position` is only the
+resting fill. The `if (click)` / `if (tapped)` early-return also drops the
+upstream redundant `setState` that fired during a drag (position was ignored
+there anyway).
+
+The real-time paths are deliberately left alone: Hibiki's `VideoSubtitleOverlay`,
+danmaku overlay and chapter markers read the controller position on their own
+(un-throttled) channels, so cue-sync / highlight latency is unchanged. The
+black-flicker detector (`VideoBlackFlickerDetector`, TODO-1119) samples mpv frame
+counters on its own 1 s timer and is independent of these listeners.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_position_throttle_test.dart`.
+
+## TODO-1243 follow-up: RepaintBoundary-isolate the seek bar + position clock (large-window iGPU 100%)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`
+(`MaterialDesktopSeekBarState.build` → `_buildSeekBarBody`,
+`MaterialDesktopPositionIndicatorState.build`) and
+`lib/media_kit_video_controls/src/controls/material.dart`
+(`MaterialSeekBarState.build` → `_buildSeekBarBody`,
+`MaterialPositionIndicatorState.build`).
+
+After the position quantize above, users on integrated GPUs (Intel HD Graphics
+620) reported the flicker / 100% GPU **fixed in a small window but still present
+maximized / fullscreen**. The throttle cut the repaint *frequency* (which is
+window-size-independent), so the remaining cost had to be the per-repaint
+*area*, which scales with window size.
+
+Root cause: the seek bar (`MaterialDesktopSeekBar` / `MaterialSeekBar`) and the
+`mm:ss` position clock are leaves inside the controls `Stack` that also holds the
+two **full-video-area gradient scrim `Container`s** (top + bottom), with **no
+`RepaintBoundary`** between them. The seek bar fill still advances every
+`kPositionUiThrottleStep` (~5 fps), and `markNeedsPaint` on any leaf propagates
+up to the nearest boundary — here the whole full-screen controls picture — so
+each fill step re-records **and re-rasterises the entire full-screen controls
+picture** (gradients + button bars). Small window = small picture = cheap even
+at 5 fps; maximized / fullscreen = full-screen picture re-raster 5×/s on top of
+the per-frame video texture composite = HD 620 raster thread pinned.
+
+The fix wraps the seek bar and the position clock each in a `RepaintBoundary`,
+so a fill/clock repaint re-rasters only its own thin bounds (a full-width but
+~seek-bar-tall strip / a few-char text) instead of the full-screen picture. The
+gradient scrims + button bars now paint once and stay cached during steady
+playback. This decouples the per-repaint raster cost from window size, so the
+large-window case costs the same as the small-window case. Purely a compositor-
+layer isolation — no behaviour, geometry, frame rate or seeking change; the
+throttle above is unchanged and complementary (it bounds build/relayout
+frequency, the boundary bounds raster area).
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_repaint_boundary_test.dart`.
+
+## BUG-1224: expose the desktop seek-bar push-down as a theme field (`seekBarBottomButtonBarOverlap`)
+
+`MaterialDesktopVideoControls` stacks the bottom chrome as a `Column`
+(seek bar, then button bar) anchored to the bottom edge, and pushes the seek bar
+**down** with a hard-coded `Transform.translate(offset: Offset(0.0, 16.0))` so
+its thin visible track rides on the top edge of the button bar. The seek bar's
+clickable area is not the track, though: it is a fully transparent
+`seekBarContainerHeight`-tall (default 36) `Container` wrapped in a bare
+`Listener`, with the track centred inside it. Net effect: the clickable area
+spans `[buttonBarHeight - 16, buttonBarHeight - 16 + 36]` above the video's
+bottom edge, i.e. it sticks out **20 logical pixels above the button bar** — and
+nothing outside this file could know that, because one number was a constructor
+default the host never passed and the other was a literal inside `build()`.
+
+Hibiki draws its own subtitles (`VideoSubtitleOverlay`) above the controls and,
+since BUG-838, absorbs pointers that land on a subtitle glyph so a lookup tap is
+not stolen by the seek bar's bare `Listener`. With the subtitle's controls-visible
+avoidance stopping at `buttonBarHeight`, the subtitle sat exactly on that 20px
+band: hovering it still showed the seek preview thumbnail (hover goes through a
+non-opaque `MouseRegion`), but pressing there was absorbed by the subtitle and
+turned into a dictionary lookup while the seek never fired.
+
+The patch adds `seekBarBottomButtonBarOverlap` (default `16.0`, so the rendered
+layout is unchanged) to `MaterialDesktopVideoControlsThemeData` + `copyWith`, and
+`Transform.translate` now reads it. Hibiki passes the same constant to the theme
+and to `videoSubtitleControlsReserve`, so the controls layout and the subtitle
+avoidance are computed from one source instead of two guesses.
+
+Source-guard test: `fushi/test/pages/video_subtitle_push_up_guard_test.dart`
+(`BUG-1224：桌面 theme 与字幕避让读同一份进度条几何…`).
+
+## BUG-1485: host-injectable horizontal drag-to-seek mapping (`horizontalSeekResolver`)
+
+`lib/media_kit_video_controls/src/controls/material.dart` — `HorizontalSeekResolver`
+typedef, `MaterialVideoControlsThemeData` (+ constructor / `copyWith`), the
+`swipeDuration` State field and `onHorizontalDragUpdate` / `onHorizontalDragEnd`.
+
+Upstream maps the mobile horizontal drag-to-seek gesture with
+`seconds = dragDx * duration / horizontalGestureSensitivity` (default divisor
+1000), i.e. **the seek amount per pixel is proportional to the video's total
+duration**. On a 2-hour movie that is 7.2 seconds per logical pixel — a ~400dp
+phone screen width spans 48 minutes, so the lightest flick throws the playhead
+across half the film (user report: "一拽就起飞"). On a 3-minute clip the very
+same formula is far too coarse in the other direction.
+
+The patch:
+
+- adds `typedef HorizontalSeekResolver` (named params: `dragDx`, `surfaceWidth`,
+  `duration`, `position`; returns the signed delta) and an optional
+  `final HorizontalSeekResolver? horizontalSeekResolver;` theme field;
+- `onHorizontalDragUpdate` calls the resolver when non-null and returns early;
+  when `null` the upstream formula runs verbatim (including the
+  `relativePosition` range check), so pub.dev behaviour is preserved;
+- **retypes** the `swipeDuration` State field from `int` (whole seconds) to
+  `Duration`, so a resolver can express sub-second deltas — the old whole-second
+  quantisation made fine scrubbing impossible. All three read sites
+  (`_seekBarDeltaValueNotifier`, `seekIndicatorBuilder`, the built-in fallback
+  HUD text) were updated;
+- clears `swipeDuration` in `onHorizontalDragEnd`, so a following degenerate drag
+  (one that never reaches a second update) cannot re-apply the previous drag's
+  delta on release.
+
+`horizontalGestureSensitivity` is left in place and is simply ignored while a
+resolver is installed.
+
+Hibiki injects `VideoHorizontalSeekGesture.resolveDelta` (duration-decoupled
+"one screen width = N seconds" + power damping + a user-selectable sensitivity
+step) through `_mobileControlsTheme` only. The desktop theme has no horizontal
+drag gesture at all, so mouse / keyboard seeking is untouched.
+
+Source-guard test: `fushi/test/pages/video_horizontal_seek_test.dart`
+(group `BUG-1485: 横滑 seek 换算模型接线守卫`).
+
+## BUG-1644: ANGLE must render on our Direct3D 11 device (`d3d11va` zero-copy)
+
+`windows/angle_surface_manager.{h,cc}` and one log line in `windows/video_output.cc`.
+
+Upstream `ANGLESurfaceManager` creates **two unrelated** Direct3D 11 devices:
+
+- one per `ANGLESurfaceManager` instance, via `D3D11CreateDevice(..., flags = 0)`,
+  used only to allocate the two shared BGRA textures Flutter samples;
+- one *hidden* device that ANGLE creates for itself, because the `EGLDisplay`
+  comes from `eglGetPlatformDisplayEXT(EGL_PLATFORM_ANGLE_ANGLE,
+  EGL_DEFAULT_DISPLAY, ...)`.
+
+libmpv's `d3d11-egl` hardware-decoding interop
+(`mpv/video/out/opengl/hwdec_d3d11egl.c`) has exactly one way to find the device
+it must decode into: it reads it back out of the *current* display with
+`eglQueryDisplayAttribEXT(EGL_DEVICE_EXT)` →
+`eglQueryDeviceAttribEXT(EGL_D3D11_DEVICE_ANGLE)`. So it can only ever see
+ANGLE's hidden device — a device nobody created with
+`D3D11_CREATE_DEVICE_VIDEO_SUPPORT` and nobody marked thread safe (ANGLE hard
+codes `debug ? D3D11_CREATE_DEVICE_DEBUG : 0`, see ANGLE `Renderer11.cpp`
+`callD3D11CreateDevice`). It then hands that device to FFmpeg
+(`d3d11_wrap_device_ref` → `d3d11va_device_init`), which `QueryInterface`s for
+`ID3D11VideoDevice` **and** `ID3D11VideoContext`. That QI is gated by the flag
+at the D3D11 *runtime* level, not by the driver: a device created without
+`D3D11_CREATE_DEVICE_VIDEO_SUPPORT` returns `E_NOINTERFACE 0x80004002`
+(measured on WARP). How much that costs depends on the adapter — measured on a
+GeForce RTX 5090 the QI on ANGLE's flag-less device still succeeded — so this
+half of the patch is about being correct everywhere rather than about one
+machine. When the QI does fail, `init()` returns `-1` and `--hwdec=d3d11va`
+degrades to `d3d11va-copy`: every decoded frame is read back to system memory
+and re-uploaded to the GPU. Independently observed in `docs/bugs/BUG-1639`
+(a separate branch, not merged into `develop` yet)
+("`d3d11va` 失败 → `Using hardware decoding (d3d11va-copy)`").
+
+**This patch alone is not sufficient.** `hwdec_d3d11egl::init()` checks
+`EGL_EXT_device_query` *before* it ever looks at the device, and libmpv older
+than mpv `1d15686142` (2026-07-31) looks for it in the EGL **display**
+extension string while ANGLE publishes it in the **client** string — so `init()`
+returns `-1` with no log line at all, whichever device the display carries
+(measured: `display: no` / `client: YES` on both the upstream
+`EGL_DEFAULT_DISPLAY` and this patch's `EGL_PLATFORM_DEVICE_EXT` display).
+`third_party/media_kit_libs_windows_video/windows/CMakeLists.txt` therefore
+pins libmpv at or after that fix and documents the floor; the guard test below
+enforces it.
+
+The patch does what mpv's own `--gpu-context=angle` does
+(`mpv/video/out/opengl/context_angle.c`, `d3d11_device_create`):
+
+- **one** process-wide `ID3D11Device` (`shared_d3d_11_device_`) replaces the
+  per-instance ones, created with
+  `D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT` and
+  marked `ID3D10Multithread::SetMultithreadProtected(TRUE)` (libmpv decodes on
+  its own threads while Flutter's raster thread reads the shared texture);
+- the `EGLDisplay` is created **on that device** with
+  `eglCreateDeviceANGLE(EGL_D3D11_DEVICE_ANGLE, device)` +
+  `eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, ...)`, so
+  `EGL_D3D11_DEVICE_ANGLE` resolves to our device and the interop adopts it;
+- `CleanUp(true)` no longer `Release`s the device per instance (that would free
+  it under the surviving `VideoOutput`s) — the last instance calls
+  `ReleaseSharedResources()`, which terminates the display, releases the
+  `EGLDeviceEXT` and only then the device.
+
+Every new step is guarded: if the device rejects the flags they are dropped one
+by one, and if `eglCreateDeviceANGLE` / the device-backed display is
+unavailable the original
+`EGL_PLATFORM_ANGLE_ANGLE`/`EGL_DEFAULT_DISPLAY` four-candidate fallback chain
+(D3D11 → D3D11 9_3 → D3D9 → wrap) runs verbatim, so machines that cannot take
+the new path behave exactly like pub.dev.
+
+`ANGLESurfaceManager::uses_shared_d3d11_device()` makes the outcome observable;
+`VideoOutput` logs `libmpv d3d11-egl zero-copy interop: available/unavailable`
+next to its existing `Using H/W rendering.` line.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_angle_interop_guard_test.dart`.
+
+## BUG-1657: a failed interop surface must not cost the whole GPU pipeline
+
+`windows/angle_surface_manager.{h,cc}` and one log line in `windows/video_output.cc`.
+
+BUG-1644 added a new display type (`EGL_PLATFORM_DEVICE_EXT` on our own D3D11
+device). `EnsureSharedEGLDisplay()` falls back to the upstream
+`EGL_DEFAULT_DISPLAY` chain only when creating *that display* fails, but the
+config, the context and the `eglCreatePbufferFromClientBuffer` all happen
+afterwards, and any of those failing threw straight out of `Create()`, which
+drops the whole `VideoOutput` into `MPV_RENDER_API_TYPE_SW`.
+
+That downgrade is far more expensive than it looks: the software path is not
+`vo=gpu`, so libmpv's `glsl-shaders` (Anime4K & other upscalers) and the
+`scale`/`cscale` filters stop applying **silently**. Measured with one user's
+real shader set, same libmpv, same clip, changing only the render API: the
+generated shaders contain 2016 `conv2d` references on the GL path and **zero**
+on the S/W path. The user-visible symptom is just "super-resolution stopped
+working", with nothing in any log.
+
+Note on evidence: mpv never emits a user shader's `//!DESC` text into the
+generated shader or the log, so "the log does not mention Anime4K" proves
+nothing. The reliable marker is the intermediate texture names a shader
+declares with `//!SAVE` (`conv2d*` here), which do appear in the generated
+GLSL/HLSL.
+
+The patch:
+
+- `Create()` calls `RetryOnUpstreamEGLDisplay()` when `CreateAndBindEGLSurface()`
+  fails. It terminates the device-backed display, releases the `EGLDeviceEXT`,
+  latches `shared_interop_display_disabled_` so neither this nor a later
+  instance rebuilds it, and rebuilds context + surface on the upstream display.
+  Only then, if that also fails, does it throw. Guarded by `instance_count_ == 0`
+  so a shared display another `VideoOutput` is already rendering on is never
+  torn down.
+- `VideoOutput` logs, next to `Using S/W rendering.`, that
+  `libmpv glsl-shaders & scale filters are INERT`, so the next such report is
+  diagnosable from the log alone.
+
+Net effect: a problem that only affects zero-copy now costs only zero-copy,
+instead of costing hardware rendering and every shader with it.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_angle_interop_guard_test.dart`.
+
+## BUG-2453: host-driven wake signal for desktop controls (`wakeSignal`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` only, both the
+theme data class (`MaterialDesktopVideoControlsThemeData`) and the desktop
+control State (`_MaterialDesktopVideoControlsState`).
+
+The desktop controls are shown / kept alive only by real pointer traffic on
+their `MouseRegion` (`onHover` / `onEnter`). Hibiki used to reach that path from
+keyboard seeks, panel closes etc. by dispatching a *synthetic*
+`PointerHoverEvent` on a fixed fake mouse device (`0x6869626B`) into the
+controls' centre. That fake device is a real entry in Flutter's `MouseTracker`
+(only a matching `PointerRemovedEvent` removes it, and nothing ever sent one),
+so it outlived the player page: after leaving the player the ghost pointer kept
+"hovering" whatever sat at the screen centre — library cards were hover-lifted
+with no mouse over them. Every attempt to retire it at the right moment
+(dispose, losing the top route) was a patch on top of the wrong abstraction
+(lock-state asserts, episode-switch clobbering, one-shot retirement vs.
+unbounded re-pokes, routes that never drive the secondary animation).
+
+The patch adds an optional `final Listenable? wakeSignal;` to
+`MaterialDesktopVideoControlsThemeData` (constructor + `copyWith`). The desktop
+State subscribes to it in `didChangeDependencies` (re-binding when the theme's
+listenable identity changes) and detaches in `dispose`. On fire, `_onWakeSignal`
+calls the existing `onHover()` — show the bar (`mount`/`visible` = true) and
+restart the auto-hide timer — i.e. exactly what the synthetic hover used to
+trigger, without inventing an input device. If the host fires the signal during
+a build/layout pass (where `setState` is illegal) the wake is deferred to the end
+of the frame. When no signal is injected the behaviour is identical to pub.dev.
+Desktop counterpart of the mobile `restartHideTimerSignal` (TODO-1059); unlike
+that one it un-hides, because on desktop keyboard seek / panel close is expected
+to reveal the bar (the host gates "only keep alive while visible" itself).
+
+Hibiki injects the same `_RestartHideTimerSignal` into the desktop theme
+(`wakeSignal:` in `_desktopControlsTheme`); `_pokeControlsVisible()` no longer
+dispatches any pointer event on either platform.
+
+Source-guard test: `fushi/test/pages/video_controls_wake_signal_guard_test.dart`.
+
+## BUG-2832: controls theme `updateShouldNotify` was inverted
+
+Files: `lib/media_kit_video_controls/src/controls/material.dart`
+(`MaterialVideoControlsTheme`) and `material_desktop.dart`
+(`MaterialDesktopVideoControlsTheme`).
+
+Upstream returned `identical(normal, old.normal) && identical(fullscreen,
+old.fullscreen)` — i.e. it notified dependents only when *nothing* changed and
+stayed silent when the host handed in a new theme. The controls body is a
+`const _Material(Desktop)VideoControls()`, so the parent rebuild is
+short-circuited and the inherited notification is the only path by which a new
+theme reaches it. Result: when the host switched themes (Hibiki swaps button
+bars / visibility by control density when the player area is resized, e.g.
+opening the subtitle side panel drops it into the `mini` tier), the controls
+kept drawing the stale theme until some unrelated internal `setState` — the full
+top / bottom bars coexisted with the host's mini-window centre buttons.
+
+The patch inverts it to "notify iff either instance changed". Both States'
+`didChangeDependencies` are idempotent (subscriptions guarded by
+`subscriptions.isEmpty`, listenables re-bound only on identity change), so the
+extra calls are safe. `VideoStateInheritedWidget` / `FullscreenInheritedWidget`
+carry the same upstream pattern but their payloads are stable for the lifetime
+of a controls subtree, so they are left untouched.
+
+Source-guard test: `fushi/test/pages/video_controls_theme_notify_guard_test.dart`.
+
+## Glass design system: rounded / thickening seek bar + scrim colour
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` and
+`lib/media_kit_video_controls/src/controls/material.dart`, theme data classes
+and the two seek bar bodies.
+
+Fushi's Apple (iOS / macOS 26 Liquid Glass) design system draws the player
+chrome as a floating glass capsule with an AVKit-style scrubber: a thin rounded
+track that thickens while scrubbing, and only a very light scrim behind the
+bars. Upstream hard-codes all three looks, so the patch exposes them as theme
+fields whose defaults reproduce the upstream pixels exactly:
+
+- `seekBarRadius` (both themes, default `0.0`): track corner radius; `> 0`
+  switches the track to a rounded `BoxDecoration` with an anti-aliased clip so
+  the buffer / position fills follow the rounded ends.
+- `seekBarActiveHeight` (mobile theme, default `null`): track height while the
+  seek bar is pressed (`tapped`); `null` keeps the constant [seekBarHeight].
+  The desktop theme already had the equivalent `seekBarHoverHeight`.
+- `backdropColor` (desktop theme, default `0x61000000`): colour of the two
+  gradient scrims (was a hard-coded constant). The mobile theme already had a
+  `backdropColor` field.
+
+Consumer: `fushi/lib/src/pages/implementations/video_fushi/controls_theme.part.dart`
+(only the Apple branch passes non-default values; MD3 leaves them untouched).
+
+## M3 Expressive chrome: host-painted seek-bar track
+
+`lib/media_kit_video_controls/src/controls/seek_bar_visual.dart` (new, exported
+from `media_kit_video_controls.dart`), plus the theme data classes and the two
+seek bar bodies in `material_desktop.dart` / `material.dart`.
+
+Fushi's MD3 design system draws the scrubber as a Material 3 Expressive wavy
+progress bar (wavy played segment while playing, flat when paused, a vertical
+handle, a time bubble while scrubbing). Upstream hard-codes the track as a
+stack of `Container`s, so the patch adds `seekBarTrackBuilder`
+(`VideoSeekBarTrackBuilder?`, both themes, default `null`). When set, the seek
+bar keeps its own `MouseRegion` / `Listener` / pan gestures, seek dispatch and
+every host callback, and only replaces the track painting with
+`seekBarTrackBuilder(context, VideoSeekBarVisual(...))`, which fills the hit
+box (`seekBarContainerHeight`). `null` = upstream track, pixel for pixel.
+
+Consumer: `fushi/lib/src/pages/implementations/video_fushi/controls_theme.part.dart`
+(MD3 branch only; the Apple branch keeps the theme-field scrubber above).
+
+## Touch on desktop (Surface): touch / stylus tap toggles the controls (`touchTapTogglesControls`)
+
+`lib/media_kit_video_controls/src/controls/widgets/desktop_tap_router.dart`
+(new, exported from `media_kit_video_controls.dart`) and the desktop theme data
+class / tap layer in `material_desktop.dart`.
+
+The desktop controls reveal the bar on mouse hover and (with
+`playAndPauseOnTap`) toggle play / pause on a click. Flutter's `MouseTracker`
+ignores touch pointers, so on a Windows touch screen a finger could never
+reveal the bar — every tap paused instead, and the only way to see the chrome
+was double-tapping into fullscreen (which remounts the controls).
+
+The patch moves the tap `GestureDetector` into `MaterialDesktopTapRouter`, which
+records the `TapDownDetails.kind` alongside the BUG-374 play/pause eligibility
+and resolves the action in `onTap` (arena-respecting, as before) through the
+pure `resolveDesktopControlsTap`:
+
+- mouse / trackpad: unchanged — `playOrPause` when `playAndPauseOnTap` and the
+  tap is outside the bottom bar strip, otherwise nothing;
+- touch / stylus with `touchTapTogglesControls: true` (new theme field, default
+  `false`): like the mobile controls' `onTap` — show the bar (and arm the
+  auto-hide timer) when hidden, hide it when visible; a tap on the bottom bar
+  strip (between buttons / around the seek bar) only keeps the visible bar
+  alive.
+
+Show / keep-alive reuse the State's `onHover()` and hide reuses `onExit()`, so
+`visibilityNotifier`, subtitle shifting and the auto-hide timer behave exactly
+as for mouse hover. With the field left `false` the behaviour is identical to
+before.
+
+Consumer: `fushi/lib/src/pages/implementations/video_fushi/controls_theme.part.dart`
+(`touchTapTogglesControls: true` in `_desktopControlsTheme`).
+
+Tests: `fushi/test/pages/video_desktop_touch_tap_router_test.dart` (widget
+test of the router with real touch / mouse taps) and
+`fushi/test/pages/video_play_pause_tap_arena_guard_test.dart` (BUG-374 shape).
+
+## Touch on desktop (Surface): mobile swipe gestures for touch / stylus (`touchSeekGesture` / `touchVolumeGesture` / `touchBrightnessGesture`)
+
+`lib/media_kit_video_controls/src/controls/widgets/touch_swipe_gesture_layer.dart`
+(new, exported from `media_kit_video_controls.dart`) and the desktop theme data
+class / control State in `material_desktop.dart`.
+
+`TouchSwipeGestureLayer` carries the mobile controls' swipe arithmetic —
+horizontal drag scrubs through the host `HorizontalSeekResolver` measured from
+one base snapshotted at drag start (`relativeSeekBasePosition`, BUG-2731
+follow-up) and commits on release through `onSeekEnd` + `onSeekDispatched`
+(same commit path as the seek bar); right-half vertical drag moves the volume
+and left-half vertical drag the brightness by `-dy / verticalGestureSensitivity`
+from the current level (`currentVolume` / `currentBrightness`). Feedback is the
+host's: `seekIndicatorBuilder` while scrubbing, the host HUD behind
+`onVolumeChanged` / `onBrightnessChanged`. Its recognizers are restricted with
+`GestureDetector.supportedDevices` to touch / stylus, so mouse drags never enter
+them.
+
+The desktop State mounts the layer (only when one of the three `touch*Gesture`
+fields is on — all default `false` = upstream) as the bottom child of its
+controls `Stack`, inset like the mobile drag layer (16px edges, bottom
+`16 + subtitleVerticalShiftOffset`, a fixed dead zone that holds whether or not
+the bar is shown). A drag that starts on a bar button hits that control first;
+a drag that goes down anywhere on the visible chrome (bar gaps, seek bar) is
+additionally dropped by the layer itself (`onXxxDragDown` →
+`VideoControlsChromeRegion.hitsRegion`, see the marker section below). The two scrim
+gradients are wrapped in `IgnorePointer` — a gradient `BoxDecoration`
+hit-tests `true` and would otherwise swallow every hit above the layer; they
+are pure decoration, and the ancestors (tap router, `MouseRegion`) still see
+the pointer.
+
+Consumer: `_desktopControlsTheme` in
+`fushi/lib/src/pages/implementations/video_fushi/controls_theme.part.dart`
+(same resolver / HUD / callbacks / sensitivity constant as `_mobileControlsTheme`;
+brightness only where `ScreenBrightnessController.canControl`, i.e. never on
+desktop).
+
+Test: `fushi/test/pages/video_desktop_touch_swipe_test.dart` (real touch /
+stylus / mouse drags).
+
+## BUG-3354: swipe seek indicator keeps the committed delta while it fades out
+
+`lib/media_kit_video_controls/src/controls/material.dart` — new State field
+`_swipeIndicatorDuration`, written next to `swipeDuration` in
+`onHorizontalDragUpdate`, read by the seek indicator (`seekIndicatorBuilder`
+and the built-in fallback HUD text).
+
+The indicator sits in an `AnimatedOpacity` that fades out after release and keeps
+rebuilding during the fade. `onHorizontalDragEnd` zeroes `swipeDuration` (the
+pending commit, BUG-1485), so an indicator reading it showed "base + 0:00" — the
+drag's starting position — for the whole fade, although the seek itself landed
+correctly (user report: the progress shown at release jumps back to where the
+swipe started). The displayed delta is now separate state that release never
+clears; the commit path still reads and clears `swipeDuration` as before.
+
+The desktop touch layer (`touch_swipe_gesture_layer.dart`) removes its indicator
+from the tree on release instead of fading it, so it never showed the reset value.
+
+Source-guard test: `fushi/test/third_party/media_kit_video_seekbar_guard_test.dart`
+(group `BUG-3354: swipe seek indicator keeps the committed delta while fading`).
+
+## BUG-3449: fullscreen PopScope exits native fullscreen only on a real pop
+
+`lib/media_kit_video_controls/src/controls/widgets/fullscreen_inherited_widget.dart`,
+`_FullscreenInheritedWidgetPopScopeState.build`.
+
+Upstream's `PopScope.onPopInvokedWithResult` ignored `didPop` and always called
+`onExitFullscreen`. Fushi's fullscreen route now carries a sibling
+`VideoFullscreenBackScope` (`canPop: false`) so a back request that arrives as
+`Navigator.maybePop` closes the top in-route panel (episode rail, subtitle list,
+side panel, dictionary popup...) before leaving fullscreen. The framework still
+notifies every `PopScope` of a vetoed pop with `didPop == false`; without the
+guard the window would leave native fullscreen while the fullscreen route stays
+on the stack. The patch adds `if (!didPop) return;`.
+
+Tests: `fushi/test/media/video/video_fullscreen_back_scope_test.dart` (source
+guard on this file plus the route-level behaviour), and
+`fushi/integration_test/video_fullscreen_episode_list_open_test.dart` (real app).
+
+## Host-held controls while a bar popup is open (`holdVisible`)
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart` and
+`lib/media_kit_video_controls/src/controls/material.dart`: theme data
+(`MaterialDesktopVideoControlsThemeData` / `MaterialVideoControlsThemeData`)
+and the control States.
+
+Fushi opens its "⋮" overflow menu from a button on the controls bar. The menu
+is a popup route whose modal barrier covers the whole page. On desktop the
+`MouseTracker` re-hit-tests the still pointer at the end of the frame, the
+controls' `MouseRegion` is no longer in the hit path and fires `onExit`, and
+`onExit()` sets `visible = false` — the bar, including the button the menu is
+anchored to, vanished the instant the menu opened (user report, Windows). On
+mobile the auto-hide timer kept running under the open menu with the same
+result a few seconds later.
+
+The patch adds an optional `final ValueListenable<bool>? holdVisible;` (field +
+constructor + `copyWith`). The States bind it in `didChangeDependencies` (re-bound
+when the theme hands over a different listenable) and unbind in `dispose`.
+While its value is `true`:
+
+- desktop: the `MouseRegion.onExit` callback returns early (the explicit
+  "hide controls" tap action still calls `onExit()` directly);
+- both: every auto-hide `Timer` callback checks `!_held` before hiding.
+
+When the value drops back to `false` the controls resume as after a hover
+(desktop: `_onWakeSignal()` → `onHover()`; mobile: `_restartHideTimer()`), i.e.
+the bar fades on its normal schedule. Null (upstream default) = no hold,
+behaviour identical to pub.dev.
+
+Fushi injects `_controlsHeldByMenu` into both themes and drives it from
+`VideoControlBar.onMenuOpenChanged`.
+
+Source-guard test: `fushi/test/pages/video_controls_menu_hold_guard_test.dart`.
+
+## BUG-3498: clicking the seek bar's upper band toggled play / pause
+
+`lib/media_kit_video_controls/src/controls/material_desktop.dart`
+(`isInPlayPauseRegion` passed to `MaterialDesktopTapRouter`) and
+`lib/media_kit_video_controls/src/controls/widgets/desktop_tap_router.dart`
+(`desktopControlsBottomStripHeight`).
+
+The seek bar takes pointers through a `Listener`, which never joins the gesture
+arena, so the controls' tap router still wins a click on it and only the
+bottom-strip y threshold keeps it from toggling play / pause. Upstream excluded
+`bottomBarOffset + 10`, but the seek bar's hit area is `seekBarContainerHeight`
+(36) tall and only pushed `seekBarBottomButtonBarOverlap` (16) into the button
+bar, so its top 20px stuck out above the bar: a click in the upper 10px seeked
+*and* paused. The strip now covers the seek bar's whole hit area (the larger of
+that and the old `+ 10` padding).
+
+Superseded (BUG-3517): `desktopControlsBottomStripHeight` is gone;
+`isInPlayPauseRegion` now asks `VideoControlsChromeRegion.hitsRegion`, which
+covers the seek bar's real hit area by construction (see the marker section
+below). Tests: `fushi/test/pages/video_desktop_touch_tap_router_test.dart`
+(hit-test group: real router click on the seek bar's upper edge / bar gap, and
+a source check that `isInPlayPauseRegion` uses the hit test).
+
+## Controls chrome hit-test marker (`VideoControlsChromeRegion`)
+
+`lib/media_kit_video_controls/src/controls/widgets/video_controls_chrome_region.dart`
+(new, exported from `media_kit_video_controls.dart`), wired in
+`material_desktop.dart` and `material.dart`.
+
+The host (Fushi video page) has to tell whether a tap landed on the controls or
+on the picture: two taps on the picture within 400 ms are a double-tap
+(fullscreen / seek / play-pause), two taps on a button are not. It used to
+guess with a fixed `buttonBarHeight` strip at the top and bottom edges, but the
+real bottom chrome (seek bar + button bar + margins + host padding) is taller,
+so rapidly clicking the upper half of a bottom-bar button (±10 s) toggled
+fullscreen.
+
+The patch wraps the top bar, the primary (center) bar, the seek bar and the
+bottom bar in a `MetaData` marker with `HitTestBehavior.translucent`. The marker
+joins the hit path whenever the pointer is inside the bar's bounds (including
+gaps between buttons and margins) but returns its child's result, so hit
+testing of everything underneath (tap router, touch swipe layer) is unchanged.
+`VideoControlsChromeRegion.hitsRegion(globalPosition:, viewId:)` runs a real
+hit test and reports whether the path contains a marker. Every "is this pointer
+on the controls or on the picture" decision uses it, always at pointer-down:
+
+- host page (Fushi): double-tap fullscreen / seek / play-pause, wheel volume,
+  long-press speed-up (plus semantics-onTap nodes for its own overlays);
+- desktop: `isInPlayPauseRegion` of `MaterialDesktopTapRouter` (replaces
+  `desktopControlsBottomStripHeight`); the touch swipe layer drops drags that
+  go down on the chrome;
+- mobile: a tap that goes down on the chrome only re-arms the auto-hide timer
+  (no hide, no double-tap seek); the drag layer drops seek / volume /
+  brightness drags that go down on the chrome. Both drag layers keep their
+  bottom dead zone (`16 + subtitleVerticalShiftOffset`) unchanged: it applies
+  while the bar is hidden too and is not a chrome test.

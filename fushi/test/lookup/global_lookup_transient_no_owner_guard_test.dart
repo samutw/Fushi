@@ -1,0 +1,62 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+/// BUG-741 — 瞬态查词覆盖窗（悬浮字幕点词/全局热键）不得 owned by
+/// 主窗（源码扫描守卫）。
+///
+/// 真机根因：`flutter_window.cpp` 里瞬态实例 `global_lookup_window_` 的 `ShowAt`
+/// / `PrewarmWebView` 曾把主窗 HWND（`GetHandle()`）当 owner 传入。owned 顶层窗
+/// 的 Z 序变更**连带把 owner 主窗拉到前台**——用户症状=悬浮字幕点词/热键查词
+/// 时 app 主窗被拽到前台，盖住底下的游戏/视频，违反 app 外查词覆盖窗「绝不夺
+/// 前台」契约（design §5 guarantee 3）。
+///
+/// 修复：owner 传 `nullptr`（无 owner）。瞬态窗短命且前台切换即自关（dismiss
+/// hooks），主窗最小化时照样收纳，无孤儿窗。
+///
+/// 覆盖窗真弹出依赖 native，headless 测不了，故用源码扫描钉住契约。
+void main() {
+  String read(String p) => File(p).readAsStringSync().replaceAll('\r\n', '\n');
+
+  late String cpp;
+  setUpAll(() {
+    cpp = read('windows/runner/flutter_window.cpp');
+  });
+
+  /// 抽出从某个方法调用起点到其结尾 `);` 的片段。
+  String callArgs(String src, String callee) {
+    final int at = src.indexOf(callee);
+    expect(at, greaterThanOrEqualTo(0), reason: '必须存在调用：$callee');
+    final int end = src.indexOf(');', at);
+    expect(end, greaterThan(at));
+    return src.substring(at, end + 2);
+  }
+
+  // 通道处理器现在按 `target` 把同一套查词管线路由到两个窗口（可见的桌面浮窗、
+  // 游戏内查词的离屏卡片窗），所以调用点是局部的 `win->` 而不再是成员
+  // `global_lookup_window_->`。owner 契约反而更要紧：这一处同时管着两个窗。
+  test('瞬态 win->ShowAt 用 nullptr owner（不拉主窗前台）', () {
+    final String seg = callArgs(cpp, 'win->ShowAt(');
+    expect(seg, contains('nullptr'),
+        reason: 'BUG-741：owner 必须 nullptr，否则 owned 窗 Z 序连带拉主窗前台');
+    expect(seg.contains('GetHandle()'), isFalse,
+        reason: '不得把主窗 HWND 当 owner（回归 signature）');
+  });
+
+  test('瞬态 win->PrewarmWebView 用 nullptr owner', () {
+    final String seg = callArgs(cpp, 'win->PrewarmWebView(');
+    expect(seg, contains('nullptr'),
+        reason: 'prewarm 与 showAt owner 必须一致，否则 ForgetDeadWindow 重建 owner 漂移');
+    expect(seg.contains('GetHandle()'), isFalse, reason: '不得把主窗 HWND 当 owner');
+  });
+
+  test('游戏内查词离屏卡片窗的预热同样是 nullptr owner', () {
+    // 离屏卡片窗是懒建的第三个 GlobalLookupWindow 实例，建出来就立刻预热一次。
+    // 它挂上主窗当 owner 的话，游戏全屏时会把 Fushi 主窗一起拉到前台——那正是
+    // BUG-741 在游戏内查词上的同形复发。
+    final String seg =
+        callArgs(cpp, 'gal_lookup_card_window_->PrewarmWebView(');
+    expect(seg, contains('nullptr'), reason: '离屏卡片窗不得有 owner');
+    expect(seg.contains('GetHandle()'), isFalse, reason: '不得把主窗 HWND 当 owner');
+  });
+}

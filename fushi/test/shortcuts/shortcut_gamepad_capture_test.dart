@@ -1,0 +1,181 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart' hide ModifierKey;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/pages/implementations/shortcut_settings_page.dart';
+import 'package:fushi/src/shortcuts/gamepad_service.dart';
+import 'package:fushi/src/shortcuts/input_binding.dart';
+import 'package:fushi/src/shortcuts/shortcut_action.dart';
+import 'package:fushi/src/shortcuts/shortcut_registry.dart';
+import 'package:fushi/src/utils/components/fushi_material_components.dart';
+
+/// 手柄绑定实时录键（快捷键设置重构批2）：编辑对话框的手柄通道与键盘/鼠标一致，
+/// 提供「捕获区 + 显式停止」的实时录键；下拉菜单降级为「从列表选择」兜底。
+///
+/// 捕获区要接住两条真实分发路径：
+/// 1. 桌面轮询（GamepadService._dispatchButton）——把按键作为
+///    [GamepadButtonIntent] `Actions.maybeInvoke` 到主焦点上下文；
+/// 2. Android 原生按键——`gameButton*` KeyEvent 从焦点节点冒泡。
+/// 两条路径都必须在捕获态被消费（阻断 A→Activate / B→返回 / 十字键移焦点），
+/// 并复用 [_addGamepad] 的冲突/重分配流程。
+void main() {
+  setUp(() {
+    LocaleSettings.setLocale(AppLocale.en);
+  });
+
+  FushiShortcutRegistry buildRegistry() =>
+      FushiShortcutRegistry()..loadDefaults(TargetPlatform.windows);
+
+  Future<void> pumpDialog(
+    WidgetTester tester,
+    FushiShortcutRegistry registry, {
+    ShortcutAction action = ShortcutAction.readerToggleFurigana,
+  }) async {
+    await tester.pumpWidget(
+      TranslationProvider(
+        child: MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: ShortcutBindingEditDialog(
+                action: action,
+                registry: registry,
+                initial: const ShortcutBindingSet(),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> startGamepadCapture(WidgetTester tester) async {
+    await tester.tap(find.byKey(const Key('shortcut_add_gamepad_capture')));
+    await tester.pumpAndSettle();
+    expect(find.text(t.shortcut_press_gamepad), findsOneWidget);
+  }
+
+  testWidgets('desktop poller path: GamepadButtonIntent records the button',
+      (WidgetTester tester) async {
+    final FushiShortcutRegistry registry = buildRegistry();
+    await pumpDialog(tester, registry);
+    await startGamepadCapture(tester);
+
+    // 模拟 GamepadService._dispatchButton：向主焦点上下文分发 intent。
+    // Select 在默认表未绑定，走无冲突直加路径。
+    final BuildContext ctx = FocusManager.instance.primaryFocus!.context!;
+    final Object? handled = Actions.maybeInvoke<GamepadButtonIntent>(
+      ctx,
+      const GamepadButtonIntent(GamepadButton.select),
+    );
+    await tester.pumpAndSettle();
+
+    expect(handled, isTrue, reason: '捕获区必须消费 intent（阻断 A→Activate 等服务端回退）');
+    expect(
+      find.widgetWithText(FushiTagChip, GamepadButton.select.label),
+      findsOneWidget,
+      reason: '捕获到的按钮应立即出现在手柄草稿 chips 中',
+    );
+    expect(find.text(t.shortcut_press_gamepad), findsNothing,
+        reason: '录到一个按钮后捕获态应结束（对齐键盘捕获契约）');
+  });
+
+  testWidgets('Android native path: gameButton* key event records the button',
+      (WidgetTester tester) async {
+    final FushiShortcutRegistry registry = buildRegistry();
+    await pumpDialog(tester, registry);
+    await startGamepadCapture(tester);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.gameButtonSelect);
+    await tester.pumpAndSettle();
+
+    expect(
+      find.widgetWithText(FushiTagChip, GamepadButton.select.label),
+      findsOneWidget,
+    );
+    expect(find.text(t.shortcut_press_gamepad), findsNothing);
+  });
+
+  testWidgets(
+      'Android native path: shoulder / trigger keys (LB RB LT RT) are captured',
+      (WidgetTester tester) async {
+    // 用户报告「安卓的 xbox 的肩键和 LT 键没识别到」。LB/RB 是真按键
+    // （KEYCODE_BUTTON_L1/R1）；LT/RT 在 Android 上是模拟轴，由原生侧
+    // GamepadTriggerKeySynthesizer 合成为 KEYCODE_BUTTON_L2/R2 后走同一条键链。
+    // 四个键到 Dart 后都应被捕获区原样录下。默认表里这四个键在 reader / audiobook
+    // 共活作用域各有归属（有声书上下句等），先把冲突方全部解绑，让这条只验
+    // 「录得到」而不进冲突重分配分支（那条另有用例）。
+    final FushiShortcutRegistry registry = buildRegistry();
+    const ShortcutAction action = ShortcutAction.readerToggleFurigana;
+    const List<(LogicalKeyboardKey, GamepadButton)> keys =
+        <(LogicalKeyboardKey, GamepadButton)>[
+      (LogicalKeyboardKey.gameButtonLeft1, GamepadButton.lb),
+      (LogicalKeyboardKey.gameButtonRight1, GamepadButton.rb),
+      (LogicalKeyboardKey.gameButtonLeft2, GamepadButton.lt),
+      (LogicalKeyboardKey.gameButtonRight2, GamepadButton.rt),
+    ];
+    for (final (_, GamepadButton button) in keys) {
+      for (;;) {
+        final ShortcutAction? owner = registry.hasGamepadConflict(
+          action.scope,
+          GamepadBinding(button),
+          exclude: action,
+        );
+        if (owner == null) break;
+        registry.updateBinding(owner, const ShortcutBindingSet());
+      }
+    }
+    await pumpDialog(tester, registry, action: action);
+    for (final (LogicalKeyboardKey key, GamepadButton button) in keys) {
+      await startGamepadCapture(tester);
+      await tester.sendKeyEvent(key);
+      await tester.pumpAndSettle();
+      expect(
+        find.widgetWithText(FushiTagChip, button.label),
+        findsOneWidget,
+        reason: '$key 应录为 ${button.label}',
+      );
+      expect(find.text(t.shortcut_press_gamepad), findsNothing);
+    }
+  });
+
+  testWidgets('keyboard keys during gamepad capture are swallowed, not bound',
+      (WidgetTester tester) async {
+    final FushiShortcutRegistry registry = buildRegistry();
+    await pumpDialog(tester, registry);
+    await startGamepadCapture(tester);
+
+    await tester.sendKeyEvent(LogicalKeyboardKey.keyA);
+    await tester.pumpAndSettle();
+
+    // 仍在捕获态，且没有把键盘 A 记成任何绑定。
+    expect(find.text(t.shortcut_press_gamepad), findsOneWidget,
+        reason: '键盘按键不结束手柄捕获（仅显式停止或录到手柄按钮）');
+    expect(find.widgetWithText(FushiTagChip, 'A'), findsNothing,
+        reason: '键盘按键不得被记录为绑定');
+  });
+
+  testWidgets('stop button cancels capture; pick-list fallback stays available',
+      (WidgetTester tester) async {
+    final FushiShortcutRegistry registry = buildRegistry();
+    await pumpDialog(tester, registry);
+    await startGamepadCapture(tester);
+
+    await tester.tap(find.byKey(const Key('shortcut_stop_gamepad_capture')));
+    await tester.pumpAndSettle();
+    expect(find.text(t.shortcut_press_gamepad), findsNothing);
+
+    // 兜底菜单仍在：无手柄在手也能从列表点选按钮。
+    expect(find.text(t.shortcut_gamepad_pick_list), findsOneWidget);
+    await tester.tap(find.text(t.shortcut_gamepad_pick_list));
+    await tester.pumpAndSettle();
+    // Select 排在菜单末尾，测试视口里可能在滚动区外——先滚到可见再点。
+    await tester.ensureVisible(find.text(GamepadButton.select.label).last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text(GamepadButton.select.label).last);
+    await tester.pumpAndSettle();
+    expect(
+      find.widgetWithText(FushiTagChip, GamepadButton.select.label),
+      findsOneWidget,
+    );
+  });
+}

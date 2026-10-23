@@ -1,0 +1,411 @@
+name: Mirror release assets to R2
+
+# 把正式发布的安装包镜像一份到 Cloudflare R2，给 fushi.moe/releases 当主下载源。
+#
+# 为什么值得做：R2 出网免费，走 CF 的路由对多数地区比 GitHub Releases 稳；
+# 更重要的是它给下载链路提供了第二份存储——GitHub 挂掉时，fushi.moe/releases
+# 仍能从 R2 里的 manifest.json + 资产把包发出去。
+#
+# 这个 workflow 刻意独立于 release.yml：只在 release 发布完成之后被动触发，
+# 不改任何现有发布路径、不参与发布通道判定。它失败也不影响发布本身，
+# 只是少一层下载冗余。
+
+on:
+  # `release: published` 只说明 release 条目建好了，**不代表资产传完了**：正式版的
+  # 安装包由 release.yml / release-desktop.yml 分批上传，实测比 published 晚 30～100
+  # 分钟（v2.2.4：published 13:14，Android 13:44，Windows/macOS/iOS 14:52）。所以它
+  # 单独当触发器必然镜像到一个残缺集合。真正「这批资产已经就位」的信号是
+  # update-manifest 分支上的正式版清单被写入——那份 JSON 由上传完成的那个 job 写，
+  # 也正是 fushi.moe 的 Worker 判定「这个版本有哪些下载」的权威。
+  #
+  # `release: published` 只说明 release 条目建好了，资产还在陆续上传（实测晚 30～100
+  # 分钟）。所以它这一趟大概率什么都不做，真正把镜像补齐的是**清单写入后的显式唤醒**：
+  # tool/publish_update_manifest.sh 推完正式版清单就 `gh workflow run` 本 workflow。
+  #
+  # 为什么唤醒不能靠一个指向 update-manifest 分支的 push 触发器（这条一度写在这里，
+  # 实测是死的）：
+  #   · GitHub 对 push 事件是从**被推送的那个 ref** 读 `.github/workflows/` 决定跑什么，
+  #     而 update-manifest 是只放 6 个 JSON 的孤儿分支，上面根本没有 workflow 文件；
+  #   · 清单是用 GITHUB_TOKEN 推的，而 GITHUB_TOKEN 的 push **不级联**新 run。
+  # 实测收口：该分支每天被推几十次，`actions/runs?branch=update-manifest` 的
+  # total_count 至今为 0 —— 历史上从没有任何 workflow 在它上面跑起来过。
+  # workflow_dispatch 是 GITHUB_TOKEN 无级联规则的明文例外，所以只能显式 dispatch。
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要镜像的 release tag（留空 = 最新正式版）'
+        required: false
+      assert_complete:
+        description: '按 update-manifest 正式版清单校验完整性（自动唤醒传 true）'
+        required: false
+        default: false
+        type: boolean
+      force_prerelease:
+        description: '允许镜像预发布版本（默认只镜像正式版）'
+        required: false
+        default: false
+        type: boolean
+      bootstrap_empty_ledger:
+        description: '仅初始化已人工确认为空的 fushi-releases 容量台账，不镜像资产'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # 保留最近几个版本。每个正式版约 1.3GB，R2 免费额度 10GB。
+  KEEP_RELEASES: '2'
+  # R2 免费层是 10 GB-month，但平台没有硬消费上限。专用桶只允许计划到 8 GB，
+  # 留 2 GB 给计量误差/元数据；预计超限整次跳过，绝不先上传后告警。
+  MAX_BUCKET_BYTES: '8000000000'
+  # wrangler r2 object put 是单次上传，超过这个大小会失败。
+  # 与其让整个 job 红掉，不如跳过该文件并明确报出来——下载会自动回退 GitHub。
+  MAX_ASSET_MB: '300'
+  BUCKET: fushi-releases
+
+jobs:
+  mirror:
+    # BUG-2817：`release` 事件只给应用 release（tag = v<数字>…）构建；模型 / 依赖资产
+    # release（manga-panel-detector-onnx-v1、vendor-libmpv、voice-hook-helper…）被手动
+    # 发布时不许整套构建、把安装包挂到它们身上。表达式没有正则，只能逐个列 v0..v9；
+    # 守卫 fushi/test/build/release_event_app_tag_guard_test.dart 钉住每个 job 都带它。
+    if: ${{ (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v0') || startsWith(github.event.release.tag_name, 'v1') || startsWith(github.event.release.tag_name, 'v2') || startsWith(github.event.release.tag_name, 'v3') || startsWith(github.event.release.tag_name, 'v4') || startsWith(github.event.release.tag_name, 'v5') || startsWith(github.event.release.tag_name, 'v6') || startsWith(github.event.release.tag_name, 'v7') || startsWith(github.event.release.tag_name, 'v8') || startsWith(github.event.release.tag_name, 'v9')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check Cloudflare credentials
+        id: guard
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$CF_TOKEN" ] || [ -z "$CF_ACCOUNT" ]; then
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID，跳过 R2 镜像。下载会全部走 GitHub Releases，功能不缺，只是少一层冗余。"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve target release
+        id: target
+        if: steps.guard.outputs.ready == 'true' && github.event.inputs.bootstrap_empty_ledger != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          FORCE_PRERELEASE: ${{ github.event.inputs.force_prerelease }}
+          ASSERT_COMPLETE: ${{ github.event.inputs.assert_complete }}
+        run: |
+          set -euo pipefail
+
+          MANUAL=false
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+            MANUAL=true
+          elif [ -n "${EVENT_TAG:-}" ]; then
+            TAG="$EVENT_TAG"
+          else
+            TAG="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          fi
+
+          PRERELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isPrerelease -q .isPrerelease)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # 调试/测试通道每次 push 都会出包，镜像它们会迅速吃光 R2 免费额度，
+          # 而下载页指向的 latest 本来就是最新正式版。默认只镜像正式版。
+          if [ "$PRERELEASE" = "true" ] && [ "${FORCE_PRERELEASE:-false}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG 是预发布版本，按策略不镜像（需要时用 workflow_dispatch 勾 force_prerelease）。"
+            exit 0
+          fi
+
+          # 人工指定 tag 是补救路径：明确知道要镜像哪个版本（含清单里没有的预发布），
+          # 不设下面的就位门，否则手动补镜像会被自己的门挡住。
+          #
+          # 但**自动唤醒也走 workflow_dispatch**（见文件头：GITHUB_TOKEN 的 push 不级联，
+          # dispatch 是唯一能自动接上的通道），它必须过门——否则下游那条完整性断言
+          # `if (fs.existsSync("expected-assets.txt"))` 永远拿不到输入，
+          # 「镜不全就红」在实际会发生的每一条路径上都不成立。
+          # 故用 assert_complete 区分：自动唤醒传 true 走门，人工补救留 false 绕过。
+          if [ "$MANUAL" = "true" ] && [ "${ASSERT_COMPLETE:-false}" != "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::人工指定 $TAG，跳过发布清单就位检查。"
+            exit 0
+          fi
+
+          # 资产就位门。
+          #
+          # `release: published` 只说明 release 条目建好了。正式版安装包由 release.yml /
+          # release-desktop.yml 分批上传，实测晚 30～100 分钟（v2.2.4：published 13:14，
+          # Android 13:44，Windows/macOS/iOS 14:52）。旧实现在 published 那一刻就把当时
+          # 存在的资产当成全集，于是只镜像到 3 个无关的 bridge apk 却报 success，
+          # fushi.moe 上「Cloudflare 镜像」三天都在 302 去 GitHub。
+          #
+          # 唯一可靠的「这批资产已就位」信号是 update-manifest 分支上的正式版清单：
+          # 它由上传完成的那个 job 写，也正是 Worker 判定「这个版本有哪些下载」的权威。
+          # 清单跨平台取并集，所以它列出的就是此刻该 tag 已发布的全部资产。
+          if ! gh api "repos/$GITHUB_REPOSITORY/contents/latest-stable-fushi.json?ref=update-manifest" \
+                 -q .content | base64 -d > published-manifest.json; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::读不到 update-manifest 分支的正式版清单，无法确认资产是否就位；本次不镜像。"
+            exit 0
+          fi
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' \
+            > release-assets.txt
+
+          # 判据本体在 tool/r2_mirror_readiness.mjs（有单测），这里只负责喂输入、播报结论。
+          # 它把 skip= 直接追加进 GITHUB_OUTPUT，就位时另写 expected-assets.txt 给下游断言。
+          node --test tool/r2_mirror_readiness.test.mjs
+          VERDICT="$(node tool/r2_mirror_readiness.mjs \
+            --published-manifest published-manifest.json \
+            --tag "$TAG" \
+            --release-assets release-assets.txt \
+            --out-expected expected-assets.txt \
+            --github-output "$GITHUB_OUTPUT")"
+
+          if [ -f expected-assets.txt ]; then
+            echo "发布清单已登记 $TAG 的资产（$VERDICT），开始镜像。"
+            exit 0
+          fi
+
+          # 到这里 = 清单还没登记这批资产。分两种：
+          #   · published 刚发生（正常）：各平台还在上传，等清单写完那一刻的显式唤醒；
+          #   · published 很久了还没就位：要么发布链路没写完清单，要么唤醒通道断了。
+          # 后者绝不能继续静默绿——「镜像三天只镜到 bridge 包却报 success」就是这么躺过来的。
+          # 正常节奏是 published 后 30～100 分钟内各平台写完（v2.2.4 实测 13:14 → 14:52）。
+          PUBLISHED_AT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY"             --json publishedAt -q .publishedAt)"
+          AGE_H=$(( ( $(date -u +%s) - $(date -u -d "$PUBLISHED_AT" +%s) ) / 3600 ))
+          if [ "$AGE_H" -ge 6 ]; then
+            echo "::error title=Mirror readiness stalled::$TAG 已发布 ${AGE_H}h，正式版清单仍未登记它的资产（$VERDICT）。发布链路没写完清单，或清单写入后的镜像唤醒断了——两者都必须人查。"
+            exit 1
+          fi
+          echo "::notice::$TAG 的资产尚未就位（$VERDICT，published ${AGE_H}h 前）。清单写入时会显式唤醒本 workflow，本次不镜像。"
+
+      - name: Download release assets
+        id: download
+        if: steps.guard.outputs.ready == 'true' && steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --clobber
+          ls -la assets
+          echo "count=$(ls -1 assets | wc -l)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        if: steps.guard.outputs.ready == 'true' && (github.event.inputs.bootstrap_empty_ledger == 'true' || steps.target.outputs.skip == 'false')
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install wrangler
+        if: steps.guard.outputs.ready == 'true' && (github.event.inputs.bootstrap_empty_ledger == 'true' || steps.target.outputs.skip == 'false')
+        # 只需要 Wrangler CLI；锁死版本并禁用依赖生命周期脚本，避免 CI 执行供应链侧代码。
+        run: npm install --ignore-scripts --no-save --package-lock=false wrangler@4.125.0
+
+      - name: Bootstrap verified-empty R2 ledger
+        if: steps.guard.outputs.ready == 'true' && github.event.inputs.bootstrap_empty_ledger == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if ./node_modules/.bin/wrangler r2 object get "$BUCKET/mirrored.json" --file existing-ledger.json --remote 2>/dev/null; then
+            echo "::error::容量台账已经存在，拒绝覆盖。"
+            exit 1
+          fi
+          echo '{"schemaVersion":2,"releases":[]}' > mirrored-bootstrap.json
+          ./node_modules/.bin/wrangler r2 object put "$BUCKET/mirrored.json" --file mirrored-bootstrap.json --content-type application/json --remote
+          echo "已初始化空容量台账；本次不会上传任何 Release 资产。"
+
+      - name: Build bounded mirror manifest
+        id: manifest
+        if: steps.guard.outputs.ready == 'true' && steps.target.outputs.skip == 'false' && github.event.inputs.bootstrap_empty_ledger != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          MAX_BYTES=$(( MAX_ASSET_MB * 1024 * 1024 ))
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,publishedAt,assets \
+            -q '{tag: .tagName, publishedAt: .publishedAt, assets: [.assets[] | {name: .name, size: .size, url: .url}]}' \
+            > manifest-full.json
+
+          MAX_BYTES="$MAX_BYTES" node -e '
+            const fs = require("fs");
+            const m = JSON.parse(fs.readFileSync("manifest-full.json", "utf8"));
+            const max = Number(process.env.MAX_BYTES);
+            const oversize = [];
+            m.assets = m.assets.filter((asset) => {
+              const path = "assets/" + asset.name;
+              if (!fs.existsSync(path)) return false;
+              asset.size = fs.statSync(path).size;
+              if (asset.size > max) {
+                oversize.push(asset.name);
+                console.log("跳过超限资产 " + asset.name + " (" + asset.size + " bytes)");
+                return false;
+              }
+              return true;
+            });
+            // 先落盘再断言：断言红了 summary 照样要能说清哪些是被上限挡掉的。
+            fs.writeFileSync("oversize-assets.txt", oversize.join("\n") + (oversize.length ? "\n" : ""));
+            if (m.assets.length === 0) throw new Error("没有可镜像的限额内资产");
+
+            // 完整性断言：发布清单登记了、又没超单文件上限的资产，必须全部进这一批。
+            // 少了任何一个都说明镜像集合和发布集合脱节了——那正是 v2.2.4 的形态：
+            // 只镜像到 bridge apk、一个本体包都没有，却报 success 三天没人发现。
+            // 这里宁可让 job 红，也不要再产出一次「成功但没用」的镜像。
+            if (fs.existsSync("expected-assets.txt")) {
+              const want = fs.readFileSync("expected-assets.txt", "utf8").split("\n").filter(Boolean);
+              const got = new Set(m.assets.map((a) => a.name));
+              const skipped = new Set(oversize);
+              const missing = want.filter((n) => !got.has(n) && !skipped.has(n));
+              if (missing.length) {
+                throw new Error("发布清单登记的资产没进镜像集合：" + missing.join(", "));
+              }
+            }
+
+            m.mirroredAt = new Date().toISOString();
+            fs.writeFileSync("manifest.json", JSON.stringify(m, null, 2));
+            console.log("清单收录 " + m.assets.length + " 个资产");
+          '
+
+          # 超限资产不是「没事」：它们永远只能从 GitHub 下（Worker 会 302 过去），
+          # 下载页上仍会显示成 Cloudflare 镜像。摆进 summary，别让它继续隐身在日志里。
+          if [ -s oversize-assets.txt ]; then
+            echo "::warning::以下资产超过 ${MAX_ASSET_MB}MB 单文件上限，未镜像到 R2，下载会 302 回 GitHub：$(tr '\n' ' ' < oversize-assets.txt)"
+          fi
+
+      - name: Read current R2 ledger
+        if: steps.guard.outputs.ready == 'true' && steps.target.outputs.skip == 'false' && github.event.inputs.bootstrap_empty_ledger != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if ! ./node_modules/.bin/wrangler r2 object get "$BUCKET/mirrored.json" --file mirrored-original.json --remote; then
+            echo "::error::读取 R2 容量台账失败。为防止把未知存量当 0，本次 fail closed；新桶必须先人工写入 schemaVersion=2 的空台账。"
+            exit 1
+          fi
+          echo "读到已有容量台账"
+
+      - name: Plan bounded R2 mirror
+        id: capacity
+        if: steps.guard.outputs.ready == 'true' && steps.target.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          node --test tool/r2_mirror_plan.test.mjs
+          node tool/r2_mirror_plan.mjs \
+            --ledger mirrored-original.json \
+            --manifest manifest.json \
+            --keep "$KEEP_RELEASES" \
+            --max-bytes "$MAX_BUCKET_BYTES" \
+            --out-ledger mirrored-planned.json \
+            --rollback-ledger mirrored-rollback.json \
+            --delete-list to-delete.txt \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Skip mirror when the free-tier budget would be exceeded
+        if: steps.capacity.outputs.allowed == 'false'
+        env:
+          INCOMING: ${{ steps.capacity.outputs.incoming_bytes }}
+          RETAINED: ${{ steps.capacity.outputs.retained_bytes }}
+          PLANNED: ${{ steps.capacity.outputs.planned_bytes }}
+        run: |
+          echo "::warning::R2 镜像预计 ${PLANNED} bytes（保留 ${RETAINED} + 新增 ${INCOMING}），超过 ${MAX_BUCKET_BYTES} bytes 安全线；整次跳过，下载回退 GitHub。"
+
+      - name: Prune old releases before uploading
+        if: steps.capacity.outputs.allowed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -s to-delete.txt ]; then
+            while IFS= read -r key || [ -n "$key" ]; do
+              [ -z "$key" ] && continue
+              echo "上传前删除 $key"
+              ./node_modules/.bin/wrangler r2 object delete "$BUCKET/$key" --remote
+            done < to-delete.txt
+          fi
+
+      - name: Upload assets and commit ledger
+        if: steps.capacity.outputs.allowed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const m = JSON.parse(require("fs").readFileSync("manifest.json", "utf8"));
+            require("fs").writeFileSync("mirror-files.txt", m.assets.map((a) => a.name).join("\n"));
+          '
+
+          while IFS= read -r name || [ -n "$name" ]; do
+            [ -z "$name" ] && continue
+            echo "上传 $name"
+            ./node_modules/.bin/wrangler r2 object put "$BUCKET/releases/$TAG/$name" --file "assets/$name" --remote
+          done < mirror-files.txt
+
+          # ledger 先于滚动 manifest：如果最后一步失败，旧 manifest 仍然可用；
+          # cleanup 会删半成品并恢复“已完成预清理”的 ledger。
+          ./node_modules/.bin/wrangler r2 object put "$BUCKET/mirrored.json" --file mirrored-planned.json --content-type application/json --remote
+          ./node_modules/.bin/wrangler r2 object put "$BUCKET/manifest.json" --file manifest.json --content-type application/json --remote
+
+      - name: Roll back partial upload on failure
+        if: failure() && steps.capacity.outputs.allowed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set +e
+          if [ -f mirror-files.txt ]; then
+            while IFS= read -r name || [ -n "$name" ]; do
+              [ -z "$name" ] && continue
+              ./node_modules/.bin/wrangler r2 object delete "$BUCKET/releases/$TAG/$name" --remote
+            done < mirror-files.txt
+          fi
+          if [ -f mirrored-rollback.json ]; then
+            ./node_modules/.bin/wrangler r2 object put "$BUCKET/mirrored.json" --file mirrored-rollback.json --content-type application/json --remote
+          fi
+
+      - name: Summary
+        if: always() && steps.guard.outputs.ready == 'true'
+        env:
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          TARGET_SKIPPED: ${{ steps.target.outputs.skip }}
+          ASSET_COUNT: ${{ steps.download.outputs.count }}
+          CAPACITY_ALLOWED: ${{ steps.capacity.outputs.allowed }}
+          PLANNED_BYTES: ${{ steps.capacity.outputs.planned_bytes }}
+        run: |
+          {
+            echo "### R2 镜像"
+            echo ""
+            printf -- '- tag: `%s`\n' "${TARGET_TAG:-}"
+            printf -- '- 是否跳过: `%s`\n' "${TARGET_SKIPPED:-}"
+            printf -- '- 资产数: `%s`\n' "${ASSET_COUNT:-0}"
+            printf -- '- 容量守卫通过: `%s`\n' "${CAPACITY_ALLOWED:-未运行}"
+            printf -- '- 计划桶容量: `%s bytes`\n' "${PLANNED_BYTES:-0}"
+            if [ -s oversize-assets.txt ]; then
+              printf -- '- 超 %sMB 未镜像（下载会 302 回 GitHub）: `%s`\n' \
+                "$MAX_ASSET_MB" "$(tr '\n' ' ' < oversize-assets.txt)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

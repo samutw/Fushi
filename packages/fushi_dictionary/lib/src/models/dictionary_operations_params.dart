@@ -1,0 +1,55 @@
+import 'dart:io';
+import 'dart:isolate';
+
+import '../engine/dictionary.dart';
+import '../formats/dictionary_format.dart';
+
+class IsolateParams {
+  IsolateParams({
+    required this.sendPort,
+    required this.directoryPath,
+  });
+
+  final SendPort sendPort;
+  final String directoryPath;
+
+  void send(Object? message) {
+    sendPort.send(message);
+  }
+}
+
+class PrepareDirectoryParams extends IsolateParams {
+  PrepareDirectoryParams({
+    required this.file,
+    required this.charset,
+    required this.resourceDirectory,
+    required this.dictionaryFormat,
+    required super.sendPort,
+    required super.directoryPath,
+  });
+
+  final File file;
+  final String charset;
+  final Directory resourceDirectory;
+  final DictionaryFormat dictionaryFormat;
+}
+
+class PrepareDictionaryParams extends IsolateParams {
+  PrepareDictionaryParams({
+    required this.dictionary,
+    required this.dictionaryFormat,
+    required this.resourceDirectory,
+    required this.alertSendPort,
+    required super.sendPort,
+    required super.directoryPath,
+  });
+
+  final Dictionary dictionary;
+  final DictionaryFormat dictionaryFormat;
+  final Directory resourceDirectory;
+  final SendPort alertSendPort;
+
+  void sendAlert({required String message}) {
+    alertSendPort.send(message);
+  }
+}

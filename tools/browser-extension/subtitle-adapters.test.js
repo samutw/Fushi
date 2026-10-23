@@ -1,0 +1,360 @@
+const test = require('node:test');
+const assert = require('node:assert');
+const {
+  extractNetflixCueText,
+  currentVideoTimeMs,
+  netflixVideoIdFromPath,
+  parseSubtitleTimestamp,
+  stripCueTags,
+  parseWebVtt,
+  parseTtml,
+  ttmlRubyToHtml,
+  fushiComposeCueContext,
+  fushiVideoCropFraction,
+  parseBilibiliJson,
+  netflixDocumentTitle,
+  findCueIndexAt,
+  pickPrimaryCueTrack,
+} = require('./subtitle-adapters.js');
+
+test('extractNetflixCueText joins span lines', () => {
+  const container = {
+    querySelectorAll: () => [{ textContent: '走り' }, { textContent: '出した' }],
+  };
+  assert.strictEqual(extractNetflixCueText(container), '走り出した');
+});
+
+test('extractNetflixCueText null container -> empty', () => {
+  assert.strictEqual(extractNetflixCueText(null), '');
+});
+
+// TODO-1270 Bug A：Netflix 每行字幕是「外层定位 span > 内层样式 span」的嵌套结构，父 span 的
+// textContent 已含子全文。旧实现把每一层 span 都拼进来 → 同句字幕重复两遍（卡里字幕出现两次）。
+// 只取叶子 span，每段文本恰好一次。
+test('extractNetflixCueText de-dups nested Netflix spans (TODO-1270 Bug A)', () => {
+  const inner = { textContent: '今日はいい天気', querySelector: () => null };
+  const outer = { textContent: '今日はいい天気', querySelector: () => inner };
+  // querySelectorAll('...span, span') 同时返回外层与内层；断言不重复。
+  const container = { querySelectorAll: () => [outer, inner] };
+  assert.strictEqual(extractNetflixCueText(container), '今日はいい天気');
+});
+
+// 单行拆成多个并列叶子 span（无嵌套）仍应按序拼接，不受去重影响。
+test('extractNetflixCueText joins sibling leaf spans (no regression)', () => {
+  const a = { textContent: '走り', querySelector: () => null };
+  const b2 = { textContent: '出した', querySelector: () => null };
+  const container = { querySelectorAll: () => [a, b2] };
+  assert.strictEqual(extractNetflixCueText(container), '走り出した');
+});
+
+test('currentVideoTimeMs seconds -> ms; null-safe', () => {
+  assert.strictEqual(currentVideoTimeMs({ currentTime: 12.34 }), 12340);
+  assert.strictEqual(currentVideoTimeMs(null), null);
+});
+
+test('netflixVideoIdFromPath extracts /watch/<id>', () => {
+  assert.strictEqual(netflixVideoIdFromPath('/watch/81234567'), '81234567');
+  assert.strictEqual(netflixVideoIdFromPath('/browse'), null);
+});
+
+// ── TODO-1219 P1：字幕解析器纯函数 ──
+
+test('parseSubtitleTimestamp clock HH:MM:SS.mmm', () => {
+  assert.strictEqual(parseSubtitleTimestamp('00:00:01.500'), 1500);
+  assert.strictEqual(parseSubtitleTimestamp('01:02:03.004'), (3600 + 120 + 3) * 1000 + 4);
+});
+
+test('parseSubtitleTimestamp SRT comma and MM:SS', () => {
+  assert.strictEqual(parseSubtitleTimestamp('00:00:02,250'), 2250);
+  assert.strictEqual(parseSubtitleTimestamp('05:06.100'), (5 * 60 + 6) * 1000 + 100);
+});
+
+test('parseSubtitleTimestamp TTML offsets s/ms/tick', () => {
+  assert.strictEqual(parseSubtitleTimestamp('3s'), 3000);
+  assert.strictEqual(parseSubtitleTimestamp('250ms'), 250);
+  // tick: 10,000,000 ticks/s -> 1000ms
+  assert.strictEqual(parseSubtitleTimestamp('10000000t', 10000000), 1000);
+  assert.strictEqual(parseSubtitleTimestamp('50000000t'), 5000); // default tickRate 1e7
+});
+
+test('parseSubtitleTimestamp rejects garbage', () => {
+  assert.strictEqual(parseSubtitleTimestamp('abc'), null);
+  assert.strictEqual(parseSubtitleTimestamp(''), null);
+  assert.strictEqual(parseSubtitleTimestamp(null), null);
+});
+
+test('stripCueTags removes inline tags and entities', () => {
+  assert.strictEqual(stripCueTags('<c.japanese>走れ</c>'), '走れ');
+  assert.strictEqual(stripCueTags('a &amp; b &#65;'), 'a & b A');
+  assert.strictEqual(stripCueTags('<i>x</i>&nbsp;y'), 'x y');
+});
+
+test('parseWebVtt parses Netflix webvtt cues, skips header', () => {
+  const vtt = [
+    'WEBVTT',
+    '',
+    '00:00:01.000 --> 00:00:04.000 align:start position:10%',
+    '<c.j>走り</c>出した',
+    '',
+    '2',
+    '00:00:05.000 --> 00:00:07.500',
+    '二行目',
+    'つづき',
+    '',
+  ].join('\n');
+  const cues = parseWebVtt(vtt);
+  assert.strictEqual(cues.length, 2);
+  assert.deepStrictEqual(cues[0], { startMs: 1000, endMs: 4000, text: '走り出した' });
+  assert.deepStrictEqual(cues[1], { startMs: 5000, endMs: 7500, text: '二行目\nつづき' });
+});
+
+test('parseWebVtt tolerant of CRLF and empty', () => {
+  assert.deepStrictEqual(parseWebVtt(''), []);
+  const cues = parseWebVtt('WEBVTT\r\n\r\n00:00:00.000 --> 00:00:01.000\r\nhi\r\n');
+  assert.strictEqual(cues.length, 1);
+  assert.strictEqual(cues[0].text, 'hi');
+});
+
+test('parseTtml parses <p begin end> clock times with <br/>', () => {
+  const xml =
+    '<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml">' +
+    '<body><div>' +
+    '<p begin="00:00:01.000" end="00:00:03.000">走れ<br/>メロス</p>' +
+    '<p begin="00:00:04.000" end="00:00:06.000"><span>二つ目</span></p>' +
+    '</div></body></tt>';
+  const cues = parseTtml(xml);
+  assert.strictEqual(cues.length, 2);
+  assert.deepStrictEqual(cues[0], { startMs: 1000, endMs: 3000, text: '走れ\nメロス' });
+  assert.deepStrictEqual(cues[1], { startMs: 4000, endMs: 6000, text: '二つ目' });
+});
+
+test('parseTtml honours ttp:tickRate offset times', () => {
+  const xml =
+    '<tt ttp:tickRate="10000000">' +
+    '<body><div><p begin="10000000t" end="30000000t">tick</p></div></body></tt>';
+  const cues = parseTtml(xml);
+  assert.strictEqual(cues.length, 1);
+  assert.deepStrictEqual(cues[0], { startMs: 1000, endMs: 3000, text: 'tick' });
+});
+
+
+// BUG-2191：IMSC 1.1（Netflix 日文轨）的注音是 `tts:ruby="base|text"` span，不是 <rt>。
+// 旧解析只剥标签留内容 → 读音拼进正文（用户卡片 Sentence 实录「地下牢ちかろう は…這は い回って」）。
+test('parseTtml：tts:ruby 读音不进正文，注音单元后的断词空格一并吃掉，ruby 分段挂 cue.ruby', () => {
+  const xml =
+    '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling"><body><div>' +
+    '<p begin="00:00:01.000" end="00:00:03.000">雛宮の' +
+    '<span tts:ruby="container"><span tts:ruby="base">地下牢</span><span tts:ruby="text">ちかろう</span> </span><br/>' +
+    'はネズミや虫が<span tts:ruby="container"><span tts:ruby="base">這</span>' +
+    '<span tts:ruby="delimiter">(</span><span tts:ruby="text">は</span><span tts:ruby="delimiter">)</span></span> い回って</p>' +
+    '<p begin="00:00:04.000" end="00:00:05.000"><span style="x">plain</span> text</p>' +
+    '</div></body></tt>';
+  const cues = parseTtml(xml);
+  assert.strictEqual(cues.length, 2);
+  assert.strictEqual(cues[0].text, '雛宮の地下牢\nはネズミや虫が這い回って');
+  assert.deepStrictEqual(cues[0].ruby, [
+    { text: '雛宮の', reading: '' },
+    { text: '地下牢', reading: 'ちかろう' },
+    { text: '\nはネズミや虫が', reading: '' },
+    { text: '這', reading: 'は' },
+    { text: 'い回って', reading: '' },
+  ]);
+  // 普通 span（无 tts:ruby）内容照旧保留，空格照旧保留。
+  assert.strictEqual(cues[1].text, 'plain text');
+  assert.strictEqual('ruby' in cues[1], false, '没有注音的行不挂 ruby');
+});
+
+test('parseTtml：不带 container 的裸 base/text 对也能剥读音（宽松形态）', () => {
+  const xml = '<tt><body><div><p begin="00:00:01.000" end="00:00:02.000">' +
+    '<span tts:ruby="base">漢</span><span tts:ruby="text">かん</span>字</p></div></body></tt>';
+  assert.strictEqual(parseTtml(xml)[0].text, '漢字');
+});
+
+test('ttmlRubyToHtml：畸形/无 tts:ruby 输入原样返回，不吃正文', () => {
+  assert.strictEqual(ttmlRubyToHtml('a <span>b</span> c'), 'a <span>b</span> c');
+  assert.strictEqual(ttmlRubyToHtml(''), '');
+  // 缺闭合的 text span：宁可多留读音也不能吃掉后面的正文。
+  const out = ttmlRubyToHtml('<span tts:ruby="text">かん</span');
+  assert.ok(out.indexOf('かん') >= 0);
+});
+
+// 多句合一制卡的纯函数（扩展侧 = app 内 joinMinedSentences / mergeMiningAudioRanges）。
+test('fushiComposeCueContext：前后封顶、换行连接、时间窗并集、越界 null', () => {
+  const cues = [
+    { startMs: 0, endMs: 900, text: 'A' },
+    { startMs: 1000, endMs: 2000, text: ' B ' },
+    { startMs: 2100, endMs: 2900, text: '' },
+    { startMs: 3000, endMs: 4000, text: 'D' },
+  ];
+  const c = fushiComposeCueContext(cues, 1, 5, 1);
+  assert.deepStrictEqual(c.prev, ['A']);
+  assert.strictEqual(c.current, ' B ');
+  assert.deepStrictEqual(c.next, ['']);
+  assert.strictEqual(c.sentence, 'A\nB', '空句丢弃、逐句 trim');
+  assert.strictEqual(c.startV, 0);
+  assert.strictEqual(c.endV, 2900, '并集含空句的时间窗（它仍是被录进去的一段）');
+  assert.strictEqual(c.prevAtMax, true);
+  assert.strictEqual(c.nextAtMax, false);
+  assert.strictEqual(fushiComposeCueContext(cues, 4, 1, 1), null);
+  assert.strictEqual(fushiComposeCueContext([], 0, 1, 1), null);
+  assert.strictEqual(fushiComposeCueContext(cues, 3, 0, 0).sentence, 'D');
+});
+
+// ── BUG-676（TODO-1361 ③）：网飞剧名抽取（Anki {document-title} 视频名字段）──
+function nfDoc(videoTitleEl, title) {
+  return {
+    title: title || '',
+    querySelector: (sel) => (sel === '[data-uia="video-title"]' ? videoTitleEl : null),
+  };
+}
+function nfEl(h4Text, spanTexts, whole) {
+  return {
+    textContent: whole || '',
+    querySelector: (sel) => (sel === 'h4' && h4Text != null ? { textContent: h4Text } : null),
+    querySelectorAll: (sel) => (sel === 'span' ? (spanTexts || []).map((t) => ({ textContent: t })) : []),
+  };
+}
+
+test('netflixDocumentTitle joins series + episode spans', () => {
+  const el = nfEl('SHERLOCK', ['第3話', 'The Great Game'], 'SHERLOCK第3話The Great Game');
+  assert.strictEqual(netflixDocumentTitle(nfDoc(el, 'x - Netflix')), 'SHERLOCK - 第3話 The Great Game');
+});
+
+test('netflixDocumentTitle movie (h4 only) -> series name', () => {
+  const el = nfEl('となりのトトロ', [], 'となりのトトロ');
+  assert.strictEqual(netflixDocumentTitle(nfDoc(el, 'ignored')), 'となりのトトロ');
+});
+
+test('netflixDocumentTitle de-dups repeated span text', () => {
+  const el = nfEl('Show', ['S1:E1', 'S1:E1'], '');
+  assert.strictEqual(netflixDocumentTitle(nfDoc(el, '')), 'Show - S1:E1');
+});
+
+test('netflixDocumentTitle falls back to document.title minus Netflix suffix', () => {
+  assert.strictEqual(netflixDocumentTitle(nfDoc(null, '呪術廻戦 - Netflix')), '呪術廻戦');
+  assert.strictEqual(netflixDocumentTitle(nfDoc(null, 'Alice in Borderland | Netflix')), 'Alice in Borderland');
+});
+
+test('netflixDocumentTitle null/empty doc -> empty string', () => {
+  assert.strictEqual(netflixDocumentTitle(null), '');
+  assert.strictEqual(netflixDocumentTitle(nfDoc(null, '')), '');
+});
+
+// ── asb 移植：stream-bridge 送来的两种新格式 ──
+
+test('parseBilibiliJson: body[{from,to,content}] 秒 → cues 毫秒', () => {
+  const text = JSON.stringify({
+    body: [
+      { from: 1.5, to: 3.25, content: 'こんにちは' },
+      { from: 4, to: 5, content: '  ' },      // 空白句丢弃
+      { from: 'x', to: 6, content: '坏行' },   // 非数值丢弃
+      { from: 6.1, to: 7.9, content: '次の句' },
+    ],
+  });
+  const cues = parseBilibiliJson(text);
+  assert.strictEqual(cues.length, 2);
+  assert.deepStrictEqual(cues[0], { startMs: 1500, endMs: 3250, text: 'こんにちは' });
+  assert.deepStrictEqual(cues[1], { startMs: 6100, endMs: 7900, text: '次の句' });
+});
+
+test('parseBilibiliJson: 坏 JSON / 无 body → 空数组', () => {
+  assert.deepStrictEqual(parseBilibiliJson('not json'), []);
+  assert.deepStrictEqual(parseBilibiliJson('{}'), []);
+  assert.deepStrictEqual(parseBilibiliJson(''), []);
+});
+
+// Bilibili srt 轨直接走 parseWebVtt：SRT 块（序号行 + 逗号毫秒）本就兼容。
+test('parseWebVtt 兼容 SRT 块（bilibili srt 轨复用同一解析器）', () => {
+  const srt = '1\n00:00:01,000 --> 00:00:02,500\n走り出した\n\n2\n00:00:04,000 --> 00:00:05,000\nこんにちは\n';
+  const cues = parseWebVtt(srt);
+  assert.strictEqual(cues.length, 2);
+  assert.deepStrictEqual(cues[0], { startMs: 1000, endMs: 2500, text: '走り出した' });
+});
+
+// ── 整轨优先仲裁的共享纯函数 ──
+
+const CUES = [
+  { startMs: 1000, endMs: 3000, text: 'A' },
+  { startMs: 5000, endMs: 7000, text: 'B' },
+];
+
+test('findCueIndexAt 命中句内时间（含左闭边界）', () => {
+  assert.strictEqual(findCueIndexAt(CUES, 1000), 0);
+  assert.strictEqual(findCueIndexAt(CUES, 2000), 0);
+  assert.strictEqual(findCueIndexAt(CUES, 5000), 1);
+  assert.strictEqual(findCueIndexAt(CUES, 6999), 1);
+});
+
+test('findCueIndexAt 间隙/越界返回 -1（不吸附邻句）', () => {
+  assert.strictEqual(findCueIndexAt(CUES, 999), -1, '首句之前');
+  assert.strictEqual(findCueIndexAt(CUES, 3000), -1, 'endMs 右开');
+  assert.strictEqual(findCueIndexAt(CUES, 4000), -1, '两句之间的静音段');
+  assert.strictEqual(findCueIndexAt(CUES, 99999), -1, '末句之后');
+});
+
+test('findCueIndexAt 坏输入不抛', () => {
+  assert.strictEqual(findCueIndexAt(null, 1000), -1);
+  assert.strictEqual(findCueIndexAt([], 1000), -1);
+  assert.strictEqual(findCueIndexAt(CUES, null), -1);
+});
+
+test('pickPrimaryCueTrack 排除 live 伪轨（它是降级来源，永不当主路径）', () => {
+  const store = { 'v1|live': [{ startMs: 0, endMs: 1, text: 'x' }] };
+  assert.strictEqual(pickPrimaryCueTrack(store, 'v1', 'live'), null);
+});
+
+test('pickPrimaryCueTrack 有整轨时取之，preferredLang 优先', () => {
+  const store = {
+    'v1|en': [{ startMs: 0, endMs: 1, text: 'en' }],
+    'v1|ja': [{ startMs: 0, endMs: 1, text: 'ja' }],
+    'v1|live': [{ startMs: 0, endMs: 1, text: 'live' }],
+  };
+  assert.strictEqual(pickPrimaryCueTrack(store, 'v1', 'live').lang, 'en', '缺省取字典序首条非 live');
+  assert.strictEqual(pickPrimaryCueTrack(store, 'v1', 'live', 'ja').lang, 'ja', 'preferredLang 优先');
+  assert.strictEqual(pickPrimaryCueTrack(store, 'v1', 'live', 'zz').lang, 'en', '偏好轨不存在时回落');
+});
+
+test('pickPrimaryCueTrack 不串视频身份，空轨不算', () => {
+  const store = {
+    'v1|ja': [],
+    'v2|ja': [{ startMs: 0, endMs: 1, text: 'other' }],
+  };
+  assert.strictEqual(pickPrimaryCueTrack(store, 'v1', 'live'), null, '空轨不算整轨；别的视频的轨不得串进来');
+  assert.strictEqual(pickPrimaryCueTrack(null, 'v1', 'live'), null);
+  assert.strictEqual(pickPrimaryCueTrack({}, '', 'live'), null);
+});
+
+
+// BUG-2192：网飞录屏片段裁黑边——可见视频画面占视口的比例矩形。
+function fakeVideo(rect, iw, ih) {
+  return { getBoundingClientRect: () => rect, videoWidth: iw, videoHeight: ih };
+}
+
+test('fushiVideoCropFraction：contain 几何——宽视口里 16:9 视频居中，左右黑边被裁掉', () => {
+  // 视口 2000×1000，元素铺满视口，视频 1920×1080 → 内容 1777.8×1000 居中。
+  const f = fushiVideoCropFraction(fakeVideo({ left: 0, top: 0, width: 2000, height: 1000 }, 1920, 1080), 2000, 1000);
+  assert.deepStrictEqual(f, { x: 0.0556, y: 0, w: 0.8889, h: 1 });
+});
+
+test('fushiVideoCropFraction：元素框未铺满视口（窗口播放）→ 裁到元素内的内容矩形', () => {
+  // 视口 1600×900；播放器 1200×600 放在 (100,100)，视频 16:9 → 内容 1066.7×600 居中于元素。
+  const f = fushiVideoCropFraction(fakeVideo({ left: 100, top: 100, width: 1200, height: 600 }, 1920, 1080), 1600, 900);
+  assert.deepStrictEqual(f, { x: 0.1042, y: 0.1111, w: 0.6667, h: 0.6667 });
+});
+
+test('fushiVideoCropFraction：拿不到 videoWidth/Height（DRM 给 0）→ 退回整个元素框', () => {
+  const f = fushiVideoCropFraction(fakeVideo({ left: 100, top: 50, width: 800, height: 400 }, 0, 0), 1000, 500);
+  assert.deepStrictEqual(f, { x: 0.1, y: 0.1, w: 0.8, h: 0.8 });
+});
+
+test('fushiVideoCropFraction：元素伸出视口 → 与视口求交', () => {
+  const f = fushiVideoCropFraction(fakeVideo({ left: -100, top: 0, width: 1200, height: 500 }, 0, 0), 1000, 500);
+  assert.strictEqual(f, null, '交集恰好铺满视口 → 不裁');
+});
+
+test('fushiVideoCropFraction：铺满视口（全屏 16:9）/ 无效输入 → null（服务端不裁）', () => {
+  assert.strictEqual(fushiVideoCropFraction(fakeVideo({ left: 0, top: 0, width: 1920, height: 1080 }, 1920, 1080), 1920, 1080), null);
+  assert.strictEqual(fushiVideoCropFraction(null, 1920, 1080), null);
+  assert.strictEqual(fushiVideoCropFraction(fakeVideo({ left: 0, top: 0, width: 0, height: 0 }, 0, 0), 1920, 1080), null);
+  assert.strictEqual(fushiVideoCropFraction(fakeVideo({ left: 0, top: 0, width: 100, height: 100 }, 0, 0), 0, 0), null);
+});

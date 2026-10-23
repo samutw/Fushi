@@ -1,0 +1,936 @@
+import 'dart:convert';
+
+import 'package:fushi/src/controls/control_layout.dart';
+
+enum VideoControlButton {
+  speed('speed'),
+  subtitleList('subtitleList'),
+  favoriteSentence('favoriteSentence'),
+  settings('settings');
+
+  const VideoControlButton(this.storageValue);
+
+  final String storageValue;
+
+  static VideoControlButton? fromStorage(String value) {
+    for (final VideoControlButton button in values) {
+      if (button.storageValue == value) return button;
+    }
+    return null;
+  }
+}
+
+enum VideoControlPlacement {
+  bottom('bottom'),
+  rightRail('rightRail'),
+  settingsOnly('settingsOnly');
+
+  const VideoControlPlacement(this.storageValue);
+
+  final String storageValue;
+
+  static VideoControlPlacement? fromStorage(String value) {
+    for (final VideoControlPlacement placement in values) {
+      if (placement.storageValue == value) return placement;
+    }
+    return null;
+  }
+}
+
+// ============================================================================
+// TODO-274 phase 0: 9-slot full drag-customization data model foundation.
+// Pure data, no rendering wired. The legacy 3-tier enums above
+// ([VideoControlButton] / [VideoControlPlacement]) are retained only to decode
+// and migrate old persisted v1 layouts (see [VideoControlLayout._migrateFromV1]);
+// the old VideoControlCustomization holder class was removed once the renderer
+// and picker moved to the 9-slot [VideoControlLayout] (the persisted source of
+// truth). The v1 wire format ({"version":1,"placements":{...}}) is read directly
+// from raw JSON by the migration, so no holder object is needed.
+// ============================================================================
+
+/// The 9 target slots for a control button (Bilibili-style: bottom L/C/R +
+/// screen L/R + top L/C/R + hidden). [hidden] = not rendered on the player.
+enum VideoControlSlot implements ControlSlotSpec {
+  bottomLeft('bottomLeft'),
+  bottomCenter('bottomCenter'),
+  bottomRight('bottomRight'),
+  screenLeft('screenLeft'),
+  screenRight('screenRight'),
+  topLeft('topLeft'),
+  topCenter('topCenter'),
+  topRight('topRight'),
+  hidden('hidden');
+
+  const VideoControlSlot(this.storageValue);
+
+  @override
+  final String storageValue;
+
+  /// Whether this slot is visible on the player (hidden is the only non-visible one).
+  bool get isOnPlayer => this != VideoControlSlot.hidden;
+
+  static VideoControlSlot? fromStorage(String value) {
+    for (final VideoControlSlot slot in VideoControlSlot.values) {
+      if (slot.storageValue == value) return slot;
+    }
+    return null;
+  }
+
+  /// The slots the phase-2 editor exposes and the player actually renders for
+  /// customizable learning buttons. Restricted to the positions that have a real
+  /// render target today (bottom bar left/right regions + floating left/right
+  /// rails + top-area left/right floating rails + hidden), so the picker never
+  /// offers a slot that silently no-ops.
+  ///
+  /// TODO-388: topLeft / topRight were added so users can also place the
+  /// customizable learning buttons in the **top** area (a floating top rail,
+  /// mirroring the screen side rails) — the player renders them via the same
+  /// learning-button path. The bottom-center transport cluster and topCenter
+  /// host fixed transport / nav chrome (title / back / episode nav) and stay out
+  /// of this set; remodeling those fixed chrome buttons + the immersion lock as
+  /// fully draggable items is a separate, larger change (PM decision pending).
+  ///
+  /// TODO-399 decision 2: [bottomCenter] joined the editable set so the central
+  /// transport cluster (play / seek / cue-nav) can also be rebalanced by the
+  /// user.
+  ///
+  /// [topCenter] 也在集合里。它此前被排除在外，理由是「只放固定的标题 chrome」——
+  /// 但 [canMoveToSlot] 一直允许把 [VideoControlItem.title] 拖进 topCenter，两个
+  /// 编辑器也一直把它画成一个可投放区域。于是这个自称「真相源」的清单**与真实能力
+  /// 相反**，且零生产消费方（两个编辑器各自硬编码了一份槽位表），谁也拦不住它们
+  /// 继续漂开。
+  ///
+  /// 这里定的是**编辑器暴露哪些槽**，不是**每个槽收哪些按钮**。后者是
+  /// [canMoveToSlot] 的职责：topCenter 依旧只收标题，拖别的按钮进去照常拒收并给
+  /// 提示。两个维度分开之后，「区域存在」与「这个按钮能不能放这儿」不再互相冒充。
+  static const List<VideoControlSlot> editableSlots = <VideoControlSlot>[
+    VideoControlSlot.topLeft,
+    VideoControlSlot.topCenter,
+    VideoControlSlot.topRight,
+    VideoControlSlot.bottomLeft,
+    VideoControlSlot.bottomCenter,
+    VideoControlSlot.bottomRight,
+    VideoControlSlot.screenLeft,
+    VideoControlSlot.screenRight,
+    VideoControlSlot.hidden,
+  ];
+}
+
+/// Full button library: transport keys + learning keys.
+/// [isSpecialRender] transport keys (play/volume/title/position) get dedicated
+/// render branches; everything else renders as a plain icon button.
+///
+/// - [pinnedRequired]: required buttons cannot be moved into
+///   [VideoControlSlot.hidden] (enforced at the model layer, all platforms), so
+///   the player always keeps a play/pause control.
+/// - [pinnedOnTouch]: buttons that are the *only* in-player entry to recover
+///   controls on touch devices (no right-click context menu there). On touch
+///   controls they cannot be moved into [VideoControlSlot.hidden] -- enforced at
+///   the UI gate via [canMoveToSlot] (`isTouchControls: true`), NOT in the pure
+///   persisted model -- so a touch user can never soft-lock themselves out of
+///   the settings panel / on-screen editor (TODO-554). Desktop keeps the
+///   button removable (the right-click `Icons.tune` menu can restore it).
+/// - [legacyButton]: mapping to the legacy [VideoControlButton] used by the
+///   v1->v2 migration to translate old placements into new slots; transport
+///   keys have no legacy peer (they were hardcoded in the media_kit theme).
+enum VideoControlItem implements ControlItemSpec<VideoControlSlot> {
+  back('back'),
+  immersiveLock('immersiveLock'),
+
+  // -- learning keys (1:1 with legacy [VideoControlButton]) --
+  speed('speed', legacyButton: VideoControlButton.speed),
+  subtitleList('subtitleList', legacyButton: VideoControlButton.subtitleList),
+  favoriteSentence(
+    'favoriteSentence',
+    legacyButton: VideoControlButton.favoriteSentence,
+  ),
+  settings(
+    'settings',
+    legacyButton: VideoControlButton.settings,
+    pinnedOnTouch: true,
+  ),
+
+  // -- transport keys (hardcoded in the media_kit theme; phase 0 only catalogs) --
+  playPause('playPause', isSpecialRender: true, pinnedRequired: true),
+  seekBackward('seekBackward'),
+  seekForward('seekForward'),
+  // 逐帧后退 / 前进（libmpv frame-back-step / frame-step，桌面专属）。渲染层用
+  // [_isDesktopVideoControls] 门控（移动端 libmpv 逐帧不可用，不显示），但模型层
+  // 保持跨平台一致，不在此加平台字段。
+  frameBackward('frameBackward'),
+  frameForward('frameForward'),
+  previousCue('previousCue'),
+  nextCue('nextCue'),
+  // 重播当前句（2026-10-05 播放器 UI 重做）：与快捷键 videoReplayCurrentSubtitle
+  // （默认 R / 手柄 LT）同一路径——回到本句开头、只播这一句。学习主路径上最常用
+  // 的动作此前只有键盘 / 手柄能触发，手机上没有入口。
+  replayCue('replayCue'),
+  volume('volume', isSpecialRender: true),
+  fullscreen('fullscreen'),
+  screenshot('screenshot'),
+  clipExport('clipExport'),
+  subtitleTrack('subtitleTrack'),
+  audioTrack('audioTrack'),
+  previousEpisode('previousEpisode'),
+  nextEpisode('nextEpisode'),
+  episodeList('episodeList'),
+  previousChapter('previousChapter'),
+  nextChapter('nextChapter'),
+  chapterList('chapterList'),
+  // 弹幕开关（2026-10-06 用户请求）：切换「显示弹幕」偏好（`video_danmaku_enabled`，
+  // 与设置面板「显示弹幕」开关同一状态源，不另立平行状态）。**默认不在播放器上**——
+  // 出厂布局 / 老布局回填一律落 removed，且不进「⋯」溢出菜单；只有用户在控件布局
+  // 编辑器里把它拖进某个槽位才出现。当前视频没有弹幕来源（远端流）时不渲染。
+  danmaku('danmaku'),
+  title('title', isSpecialRender: true),
+  positionIndicator('positionIndicator', isSpecialRender: true),
+
+  // -- 自定义「快捷键」按钮（用户请求）--
+  // 4 个空槽位，各由用户绑一个视频动作（绑定表见 [VideoCustomActionBindings]，与本
+  // 布局分开持久化：这里只管「按钮放在哪」，那里只管「按钮干什么」）。存在的理由是
+  // 触摸端没有键盘——近 40 个视频动作里只有 ~25 个有具名按钮，其余在手机上根本没法
+  // 触发。与其为每个动作再加一个枚举项，不如给几个可绑定的通用槽位。
+  //
+  // **未绑定也照常渲染**（用户拍板，见 `_shouldRenderControlItem`）：空槽位点一下就
+  // 地弹动作选择器，所以它不是死按钮，而是手机上最短的配置路径——看得见、点得到、
+  // 当场配好。代价是所有用户（含老用户，见 [currentChrome] 的兜底 assignment）升级后
+  // 底栏右区会多出 4 个按钮；不想要的可以像其它按钮一样拖进隐藏托盘。
+  customAction1('customAction1'),
+  customAction2('customAction2'),
+  customAction3('customAction3'),
+  customAction4('customAction4');
+
+  const VideoControlItem(
+    this.storageValue, {
+    this.isSpecialRender = false,
+    this.pinnedRequired = false,
+    this.pinnedOnTouch = false,
+    this.legacyButton,
+  });
+
+  @override
+  final String storageValue;
+
+  /// Special render item (not a plain icon button: play/pause toggle, volume
+  /// slider, title text, position indicator). Phase 0 only flags it.
+  final bool isSpecialRender;
+
+  /// Required button: cannot be moved into [VideoControlSlot.hidden] on every
+  /// platform.
+  @override
+  final bool pinnedRequired;
+
+  /// Touch-only pinned button: the sole in-player entry to recover controls on
+  /// touch devices, so on touch controls it cannot be moved into
+  /// [VideoControlSlot.hidden] (TODO-554). Desktop is unaffected (it has a
+  /// right-click context-menu fallback to reopen settings / restore the button).
+  @override
+  final bool pinnedOnTouch;
+
+  /// Legacy [VideoControlButton] peer (learning keys only; transport keys null).
+  final VideoControlButton? legacyButton;
+
+  /// 自定义「快捷键」按钮的槽位下标（0-based，对应
+  /// [VideoCustomActionBindings.actionAt] 的参数）；非自定义按钮返回 null。
+  ///
+  /// 单一真相源：图标 / 标签 / 是否渲染 / 点击执行四条路径都用它把枚举项换算成槽位
+  /// 号，而不是各自写一遍 `item == customAction1 ? 0 : ...` 的四分支 switch。
+  int? get customActionSlotIndex {
+    switch (this) {
+      case VideoControlItem.customAction1:
+        return 0;
+      case VideoControlItem.customAction2:
+        return 1;
+      case VideoControlItem.customAction3:
+        return 2;
+      case VideoControlItem.customAction4:
+        return 3;
+      // ignore: no_default_cases
+      default:
+        return null;
+    }
+  }
+
+  /// 是否是自定义「快捷键」按钮槽位。
+  bool get isCustomAction => customActionSlotIndex != null;
+
+  /// 全部自定义「快捷键」按钮槽位，按序号升序（= 快捷键1、2、3、4）。
+  static List<VideoControlItem> get customActionItems => <VideoControlItem>[
+        for (final VideoControlItem item in VideoControlItem.values)
+          if (item.isCustomAction) item,
+      ]..sort(
+          (VideoControlItem a, VideoControlItem b) =>
+              a.customActionSlotIndex!.compareTo(b.customActionSlotIndex!),
+        );
+
+  static VideoControlItem? fromStorage(String value) {
+    for (final VideoControlItem item in VideoControlItem.values) {
+      if (item.storageValue == value) return item;
+    }
+    return null;
+  }
+
+  /// Find the new [VideoControlItem] for a legacy [VideoControlButton] (migration).
+  static VideoControlItem? fromLegacy(VideoControlButton button) {
+    for (final VideoControlItem item in VideoControlItem.values) {
+      if (item.legacyButton == button) return item;
+    }
+    return null;
+  }
+
+  /// The learning-key items the phase-2 editor lets users place / hide (the
+  /// keys with a legacy peer: speed / subtitleList / favoriteSentence /
+  /// settings). Transport / nav keys stay fixed in the chrome and are not
+  /// user-customizable in this stage.
+  static List<VideoControlItem> get customizableLearning => <VideoControlItem>[
+        for (final VideoControlItem item in VideoControlItem.values)
+          if (item.legacyButton != null) item,
+      ];
+
+  /// Whether the visual icon-chip editor can represent this button as a single
+  /// draggable chip. [volume] is a dedicated player widget, but the editor can
+  /// still represent its placement with a volume icon chip. The only items it
+  /// cannot show as a chip is [positionIndicator] (time text). [title] is a
+  /// special text chip in the editor: it keeps a dedicated player render path,
+  /// but users can move it among top slots or move it out of the player.
+  /// [playPause] is special-render but still a single button, so it is
+  /// chip-renderable (TODO-399 decision 2).
+  bool get isChipRenderable => this != VideoControlItem.positionIndicator;
+
+  /// Whether the item should be moved as a single instance rather than copied
+  /// from the palette. Most controls may sit in several slots; title is unique.
+  @override
+  bool get isSingleInstance => this == VideoControlItem.title;
+
+  /// Recovery slot for a required button wrongly removed (does not
+  /// depend on [VideoControlLayout.defaults] to avoid an init cycle).
+  @override
+  VideoControlSlot get recoverySlot => this == VideoControlItem.playPause
+      ? VideoControlSlot.bottomCenter
+      : VideoControlSlot.bottomRight;
+
+  /// Whether the item may be placed in [target] by the model/editor.
+  ///
+  /// [volume] is intentionally limited to the bottom bar in this round: its
+  /// dedicated render branch is a full button + popover anchor that must never
+  /// enter top bars, side rails, or the removed tray.
+  ///
+  /// [isTouchControls] is the UI-gate hook (TODO-554): the pure persisted model
+  /// always calls this with the default `false` so a saved layout stays
+  /// cross-platform identical (decode/normalize never depend on the current
+  /// platform). Only the on-screen editor / quick-settings sheet pass `true` on
+  /// touch devices, which additionally forbids a [pinnedOnTouch] button (the
+  /// sole in-player settings entry) from being dragged into
+  /// [VideoControlSlot.hidden] -- desktop keeps it removable (right-click menu
+  /// restores it).
+  @override
+  bool canMoveToSlot(VideoControlSlot target, {bool isTouchControls = false}) {
+    if (this == VideoControlItem.volume) {
+      return target == VideoControlSlot.bottomLeft ||
+          target == VideoControlSlot.bottomRight;
+    }
+    if (this == VideoControlItem.title) {
+      return target == VideoControlSlot.topLeft ||
+          target == VideoControlSlot.topCenter ||
+          target == VideoControlSlot.topRight ||
+          target == VideoControlSlot.hidden;
+    }
+    if (target == VideoControlSlot.topCenter) return false;
+    if (pinnedRequired && target == VideoControlSlot.hidden) return false;
+    if (isTouchControls && pinnedOnTouch && target == VideoControlSlot.hidden) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Whether the persisted model allows removing this button from the player
+  /// (cross-platform, no touch gate). Used by decode / normalize / backfill so a
+  /// saved layout round-trips identically on every platform.
+  bool get canBeRemovedFromPlayer => canMoveToSlot(VideoControlSlot.hidden);
+
+  /// Whether the UI should let the user remove this button from the player on
+  /// the current surface. On touch controls a [pinnedOnTouch] button (the sole
+  /// in-player settings entry) is not removable, so the user can never soft-lock
+  /// themselves out of the controls editor (TODO-554).
+  bool canRemoveFromPlayer({bool isTouchControls = false}) =>
+      canMoveToSlot(VideoControlSlot.hidden, isTouchControls: isTouchControls);
+
+  /// TODO-399 decision 3b: the full set of buttons the visual editor lets users
+  /// freely place / duplicate / hide. This is every modeled button that is
+  /// [isChipRenderable] -- i.e. all the learning keys plus volume and transport / nav
+  /// keys (play/pause, seek +/-, cue nav, screenshot, subtitle / audio track,
+  /// episode list, fullscreen). The non-chip special renders (volume slider,
+  /// title text, position indicator) keep their dedicated branch and stay out.
+  static List<VideoControlItem> get customizableItems => <VideoControlItem>[
+        for (final VideoControlItem item in VideoControlItem.values)
+          if (item.isChipRenderable) item,
+      ];
+}
+
+/// Per-slot ordered full control button layout. Each [VideoControlSlot]
+/// holds an ordered List<VideoControlItem> (drag reorder = reorder that list).
+/// A button may live in several visible slots. Moving a removable button into
+/// [VideoControlSlot.hidden] removes it from the player and records it in the
+/// explicit removed set; hidden is not a restore surface.
+///
+/// Thin wrapper over the generic [ControlLayout] (`src/controls/`): the slot /
+/// item invariants, the write operations and the slot-table codec live there;
+/// this class keeps the video-only pieces -- the two canonical layouts
+/// ([defaults] / [currentChrome]), the v1 / v2 persisted-format migrations and
+/// the volume / title chrome rules ([_normalizeVideoChrome]).
+///
+/// Invariants (kept by the normalizing constructor + the pinned guard):
+///   - each [VideoControlItem] appears at most once per visible slot;
+///   - missing buttons can be backfilled by decode fallback assignments;
+///   - removed buttons are absent from all visible slots and are not listed in
+///     [VideoControlSlot.hidden] for rendering;
+///   - required buttons ([VideoControlItem.pinnedRequired], currently
+///     [VideoControlItem.playPause]) cannot be removed.
+class VideoControlLayout {
+  const VideoControlLayout._(this._core);
+
+  /// The generic scheme: 9 slots, ~33 items, hidden slot, video chrome rules.
+  static const ControlLayoutScheme<VideoControlSlot, VideoControlItem> scheme =
+      ControlLayoutScheme<VideoControlSlot, VideoControlItem>(
+    slots: VideoControlSlot.values,
+    hiddenSlot: VideoControlSlot.hidden,
+    items: VideoControlItem.values,
+    postNormalize: _normalizeVideoChrome,
+  );
+
+  /// Build from a flat button->slot map; normalizes into slot->ordered list.
+  /// [explicitOrder] controls within-slot ordering (preserves user drag order).
+  factory VideoControlLayout.fromAssignments(
+    Map<VideoControlItem, VideoControlSlot> assignments, {
+    Map<VideoControlSlot, List<VideoControlItem>>? explicitOrder,
+  }) =>
+      VideoControlLayout._(
+        ControlLayout<VideoControlSlot, VideoControlItem>.fromAssignments(
+          scheme,
+          assignments,
+          explicitOrder: explicitOrder,
+        ),
+      );
+
+  /// Build directly from a slot->ordered-items map **without de-duplicating**:
+  /// the same [VideoControlItem] may appear in more than one slot (TODO-399:
+  /// one button in multiple positions). Any button absent from every visible
+  /// slot is backfilled into [assignments] unless it is in [removedItems]; the
+  /// pinned guard still keeps required keys on the player.
+  factory VideoControlLayout.fromSlots(
+    Map<VideoControlSlot, List<VideoControlItem>> slotItems, {
+    Map<VideoControlItem, VideoControlSlot>? assignments,
+    Set<VideoControlItem>? removedItems,
+  }) =>
+      VideoControlLayout._(
+        ControlLayout<VideoControlSlot, VideoControlItem>.fromSlots(
+          scheme,
+          slotItems,
+          assignments: assignments,
+          removedItems: removedItems,
+        ),
+      );
+
+  /// Default layout: transport keys at traditional positions + learning keys
+  /// per the user decision (favorite buttons default to bottomRight).
+  ///
+  /// This is the new model's own default and is independent of the old legacy
+  /// 3-tier defaults (speed in the bottom cluster, the rest on the right rail).
+  static final VideoControlLayout defaults = VideoControlLayout.fromAssignments(
+    const <VideoControlItem, VideoControlSlot>{
+      VideoControlItem.back: VideoControlSlot.topLeft,
+      VideoControlItem.immersiveLock: VideoControlSlot.screenLeft,
+      VideoControlItem.title: VideoControlSlot.topCenter,
+      VideoControlItem.previousEpisode: VideoControlSlot.topRight,
+      VideoControlItem.nextEpisode: VideoControlSlot.topRight,
+      VideoControlItem.episodeList: VideoControlSlot.topRight,
+      VideoControlItem.chapterList: VideoControlSlot.topRight,
+      VideoControlItem.previousChapter: VideoControlSlot.topRight,
+      VideoControlItem.nextChapter: VideoControlSlot.topRight,
+      VideoControlItem.positionIndicator: VideoControlSlot.bottomLeft,
+      VideoControlItem.previousCue: VideoControlSlot.bottomCenter,
+      VideoControlItem.seekBackward: VideoControlSlot.bottomCenter,
+      VideoControlItem.frameBackward: VideoControlSlot.bottomCenter,
+      VideoControlItem.playPause: VideoControlSlot.bottomCenter,
+      VideoControlItem.frameForward: VideoControlSlot.bottomCenter,
+      VideoControlItem.seekForward: VideoControlSlot.bottomCenter,
+      VideoControlItem.nextCue: VideoControlSlot.bottomCenter,
+      VideoControlItem.replayCue: VideoControlSlot.bottomCenter,
+      VideoControlItem.volume: VideoControlSlot.bottomRight,
+      VideoControlItem.speed: VideoControlSlot.bottomRight,
+      VideoControlItem.subtitleTrack: VideoControlSlot.bottomRight,
+      VideoControlItem.audioTrack: VideoControlSlot.bottomRight,
+      VideoControlItem.screenshot: VideoControlSlot.bottomRight,
+      VideoControlItem.clipExport: VideoControlSlot.bottomRight,
+      VideoControlItem.fullscreen: VideoControlSlot.bottomRight,
+      VideoControlItem.settings: VideoControlSlot.bottomRight,
+      VideoControlItem.favoriteSentence: VideoControlSlot.bottomRight,
+      VideoControlItem.subtitleList: VideoControlSlot.screenRight,
+      // 弹幕开关默认不在播放器上（用户拍板：可自定义加上去，默认不出现）。
+      VideoControlItem.danmaku: VideoControlSlot.hidden,
+      // 自定义「快捷键」按钮默认落底栏右区，未绑定也显示——空槽位点一下即弹动作
+      // 选择器，是手机上最短的配置路径。与 [currentChrome] 保持一致（那份还兼任老
+      // 布局的解码兜底）。
+      VideoControlItem.customAction1: VideoControlSlot.bottomRight,
+      VideoControlItem.customAction2: VideoControlSlot.bottomRight,
+      VideoControlItem.customAction3: VideoControlSlot.bottomRight,
+      VideoControlItem.customAction4: VideoControlSlot.bottomRight,
+    },
+    explicitOrder: const <VideoControlSlot, List<VideoControlItem>>{
+      VideoControlSlot.topLeft: <VideoControlItem>[VideoControlItem.back],
+      VideoControlSlot.topRight: <VideoControlItem>[
+        VideoControlItem.previousEpisode,
+        VideoControlItem.nextEpisode,
+        VideoControlItem.episodeList,
+        VideoControlItem.chapterList,
+        VideoControlItem.previousChapter,
+        VideoControlItem.nextChapter,
+      ],
+      VideoControlSlot.screenLeft: <VideoControlItem>[
+        VideoControlItem.immersiveLock,
+      ],
+      VideoControlSlot.bottomCenter: <VideoControlItem>[
+        VideoControlItem.seekBackward,
+        VideoControlItem.frameBackward,
+        VideoControlItem.previousCue,
+        VideoControlItem.playPause,
+        VideoControlItem.nextCue,
+        VideoControlItem.replayCue,
+        VideoControlItem.frameForward,
+        VideoControlItem.seekForward,
+      ],
+      VideoControlSlot.bottomRight: <VideoControlItem>[
+        VideoControlItem.volume,
+        VideoControlItem.speed,
+        VideoControlItem.subtitleTrack,
+        VideoControlItem.audioTrack,
+        VideoControlItem.screenshot,
+        VideoControlItem.clipExport,
+        VideoControlItem.fullscreen,
+        VideoControlItem.settings,
+        VideoControlItem.favoriteSentence,
+      ],
+      VideoControlSlot.screenRight: <VideoControlItem>[
+        VideoControlItem.subtitleList,
+      ],
+    },
+  );
+
+  /// 出厂布局（解码兜底 / 「重置为默认」/ 页面初值都用它，[defaults] 只是测试里的
+  /// 早期目标布局）。2026-10-06 播放器「控件显示时遮挡最小化」重做（M3E 媒体播放器 /
+  /// 新版 YouTube 桌面播放器思路）：常驻的只剩少量悬浮小胶囊，其余动作默认移出
+  /// 播放器、收进栏尾「⋯」（[VideoBarEntry.folded]），键盘 / 手势（方向键、双击、
+  /// 字幕快捷键）本就覆盖它们：
+  ///
+  /// - **左上**：返回（M3E 下与标题合成一颗胶囊）；**右上**：选集 / 章节（只在合集 /
+  ///   有章节时出现）/ 截图 / 设置。音轨、片段导出、上下集、上下章进右上「⋯」。
+  /// - **左下**：播放 / 暂停 + 时间（一颗紧凑胶囊）。
+  /// - **右下**：音量 / 字幕轨 / 倍速 / 全屏（一颗紧凑胶囊）。±10s、上下句、重播本句、
+  ///   逐帧、收藏句子、自定义快捷键进右下「⋯」。
+  /// - **右侧栏**：字幕列表（学习侧栏）；**左侧**：沉浸锁。
+  ///
+  /// 被移出的按钮仍可在控件布局编辑器里拖回任意槽位。已保存过布局的用户不受影响：
+  /// 持久化布局原样解码，只有**新增**的按钮按 [_kSavedLayoutFallback] / 这里的槽位
+  /// 补进去。compact / mini 档的退化不在布局层，由 [planVideoControlBar] 按优先级
+  /// 收起、由密度档收掉整条栏。
+  static final VideoControlLayout currentChrome =
+      VideoControlLayout.fromAssignments(
+    const <VideoControlItem, VideoControlSlot>{
+      // -- 顶栏 / 侧栏锁 --
+      VideoControlItem.back: VideoControlSlot.topLeft,
+      VideoControlItem.immersiveLock: VideoControlSlot.screenLeft,
+      VideoControlItem.title: VideoControlSlot.topCenter,
+      VideoControlItem.episodeList: VideoControlSlot.topRight,
+      VideoControlItem.chapterList: VideoControlSlot.topRight,
+      VideoControlItem.screenshot: VideoControlSlot.topRight,
+      VideoControlItem.settings: VideoControlSlot.topRight,
+      // -- 左下：播放 / 暂停 + 时间 --
+      VideoControlItem.playPause: VideoControlSlot.bottomLeft,
+      VideoControlItem.positionIndicator: VideoControlSlot.bottomLeft,
+      // -- 右下 --
+      VideoControlItem.volume: VideoControlSlot.bottomRight,
+      VideoControlItem.subtitleTrack: VideoControlSlot.bottomRight,
+      VideoControlItem.speed: VideoControlSlot.bottomRight,
+      VideoControlItem.fullscreen: VideoControlSlot.bottomRight,
+      // -- 学习侧栏 --
+      VideoControlItem.subtitleList: VideoControlSlot.screenRight,
+      // -- 默认移出播放器（进「⋯」，布局编辑器里可拖回）--
+      VideoControlItem.audioTrack: VideoControlSlot.hidden,
+      VideoControlItem.clipExport: VideoControlSlot.hidden,
+      VideoControlItem.previousEpisode: VideoControlSlot.hidden,
+      VideoControlItem.nextEpisode: VideoControlSlot.hidden,
+      VideoControlItem.previousChapter: VideoControlSlot.hidden,
+      VideoControlItem.nextChapter: VideoControlSlot.hidden,
+      VideoControlItem.seekBackward: VideoControlSlot.hidden,
+      VideoControlItem.frameBackward: VideoControlSlot.hidden,
+      VideoControlItem.previousCue: VideoControlSlot.hidden,
+      VideoControlItem.replayCue: VideoControlSlot.hidden,
+      VideoControlItem.nextCue: VideoControlSlot.hidden,
+      VideoControlItem.frameForward: VideoControlSlot.hidden,
+      VideoControlItem.seekForward: VideoControlSlot.hidden,
+      VideoControlItem.favoriteSentence: VideoControlSlot.hidden,
+      // 弹幕开关：默认移出播放器，且**不**进「⋯」（见 `_foldedBarEntries`）——只有
+      // 用户在布局编辑器里拖进槽位才出现。
+      VideoControlItem.danmaku: VideoControlSlot.hidden,
+      // 自定义「快捷键 1..4」按钮：默认在右下「⋯」里（已绑的 + 第一个未绑的「加号」，
+      // 门控在 `_shouldRenderControlItem`），点它就地配动作。
+      VideoControlItem.customAction1: VideoControlSlot.hidden,
+      VideoControlItem.customAction2: VideoControlSlot.hidden,
+      VideoControlItem.customAction3: VideoControlSlot.hidden,
+      VideoControlItem.customAction4: VideoControlSlot.hidden,
+    },
+    explicitOrder: const <VideoControlSlot, List<VideoControlItem>>{
+      VideoControlSlot.topLeft: <VideoControlItem>[VideoControlItem.back],
+      VideoControlSlot.topRight: <VideoControlItem>[
+        VideoControlItem.episodeList,
+        VideoControlItem.chapterList,
+        VideoControlItem.screenshot,
+        VideoControlItem.settings,
+      ],
+      VideoControlSlot.screenLeft: <VideoControlItem>[
+        VideoControlItem.immersiveLock,
+      ],
+      VideoControlSlot.bottomLeft: <VideoControlItem>[
+        VideoControlItem.playPause,
+        VideoControlItem.positionIndicator,
+      ],
+      VideoControlSlot.bottomRight: <VideoControlItem>[
+        VideoControlItem.volume,
+        VideoControlItem.subtitleTrack,
+        VideoControlItem.speed,
+        VideoControlItem.fullscreen,
+      ],
+      VideoControlSlot.screenRight: <VideoControlItem>[
+        VideoControlItem.subtitleList,
+      ],
+    },
+  );
+
+  /// Re-wrap a generic layout handed back by the generic editor. Only layouts
+  /// built on [scheme] are valid here (the editor never swaps schemes).
+  factory VideoControlLayout.fromCore(
+    ControlLayout<VideoControlSlot, VideoControlItem> core,
+  ) {
+    assert(identical(core.scheme, scheme), 'foreign ControlLayoutScheme');
+    return VideoControlLayout._(core);
+  }
+
+  final ControlLayout<VideoControlSlot, VideoControlItem> _core;
+
+  /// The generic layout underneath (for the generic editor / renderers).
+  ControlLayout<VideoControlSlot, VideoControlItem> get core => _core;
+
+  /// Ordered buttons in a slot (unmodifiable copy).
+  List<VideoControlItem> itemsIn(VideoControlSlot slot) => _core.itemsIn(slot);
+
+  /// The slot a button currently lives in (constructor guarantees full coverage).
+  VideoControlSlot slotOf(VideoControlItem item) => _core.slotOf(item);
+
+  /// Whether the button is visible on the player (non-hidden slot).
+  bool isOnPlayer(VideoControlItem item) => _core.isOnPlayer(item);
+
+  /// Items explicitly removed from the player, in enum order.
+  List<VideoControlItem> get removedItems => _core.removedItems;
+
+  /// Hidden slot entries are no longer persisted as recoverable buttons. Kept
+  /// for old callers and tests that inspect the slot directly; removed items
+  /// are exposed via [removedItems] and restored from the palette/default reset.
+  List<VideoControlItem> get hiddenItems => _core.hiddenItems;
+
+  /// All slots [item] currently lives in, in [VideoControlSlot.values] order
+  /// (TODO-399: a button may sit in more than one slot). Empty maps to
+  /// `[hidden]` (the normalizer guarantees every button appears somewhere).
+  List<VideoControlSlot> slotsOf(VideoControlItem item) => _core.slotsOf(item);
+
+  /// Move [item] into [target] at [index] (the core drag-reorder write op).
+  /// Moving a required button into hidden is rejected (returns this).
+  VideoControlLayout moveItem(
+    VideoControlItem item,
+    VideoControlSlot target, {
+    int? index,
+  }) =>
+      _wrap(_core.moveItem(item, target, index: index));
+
+  /// Add a copy of [item] into [target] WITHOUT removing it from other slots
+  /// (TODO-399: one button in multiple positions). Idempotent within a slot.
+  /// Adding a required button into hidden is rejected (returns this).
+  VideoControlLayout addItemToSlot(
+    VideoControlItem item,
+    VideoControlSlot target, {
+    int? index,
+  }) =>
+      _wrap(_core.addItemToSlot(item, target, index: index));
+
+  /// Move the exact dragged copy represented by [payload] into [target].
+  ///
+  /// Palette drags ([VideoControlDragData.sourceSlot] == null) add a new copy.
+  /// Placed-chip drags remove only [payload.sourceIndex] from its source slot
+  /// before inserting into [target], so another copy of the same item in a
+  /// different slot survives. Same-slot drags become an index-aware reorder.
+  VideoControlLayout moveDraggedItem(
+    VideoControlDragData payload,
+    VideoControlSlot target, {
+    int? targetIndex,
+  }) =>
+      _wrap(_core.moveDraggedItem(payload, target, targetIndex: targetIndex));
+
+  /// Remove the copy of [item] sitting in [slot] (TODO-399 delete / un-place).
+  /// If that was its last visible copy, the button is marked removed. A required
+  /// key whose last visible copy is removed is bounced back to a default slot.
+  VideoControlLayout removeItemFromSlot(
+    VideoControlItem item,
+    VideoControlSlot slot,
+  ) =>
+      _wrap(_core.removeItemFromSlot(item, slot));
+
+  /// Rejected write ops return the same core instance; keep `this` so callers
+  /// comparing identity / equality see a no-op either way.
+  VideoControlLayout _wrap(
+    ControlLayout<VideoControlSlot, VideoControlItem> next,
+  ) =>
+      identical(next, _core) ? this : VideoControlLayout._(next);
+
+  String encode() {
+    final List<String> removed = _core.encodeRemoved();
+    return jsonEncode(<String, Object>{
+      'version': 3,
+      'slots': _core.encodeSlots(),
+      if (removed.isNotEmpty) 'removed': removed,
+    });
+  }
+
+  String encodeV2ForTests() {
+    return jsonEncode(<String, Object>{
+      'version': 2,
+      'slots': _core.encodeSlots(includeHidden: true),
+    });
+  }
+
+  /// Decode persisted string; auto-detects v1 (old placements), v2 (slots where
+  /// hidden entries migrate to removed items), and v3 (slots + explicit removed).
+  /// Missing buttons in old/partial payloads are backfilled from current chrome.
+  /// Any unparseable input falls back to
+  /// [currentChrome] and never throws, so upgrading users do not see the player
+  /// chrome move until they explicitly save a new visual layout.
+  static VideoControlLayout decode(String json) {
+    if (json.trim().isEmpty) return currentChrome;
+    try {
+      final Object? raw = jsonDecode(json);
+      if (raw is! Map<String, dynamic>) return currentChrome;
+      final Object? version = raw['version'];
+      // v1: old 3-tier placements -> new slots (backward-compat iron rule).
+      if (raw.containsKey('placements')) {
+        return _migrateFromV1(raw['placements']);
+      }
+      final Object? slotsRaw = raw['slots'];
+      if ((version == 2 || version == 3) && slotsRaw is Map<String, dynamic>) {
+        return _decodeSlots(
+          slotsRaw,
+          removedRaw: version == 3 ? raw['removed'] : null,
+        );
+      }
+      return currentChrome;
+    } catch (_) {
+      return currentChrome;
+    }
+  }
+
+  /// v1 migration: bottom->bottomRight / rightRail->screenRight /
+  /// settingsOnly->removed. Old model only had 5 learning keys; transport keys
+  /// keep their current chrome slots (the old model never tracked them).
+  static VideoControlLayout _migrateFromV1(Object? placementsRaw) {
+    final Map<VideoControlItem, VideoControlSlot> assignments =
+        _currentChromeAssignments();
+    if (placementsRaw is Map<String, dynamic>) {
+      for (final MapEntry<String, dynamic> entry in placementsRaw.entries) {
+        final VideoControlButton? legacy = VideoControlButton.fromStorage(
+          entry.key,
+        );
+        final Object? value = entry.value;
+        final VideoControlPlacement? placement =
+            value is String ? VideoControlPlacement.fromStorage(value) : null;
+        if (legacy == null || placement == null) continue;
+        final VideoControlItem? item = VideoControlItem.fromLegacy(legacy);
+        if (item == null) continue;
+        assignments[item] = _slotForLegacyPlacement(placement);
+      }
+    }
+    return VideoControlLayout.fromAssignments(assignments);
+  }
+
+  /// Old placement -> new slot lossless mapping. The hidden target is consumed
+  /// by [fromAssignments] as "removed from player", not as a visible tray item.
+  static VideoControlSlot _slotForLegacyPlacement(
+    VideoControlPlacement placement,
+  ) {
+    switch (placement) {
+      case VideoControlPlacement.bottom:
+        return VideoControlSlot.bottomRight;
+      case VideoControlPlacement.rightRail:
+        return VideoControlSlot.screenRight;
+      case VideoControlPlacement.settingsOnly:
+        return VideoControlSlot.hidden;
+    }
+  }
+
+  /// 已保存布局（v1 / v2 / v3）里**缺失**的按钮落到哪：2026-10-05 M3E 重排之前的
+  /// 出厂位置。重排只改「从没保存过布局的用户」看到的默认（[currentChrome]）；已经
+  /// 存过布局的用户，缺项仍按他们当年熟悉的旧默认补（播放键补回底栏正中、设置补回
+  /// 右侧栏……），不会因为改默认把一个已定制布局里的按钮挪到别处。旧默认里没有的
+  /// 新按钮（如 [VideoControlItem.replayCue]）才按 [currentChrome] 补。
+  static const Map<VideoControlItem, VideoControlSlot> _kSavedLayoutFallback =
+      <VideoControlItem, VideoControlSlot>{
+        VideoControlItem.back: VideoControlSlot.topLeft,
+        VideoControlItem.immersiveLock: VideoControlSlot.screenLeft,
+        VideoControlItem.title: VideoControlSlot.topCenter,
+        VideoControlItem.episodeList: VideoControlSlot.topRight,
+        VideoControlItem.screenshot: VideoControlSlot.topRight,
+        VideoControlItem.clipExport: VideoControlSlot.topRight,
+        VideoControlItem.subtitleTrack: VideoControlSlot.topRight,
+        VideoControlItem.audioTrack: VideoControlSlot.topRight,
+        VideoControlItem.chapterList: VideoControlSlot.topRight,
+        VideoControlItem.seekBackward: VideoControlSlot.bottomCenter,
+        VideoControlItem.frameBackward: VideoControlSlot.bottomCenter,
+        VideoControlItem.previousCue: VideoControlSlot.bottomCenter,
+        VideoControlItem.replayCue: VideoControlSlot.bottomCenter,
+        VideoControlItem.playPause: VideoControlSlot.bottomCenter,
+        VideoControlItem.nextCue: VideoControlSlot.bottomCenter,
+        VideoControlItem.frameForward: VideoControlSlot.bottomCenter,
+        VideoControlItem.seekForward: VideoControlSlot.bottomCenter,
+        VideoControlItem.positionIndicator: VideoControlSlot.bottomLeft,
+        VideoControlItem.volume: VideoControlSlot.bottomRight,
+        VideoControlItem.fullscreen: VideoControlSlot.bottomRight,
+        VideoControlItem.speed: VideoControlSlot.bottomRight,
+        VideoControlItem.subtitleList: VideoControlSlot.screenRight,
+        VideoControlItem.favoriteSentence: VideoControlSlot.screenRight,
+        VideoControlItem.settings: VideoControlSlot.screenRight,
+        VideoControlItem.customAction1: VideoControlSlot.bottomRight,
+        VideoControlItem.customAction2: VideoControlSlot.bottomRight,
+        VideoControlItem.customAction3: VideoControlSlot.bottomRight,
+        VideoControlItem.customAction4: VideoControlSlot.bottomRight,
+        VideoControlItem.previousEpisode: VideoControlSlot.hidden,
+        VideoControlItem.nextEpisode: VideoControlSlot.hidden,
+        VideoControlItem.previousChapter: VideoControlSlot.hidden,
+        VideoControlItem.nextChapter: VideoControlSlot.hidden,
+        // 新增的弹幕开关：老布局解码时同样落 removed，升级后不会凭空冒出来。
+        VideoControlItem.danmaku: VideoControlSlot.hidden,
+      };
+
+  static Map<VideoControlItem, VideoControlSlot> _currentChromeAssignments() =>
+      <VideoControlItem, VideoControlSlot>{
+        for (final VideoControlItem item in VideoControlItem.values)
+          item: _kSavedLayoutFallback[item] ?? currentChrome.slotOf(item),
+      };
+
+  /// v2 / v3 slot table. TODO-598 / BUG-339: the v2 layout persisted everything
+  /// the user took off the player inside a single `hidden` slot; v3 replaced
+  /// that slot with an explicit `removed` set, so on upgrade every v2 hidden key
+  /// is carried across as removed (still restorable from the palette) -- never
+  /// silently dropped from both the player and the tray. The generic
+  /// [ControlLayout.decodeSlots] treats hidden-slot entries exactly that way; a
+  /// key that is no longer removable (only [VideoControlItem.playPause] today)
+  /// is skipped and backfilled onto the player by the normalizer. Empty /
+  /// all-unknown payloads fall back to [currentChrome].
+  static VideoControlLayout _decodeSlots(
+    Map<String, dynamic> slotsRaw, {
+    Object? removedRaw,
+  }) {
+    final ControlLayout<VideoControlSlot, VideoControlItem>? decoded =
+        ControlLayout.decodeSlots<VideoControlSlot, VideoControlItem>(
+      scheme,
+      slotsRaw,
+      removedRaw: removedRaw,
+      fallbackAssignments: _currentChromeAssignments(),
+    );
+    return decoded == null ? currentChrome : VideoControlLayout._(decoded);
+  }
+
+  /// Video chrome rules applied after the generic normalizer's dedupe /
+  /// backfill pass: volume lives only in the bottom bar, title only in the top
+  /// bar (or removed).
+  static void _normalizeVideoChrome(
+    Map<VideoControlSlot, List<VideoControlItem>> slots,
+    Set<VideoControlItem> removed,
+  ) {
+    _normalizeVolume(slots, removed);
+    _normalizeTitle(slots, removed);
+  }
+
+  static void _normalizeVolume(
+    Map<VideoControlSlot, List<VideoControlItem>> slots,
+    Set<VideoControlItem> removed,
+  ) {
+    bool hasBottomVolume = false;
+    for (final VideoControlSlot slot in const <VideoControlSlot>[
+      VideoControlSlot.bottomLeft,
+      VideoControlSlot.bottomRight,
+    ]) {
+      hasBottomVolume =
+          hasBottomVolume || slots[slot]!.contains(VideoControlItem.volume);
+    }
+
+    for (final VideoControlSlot slot in VideoControlSlot.values) {
+      if (slot == VideoControlSlot.bottomLeft ||
+          slot == VideoControlSlot.bottomRight) {
+        continue;
+      }
+      slots[slot]!.removeWhere(
+        (VideoControlItem item) => item == VideoControlItem.volume,
+      );
+    }
+
+    if (!hasBottomVolume) {
+      slots[VideoControlSlot.bottomRight]!.insert(0, VideoControlItem.volume);
+    }
+    removed.remove(VideoControlItem.volume);
+  }
+
+  static void _normalizeTitle(
+    Map<VideoControlSlot, List<VideoControlItem>> slots,
+    Set<VideoControlItem> removed,
+  ) {
+    VideoControlSlot? target;
+    int targetIndex = 0;
+    for (final VideoControlSlot slot in const <VideoControlSlot>[
+      VideoControlSlot.topLeft,
+      VideoControlSlot.topCenter,
+      VideoControlSlot.topRight,
+    ]) {
+      final int index = slots[slot]!.indexOf(VideoControlItem.title);
+      if (index < 0) continue;
+      target ??= slot;
+      if (target == slot) targetIndex = index;
+    }
+
+    for (final VideoControlSlot slot in VideoControlSlot.values) {
+      slots[slot]!.removeWhere(
+        (VideoControlItem item) => item == VideoControlItem.title,
+      );
+    }
+
+    if (target == null && removed.contains(VideoControlItem.title)) {
+      return;
+    }
+    final VideoControlSlot resolved = target ?? VideoControlSlot.topCenter;
+    final List<VideoControlItem> list = slots[resolved]!;
+    list.insert(targetIndex.clamp(0, list.length), VideoControlItem.title);
+    removed.remove(VideoControlItem.title);
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is VideoControlLayout && _core == other._core);
+
+  @override
+  int get hashCode => _core.hashCode;
+}
+
+/// Drag payload for visual control-layout editors: the dragged
+/// [VideoControlItem] plus the slot it came from (`sourceSlot == null` means it
+/// was dragged from an "all buttons" palette, i.e. an add) and the source index
+/// (same-slot reorder / exact-copy removal). Alias of the generic
+/// [ControlDragData] so the generic editor and the video editors share one
+/// payload type.
+typedef VideoControlDragData
+    = ControlDragData<VideoControlSlot, VideoControlItem>;

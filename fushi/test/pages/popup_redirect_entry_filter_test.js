@@ -1,0 +1,216 @@
+// Redirect-only dictionary records should not occupy result cards. This executes
+// the real popup.js grouping function against the shapes reported for LDOCE5 and
+// OALD10, while protecting an ordinary definition that happens to use the word
+// "redirect".
+//
+// Run: node fushi/test/pages/popup_redirect_entry_filter_test.js
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+// popup.html loads dict-media.js BEFORE popup.js, and popup.js calls straight
+// into it with no guard (constructDictCss / rewriteDictLinks /
+// rewriteDictionaryMediaPath / normalizeDictMediaPath / runDictScripts).
+// Running popup.js on its own only ever worked by accident -- by whichever of
+// those call sites this fixture's branches happened not to reach. Load the real
+// sibling into the same context, in the same order, so a new cross-file call in
+// popup.js cannot break fixtures that have nothing to do with it.
+const popupPath = path.resolve(__dirname, '../../assets/popup/popup.js');
+const dictMediaPath = path.resolve(__dirname, '../../assets/popup/dict-media.js');
+const dictMediaSource = fs.readFileSync(dictMediaPath, 'utf8');
+const source = fs.readFileSync(popupPath, 'utf8');
+
+function makeElement(tag) {
+  return {
+    tagName: (tag || 'div').toUpperCase(),
+    className: '',
+    id: '',
+    textContent: '',
+    innerHTML: '',
+    style: {},
+    dataset: {},
+    children: [],
+    attributes: [],
+    classList: {
+      _set: new Set(),
+      add(name) { this._set.add(name); },
+      remove(name) { this._set.delete(name); },
+      contains(name) { return this._set.has(name); },
+    },
+    appendChild(child) { this.children.push(child); return child; },
+    append(...nodes) { this.children.push(...nodes); },
+    setAttribute() {},
+    removeAttribute() {},
+    addEventListener() {},
+    querySelectorAll() { return []; },
+    querySelector() { return null; },
+    closest() { return null; },
+  };
+}
+
+function loadPopup() {
+  const documentObj = {
+    documentElement: { style: {}, classList: makeElement().classList },
+    head: { appendChild() {} },
+    body: makeElement('body'),
+    getElementById() { return null; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    createElement(tag) { return makeElement(tag); },
+    addEventListener() {},
+  };
+  const windowObj = {
+    audioSources: [],
+    needsAudio: false,
+    lookupEntries: [],
+    dictionaryStyles: {},
+    hiddenDictionaryNames: [],
+    collapsedDictionaryNames: [],
+    flutter_inappwebview: { callHandler() { return Promise.resolve(false); } },
+    getSelection() { return { toString() { return ''; } }; },
+  };
+  documentObj.defaultView = windowObj;
+  const sandbox = {
+    Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+    Date, Math, URL, JSON, RegExp, Set, Map, Object, Array, Promise, console,
+    performance: { now() { return 0; } },
+    setTimeout, clearTimeout,
+    DOMParser: class {
+      parseFromString() {
+        return {
+          body: makeElement('body'),
+          querySelectorAll() { return []; },
+        };
+      }
+    },
+    document: documentObj,
+    window: windowObj,
+    getComputedStyle() { return {}; },
+  };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(dictMediaSource, sandbox, { filename: 'dict-media.js' });
+  vm.runInContext(source + `
+    ;window.__test = {
+      isRedirect: function(glossary) { return isRedirectGlossary(glossary); },
+      wrap: function(entry) { return createGlossarySectionWrapper(entry); },
+    };
+  `, sandbox, { filename: 'popup.js' });
+  return sandbox;
+}
+
+function structured(...content) {
+  return { tag: 'div', content };
+}
+
+function glossary(dictionary, content, termTags = '', definitionTags = '') {
+  return { dictionary, content, termTags, definitionTags };
+}
+
+(function run() {
+  const sb = loadPopup();
+  const ldoceRedirect = glossary(
+    'LDOCE5',
+    structured(
+      { tag: 'span', content: 'repair' },
+      { tag: 'span', content: 'Redirected from repaired' },
+    ),
+  );
+  const oaldRedirect = glossary(
+    'OALD10',
+    structured(
+      { tag: 'span', content: 'repair' },
+      { tag: 'span', content: 'redirect' },
+    ),
+    'non-lemma',
+  );
+  const oxfordDefinition = glossary(
+    'Oxford Dictionary of English',
+    structured({ tag: 'span', content: 'restore something damaged to good condition' }),
+  );
+
+  assert.strictEqual(sb.window.__test.isRedirect(ldoceRedirect), true,
+    'the LDOCE "Redirected from ..." record must be recognized');
+  assert.strictEqual(sb.window.__test.isRedirect(oaldRedirect), true,
+    'the OALD non-lemma + redirect record must be recognized');
+  assert.strictEqual(sb.window.__test.isRedirect(oxfordDefinition), false,
+    'a real definition must remain visible');
+
+  const out = sb.window.__test.wrap({
+    expression: 'repaired',
+    reading: '',
+    glossaries: [ldoceRedirect, oaldRedirect, oxfordDefinition],
+    frequencies: [],
+    pitches: [],
+  });
+  assert.notStrictEqual(out, null, 'the surviving Oxford definition needs a wrapper');
+  assert.deepStrictEqual(out.dictNames, ['Oxford Dictionary of English'],
+    'redirect-only dictionaries must disappear from the grouped results');
+
+  assert.strictEqual(
+    sb.window.__test.isRedirect(glossary(
+      'Technical English',
+      'Use a 301 redirect to move traffic.',
+    )),
+    false,
+    'definitions containing the word redirect must not be filtered',
+  );
+  assert.strictEqual(
+    sb.window.__test.isRedirect(glossary('Technical English', 'redirect')),
+    false,
+    'a standalone word without redirect metadata must not be guessed away',
+  );
+
+  // BUG-2566: OALDPE10 real shapes (dumped from the user's dictionary). Every
+  // phrasal-verb record starts with a self-redirect label and then carries the
+  // definition as structured content; alias records carry the label alone.
+  const oaldpeAliasOnly = glossary(
+    'OALDPE10',
+    [['give-up', ['Redirected from give up']]],
+  );
+  const oaldpePhrasalContent = [
+    ['give up', ['Redirected from give up']],
+    {
+      type: 'structured-content',
+      content: {
+        tag: 'div',
+        content: [
+          { tag: 'div', content: 'give up' },
+          {
+            tag: 'ol',
+            content: [
+              { tag: 'li', content: [{ tag: 'span', content: 'to stop trying to do something' }] },
+            ],
+          },
+        ],
+      },
+    },
+  ];
+  const oaldpePhrasal = glossary('OALDPE10', oaldpePhrasalContent, '', 'phrasal');
+  // The popup bridge hands content over as a JSON string; same verdict.
+  const oaldpePhrasalJson = glossary(
+    'OALDPE10',
+    JSON.stringify(oaldpePhrasalContent),
+    '',
+    'phrasal',
+  );
+  assert.strictEqual(sb.window.__test.isRedirect(oaldpeAliasOnly), true,
+    'an OALDPE10 alias record (label only) is redirect-only');
+  assert.strictEqual(sb.window.__test.isRedirect(oaldpePhrasal), false,
+    'an OALDPE10 phrasal-verb record with a definition next to the label must stay');
+  assert.strictEqual(sb.window.__test.isRedirect(oaldpePhrasalJson), false,
+    'the JSON-string form of that record must stay too');
+  const phrasalOut = sb.window.__test.wrap({
+    expression: 'give up',
+    reading: '',
+    glossaries: [oaldpeAliasOnly, oaldpePhrasal, oxfordDefinition],
+    frequencies: [],
+    pitches: [],
+  });
+  assert.deepStrictEqual(phrasalOut.dictNames, ['OALDPE10', 'Oxford Dictionary of English'],
+    'OALDPE10 keeps its card through the definition-bearing record');
+
+  console.log('popup_redirect_entry_filter_test.js: all assertions passed');
+})();

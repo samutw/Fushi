@@ -1,0 +1,12 @@
+## BUG-1589 · Windows 发布构建固定红，且真错误被 MSBuild 折叠得看不见
+- **报告**：2026-08-13（排查 BUG-1586 时发现：`v1.4.0-beta.9473` 只有 ipa+zip，没有 Windows setup）
+- **真实性**：✅ 真 bug（两条，第二条是第一条查不下去的原因）。
+  - **红**：`release-desktop.yml` 的 `windows` job 在 develop `62d5d8679` 上失败（run 31619461990），单独重跑 windows job（attempt 3）**同样失败**——不是并发伪红。连锁后果：同 run 的 `Publish mirror update manifest` 报 `No files matched fushi-*-windows-setup.exe` 而挂，于是 `latest-beta.json` 从未写出、`v1.4.0-beta.9473` 成了只有 ipa+zip 的半成品发布。
+  - **看不见**：日志里只有两行——`Target dart_build failed : error : Building native assets failed.` 和 `error MSB8066: Custom build ... exited with code`。MSBuild 把自定义生成步骤的真实报错整个折叠掉了。
+  - **本机复现不出来**：本机 `flutter build windows --release -v` **顺利通过 native assets**（`fushidicts_ffi.dll` 已产出并安装），失败在更后面的 `cmake_install.cmake:429`「Missing required Windows download runtime: fushi_torrent_ffi.dll」——那是每 worktree 需先跑 `native/fushi_torrent/build_windows_dll.ps1` 的本地前置条件，与 CI 那条不是同一处。
+  - **为什么「CI 全绿」从没暴露它**：验证构建 `build-multiplatform.yml` 的 windows job 跑的是 `flutter build windows --debug`（**不走 AOT**），发布构建跑 `--release`。两者根本不是同一种构建。这与 BUG-1588（TMDB key 只注入验证构建）是同一种病：**把验证构建的绿当成发布构建的绿**。
+  - 另注（2026-08-13 已确证）：`editbin /STACK` 那个 gen_snapshot 栈溢出 workaround 只存在于本机 SDK，仓库/CI 里**一处都没有**。`-v` 落地后第一轮 CI（run 31700342531，push 自动发布恢复触发）拿到真错误：`Target aot_elf_release failed: Exception: AOT snapshotter exited with code -1073741571`（= 0xC00000FD 栈溢出）——**成因就是它**。
+- **[x] ① 已修复（可见性这一半）** — `release-desktop.yml` 的 Windows 发布构建加 `-v`（本机正是靠它拿到被折叠的真错误），并新增 `if: failure()` 步骤把 `CMakeOutput.log` / `CMakeError.log` 传成 artifact（`-v` 打的是 flutter 侧，CMake 配置期报错只在这两个文件里）。
+- **[x] ①b 已修复（红本身）** — `release-desktop.yml` windows job 在 release 构建前新增「Raise gen_snapshot stack reserve」步骤：`flutter precache --windows` 后对 engine artifacts 下所有 `gen_snapshot.exe` 执行 `editbin /STACK:134217728`（128MB，与本机补丁同值）。gen_snapshot 不暴露栈参数，属上游工具链限制，只能改二进制头；上游抬默认栈或 AOT 深度下降后可移除本步。
+- **[x] ② 已加自动化测试** — `fushi/test/build/release_build_diagnosability_guard_test.dart`（5 条）：发布构建必须带 `-v`；失败时必须上传 CMake 日志且挂 `if: failure()`；「验证构建是 debug、发布构建是 release」事实钉住；新增「构建前必须有 `/STACK:134217728` 栈补丁步骤且排在 release 构建之前」。变异实测：去掉 `-v` → 红；把栈值改成 `/STACK:999` → 精确红在新用例；均已还原全绿。
+- **备注**：真日志已由恢复自动发布的首轮 push run 免费产出，无需再手动 dispatch。同轮 publish job 的 `No files matched fushi-*-windows-setup.exe` 与 `latest-beta.json` 半成品发布均为本红级联，windows job 转绿后自愈。栈补丁生效与否看下一轮 develop push 的 windows job。

@@ -1,0 +1,666 @@
+import 'package:flutter/services.dart';
+import 'dart:async';
+import 'dart:ui';
+
+import 'package:flutter/gestures.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/widgets.dart';
+import '_static_channel.dart';
+import 'trackpad_gesture_router.dart';
+
+const Map<String, SystemMouseCursor> _cursors = {
+  'none': SystemMouseCursors.none,
+  'basic': SystemMouseCursors.basic,
+  'click': SystemMouseCursors.click,
+  'forbidden': SystemMouseCursors.forbidden,
+  'wait': SystemMouseCursors.wait,
+  'progress': SystemMouseCursors.progress,
+  'contextMenu': SystemMouseCursors.contextMenu,
+  'help': SystemMouseCursors.help,
+  'text': SystemMouseCursors.text,
+  'verticalText': SystemMouseCursors.verticalText,
+  'cell': SystemMouseCursors.cell,
+  'precise': SystemMouseCursors.precise,
+  'move': SystemMouseCursors.move,
+  'grab': SystemMouseCursors.grab,
+  'grabbing': SystemMouseCursors.grabbing,
+  'noDrop': SystemMouseCursors.noDrop,
+  'alias': SystemMouseCursors.alias,
+  'copy': SystemMouseCursors.copy,
+  'disappearing': SystemMouseCursors.disappearing,
+  'allScroll': SystemMouseCursors.allScroll,
+  'resizeLeftRight': SystemMouseCursors.resizeLeftRight,
+  'resizeUpDown': SystemMouseCursors.resizeUpDown,
+  'resizeUpLeftDownRight': SystemMouseCursors.resizeUpLeftDownRight,
+  'resizeUpRightDownLeft': SystemMouseCursors.resizeUpRightDownLeft,
+  'resizeUp': SystemMouseCursors.resizeUp,
+  'resizeDown': SystemMouseCursors.resizeDown,
+  'resizeLeft': SystemMouseCursors.resizeLeft,
+  'resizeRight': SystemMouseCursors.resizeRight,
+  'resizeUpLeft': SystemMouseCursors.resizeUpLeft,
+  'resizeUpRight': SystemMouseCursors.resizeUpRight,
+  'resizeDownLeft': SystemMouseCursors.resizeDownLeft,
+  'resizeDownRight': SystemMouseCursors.resizeDownRight,
+  'resizeColumn': SystemMouseCursors.resizeColumn,
+  'resizeRow': SystemMouseCursors.resizeRow,
+  'zoomIn': SystemMouseCursors.zoomIn,
+  'zoomOut': SystemMouseCursors.zoomOut,
+};
+
+SystemMouseCursor _getCursorByName(String name) =>
+    _cursors[name] ?? SystemMouseCursors.basic;
+
+/// Pointer button type
+// Order must match InAppWebViewPointerEventKind (see in_app_webview.h)
+enum PointerButton { none, primary, secondary, tertiary }
+
+/// Pointer Event kind
+// Order must match InAppWebViewPointerEventKind (see in_app_webview.h)
+enum InAppWebViewPointerEventKind { activate, down, enter, leave, up, update }
+
+/// Attempts to translate a button constant such as [kPrimaryMouseButton]
+/// to a [PointerButton]
+PointerButton _getButton(int value) {
+  switch (value) {
+    case kPrimaryMouseButton:
+      return PointerButton.primary;
+    case kSecondaryMouseButton:
+      return PointerButton.secondary;
+    case kTertiaryButton:
+      return PointerButton.tertiary;
+    default:
+      return PointerButton.none;
+  }
+}
+
+/// 一次要发给 WebView2 的按钮状态翻转（[button] 在 [isDown] 方向上变化）。
+typedef MouseButtonTransition = ({PointerButton button, bool isDown});
+
+/// 位掩码 → 单键的顺序表，[diffMouseButtonMasks] 逐位比对用。
+const List<int> kMouseButtonMasks = <int>[
+  kPrimaryMouseButton,
+  kSecondaryMouseButton,
+  kTertiaryButton,
+];
+
+/// BUG-1419：算出从按钮掩码 [previous] 到 [next] 需要补发的 down/up 序列。
+///
+/// WebView2 侧的 `VirtualKeyState`（in_app_webview.h）是粘滞增量位集，没有自愈；
+/// 因此按钮真值必须唯一来源于 Flutter 指针事件自带的 `buttons` 掩码，逐位补差。
+/// 只对**变化**的位产出一次翻转：掩码相同则返回空表（不产生冗余 SendMouseInput），
+/// 多键并按各自独立成对，任何一次丢失的 up 都会在下一个掩码为 0 的事件（hover）
+/// 被补上。
+List<MouseButtonTransition> diffMouseButtonMasks(int previous, int next) {
+  if (previous == next) return const <MouseButtonTransition>[];
+  final List<MouseButtonTransition> transitions = <MouseButtonTransition>[];
+  for (final int mask in kMouseButtonMasks) {
+    final bool wasDown = (previous & mask) != 0;
+    final bool isDown = (next & mask) != 0;
+    if (wasDown == isDown) continue;
+    transitions.add((button: _getButton(mask), isDown: isDown));
+  }
+  return transitions;
+}
+
+/// 一次非触摸鼠标事件要按顺序下发给 WebView2 的命令。
+///
+/// [position] 与 [buttonTransition] 恰有一个非空。用 record 保持这个纯规划器轻量；
+/// 真正的 MethodChannel 调用仍由 widget state 执行。
+typedef MouseInputDispatch = ({
+  Offset? position,
+  MouseButtonTransition? buttonTransition,
+});
+
+/// BUG-1652：规划一次非触摸鼠标事件的完整下发顺序。
+///
+/// WebView2 的 `setPointerButtonState` 使用 native 端缓存的 `lastCursorPos_`。因此即使
+/// Flutter 没先发 hover/move（弹窗刚出现在静止光标下、或光标跨平台视图边界），
+/// down/up 也必须先把**本次事件坐标**写进去，否则 click 会落在旧 DOM 位置。
+///
+/// [position] 为 null = **本次事件没有可信坐标**，此时绝不前置 setCursorPos，沿用
+/// native 最后一次有效的 `lastCursorPos_`。唯一这样的来源是 `PointerCancelEvent`：
+/// `GestureBinding.cancelPointer` 只传 `pointer`，其余全走默认值，`position` 恒为
+/// `Offset.zero`（framework 的 `events.dart`）。而 native 的 `setCursorPos` 不是纯
+/// 赋值——`in_app_webview.cpp` 写完 `lastCursorPos_` 还会用**翻转前**的
+/// `virtualKeys_.state()` 发一个 `MOUSE_EVENT_KIND_MOVE`；取消时左键位仍是 down，于是
+/// 「带左键按下的 MOVE 到 (0,0)」被 Blink 判成拖拽，选区从锚点一路刷到文档左上角，
+/// 正是 BUG-1419「鼠标一动就刷蓝选区」的症状。补发的 up 不需要坐标，落在最后一次
+/// 有效位置即可。
+List<MouseInputDispatch> planMouseInputDispatches({
+  required Offset? position,
+  required int previousButtons,
+  required int nextButtons,
+}) {
+  return <MouseInputDispatch>[
+    if (position != null) (position: position, buttonTransition: null),
+    for (final MouseButtonTransition transition
+        in diffMouseButtonMasks(previousButtons, nextButtons))
+      (position: null, buttonTransition: transition),
+  ];
+}
+
+const MethodChannel _pluginChannel = IN_APP_WEBVIEW_STATIC_CHANNEL;
+
+/// setSize 去抖判定（TODO-428/420）。
+///
+/// 喂入 `_setSize` 的三条路径（`SizeChangedLayoutNotification` /
+/// `onPointerDown` / postFrame）会在尺寸根本没变时反复调用；每次下发都会经 native
+/// `setSurfaceSize` -> `NotifySurfaceSizeChanged` -> `needs_update_=true` ->
+/// `OnFrameArrived` 里 `RecreateFramePoolLocked` 退役并重建 WGC 帧池。布局尺寸在两个
+/// 值间抖（滚动条出现/消失、DPI 取整、动画）就每帧重建帧池 = 病态 churn，稳定帧出不来。
+///
+/// 在唯一汇聚点用本判定去重：首次（尚无记录）放行、尺寸真变放行，只拦「与上次下发
+/// 完全相等」的重复。纯状态机，便于单测。
+class SetSizeDedup {
+  double? _width;
+  double? _height;
+  double? _scaleFactor;
+
+  /// 返回是否应把本次 `(width, height, scaleFactor)` 下发给 native。
+  /// 应下发时同时把它记为「最近一次已下发」。
+  bool shouldDispatch(double width, double height, double scaleFactor) {
+    if (width == _width && height == _height && scaleFactor == _scaleFactor) {
+      return false;
+    }
+    _width = width;
+    _height = height;
+    _scaleFactor = scaleFactor;
+    return true;
+  }
+}
+
+class CustomFlutterViewControllerValue {
+  const CustomFlutterViewControllerValue({
+    required this.isInitialized,
+  });
+
+  final bool isInitialized;
+
+  CustomFlutterViewControllerValue copyWith({
+    bool? isInitialized,
+  }) {
+    return CustomFlutterViewControllerValue(
+      isInitialized: isInitialized ?? this.isInitialized,
+    );
+  }
+
+  CustomFlutterViewControllerValue.uninitialized()
+      : this(
+          isInitialized: false,
+        );
+}
+
+/// Controls a WebView and provides streams for various change events.
+class CustomPlatformViewController
+    extends ValueNotifier<CustomFlutterViewControllerValue> {
+  Completer<void> _creatingCompleter = Completer<void>();
+  int _textureId = 0;
+  bool _isDisposed = false;
+
+  Future<void> get ready => _creatingCompleter.future;
+
+  late MethodChannel _methodChannel;
+  late EventChannel _eventChannel;
+  StreamSubscription? _eventStreamSubscription;
+
+  final StreamController<SystemMouseCursor> _cursorStreamController =
+      StreamController<SystemMouseCursor>.broadcast();
+
+  // setSize 去抖（TODO-428/420）：在唯一汇聚点 _setSize 拦掉「与上次下发完全相等」的
+  // 重复，掐断三条喂入路径（SizeChangedLayoutNotification / onPointerDown / postFrame）
+  // 的无谓重复下发，避免 native 端每帧重建 WGC 帧池。判定逻辑见 SetSizeDedup。
+  final SetSizeDedup _setSizeDedup = SetSizeDedup();
+
+  /// A stream reflecting the current cursor style.
+  Stream<SystemMouseCursor> get _cursor => _cursorStreamController.stream;
+
+  CustomPlatformViewController()
+      : super(CustomFlutterViewControllerValue.uninitialized());
+
+  /// Initializes the underlying platform view.
+  ///
+  /// TODO-904: 失败路径上必须让 [_creatingCompleter] 以错误解放等待者，否则
+  /// [dispose] 首行 `await _creatingCompleter.future` 在创建失败时永久挂起、native
+  /// `'dispose'` 永远到不了，导致资源不回收（死亡螺旋）。成功路径行为零变化。
+  Future<void> initialize(
+      {Function(int id)? onPlatformViewCreated, dynamic arguments}) async {
+    if (_isDisposed) {
+      return;
+    }
+    try {
+      _textureId = (await _pluginChannel.invokeMethod<int>(
+          'createInAppWebView', arguments))!;
+
+      _methodChannel =
+          MethodChannel('com.pichillilorenzo/custom_platform_view_$_textureId');
+      _eventChannel = EventChannel(
+          'com.pichillilorenzo/custom_platform_view_${_textureId}_events');
+      _eventStreamSubscription =
+          _eventChannel.receiveBroadcastStream().listen((event) {
+        final map = event as Map<dynamic, dynamic>;
+        switch (map['type']) {
+          case 'cursorChanged':
+            _cursorStreamController.add(_getCursorByName(map['value']));
+            break;
+        }
+      });
+
+      _methodChannel.setMethodCallHandler((call) {
+        throw MissingPluginException('Unknown method ${call.method}');
+      });
+
+      value = value.copyWith(isInitialized: true);
+
+      _creatingCompleter.complete();
+
+      onPlatformViewCreated?.call(_textureId);
+    } catch (error, stackTrace) {
+      // 让 dispose() 的等待者带错误解放，绝不留未完成的 completer。
+      if (!_creatingCompleter.isCompleted) {
+        _creatingCompleter.completeError(error, stackTrace);
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> dispose() async {
+    // TODO-904: 不无条件 await 失败的 completer。创建失败时 completer 带错误，
+    // 这里吞掉等待异常即可继续走 native dispose 兜底回收；成功路径 await 正常完成、
+    // 行为零变化。
+    try {
+      await _creatingCompleter.future;
+    } catch (_) {
+      // 创建失败：completer 已 completeError。不阻断 dispose，继续兜底回收。
+    }
+    if (_isDisposed) {
+      // 已 dispose：第二次调用整体 no-op，绝不重复 super.dispose()（会触发
+      // ChangeNotifier 的 used-after-dispose 断言），也不重复发 native dispose。
+      return;
+    }
+    _isDisposed = true;
+    await _eventStreamSubscription?.cancel();
+    // 失败时 _textureId 保持默认 0：native manager 对未知 id 是纯 no-op
+    // （map_contains(webViews, 0) 为 false），不会 double-free。
+    await _pluginChannel.invokeMethod('dispose', {"id": _textureId});
+    super.dispose();
+  }
+
+  /// Limits the number of frames per second to the given value.
+  Future<void> setFpsLimit([int? maxFps = 0]) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel.invokeMethod('setFpsLimit', maxFps);
+  }
+
+  /// Sends a Pointer (Touch) update
+  Future<void> _setPointerUpdate(InAppWebViewPointerEventKind kind, int pointer,
+      Offset position, double size, double pressure) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel.invokeMethod('setPointerUpdate',
+        [pointer, kind.index, position.dx, position.dy, size, pressure]);
+  }
+
+  /// Moves the virtual cursor to [position].
+  Future<void> _setCursorPos(Offset position) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel
+        .invokeMethod('setCursorPos', [position.dx, position.dy]);
+  }
+
+  /// Indicates whether the specified [button] is currently down.
+  Future<void> _setPointerButtonState(PointerButton button, bool isDown) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel.invokeMethod('setPointerButton',
+        <String, dynamic>{'button': button.index, 'isDown': isDown});
+  }
+
+  /// Sets the horizontal and vertical scroll delta.
+  Future<void> _setScrollDelta(double dx, double dy) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel.invokeMethod('setScrollDelta', [dx, dy]);
+  }
+
+  /// 触控板捏合：发一条带 Ctrl 的滚轮，[wheelDelta] 是逻辑像素口径的 deltaY
+  /// （见 [TrackpadGestureRouter]）。
+  Future<void> _setPinchDelta(double wheelDelta) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel.invokeMethod('setPinchDelta', wheelDelta);
+  }
+
+  /// Sets the surface size to the provided [size].
+  Future<void> _setSize(Size size, double scaleFactor) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    // 尺寸去抖（TODO-428/420）：与上次真正下发的三元组完全相等则直接返回，不再
+    // invokeMethod，避免 native 端无谓地置 needs_update_ 并重建 WGC 帧池。首次
+    // （尚无记录）和尺寸真变都会被放行下发。
+    if (!_setSizeDedup.shouldDispatch(size.width, size.height, scaleFactor)) {
+      return;
+    }
+    return _methodChannel
+        .invokeMethod('setSize', [size.width, size.height, scaleFactor]);
+  }
+
+  /// Sets the surface size to the provided [size].
+  Future<void> _setPosition(Offset position, double scaleFactor) async {
+    if (_isDisposed) {
+      return;
+    }
+    assert(value.isInitialized);
+    return _methodChannel
+        .invokeMethod('setPosition', [position.dx, position.dy, scaleFactor]);
+  }
+}
+
+class CustomPlatformView extends StatefulWidget {
+  /// An optional scale factor. Defaults to [FlutterView.devicePixelRatio] for
+  /// rendering in native resolution.
+  /// Setting this to 1.0 will disable high-DPI support.
+  /// This should only be needed to mimic old behavior before high-DPI support
+  /// was available.
+  final double? scaleFactor;
+
+  /// The [FilterQuality] used for scaling the texture's contents.
+  /// Defaults to [FilterQuality.none] as this renders in native resolution
+  /// unless specifying a [scaleFactor].
+  final FilterQuality filterQuality;
+
+  final dynamic creationParams;
+
+  final Function(int id)? onPlatformViewCreated;
+
+  /// TODO-904: native WebView2 实例创建失败时的回调（如
+  /// `Cannot create the InAppWebView instance!`）。原本 initialize() 是未捕获
+  /// Future，失败被 UncaughtZone 静默吞掉、上层永远收不到信号 → reader 永久 spinner。
+  /// 此回调把失败冒泡给上层，让 reader 走可见恢复（toast + 退回书架）。
+  final void Function(Object error, StackTrace stackTrace)? onCreationError;
+
+  const CustomPlatformView(
+      {this.creationParams,
+      this.onPlatformViewCreated,
+      this.onCreationError,
+      this.scaleFactor,
+      this.filterQuality = FilterQuality.none});
+
+  @override
+  _CustomPlatformViewState createState() => _CustomPlatformViewState();
+}
+
+class _CustomPlatformViewState extends State<CustomPlatformView> {
+  final GlobalKey _key = GlobalKey();
+
+  /// BUG-1419：WebView2 侧的鼠标键状态（`VirtualKeyState`，in_app_webview.h）是
+  /// **粘滞增量**位集——只有 `setPointerButton` 的 down/up 会翻转它，没有任何自愈。
+  /// 旧实现按 pointer id 记一个**单值** `PointerButton`，把整个 `ev.buttons` 掩码喂给
+  /// `_getButton`；而该掩码在同时按住两个键时是复合值（左|右 = 3），
+  /// `_getButton` 落进 `default → none`，覆盖掉已记的按钮 → 抬起时发不出对应的
+  /// button-up → WebView2 的 `MK_*` 位**永久卡死**。此后每个 MOVE 都带着「某键仍按住」
+  /// 送进 Blink，被判成拖拽：鼠标一动就把正文刷成原生蓝色选区，且 click 不成立
+  /// （查词 tap 链因此永久失效，见 docs/bugs/BUG-1419）。
+  ///
+  /// 根因修复：按钮真值唯一来源是 Flutter 每个指针事件自带的 `ev.buttons` 掩码，
+  /// fork 不再维护可漂移的副本。这里只保存「上一次同步给 native 的掩码」用于算差分，
+  /// 逐位补发 down/up。鼠标是单一设备，状态天然全局，故**不按 pointer id 分桶**——
+  /// 那正是旧实现无法用 hover（另一个 pointer id）自愈残留的原因。
+  int _mouseButtons = 0;
+
+  PointerDeviceKind _pointerKind = PointerDeviceKind.unknown;
+  final TrackpadGestureRouter _trackpad = TrackpadGestureRouter();
+
+  MouseCursor _cursor = SystemMouseCursors.basic;
+
+  final _controller = CustomPlatformViewController();
+  final _focusNode = FocusNode();
+
+  StreamSubscription? _cursorSubscription;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // TODO-904: 不再裸 fire-and-forget。失败时把错误冒泡给上层（onCreationError），
+    // 而不是逃逸到 UncaughtZone 被静默吞掉 → reader 可走可见恢复而非永久 spinner。
+    _controller
+        .initialize(
+      onPlatformViewCreated: (id) {
+        widget.onPlatformViewCreated?.call(id);
+        setState(() {});
+      },
+      arguments: widget.creationParams,
+    )
+        .catchError((Object error, StackTrace stackTrace) {
+      if (!mounted) return;
+      widget.onCreationError?.call(error, stackTrace);
+    });
+
+    // Report initial surface size and widget position
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _reportSurfaceSize();
+      _reportWidgetPosition();
+    });
+
+    _cursorSubscription = _controller._cursor.listen((cursor) {
+      setState(() {
+        _cursor = cursor;
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Focus(
+      autofocus: true,
+      focusNode: _focusNode,
+      canRequestFocus: true,
+      debugLabel: "flutter_inappwebview_windows_custom_platform_view",
+      onFocusChange: (focused) {},
+      child: SizedBox.expand(key: _key, child: _buildInner()),
+    );
+  }
+
+  /// BUG-1652：坐标与按钮翻转作为一个有序输入批次下发。所有 mouse 事件都走这里，
+  /// 保证 down/up 不再依赖此前是否恰好收到 hover/move。
+  ///
+  /// [position] 为 null = 本次事件没有可信坐标（只有 `PointerCancelEvent` 如此），
+  /// 只补按钮差分，不动 native 光标——理由见 [planMouseInputDispatches]。
+  void _syncMouseInput(Offset? position, int buttons) {
+    for (final MouseInputDispatch dispatch in planMouseInputDispatches(
+      position: position,
+      previousButtons: _mouseButtons,
+      nextButtons: buttons,
+    )) {
+      final Offset? cursorPosition = dispatch.position;
+      if (cursorPosition != null) {
+        _controller._setCursorPos(cursorPosition);
+        continue;
+      }
+      final MouseButtonTransition transition = dispatch.buttonTransition!;
+      _controller._setPointerButtonState(
+        transition.button,
+        transition.isDown,
+      );
+    }
+    _mouseButtons = buttons;
+  }
+
+  Widget _buildInner() {
+    return NotificationListener<SizeChangedLayoutNotification>(
+        onNotification: (notification) {
+          _reportSurfaceSize();
+          _reportWidgetPosition();
+          return true;
+        },
+        child: SizeChangedLayoutNotifier(
+            child: _controller.value.isInitialized
+                ? Listener(
+                    onPointerHover: (ev) {
+                      // ev.kind is for whatever reason not set to touch
+                      // even on touch input
+                      if (_pointerKind == PointerDeviceKind.touch) {
+                        // Ignoring hover events on touch for now
+                        return;
+                      }
+                      // BUG-1419：hover 的语义就是「当前没有任何键按下」，是残留
+                      // MK_* 位唯一可靠的自愈点。坐标先同步，补发的 up 才落在实处。
+                      _syncMouseInput(ev.localPosition, ev.buttons);
+                    },
+                    onPointerDown: (ev) {
+                      _reportSurfaceSize();
+                      _reportWidgetPosition();
+
+                      if (!_focusNode.hasFocus) {
+                        _focusNode.requestFocus();
+                        Future.delayed(const Duration(milliseconds: 50), () {
+                          if (!_focusNode.hasFocus) {
+                            _focusNode.requestFocus();
+                          }
+                        });
+                      }
+
+                      _pointerKind = ev.kind;
+                      if (ev.kind == PointerDeviceKind.touch) {
+                        _controller._setPointerUpdate(
+                            InAppWebViewPointerEventKind.down,
+                            ev.pointer,
+                            ev.localPosition,
+                            ev.size,
+                            ev.pressure);
+                        return;
+                      }
+                      _syncMouseInput(ev.localPosition, ev.buttons);
+                    },
+                    onPointerUp: (ev) {
+                      _pointerKind = ev.kind;
+                      if (ev.kind == PointerDeviceKind.touch) {
+                        _controller._setPointerUpdate(
+                            InAppWebViewPointerEventKind.up,
+                            ev.pointer,
+                            ev.localPosition,
+                            ev.size,
+                            ev.pressure);
+                        return;
+                      }
+                      // PointerUpEvent.buttons 是**抬起之后**仍按住的键，多键并按时
+                      // 只清掉真正松开的那一位。
+                      _syncMouseInput(ev.localPosition, ev.buttons);
+                    },
+                    onPointerCancel: (ev) {
+                      _pointerKind = ev.kind;
+                      // BUG-871: a cancelled touch must still send an up to the
+                      // WebView, else the native primary-contact id is stranded
+                      // (POINTER_FLAG_PRIMARY tracking) and the next gesture can
+                      // no longer start a pan/scroll manipulation.
+                      if (ev.kind == PointerDeviceKind.touch) {
+                        _controller._setPointerUpdate(
+                            InAppWebViewPointerEventKind.up,
+                            ev.pointer,
+                            ev.localPosition,
+                            ev.size,
+                            ev.pressure);
+                        return;
+                      }
+                      // 取消 = 该指针的所有键都不再按住（Flutter 的 cancel 事件
+                      // buttons 已为 0，这里显式走同一条差分路径补发 up）。
+                      // BUG-1419：坐标传 null。cancel 是 GestureBinding.cancelPointer
+                      // 合成的，`ev.localPosition` 恒为 (0,0) 而非真实光标；前置
+                      // setCursorPos 会在左键位翻转**之前**发出一个带左键按下的
+                      // MOVE 到 (0,0)，Blink 判为拖拽 → 选区从锚点刷到文档左上角。
+                      _syncMouseInput(null, ev.buttons);
+                    },
+                    onPointerMove: (ev) {
+                      _pointerKind = ev.kind;
+                      if (ev.kind == PointerDeviceKind.touch) {
+                        _controller._setPointerUpdate(
+                            InAppWebViewPointerEventKind.update,
+                            ev.pointer,
+                            ev.localPosition,
+                            ev.size,
+                            ev.pressure);
+                      } else {
+                        // 拖动中掩码变化（第二个键按下/松开）也必须逐位补发，
+                        // 否则又会退化成旧的粘滞状态。
+                        _syncMouseInput(ev.localPosition, ev.buttons);
+                      }
+                    },
+                    onPointerSignal: (signal) {
+                      if (signal is PointerScrollEvent) {
+                        _controller._setScrollDelta(
+                            -signal.scrollDelta.dx, -signal.scrollDelta.dy);
+                      }
+                    },
+                    onPointerPanZoomStart: (_) => _trackpad.start(),
+                    onPointerPanZoomUpdate: (ev) {
+                      final TrackpadGestureOutput out = _trackpad.update(
+                          panDelta: ev.panDelta, scale: ev.scale);
+                      switch (out.kind) {
+                        case TrackpadGestureKind.scroll:
+                          _controller._setScrollDelta(
+                              out.scrollDelta.dx, out.scrollDelta.dy);
+                        case TrackpadGestureKind.pinch:
+                          if (out.pinchWheelDelta != 0) {
+                            _controller._setPinchDelta(out.pinchWheelDelta);
+                          }
+                      }
+                    },
+                    child: MouseRegion(
+                        cursor: _cursor,
+                        child: Texture(
+                          textureId: _controller._textureId,
+                          filterQuality: widget.filterQuality,
+                        )),
+                  )
+                : const SizedBox()));
+  }
+
+  void _reportSurfaceSize() async {
+    // 先等 native WebView2 跨帧创建完成；await 之后旧的 box/context 可能已随
+    // widget 销毁/重建失效（TODO-965），必须复检 mounted 并重新取 box，
+    // 否则 View.of 返回 null 被 `!` 解引用、box.localToGlobal 崩溃。
+    await _controller.ready;
+    if (!mounted) return;
+    final BuildContext? context = _key.currentContext;
+    final RenderBox? box = context?.findRenderObject() as RenderBox?;
+    if (context == null || box == null || !box.attached) return;
+    unawaited(_controller._setSize(
+        box.size, widget.scaleFactor ?? View.of(context).devicePixelRatio));
+  }
+
+  void _reportWidgetPosition() async {
+    await _controller.ready;
+    if (!mounted) return;
+    final BuildContext? context = _key.currentContext;
+    final RenderBox? box = context?.findRenderObject() as RenderBox?;
+    if (context == null || box == null || !box.attached) return;
+    final Offset position = box.localToGlobal(Offset.zero);
+    unawaited(_controller._setPosition(
+        position, widget.scaleFactor ?? View.of(context).devicePixelRatio));
+  }
+
+  @override
+  void dispose() {
+    super.dispose();
+    _cursorSubscription?.cancel();
+    _controller.dispose();
+    _focusNode.dispose();
+  }
+}

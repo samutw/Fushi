@@ -1,0 +1,701 @@
+import 'dart:convert';
+
+import 'package:meta/meta.dart';
+import 'package:path/path.dart' as p;
+
+import 'package:fushi_engine/media/video/external_video.dart'
+    show decodedSourceBasename;
+import 'package:fushi_engine/media/video/strm_file.dart'
+    show isNetworkStreamUrl, isSourceLibrarySftpVideoPath;
+
+/// **纯函数**：从 `VideoBooks.playlistJson` 解析出集数；空 / 非播放列表 / 解析失败
+/// 返回 0。供视频库卡片角标与「单视频 vs 播放列表」区分用——返回 ≥2 即播放列表。
+int playlistEpisodeCount(String? playlistJson) {
+  if (playlistJson == null || playlistJson.isEmpty) return 0;
+  try {
+    final dynamic decoded = jsonDecode(playlistJson);
+    if (decoded is List) return decoded.length;
+  } catch (_) {
+    // 坏 JSON：当单视频处理（返回 0），不抛。
+  }
+  return 0;
+}
+
+/// **纯函数**：视频库卡片的观看进度分数 [0,1]；返回 `null` = 无可展示进度（不画进度
+/// 条）。TODO-1346：`VideoBooks` 不持久化视频总时长（时长只在播放期从 controller 得到），
+/// 故无法对单视频算 `lastPositionMs / duration`。规则：
+/// - 已看完（[completed]，即 `completedAt != null`）→ 满格 `1.0`。
+/// - 多集播放列表（[episodeCount] ≥ 2）→ 按「看到第几集」到集粒度：`currentEpisode`
+///   是 0-based 当前集索引，其前的整集算已看，`currentEpisode / episodeCount`（clamp
+///   到 [0,1]）；为 0（还在第一集且未看完）时返回 `null` 不画。
+/// - 单视频 / 流：无总时长无法算章内百分比，未看完时返回 `null`（不误导）。
+double? videoWatchFraction({
+  required bool completed,
+  required int currentEpisode,
+  required int episodeCount,
+}) {
+  if (completed) return 1.0;
+  if (episodeCount >= 2) {
+    final double f =
+        (currentEpisode.clamp(0, episodeCount) / episodeCount).clamp(0.0, 1.0);
+    return f > 0 ? f : null;
+  }
+  return null;
+}
+
+/// 播放列表中的一集：标题 + 视频绝对路径 + 本集自己的播放进度。
+///
+/// [path] 始终是绝对路径（由 [parseM3u8] 用 baseDir 解析 m3u8 中的相对路径得到，
+/// Windows `\` 已归一化为平台分隔符）。
+///
+/// [positionMs] 记本集自己的播放进度（毫秒，默认 0）；换集时各集互不干扰，下次
+/// 打开播放列表回到 currentEpisode 那集的该位置（取代旧的「整个 VideoBook 一个
+/// lastPositionMs、换集归零」语义）。
+class PlaylistEntry {
+  const PlaylistEntry({
+    required this.title,
+    required this.path,
+    this.positionMs = 0,
+  });
+
+  final String title;
+  final String path;
+  final int positionMs;
+
+  /// 返回一个仅 [positionMs] 改变的副本（不可变更新）。
+  PlaylistEntry copyWith({int? positionMs}) => PlaylistEntry(
+        title: title,
+        path: path,
+        positionMs: positionMs ?? this.positionMs,
+      );
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'title': title,
+        'path': path,
+        'positionMs': positionMs,
+      };
+
+  factory PlaylistEntry.fromJson(Map<String, dynamic> json) => PlaylistEntry(
+        title: json['title'] as String,
+        path: json['path'] as String,
+        // 兼容旧 playlistJson（无 positionMs 字段）：缺省回退 0。
+        positionMs: (json['positionMs'] as int?) ?? 0,
+      );
+}
+
+/// 把 [entries] 中第 [index] 集的播放进度更新为 [positionMs]，返回新列表
+/// （不可变更新；越界或负位置安全处理）。纯函数，便于单测「切集保存+恢复各集
+/// position」逻辑。
+List<PlaylistEntry> updateEntryPosition(
+  List<PlaylistEntry> entries,
+  int index,
+  int positionMs,
+) {
+  if (index < 0 || index >= entries.length) return entries;
+  final int clamped = positionMs < 0 ? 0 : positionMs;
+  final List<PlaylistEntry> next = List<PlaylistEntry>.of(entries);
+  next[index] = next[index].copyWith(positionMs: clamped);
+  return next;
+}
+
+/// 视频播到 EOF 后播放列表应切到的下一集；没有下一集时返回 null。
+///
+/// 单集列表 / 越界下标 / 最后一集都不推进，调用方据此保持当前位置。
+int? nextPlaylistIndexAfterCompletion(
+  List<PlaylistEntry> entries,
+  int currentIndex,
+) {
+  if (entries.length <= 1) return null;
+  if (currentIndex < 0 || currentIndex >= entries.length - 1) return null;
+  return currentIndex + 1;
+}
+
+/// 当前集 load 成功后可后台预热的下一集视频路径。
+///
+/// [lastPrewarmedPath] 是调用方保存的去重位：同一下一集已经预热过时返回 null，
+/// 避免每次 setState / reload 都重复触发整容器 ffmpeg 预抽。
+String? nextPlaylistPathToPrewarm({
+  required List<PlaylistEntry> entries,
+  required int currentIndex,
+  required String? lastPrewarmedPath,
+}) {
+  final int? nextIndex =
+      nextPlaylistIndexAfterCompletion(entries, currentIndex);
+  if (nextIndex == null) return null;
+  final String path = entries[nextIndex].path;
+  return path == lastPrewarmedPath ? null : path;
+}
+
+/// TODO-1237: resolve one m3u8 entry path [entryRaw] against the manifest dir
+/// [playlistDir]. Absoluteness is judged by STRING SHAPE
+/// ([_isAbsoluteM3uEntryPath]), not the host-dependent `p.isAbsolute`, so a
+/// `D:\...` entry stays absolute even on a non-Windows CI / after cross-device
+/// sync and is never mis-joined onto [playlistDir]:
+/// - Absolute (Windows drive root `X:\`/`X:/`, UNC `\host\share`/`//host/share`,
+///   POSIX `/...`): normalized and returned as-is (NOT joined with playlistDir;
+///   the old unconditional `p.join(baseDir, entry)` only "worked" on Windows by
+///   luck and turned UNC `\NAS\a` into `D:\NAS\a`).
+/// - Relative: both `\` and `/` treated as separators, resolved against
+///   [playlistDir] (the m3u8 file's own directory).
+///
+/// [context] is a test seam to inject a fixed [p.Context] (windows/posix) for
+/// deterministic assertions; production uses the host `p.context`, byte-for-byte
+/// identical to the old parseM3u8 relative-path resolution.
+///
+/// **远端清单（[playlistDir] 带 `scheme://`）只产出网络流地址**：清单作者不可信，
+/// 它写的 UNC `\\host\share\a.mkv` / `//host/share`、盘符 `C:\…`、POSIX `/…`、
+/// `file://`、`smb://` 等条目若原样落成本地路径入库，书架封面补齐 / 互联 host 列清单 /
+/// 同步上传会无交互地 stat 它（Windows 上即 SMB 连接、泄 NTLM 哈希），合集删除框还会
+/// 把它列成「同时删除本地文件」的候选。这些条目一律返回空串（调用方跳过）；绝对 URL
+/// 条目只放行 [isNetworkStreamUrl]；相对条目按 URL 语义解析（仍在远端）。
+String resolveM3uEntryPath(
+  String entryRaw,
+  String playlistDir, {
+  p.Context? context,
+}) {
+  final p.Context ctx = context ?? p.context;
+  final String entry = entryRaw.trim();
+  if (entry.isEmpty) return entry;
+  final bool remoteList = _isRemotePlaylistBase(playlistDir);
+  // 绝对 URL 条目（HLS/直链清单的 http(s)，IPTV 频道列表的 rtsp / rtmp / udp …）：
+  // 原样直通。此前会落进下面的「相对」分支被 join 到 playlistDir 上，纯属误判。
+  // 远端清单里只认网络流协议：`file://` / `smb://` 等指回本机或内网文件系统的一律丢。
+  if (_hasUrlScheme(entry)) {
+    return !remoteList || isNetworkStreamUrl(entry) ? entry : '';
+  }
+  if (remoteList && _isAbsoluteM3uEntryPath(entry)) return '';
+  if (_isAbsoluteM3uEntryPath(entry)) {
+    // Absolute: normalize only; never join playlistDir (would break drive/UNC).
+    return ctx.normalize(entry);
+  }
+  // 网络（WebDAV）清单：基底是 URL，相对条目按 URL 语义解析——正斜杠 join、
+  // 段按需百分号编码（清单里通常写明文文件名；已编码段不二次编码）、`..`
+  // 钳制在 `scheme://host` 之下。不能走 p.Context：它会把 `https://` 的
+  // 双斜杠折叠掉。
+  //
+  // 来源库 SFTP 清单（[isSourceLibrarySftpVideoPath]）同一套正斜杠解析，只是段
+  // **不编码**：SFTP 行存的是解码态远端路径（起播时由来源的解析器按原样取文件），
+  // 编码后反而对不上真实文件名。
+  final bool sftpList = isSourceLibrarySftpVideoPath(playlistDir);
+  if (_isHttpUrl(playlistDir) || sftpList) {
+    final List<String> base = playlistDir.split('/');
+    while (base.isNotEmpty && base.last.isEmpty) {
+      base.removeLast();
+    }
+    for (final String seg in entry.replaceAll('\\', '/').split('/')) {
+      if (seg.isEmpty || seg == '.') continue;
+      if (seg == '..') {
+        // base 形如 ['https:', '', 'host', ...]：前三段是 scheme://host，不可越。
+        if (base.length > 3) base.removeLast();
+        continue;
+      }
+      base.add(sftpList ? seg : _encodeUrlSegmentIfNeeded(seg));
+    }
+    return base.join('/');
+  }
+  // 非 http(s) 的远端基址没有可用的相对解析语义：丢弃，绝不回落成本地 join。
+  if (remoteList) return '';
+  // Relative: normalize both separators to `/`, resolve against the m3u8 dir.
+  final String rel = entry.replaceAll('\\', '/');
+  return ctx.normalize(ctx.join(playlistDir, rel));
+}
+
+final RegExp _urlSchemePrefix = RegExp(r'^[A-Za-z][A-Za-z0-9+.\-]*://');
+
+/// 纯字符串判「带 scheme 的绝对 URL」（`xxx://`）。Windows 盘符路径 `C:\` / `C:/`
+/// 没有 `//`，不会误中。
+bool _hasUrlScheme(String s) => _urlSchemePrefix.hasMatch(s);
+
+/// 纯字符串判清单基址是不是远端 URL（`scheme://`，scheme 至少两个字符——单字母
+/// 是盘符 `D://…` 这类手写的本地路径，不当远端）。
+bool _isRemotePlaylistBase(String dir) {
+  final Match? m = _urlSchemePrefix.firstMatch(dir.trim());
+  return m != null && m.end - '://'.length >= 2;
+}
+
+/// 纯字符串判 http(s) URL（不经 Uri.parse，空串/畸形不抛）。
+bool _isHttpUrl(String s) =>
+    s.startsWith('http://') || s.startsWith('https://');
+
+final RegExp _pctEncodedSeq = RegExp(r'%[0-9A-Fa-f]{2}');
+
+/// URL 路径段按需编码：已含合法 %XX 序列的段视为「作者已编码」原样保留
+/// （二次编码会把 %20 变成 %2520）；其余按组件编码（空格/中文/括号全覆盖）。
+String _encodeUrlSegmentIfNeeded(String seg) =>
+    _pctEncodedSeq.hasMatch(seg) ? seg : Uri.encodeComponent(seg);
+
+/// Pure string test for whether m3u8 entry [entry] is an ABSOLUTE path (no IO,
+/// host-independent). True for: UNC prefix (`\`/`//`), Windows drive root
+/// (`X:\`/`X:/`), or POSIX root (single leading `/`). A drive-relative `X:foo`
+/// and ordinary relative paths return false.
+bool _isAbsoluteM3uEntryPath(String entry) {
+  if (entry.length >= 2) {
+    final String c0 = entry[0];
+    final String c1 = entry[1];
+    // UNC: \host\share or //host/share (mixed separators tolerated).
+    if ((c0 == '\\' || c0 == '/') && (c1 == '\\' || c1 == '/')) return true;
+    // Windows drive root: X:\ or X:/ (must carry a root separator).
+    if (_isDriveLetter(c0) &&
+        c1 == ':' &&
+        entry.length >= 3 &&
+        (entry[2] == '\\' || entry[2] == '/')) {
+      return true;
+    }
+  }
+  // POSIX absolute: single leading `/` (UNC's `//` already handled above).
+  return entry.startsWith('/');
+}
+
+/// Pure: is [ch] an ASCII letter (a Windows drive letter A-Z / a-z).
+bool _isDriveLetter(String ch) {
+  final int code = ch.codeUnitAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+/// 解析扩展 M3U（m3u8）播放列表为 [PlaylistEntry] 列表（纯函数，无 IO）。
+///
+/// 语义：
+/// - `#EXTINF:-1,<title>` 记下一条目的标题；逗号后整段为标题（含中文、括号）。
+/// - 紧随其后的第一条非空、非注释行视为该集的相对路径，用 [baseDir] 解析成绝对
+///   路径。Windows 反斜杠 `\` 先统一成 `/` 再 `p.join` + `p.normalize`，得到当前
+///   平台的分隔符表示。
+/// - 没有前置 `#EXTINF` 的裸路径行也作为一集，标题回退为该文件的 basename。
+/// - 空行、`#EXTM3U` 及其它 `#` 注释行跳过（仅 `#EXTINF` 携带标题）。
+List<PlaylistEntry> parseM3u8({
+  required String content,
+  required String baseDir,
+}) {
+  final List<PlaylistEntry> entries = <PlaylistEntry>[];
+  String? pendingTitle;
+
+  for (final String rawLine in content.split('\n')) {
+    final String line = rawLine.trim();
+    if (line.isEmpty) continue;
+
+    if (line.startsWith('#')) {
+      if (line.startsWith('#EXTINF:')) {
+        // 逗号后整段是标题；属性值里引号包着的逗号（`group-title="A, B"`）不算
+        // 分隔符。显示名为空时退回 `tvg-name`（IPTV 列表常见写法）。
+        final M3uExtinf info = parseM3uExtinf(line);
+        final String display = info.displayName.isNotEmpty
+            ? info.displayName
+            : (info.attributes['tvg-name'] ?? '').trim();
+        pendingTitle = display.isEmpty ? null : display;
+      }
+      // 其它注释（#EXTM3U 等）忽略。
+      continue;
+    }
+
+    // 非注释非空行 = 视频相对/绝对路径。
+    final String absPath = resolveM3uEntryPath(line, baseDir);
+    // 解析层拒收的条目（远端清单里的本地 / UNC / file:// 等）：连同它的标题一起丢。
+    if (absPath.isEmpty) {
+      pendingTitle = null;
+      continue;
+    }
+    // 标题回退用解码 basename：URL 条目的 %20 之类不渗进集标题。
+    final String title = (pendingTitle != null && pendingTitle.isNotEmpty)
+        ? pendingTitle
+        : decodedSourceBasename(absPath);
+    entries.add(PlaylistEntry(title: title, path: absPath));
+    pendingTitle = null;
+  }
+
+  return entries;
+}
+
+/// 一行 `#EXTINF` 的解析结果（扩展 M3U / IPTV 频道列表）。
+///
+/// 形如 `#EXTINF:-1 tvg-id="x" tvg-name="名" tvg-logo="http://…" group-title="组",显示名`：
+/// [durationSeconds] 是冒号后的时长（直播频道写 `-1`，解析不出为 null）；
+/// [attributes] 的键统一小写（`tvg-name` / `tvg-logo` / `group-title` …），值已剥引号；
+/// [displayName] 是**引号外第一个逗号**之后的整段（可再含逗号）。
+@immutable
+class M3uExtinf {
+  const M3uExtinf({
+    required this.durationSeconds,
+    required this.attributes,
+    required this.displayName,
+  });
+
+  final double? durationSeconds;
+  final Map<String, String> attributes;
+  final String displayName;
+}
+
+final RegExp _m3uAttrPattern =
+    RegExp(r'([A-Za-z0-9_\-]+)\s*=\s*(?:"([^"]*)"|([^\s",]+))');
+
+/// **纯函数**：解析一行 `#EXTINF:`（容错：缺逗号 / 缺时长 / 未闭合引号都不抛）。
+M3uExtinf parseM3uExtinf(String line) {
+  String body = line.trim();
+  if (body.startsWith('#EXTINF:')) body = body.substring('#EXTINF:'.length);
+  // 引号外第一个逗号切开「时长 + 属性」与显示名。
+  int split = -1;
+  bool inQuotes = false;
+  for (int i = 0; i < body.length; i++) {
+    final String ch = body[i];
+    if (ch == '"') {
+      inQuotes = !inQuotes;
+    } else if (ch == ',' && !inQuotes) {
+      split = i;
+      break;
+    }
+  }
+  final String head = split >= 0 ? body.substring(0, split) : body;
+  final String displayName = split >= 0 ? body.substring(split + 1).trim() : '';
+  final String headTrimmed = head.trimLeft();
+  final Match? durationMatch =
+      RegExp(r'^-?\d+(?:\.\d+)?').firstMatch(headTrimmed);
+  final double? duration =
+      durationMatch == null ? null : double.tryParse(durationMatch.group(0)!);
+  final String attrText = durationMatch == null
+      ? headTrimmed
+      : headTrimmed.substring(durationMatch.end);
+  final Map<String, String> attributes = <String, String>{};
+  for (final Match m in _m3uAttrPattern.allMatches(attrText)) {
+    final String key = m.group(1)!.toLowerCase();
+    final String value = (m.group(2) ?? m.group(3) ?? '').trim();
+    attributes[key] = value;
+  }
+  return M3uExtinf(
+    durationSeconds: duration,
+    attributes: attributes,
+    displayName: displayName,
+  );
+}
+
+/// IPTV 频道列表里的一个频道（[parseM3uChannels] 的产物）。
+///
+/// [url] 已按列表位置解析（相对条目 → 列表所在目录 / URL 目录，见
+/// [resolveM3uEntryPath]）；[title] 取 `#EXTINF` 逗号后的显示名，空则退
+/// `tvg-name`，再空退条目 basename。其余属性缺省为 null。
+@immutable
+class M3uChannel {
+  const M3uChannel({
+    required this.title,
+    required this.url,
+    this.tvgId,
+    this.tvgName,
+    this.tvgLogo,
+    this.groupTitle,
+  });
+
+  final String title;
+  final String url;
+  final String? tvgId;
+  final String? tvgName;
+
+  /// 频道台标 URL（`tvg-logo`），可作封面。
+  final String? tvgLogo;
+
+  /// 分组（`group-title`）；`#EXTGRP:` 行同样落到这里（`#EXTINF` 自带的优先）。
+  final String? groupTitle;
+
+  /// 转成既有入库形状（`VideoBookRepository.importSplitPlaylist` 吃的
+  /// [PlaylistEntry]）——频道列表不另造存储。
+  PlaylistEntry toPlaylistEntry() => PlaylistEntry(title: title, path: url);
+}
+
+/// IPTV 频道列表导入建出的频道行的 bookUid 命名空间前缀：
+/// `video/iptv/<列表来源摘要>-<频道地址摘要>`（派生规则在 app 侧
+/// `iptv_playlist_import.dart`）。与 `video/<文件名>` / `video/stream/…` /
+/// `video/playlist/…` 命名族不撞（文件名里不可能有 `/`）。
+const String kIptvChannelBookUidPrefix = 'video/iptv/';
+
+/// 纯函数：[bookUid] 是否是 IPTV 频道行（直播频道）——按条目来源判定，
+/// 不看地址长什么样。
+bool isIptvChannelBookUid(String bookUid) =>
+    bookUid.startsWith(kIptvChannelBookUidPrefix);
+
+String? _nonEmpty(String? s) {
+  final String? t = s?.trim();
+  return (t == null || t.isEmpty) ? null : t;
+}
+
+/// **纯函数**：把扩展 M3U 频道列表解析成 [M3uChannel]（无 IO）。
+///
+/// - `#EXTINF` 提供显示名与 `tvg-*` / `group-title` 属性，作用于其后第一条
+///   非空、非 `#` 行（频道地址）；`#EXTGRP:` 提供分组兜底。
+/// - 无前置 `#EXTINF` 的裸地址行也算一个频道（标题回退 basename）。
+/// - 其余 `#` 行（`#EXTM3U` / `#EXTVLCOPT` …）忽略；`\r\n` 与 BOM 容错。
+///
+/// 调用前应先用 [isHlsStreamPlaylist] 排除 HLS 媒体 / master 列表——那是**单条
+/// 流**，拆开会把分片当频道。
+List<M3uChannel> parseM3uChannels({
+  required String content,
+  required String baseDir,
+}) {
+  final List<M3uChannel> channels = <M3uChannel>[];
+  M3uExtinf? pending;
+  String? pendingGroup;
+  String text = content;
+  if (text.startsWith('\uFEFF')) text = text.substring(1);
+  for (final String rawLine in text.split('\n')) {
+    final String line = rawLine.trim();
+    if (line.isEmpty) continue;
+    if (line.startsWith('#')) {
+      if (line.startsWith('#EXTINF:')) {
+        pending = parseM3uExtinf(line);
+      } else if (line.startsWith('#EXTGRP:')) {
+        pendingGroup = _nonEmpty(line.substring('#EXTGRP:'.length));
+      }
+      continue;
+    }
+    final String url = resolveM3uEntryPath(line, baseDir);
+    if (url.isEmpty) {
+      // 解析层拒收（远端列表里的本地 / UNC / file:// 条目）：它的 #EXTINF 不能
+      // 串到下一个频道头上。
+      pending = null;
+      pendingGroup = null;
+      continue;
+    }
+    final Map<String, String> attrs =
+        pending?.attributes ?? const <String, String>{};
+    final String? tvgName = _nonEmpty(attrs['tvg-name']);
+    final String title = _nonEmpty(pending?.displayName) ??
+        tvgName ??
+        decodedSourceBasename(url);
+    channels.add(M3uChannel(
+      title: title,
+      url: url,
+      tvgId: _nonEmpty(attrs['tvg-id']),
+      tvgName: tvgName,
+      tvgLogo: _nonEmpty(attrs['tvg-logo']),
+      groupTitle: _nonEmpty(attrs['group-title']) ?? pendingGroup,
+    ));
+    pending = null;
+    pendingGroup = null;
+  }
+  return channels;
+}
+
+/// HLS 专有标签：出现任一个，这份 m3u8 就是**一条 HLS 流**（media playlist 的
+/// 分片表或 master playlist 的码率档），不是频道 / 分集列表。
+const List<String> _kHlsStreamTags = <String>[
+  '#EXT-X-TARGETDURATION',
+  '#EXT-X-STREAM-INF',
+  '#EXT-X-I-FRAME-STREAM-INF',
+  '#EXT-X-MEDIA-SEQUENCE',
+  '#EXT-X-DISCONTINUITY-SEQUENCE',
+  '#EXT-X-ENDLIST',
+  '#EXT-X-PLAYLIST-TYPE',
+  '#EXT-X-MAP',
+  '#EXT-X-KEY',
+  '#EXT-X-PART-INF',
+  '#EXT-X-SERVER-CONTROL',
+];
+
+/// **纯函数**：[content] 是否是 HLS 流（media 或 master playlist）。
+///
+/// 判据是 HLS 专有标签（[_kHlsStreamTags]），不看 `#EXT-X-VERSION`（部分 IPTV
+/// 列表也会带）也不看 `#EXTINF`（频道列表 / 分集清单都有）。true 时整份清单应当
+/// 作为**单个流**直接交给播放器，不能按行拆成频道或分集。
+bool isHlsStreamPlaylist(String content) {
+  for (final String rawLine in content.split('\n')) {
+    final String line = rawLine.trim();
+    if (!line.startsWith('#EXT-X-')) continue;
+    for (final String tag in _kHlsStreamTags) {
+      if (line.startsWith(tag)) return true;
+    }
+  }
+  return false;
+}
+
+/// HLS **master** playlist 里的一个码率 variant（同一内容的不同画质档）。
+///
+/// 每个 variant 由一行 `#EXT-X-STREAM-INF:...` 属性 + 紧随其后的子 playlist URI 组成
+/// （见 [parseM3u8Master]）。[url] 已解析成相对 master URL 的绝对 URL（HTTP URL 语义，
+/// 不是文件路径）；[bandwidth]（bps）/ [resolution]（`宽x高`）/ [codecs] / [frameRate]
+/// 可能缺省（HLS 规范只强制 BANDWIDTH，其余可空）。
+///
+/// 与 [PlaylistEntry]（本地多集文件清单）正交：那是「一本书多集本地文件」，这是「一条
+/// 网络流多档码率」。两者靠 m3u8 内容里有无 `#EXT-X-STREAM-INF` 区分（[isHlsMasterPlaylist]），
+/// 互不误伤。
+@immutable
+class HlsVariant {
+  const HlsVariant({
+    required this.url,
+    this.bandwidth,
+    this.resolution,
+    this.codecs,
+    this.frameRate,
+  });
+
+  /// variant 子 playlist 的绝对 URL（已按 master URL 做 HTTP URL 语义解析）。
+  final String url;
+
+  /// BANDWIDTH（峰值码率，bps）；缺省 null。
+  final int? bandwidth;
+
+  /// RESOLUTION（`宽x高`，如 `1920x1080`）；缺省 null。
+  final String? resolution;
+
+  /// CODECS（逗号分隔编解码器标识，原样保留）；缺省 null。
+  final String? codecs;
+
+  /// FRAME-RATE（帧率）；缺省 null。
+  final double? frameRate;
+
+  /// 从 [resolution] `宽x高` 取宽；解析不出返回 null。
+  int? get width => _resolutionPart(0);
+
+  /// 从 [resolution] `宽x高` 取高（用于 `720p` 这类画质档标注）；解析不出返回 null。
+  int? get height => _resolutionPart(1);
+
+  int? _resolutionPart(int index) {
+    final String? res = resolution;
+    if (res == null) return null;
+    final List<String> parts = res.toLowerCase().split('x');
+    if (parts.length != 2) return null;
+    return int.tryParse(parts[index].trim());
+  }
+
+  /// UI 画质标签：优先 `高度p`（如 `1080p`），附加码率（`1080p · 5.0 Mbps`）；无分辨率
+  /// 时退回纯码率；两者都无退回 `HLS`。纯函数便于单测。
+  String get qualityLabel {
+    final int? h = height;
+    final String? res = h != null ? '${h}p' : null;
+    final String? rate = _bitrateLabel;
+    if (res != null && rate != null) return '$res · $rate';
+    return res ?? rate ?? 'HLS';
+  }
+
+  String? get _bitrateLabel {
+    final int? b = bandwidth;
+    if (b == null || b <= 0) return null;
+    if (b >= 1000000) return '${(b / 1000000).toStringAsFixed(1)} Mbps';
+    return '${(b / 1000).round()} kbps';
+  }
+}
+
+/// 判定 m3u8 [content] 是否为 HLS **master** playlist（含 `#EXT-X-STREAM-INF` 码率
+/// variant）。纯函数。
+///
+/// master → true；media playlist（只有 `#EXTINF` 分段 / `#EXT-X-TARGETDURATION`）与本地
+/// 多集文件清单（[parseM3u8] 消费的扩展 M3U）→ false。判据是「有无 STREAM-INF」，故
+/// 绝不误伤本地分集清单（那里只有 `#EXTINF`，无 STREAM-INF）。
+bool isHlsMasterPlaylist(String content) {
+  for (final String rawLine in content.split('\n')) {
+    if (rawLine.trim().startsWith('#EXT-X-STREAM-INF')) return true;
+  }
+  return false;
+}
+
+/// 解析 HLS **master** playlist 的 `#EXT-X-STREAM-INF` variant 列表（纯函数，无 IO）。
+///
+/// 语义：
+/// - 每行 `#EXT-X-STREAM-INF:BANDWIDTH=..,RESOLUTION=WxH,CODECS="..",FRAME-RATE=..`
+///   携带该 variant 属性（属性值可含引号包裹的逗号，用引号感知切分）。
+/// - 紧随其后的第一条非空、非注释行是该 variant 子 playlist 的 URI，按 **HTTP URL 语义**
+///   相对 [baseUrl]（master playlist URL）解析成绝对 URL（`Uri.resolve`，不是文件路径 join）。
+/// - media playlist（无 STREAM-INF，只有 `#EXTINF` 分段）或本地文件清单 → 返回空列表。
+///
+/// 与 [parseM3u8]（本地多集文件清单，走 `p.join` 文件路径语义）严格分开：master 的
+/// 子 URI 是 URL、按 URL 解析；本地清单的路径是文件、按平台分隔符 join。
+List<HlsVariant> parseM3u8Master({
+  required String content,
+  required String baseUrl,
+}) {
+  final List<HlsVariant> variants = <HlsVariant>[];
+  final Uri? base = Uri.tryParse(baseUrl);
+  Map<String, String>? pendingAttrs;
+
+  for (final String rawLine in content.split('\n')) {
+    final String line = rawLine.trim();
+    if (line.isEmpty) continue;
+
+    if (line.startsWith('#')) {
+      if (line.startsWith('#EXT-X-STREAM-INF:')) {
+        pendingAttrs = _parseHlsAttributes(
+          line.substring('#EXT-X-STREAM-INF:'.length),
+        );
+      }
+      // 其它标签（#EXTM3U / #EXT-X-MEDIA / #EXT-X-VERSION 等）忽略。
+      continue;
+    }
+
+    // 非注释非空行：仅当前面有 STREAM-INF 时才是 variant URI；否则（无 pendingAttrs）
+    // 是 media playlist 的分段或裸行，跳过（master 解析只关心 variant）。
+    if (pendingAttrs == null) continue;
+
+    final Map<String, String> attrs = pendingAttrs;
+    pendingAttrs = null;
+
+    final String resolvedUrl = _resolveHlsUri(base, baseUrl, line);
+    final String? bw = attrs['BANDWIDTH'];
+    final String? avgBw = attrs['AVERAGE-BANDWIDTH'];
+    variants.add(HlsVariant(
+      url: resolvedUrl,
+      bandwidth: int.tryParse(bw ?? avgBw ?? ''),
+      resolution: attrs['RESOLUTION'],
+      codecs: attrs['CODECS'],
+      frameRate: double.tryParse(attrs['FRAME-RATE'] ?? ''),
+    ));
+  }
+
+  return variants;
+}
+
+/// 按画质从高到低排序 variant（高度优先、码率其次）；缺分辨率的排后。返回新列表，
+/// 不改入参。纯函数便于单测「1080/720/480 降序」。
+List<HlsVariant> sortedHlsVariantsByQualityDesc(List<HlsVariant> variants) {
+  final List<HlsVariant> sorted = List<HlsVariant>.of(variants);
+  sorted.sort((HlsVariant a, HlsVariant b) {
+    final int ha = a.height ?? -1;
+    final int hb = b.height ?? -1;
+    if (ha != hb) return hb.compareTo(ha);
+    final int ba = a.bandwidth ?? -1;
+    final int bb = b.bandwidth ?? -1;
+    return bb.compareTo(ba);
+  });
+  return sorted;
+}
+
+/// 解析 `#EXT-X-STREAM-INF:` 后的属性串为 `键→值` map（引号感知：`CODECS="a,b"` 的
+/// 内部逗号不切分，值两端引号剥掉）。纯函数。
+Map<String, String> _parseHlsAttributes(String attrs) {
+  final Map<String, String> out = <String, String>{};
+  final List<String> fields = <String>[];
+  final StringBuffer buf = StringBuffer();
+  bool inQuotes = false;
+  for (int i = 0; i < attrs.length; i++) {
+    final String ch = attrs[i];
+    if (ch == '"') {
+      inQuotes = !inQuotes;
+      buf.write(ch);
+    } else if (ch == ',' && !inQuotes) {
+      fields.add(buf.toString());
+      buf.clear();
+    } else {
+      buf.write(ch);
+    }
+  }
+  if (buf.isNotEmpty) fields.add(buf.toString());
+
+  for (final String field in fields) {
+    final int eq = field.indexOf('=');
+    if (eq < 0) continue;
+    final String key = field.substring(0, eq).trim().toUpperCase();
+    if (key.isEmpty) continue;
+    String value = field.substring(eq + 1).trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.substring(1, value.length - 1);
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
+/// 把 variant 子 URI [uri] 相对 master URL 解析成绝对 URL（HTTP URL 语义）。解析失败
+/// （baseUrl 非法 URL 等）时原样返回 [uri]。纯函数。
+String _resolveHlsUri(Uri? base, String baseUrl, String uri) {
+  final Uri? child = Uri.tryParse(uri);
+  if (child != null && child.hasScheme) return uri; // 已是绝对 URL。
+  if (base == null) return uri;
+  try {
+    return base.resolve(uri).toString();
+  } catch (_) {
+    return uri;
+  }
+}

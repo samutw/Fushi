@@ -1,0 +1,184 @@
+import 'dart:io';
+
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/media.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/focus/fushi_focus_controller.dart';
+import 'package:fushi/src/focus/fushi_focus_target.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/media_collection_grid_detail_page.dart';
+import 'package:fushi/src/pages/implementations/reader_fushi_history_page.dart';
+import 'package:fushi_audio/fushi_audio.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+import '../helpers/test_platform_services.dart';
+
+/// BUG-1009（预防性）：合集详情页成员卡的手柄/键盘焦点 id 不得与书架同名。
+///
+/// 详情页 push 在书架路由之上、两条路由的 FushiFocusTarget 同时存活；焦点注册表
+/// 按 id 覆盖（fushi_focus_controller.dart `_targets[id] = entry`），同名即撞号
+/// ——后注册者赢、owner unregister 时另一方失联。修复 = 详情页渲染路径
+/// （[_buildCollectionMemberCard]）给成员卡 focusId 加 'collection-detail-' 路由
+/// 前缀，书架前缀不动（快捷键/方向锚点语义零变化）。
+void main() {
+  final TestWidgetsFlutterBinding binding =
+      TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Directory pathProviderDir;
+  setUpAll(() {
+    pathProviderDir =
+        Directory.systemTemp.createTempSync('fushi_collection_focus_pp');
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      (MethodCall call) async => pathProviderDir.path,
+    );
+  });
+  tearDownAll(() {
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      null,
+    );
+    if (pathProviderDir.existsSync()) {
+      try {
+        pathProviderDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
+  late FushiDatabase db;
+  late PreferencesRepository prefs;
+  late AppModel appModel;
+  late Directory storeDir;
+  late List<MediaItem> epubItems;
+  late List<SrtBook> srtItems;
+
+  setUp(() async {
+    LocaleSettings.setLocale(AppLocale.zhCn);
+    db = FushiDatabase.forTesting(NativeDatabase.memory());
+    prefs = PreferencesRepository(db);
+    await prefs.loadFromDb();
+    storeDir = Directory.systemTemp.createTempSync('fushi_collection_focus');
+    appModel = AppModel(testPlatformServices())
+      ..wireDatabaseForTesting(db)
+      ..wireLocalAudioForTesting(prefsRepo: prefs, databaseDirectory: storeDir);
+    appModel.populateLanguages();
+    epubItems = <MediaItem>[];
+    srtItems = <SrtBook>[];
+  });
+
+  tearDown(() async {
+    await db.close();
+    if (storeDir.existsSync()) {
+      try {
+        storeDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
+  Future<void> seedEpub(String bookKey, String title) async {
+    await db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: bookKey,
+      title: title,
+      epubPath: '${pathProviderDir.path}/$bookKey.epub',
+      extractDir: pathProviderDir.path,
+      chapterCount: 1,
+      chaptersJson: '["a"]',
+      importedAt: 0,
+    ));
+    epubItems.add(MediaItem(
+      mediaIdentifier: ReaderFushiSource.mediaIdentifierFor(bookKey),
+      title: title,
+      mediaTypeIdentifier: ReaderFushiSource.instance.mediaType.uniqueKey,
+      mediaSourceIdentifier: ReaderFushiSource.instance.uniqueKey,
+      position: 0,
+      duration: 1,
+      canDelete: false,
+      canEdit: true,
+    ));
+  }
+
+  Widget buildApp() => ProviderScope(
+        overrides: <Override>[
+          appProvider.overrideWith((ref) => appModel),
+          fushiBooksProvider.overrideWith(
+            (ref, language) => Future<List<MediaItem>>.value(epubItems),
+          ),
+          srtBooksProvider.overrideWith(
+            (ref) => Future<List<SrtBook>>.value(srtItems),
+          ),
+        ],
+        child: TranslationProvider(
+          child: MaterialApp(
+            // 焦点根置于 Navigator 之上：书架与 push 出的详情页共用同一注册表，
+            // 复刻生产的「两条路由同时注册」环境。
+            builder: (BuildContext context, Widget? child) =>
+                FushiFocusRoot(child: child ?? const SizedBox.shrink()),
+            home: Scaffold(
+              body: ReaderFushiHistoryPage(
+                remoteBookClientLoader: () async => null,
+              ),
+            ),
+          ),
+        ),
+      );
+
+  testWidgets('BUG-1009：详情页成员卡 focusId 带 collection-detail- 前缀，与书架不撞号',
+      (WidgetTester tester) async {
+    await seedEpub('memberKey', '成员书');
+    final int cid = await db.createMediaCollection('系列甲');
+    // v83（P3 Stage 2，2ceccf8bda）：本地 epub 合集成员行的 entryKey 是**稳定 uid**，
+    // 不再是 bookKey（书架侧按 `_epubUidByKey[key] ?? key` 换算后查归属）。这里照旧
+    // 塞 bookKey 会让合集成员数为 0 ⇒ 书架不渲染合集卡 ⇒ 后面 tap「查看全部」找不到
+    // 控件（BUG-1496 就是这么红进 develop 的）。uid 由 insertEpubBook 单点生成。
+    final String? memberUid = await db.resolveEpubBookUid('memberKey');
+    expect(memberUid, isNotNull, reason: 'insertEpubBook 必须给书生成稳定 uid');
+    await db.addToCollection(cid, MediaKind.epub, memberUid!);
+    final String mediaId = ReaderFushiSource.mediaIdentifierFor('memberKey');
+    // 书架合集是单个格子（整行展开已移除）：成员卡只在详情页出现。
+
+    tester.view.physicalSize = const Size(1400, 1200);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    // 书架上是合集格子（无前缀 id），成员书不外露。
+    List<String> onstageIds() => tester
+        .widgetList<FushiFocusTarget>(find.byType(FushiFocusTarget))
+        .map((FushiFocusTarget w) => w.id.value)
+        .toList();
+    expect(onstageIds(), contains('reader-shelf-collection-$cid'),
+        reason: '书架合集格子保持既有无前缀 focusId');
+    expect(onstageIds(), isNot(contains('reader-shelf-book-$mediaId')),
+        reason: '合集成员折进格子，书架上没有它自己的卡');
+
+    // 进详情页（点合集格子）。
+    await tester.tap(find.byKey(
+        ValueKey<String>('reader_shelf_collection_card_$cid')));
+    await tester.pumpAndSettle();
+    expect(find.byType(MediaCollectionGridDetailPage), findsOneWidget);
+
+    // 详情页成员卡：带路由前缀，且不再出现与书架同名的 id。
+    final List<String> detailIds = onstageIds();
+    expect(detailIds, contains('collection-detail-reader-shelf-book-$mediaId'),
+        reason: '详情页成员卡必须带 collection-detail- 前缀（BUG-1009）');
+    expect(detailIds, isNot(contains('reader-shelf-book-$mediaId')),
+        reason: '详情页（onstage）不得复用书架同名 focusId');
+
+    // 书架路由仍在其下存活（offstage），其合集格子的 id 未被改动——两条路由并存时
+    // 注册表里是两个不同 id，不再互相覆盖。
+    final List<String> allIds = tester
+        .widgetList<FushiFocusTarget>(
+            find.byType(FushiFocusTarget, skipOffstage: false))
+        .map((FushiFocusTarget w) => w.id.value)
+        .toList();
+    expect(allIds, contains('reader-shelf-collection-$cid'));
+    expect(allIds, contains('collection-detail-reader-shelf-book-$mediaId'));
+  });
+}

@@ -1,0 +1,454 @@
+import 'package:fushi_engine/media/video/bluray/bluray_disc.dart'
+    show blurayDiscRootForFile;
+import 'package:path/path.dart' as p;
+
+/// 书籍扩展名（不带点，小写）。= epub + pdf + TextToEpub.supportedExtensions。
+///
+/// `pdf` 在列：PDF 是 `EpubBooks.format` 的三种书身份之一（`ImportCarrier.pdf` →
+/// `PdfImporter`），导入对话框的文件选择器一直认它。此前只有这份拖放白名单漏了，
+/// 于是「按钮能导、拖进去说不支持」——同一件东西两个入口两种答案（用户实报）。
+const Set<String> kDragBookExtensions = <String>{
+  'epub',
+  'pdf',
+  'txt',
+  'html',
+  'htm',
+  'xhtml',
+  'md',
+  'markdown',
+  'rst',
+  'org',
+  'csv',
+  'tsv',
+  'log',
+  'json',
+  'xml',
+};
+
+/// 字幕扩展名（不带点，小写）。
+const Set<String> kDragSubtitleExtensions = <String>{
+  'srt',
+  'vtt',
+  'ass',
+  'ssa',
+  'lrc',
+};
+
+/// 视频扩展名（不带点，小写）。镜像 [kVideoExtensions]（media_extensions.dart
+/// 共享真相源，文件夹扫描 / 刮削同用一份），守卫测试钉死两者同步——否则拖入
+/// .mts/.vob/.rmvb 等容器格式的视频会被分到 unknown，识别不出（TODO-558 / BUG-326）。
+const Set<String> kDragVideoExtensions = <String>{
+  'mp4',
+  'mkv',
+  'avi',
+  'mov',
+  'webm',
+  'm4v',
+  'ts',
+  'm2ts',
+  'mts',
+  'flv',
+  'wmv',
+  'mpg',
+  'mpeg',
+  'ogv',
+  'rmvb',
+  'rm',
+  'vob',
+};
+
+/// 播放列表扩展名（不带点，小写）。扩展 M3U（m3u8/m3u）= 多集视频清单，语义不同于
+/// 单个视频文件：拖入后走 [parseM3u8] 解析成 playlist VideoBook（多集 + 各集进度），
+/// 不能当单视频导入。故单列一类，与 [kDragVideoExtensions] 区分。
+const Set<String> kDragPlaylistExtensions = <String>{
+  'm3u8',
+  'm3u',
+};
+
+/// 词典包扩展名（不带点，小写）。= 词典管理页文件选择器实际能导入的格式
+/// （Yomitan/Migaku/mdict/dsl 的 zip + 裸 .dsl/.mdx），见 DictionaryImportManager
+/// 的 detectFormat。`.ifo`/`.css` 不在此列：前者非独立导入单位、后者是随词典的样式
+/// 附件（拖单个 css 不构成一次导入）。词典拖放是词典管理页专属落点，与书架/视频
+/// 表面（books/video）互不影响，故 .zip 在此被识别为词典包而非 unknown。
+const Set<String> kDragDictionaryExtensions = <String>{
+  'zip',
+  'dsl',
+  'mdx',
+};
+
+/// 漫画扩展名（不带点，小写）：**明确**的漫画载体，落点表面一见即知。
+///
+/// - `mokuro`：mokuro v0.2+ 的 OCR 结果文件（+ 同级图片），走 `MangaImporter`；
+/// - `cbz`：ZIP 图片压缩包，走 `MangaArchiveImporter`；
+/// - `cbr` / `rar` / `cb7`：7-Zip 解包的图片压缩包（Windows 发布包自带）。
+///
+/// 不含 `zip`：它同时是词典包扩展名，光看扩展名分不出「一包页图」还是 Yomitan
+/// 词典包，故走 [kDragImageArchiveProbeExtensions] + `isImageArchive` 注入判据。
+///
+/// 也不含 `epub`：图片型 EPUB（扫描版漫画）确实存在，但它在 books 分支就走
+/// `importNewBook` → `BookImportDialog`，而对话框的分派本来就会真读包
+/// （`{'.zip','.epub'} && MangaModule.isImageArchive` → `importArchive`），最终
+/// 照样导成漫画——行为已经正确。为它在**每次拖 EPUB** 时白开一次包换不来任何
+/// 可见改进，不值得。
+const Set<String> kDragMangaExtensions = <String>{
+  'mokuro',
+  'cbz',
+  'cbr',
+  'rar',
+  'cb7',
+};
+
+/// 需要**真读包内容**才能定性的容器扩展名（不带点，小写）。
+///
+/// 只含 `zip`：它既可能是页图漫画包，也可能是 Yomitan/mdict 词典包。没有判据时
+/// 分类层只能按扩展名归 dictionaries，于是**图片型 zip 拖到书架/漫画库会回「本
+/// 页面不支持」**（books 分支走到 `files.hasAny` 兜底），而导入对话框导得了它——
+/// 又一处「按钮能导、拖进去不认」。判据由调用方注入（widget 层传
+/// `MangaModule.isImageArchive`，即 `MangaArchiveImporter.looksLikeImageArchive`），
+/// 分类层自身仍不碰文件系统；判据缺席时 zip 维持词典包分类，向后兼容。
+const Set<String> kDragImageArchiveProbeExtensions = <String>{
+  'zip',
+};
+
+/// 落点**偏好漫画**（漫画库）时额外开包定性的扩展名（不带点，小写）。
+///
+/// 书架上拖 `.epub` 不开包：它默认就是一本书，书籍导入框收下路径时会再真读包，
+/// 认出扫描版就提示转交漫画。但用户已经站在漫画库里时，先进书籍框再被告知「这看起来
+/// 是漫画」是倒过来的——落点本身已经回答了「用户想导什么」。所以漫画库把 `.epub`
+/// 也纳入同一个判据（与 [kDragImageArchiveProbeExtensions] 同一个 `isImageArchive`），
+/// 图片型 EPUB 直接归漫画；文字 EPUB 判据为假，照旧归书（不收窄漫画库拖文字书
+/// 自动导去书架的既有能力）。
+const Set<String> kDragMangaSurfaceProbeExtensions = <String>{
+  ...kDragImageArchiveProbeExtensions,
+  'epub',
+};
+
+/// 落点偏好漫画时**直接**归漫画的扩展名（不带点，小写）：`pdf`。
+///
+/// 一卷扫描版漫画常就是一份 PDF，漫画导入框把它逐页栅格化成漫画
+/// （`ImportCarrier.pdf` → `importPdfAsManga`）。PDF 没有便宜的「是不是页图」判据，
+/// 在漫画库里就按落点意图走漫画；书架上它仍是一本 PDF 书。
+const Set<String> kDragMangaSurfaceDirectExtensions = <String>{'pdf'};
+
+/// [classifyDroppedFiles] / `probeDroppedImageArchives` 按落点取开包扩展名。
+Set<String> dragImageArchiveProbeExtensionsFor({required bool preferManga}) =>
+    preferManga
+        ? kDragMangaSurfaceProbeExtensions
+        : kDragImageArchiveProbeExtensions;
+
+/// 看得出是漫画包、但当前**导入器不支持**的扩展名（不带点，小写）。
+///
+/// `archive` 包不解 RAR，故 cbr/cb7/rar 无法导入。单列一类只为一件事：让落点
+/// 给出明确的「不支持」提示，而不是归进 unknown 后静默无反应（用户实报「拖进去
+/// 一点反应都没有」）。
+/// Superseded by the supported set above; RAR/CBR/CB7 no longer enter here.
+const Set<String> kDragUnsupportedMangaExtensions = <String>{};
+
+/// 音频扩展名（不带点，小写）。镜像 AudiobookStorage.audioExtensions（守卫测试钉死同步）。
+const Set<String> kDragAudioExtensions = <String>{
+  'mp3',
+  'm4a',
+  'm4b',
+  'aac',
+  'ogg',
+  'opus',
+  'flac',
+  'wav',
+  'wma',
+  'ac3',
+  'eac3',
+  'aiff',
+  'aif',
+  'mp4',
+};
+
+/// BT 种子扩展名（不带点，小写）。拖入后走下载中心「添加任务」对话框
+/// （`ManualDownloadTaskDialog`）预填种子——与该对话框「选 .torrent 文件」按钮
+/// 同一条入库路径，不在拖放层另解 metainfo。磁力链接不经此处：它是字符串不是
+/// 文件，桌面拖放通道也不会把它当路径送进来。
+const Set<String> kDragTorrentExtensions = <String>{
+  'torrent',
+};
+
+/// 拖入文件按扩展名分类的结果。一个路径可同时落入多个类（如 .mp4 既是视频又是音频），
+/// 由落点上下文（DropSurface）决定最终语义。
+class DroppedFiles {
+  const DroppedFiles({
+    required this.books,
+    required this.videos,
+    required this.subtitles,
+    required this.audios,
+    required this.playlists,
+    required this.dictionaries,
+    required this.urls,
+    required this.unknown,
+    this.mangas = const <String>[],
+    this.unsupportedMangas = const <String>[],
+    this.directories = const <String>[],
+    this.torrents = const <String>[],
+    this.blurayDiscs = const <String>[],
+  });
+
+  final List<String> books;
+  final List<String> videos;
+  final List<String> subtitles;
+  final List<String> audios;
+  final List<String> playlists;
+  final List<String> dictionaries;
+
+  /// 漫画载体：`.mokuro` / `.cbz` / `.cbr` / `.rar` / `.cb7`，以及被
+  /// [classifyDroppedFiles] 的 `isDirectory` 谓词判定为**目录**的路径
+  /// （整目录页图导入，manga_importer 的 `importFromImageFolder` 路径）。
+  final List<String> mangas;
+
+  /// 认得出是漫画包但导入器不支持的（cbr/cb7/rar，见
+  /// [kDragUnsupportedMangaExtensions]）——落点据此给明确提示而非静默。
+  final List<String> unsupportedMangas;
+
+  /// 被 `isDirectory` 谓词判定为**目录**的路径，作为**事实**原样记录。
+  ///
+  /// 与 [mangas] 是交叠而非互斥的：目录同时也会进 [mangas]，保住书架/漫画库既有的
+  /// 「整目录页图导入一本漫画」。分开记的理由是——「这是个目录」是事实，「目录算漫画」
+  /// 是判断，判断必须留给知道落点表面的 [decideDropIntent] 去做。此前事实被就地
+  /// 编码成判断，于是视频页永远拿不到「用户拖进来的是个文件夹」这个信息。
+  final List<String> directories;
+
+  /// 拖入的可导入网络流 URL（http(s)，非文件路径）。浏览器地址栏/链接拖进来时，
+  /// 原生（Windows CFSTR_INETURLW / macOS public.url / Linux text/uri-list）把 URL
+  /// 当作一个「路径」字符串经同一通道传回，[classifyDroppedFiles] 按 scheme 从文件
+  /// 路径中甄别出来落到本类（TODO-1306），由落点决策路由到流媒体导入 [_importStreamUrl]。
+  final List<String> urls;
+
+  /// BT 种子文件（`.torrent`），见 [kDragTorrentExtensions]。任何表面拖入都路由到
+  /// 下载中心的添加任务对话框，落点表面只决定预填的内容类型（书架→小说、漫画库→
+  /// 漫画、视频页→视频）。
+  final List<String> torrents;
+
+  final List<String> unknown;
+
+  /// 拖入物所属蓝光盘的**盘根**（含 `BDMV` 的那层目录），去重、按出现顺序。
+  ///
+  /// 盘根不是拖进来的那个东西本身，而是从它反推出来的：盘根目录、`BDMV` 目录、
+  /// `index.bdmv` / `MovieObject.bdmv`、`PLAYLIST/*.mpls`、`STREAM/*.m2ts`、
+  /// `CLIPINF/*.clpi` 都指向同一张盘。一张盘只有整张扫才有意义——单拿一段 m2ts
+  /// 入库是一条叫 `00001` 的碎片，拿 `index.bdmv` 更是什么也导不了（此前它落
+  /// [unknown]，视频页拖进去毫无反应）。与其余分类交叠：盘里的 m2ts 仍记进
+  /// [videos]，要不要按盘处理由 [decideDropIntent] 按落点表面决定。
+  final List<String> blurayDiscs;
+
+  /// 视频页要登记成来源库的目录：先是各张盘的盘根，再是其余拖入的普通目录。
+  ///
+  /// 拖进来的若是盘根本身或它的 `BDMV` 目录，已由对应盘根代表，不再重复登记——
+  /// 尤其不能把 `BDMV` 目录本身登记成来源：盘根在来源之外，库对账与扫描边界都会错位。
+  List<String> get videoSourceFolders => <String>[
+    ...blurayDiscs,
+    for (final String dir in directories)
+      if (!_representedByDisc(dir)) dir,
+  ];
+
+  bool _representedByDisc(String directory) {
+    final String normalized = p.normalize(directory);
+    if (blurayDiscs.contains(normalized)) return true;
+    return p.basename(normalized) == 'BDMV' &&
+        blurayDiscs.contains(p.dirname(normalized));
+  }
+
+  /// 视频库能收录的媒体：全部视频 + 不是视频的纯音频（`.mp4` 两类都在，只算一次）。
+  ///
+  /// 纯音频在视频页按「无画面的视频」入库（专辑曲目等）；书架表面仍把音频当有声书
+  /// 素材（挂到书卡），不走这里。
+  List<String> get videoLibraryMedia => <String>[
+    ...videos,
+    for (final String audio in audios)
+      if (!videos.contains(audio)) audio,
+  ];
+
+  /// 是否有任何可被本功能识别（非 unknown）的文件。
+  bool get hasAny =>
+      books.isNotEmpty ||
+      videos.isNotEmpty ||
+      subtitles.isNotEmpty ||
+      audios.isNotEmpty ||
+      playlists.isNotEmpty ||
+      dictionaries.isNotEmpty ||
+      urls.isNotEmpty ||
+      mangas.isNotEmpty ||
+      unsupportedMangas.isNotEmpty ||
+      torrents.isNotEmpty ||
+      blurayDiscs.isNotEmpty;
+}
+
+String _ext(String path) {
+  final String e = p.extension(path); // 含前导点，如 ".EPUB"
+  if (e.isEmpty) return '';
+  return e.substring(1).toLowerCase();
+}
+
+/// 纯函数：判断拖入的字符串是否是一条可导入的网络流 URL（http/https + 非空 host）。
+///
+/// 语义与 `isPlayableStreamUrl`（url_stream_video.dart）钉死同步（守卫测试
+/// `url_drop_url_predicate_guard_test`），是「拖入的这条字符串到底是文件路径还是可
+/// 导入 URL」的单一判据：Windows 盘符路径 `C:\a.mp4` 的 scheme 会被解析成 `c`、UNC /
+/// POSIX 路径 scheme 为空，均非 http(s) → 判为文件路径，不会误吞。纯字符串判定，不碰
+/// 文件系统 / 网络（TODO-1306）。
+bool isImportableDropUrl(String candidate) {
+  final Uri? uri = Uri.tryParse(candidate.trim());
+  if (uri == null) return false;
+  final String scheme = uri.scheme.toLowerCase();
+  if (scheme != 'http' && scheme != 'https') return false;
+  return uri.host.isNotEmpty;
+}
+
+/// 把拖入文件路径按扩展名分类。纯函数，无副作用。
+///
+/// [isDirectory] 是唯一的外注入判据：拖入的**目录**（漫画页图文件夹）没有扩展名，
+/// 纯扩展名分类无法与「无扩展名的文件」区分，而本函数不碰文件系统。调用方
+/// （widget 层）传 `(pth) => Directory(pth).existsSync()`，测试注入假谓词。
+/// 不传（默认 null）时行为与历史逐字节一致——目录会落进 [DroppedFiles.unknown]。
+///
+/// [blurayDiscRootForDirectory] 同理由 widget 层注入（`bluray_disc.dart` 的同名函数，
+/// 要看目录下有没有 `BDMV/PLAYLIST`）；盘内**文件**只看路径形状，本函数自己认。
+///
+/// [preferManga]：落点是漫画库。图片型 `.epub` 经 [isImageArchive] 归漫画、`.pdf`
+/// 直接归漫画（见 [kDragMangaSurfaceProbeExtensions] / [kDragMangaSurfaceDirectExtensions]）。
+/// 默认 false，书架与其它落点的分类与历史逐字节一致。
+DroppedFiles classifyDroppedFiles(
+  List<String> paths, {
+  bool Function(String path)? isDirectory,
+  bool Function(String path)? isImageArchive,
+  String? Function(String directory)? blurayDiscRootForDirectory,
+  bool preferManga = false,
+}) {
+  final Set<String> probeExtensions =
+      dragImageArchiveProbeExtensionsFor(preferManga: preferManga);
+  final List<String> books = <String>[];
+  final List<String> videos = <String>[];
+  final List<String> subtitles = <String>[];
+  final List<String> audios = <String>[];
+  final List<String> playlists = <String>[];
+  final List<String> dictionaries = <String>[];
+  final List<String> urls = <String>[];
+  final List<String> mangas = <String>[];
+  final List<String> unsupportedMangas = <String>[];
+  final List<String> directories = <String>[];
+  final List<String> torrents = <String>[];
+  final List<String> unknown = <String>[];
+  final Set<String> blurayDiscs = <String>{};
+
+  for (final String path in paths) {
+    // URL（浏览器地址栏/链接拖入）不是文件路径，先按 scheme 甄别，命中即归 urls 并
+    // 跳过扩展名分类——URL 即便末段带 `.mp4` 也交给流媒体导入而非当本地文件（TODO-1306）。
+    if (isImportableDropUrl(path)) {
+      urls.add(path.trim());
+      continue;
+    }
+    // 目录（漫画页图文件夹）：整目录导入一本漫画。放在扩展名分类之前——目录名
+    // 带点时（如 `第01巻.v2`）会被 p.extension 当成扩展名而误分类。
+    if (isDirectory != null && isDirectory(path)) {
+      directories.add(path);
+      mangas.add(path);
+      final String? discRoot = blurayDiscRootForDirectory?.call(path);
+      if (discRoot != null) blurayDiscs.add(discRoot);
+      continue;
+    }
+    final String ext = _ext(path);
+    final String? discRoot = blurayDiscRootForFile(path);
+    if (discRoot != null) blurayDiscs.add(discRoot);
+    bool matched = discRoot != null;
+    // 图片包（`.zip`）：光看扩展名与词典包同形，必须真读包——同 isDirectory，判据
+    // 由 widget 层注入。命中即**只**归 mangas（不再落 dictionaries），否则图片型
+    // zip 会走到 books 分支的 `files.hasAny` 兜底、回「本页面不支持」，而导入对话框
+    // 明明导得了它。与对话框同一判据，两条入口的回答因此必然一致。
+    if (isImageArchive != null &&
+        probeExtensions.contains(ext) &&
+        isImageArchive(path)) {
+      mangas.add(path);
+      continue;
+    }
+    if (preferManga && kDragMangaSurfaceDirectExtensions.contains(ext)) {
+      mangas.add(path);
+      continue;
+    }
+    if (kDragMangaExtensions.contains(ext)) {
+      mangas.add(path);
+      matched = true;
+    }
+    if (kDragUnsupportedMangaExtensions.contains(ext)) {
+      unsupportedMangas.add(path);
+      matched = true;
+    }
+    if (kDragBookExtensions.contains(ext)) {
+      books.add(path);
+      matched = true;
+    }
+    if (kDragVideoExtensions.contains(ext)) {
+      videos.add(path);
+      matched = true;
+    }
+    if (kDragPlaylistExtensions.contains(ext)) {
+      playlists.add(path);
+      matched = true;
+    }
+    if (kDragSubtitleExtensions.contains(ext)) {
+      subtitles.add(path);
+      matched = true;
+    }
+    if (kDragAudioExtensions.contains(ext)) {
+      audios.add(path);
+      matched = true;
+    }
+    if (kDragDictionaryExtensions.contains(ext)) {
+      dictionaries.add(path);
+      matched = true;
+    }
+    if (kDragTorrentExtensions.contains(ext)) {
+      torrents.add(path);
+      matched = true;
+    }
+    if (!matched) unknown.add(path);
+  }
+
+  return DroppedFiles(
+    books: books,
+    videos: videos,
+    subtitles: subtitles,
+    audios: audios,
+    playlists: playlists,
+    dictionaries: dictionaries,
+    urls: urls,
+    mangas: mangas,
+    unsupportedMangas: unsupportedMangas,
+    directories: directories,
+    torrents: torrents,
+    unknown: unknown,
+    blurayDiscs: blurayDiscs.toList(),
+  );
+}
+
+/// 词典管理页拖放专用分类：从拖入路径里挑出词典包（`.zip`/`.dsl`/`.mdx`）以及同批
+/// 拖入的 `.css` 样式附件，按「先词典包后 css」拼成可直接喂给词典导入器的路径列表。
+/// 纯函数，无副作用，便于单测。无词典包时返回空列表（即便夹带了 css 也不导入——
+/// 单独拖个 css 不构成一次导入，与文件选择器 [_importDictionaryFiles] 同语义）。
+List<String> classifyDroppedFilesForDictionary(List<String> paths) {
+  final DroppedFiles files = classifyDroppedFiles(paths);
+  if (files.dictionaries.isEmpty) return const <String>[];
+  final List<String> cssAttachments = paths
+      .where((String pth) => p.extension(pth).toLowerCase() == '.css')
+      .toList();
+  return <String>[...files.dictionaries, ...cssAttachments];
+}
+
+/// 给一个视频挑配对字幕：按**文件名主干**（不含扩展名）大小写不敏感匹配，
+/// 找不到返回 null。
+///
+/// 多个视频一起拖入时用它逐个配对——把同一条字幕挂到每一集比不挂更糟。单个视频
+/// 的历史行为（直接取第一条字幕）由调用方保留，不走这里。
+String? subtitleForVideoByStem(String videoPath, List<String> subtitles) {
+  final String stem = p.basenameWithoutExtension(videoPath).toLowerCase();
+  for (final String subtitle in subtitles) {
+    if (p.basenameWithoutExtension(subtitle).toLowerCase() == stem) {
+      return subtitle;
+    }
+  }
+  return null;
+}

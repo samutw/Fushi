@@ -1,0 +1,59 @@
+# 行尾策略：仓库内统一存 LF，工作树 checkout 也用 LF（消除 Windows autocrlf 的 CRLF 噪声）
+* text=auto eol=lf
+
+# Windows 专用脚本必须保留 CRLF，否则部分 shell/批处理会异常
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 补丁里的空上下文行就是「一个空格」，那是 unified diff 的行首标记，不是可清理
+# 的行尾空白。剥掉它补丁就打不上（BUG-1428）。关掉 whitespace 检查，免得
+# `git diff --check` 每次都报一片假阳、并诱使后人真去「修」它。
+*.patch -whitespace
+*.diff  -whitespace
+
+# 上游 flutter_inappwebview_linux 源码原样 vendored（含大量行尾空白）。保持与上游
+# 逐字节一致才能在升级时直接 diff 出本仓改动（见该目录 UPSTREAM.md），不做清理。
+packages/flutter_inappwebview_linux/** -whitespace
+
+# 二进制文件不做行尾转换
+*.bmp   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.webp  binary
+*.ico   binary
+*.icns  binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.so    binary
+*.dll   binary
+*.dylib binary
+*.a     binary
+*.lib   binary
+*.jar   binary
+*.keystore binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.mp3   binary
+*.wav   binary
+*.m4a   binary
+*.mp4   binary
+*.pdf   binary
+
+# TMDB 官方 logo 矢量原图：合约署名素材，必须与 themoviedb.org 下发文件逐字节相同
+# （守卫 fushi/test/settings/tmdb_attribution_test.dart 按 sha256 校验）。虽然它是
+# 文本(SVG)，但绝不能参与行尾/文本规范化——任何一字节变动都会让哈希证据链断掉。
+fushi/assets/attribution/tmdb/blue_square_1.svg binary
+
+# i18n json 按 key 三方合并（fushi/tool/i18n_merge_driver.dart；驱动命令由
+# tool/setup_worktree.ps1 写进 git config）。只对本地合并生效，GitHub 网页合并不认。
+fushi/lib/i18n/*.i18n.json merge=fushi-i18n-json
+
+# docs/BUGS.md 是生成的索引表：两边各加一行时按行并集合并、永不冲突；
+# 行序 / 去重交给 `tool/bug.dart settle`（或 reindex）重建。
+docs/BUGS.md merge=union

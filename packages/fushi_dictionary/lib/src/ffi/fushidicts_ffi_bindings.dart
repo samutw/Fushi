@@ -1,0 +1,353 @@
+import 'dart:ffi';
+import 'dart:io';
+
+import 'package:ffi/ffi.dart';
+
+DynamicLibrary _openNativeLib() {
+  // 宿主显式给了绝对路径（无头服务端按 bundle 布局 `bin/../lib/` 定位）就只认它：
+  // 找错库时宁可在这里抛出，也不悄悄退回裸名加载一份别处的旧库。
+  final String? override = FushidictsFfiBindings.libraryPathOverride;
+  if (override != null && override.isNotEmpty) {
+    return DynamicLibrary.open(override);
+  }
+  if (Platform.isAndroid) return DynamicLibrary.open('libfushidicts_ffi.so');
+  if (Platform.isWindows) return DynamicLibrary.open('fushidicts_ffi.dll');
+  if (Platform.isMacOS) return DynamicLibrary.open('libfushidicts_ffi.dylib');
+  if (Platform.isLinux) return _openLinuxBundled('libfushidicts_ffi.so');
+  if (Platform.isIOS) return DynamicLibrary.process();
+  throw UnsupportedError(
+      'fushidicts: unsupported platform ${Platform.operatingSystem}');
+}
+
+/// Linux bundle 把随包 .so 装在 `<exe 目录>/lib/`。runner 的 RUNPATH
+/// (`$ORIGIN/lib`) 只作用于 exe 自己的直接依赖，**不**作用于 Dart VM（在
+/// libflutter_linux_gtk.so 里）发起的 `dlopen`，所以裸名加载找不到它——
+/// pdfium_dart 在 Linux 上同样按这个绝对路径加载。exe 旁没有（flutter test /
+/// 纯 Dart 宿主）时退回裸名，交给 LD_LIBRARY_PATH / 系统路径。
+DynamicLibrary _openLinuxBundled(String name) {
+  final String bundled =
+      '${File(Platform.resolvedExecutable).parent.path}/lib/$name';
+  if (File(bundled).existsSync()) return DynamicLibrary.open(bundled);
+  return DynamicLibrary.open(name);
+}
+
+// ── C struct mirrors ────────────────────────────────────────────────
+
+final class FfiGlossary extends Struct {
+  external Pointer<Utf8> dictName;
+  external Pointer<Utf8> glossary;
+  external Pointer<Utf8> definitionTags;
+  external Pointer<Utf8> termTags;
+}
+
+final class FfiFrequency extends Struct {
+  external Pointer<Utf8> dictName;
+  external Pointer<Int32> values;
+  external Pointer<Pointer<Utf8>> displayValues;
+  @Int32()
+  external int count;
+}
+
+final class FfiPitch extends Struct {
+  external Pointer<Utf8> dictName;
+  external Pointer<Int32> positions;
+  @Int32()
+  external int count;
+  external Pointer<Pointer<Utf8>> transcriptions;
+  @Int32()
+  external int transcriptionCount;
+  // 79c55c2 二期：pattern 式 accent（"heiban" 等字符串位）；与 native FfiPitch
+  // 字段顺序严格镜像。
+  external Pointer<Pointer<Utf8>> patterns;
+  @Int32()
+  external int patternCount;
+}
+
+final class FfiTermResult extends Struct {
+  external Pointer<Utf8> expression;
+  external Pointer<Utf8> reading;
+  external Pointer<Utf8> rules;
+  external Pointer<FfiGlossary> glossaries;
+  @Int32()
+  external int glossaryCount;
+  external Pointer<FfiFrequency> frequencies;
+  @Int32()
+  external int frequencyCount;
+  external Pointer<FfiPitch> pitches;
+  @Int32()
+  external int pitchCount;
+}
+
+final class FfiQueryResult extends Struct {
+  external Pointer<FfiTermResult> terms;
+  @Int32()
+  external int count;
+}
+
+final class FfiTransformGroup extends Struct {
+  external Pointer<Utf8> name;
+  external Pointer<Utf8> description;
+}
+
+final class FfiLookupResult extends Struct {
+  external Pointer<Utf8> matched;
+  external Pointer<Utf8> deinflected;
+  external Pointer<FfiTransformGroup> trace;
+  @Int32()
+  external int traceCount;
+  external FfiTermResult term;
+  @Int32()
+  external int preprocessorSteps;
+}
+
+final class FfiLookupResults extends Struct {
+  external Pointer<FfiLookupResult> results;
+  @Int32()
+  external int count;
+}
+
+final class FfiImportResult extends Struct {
+  @Int32()
+  external int success;
+  external Pointer<Utf8> title;
+  @Int32()
+  external int termCount;
+  @Int32()
+  external int metaCount;
+  @Int32()
+  external int freqCount;
+  @Int32()
+  external int pitchCount;
+  @Int32()
+  external int mediaCount;
+  @Int32()
+  external int kanjiCount;
+  external Pointer<Utf8> detectedType;
+  external Pointer<Utf8> error;
+}
+
+final class FfiDictStyle extends Struct {
+  external Pointer<Utf8> dictName;
+  external Pointer<Utf8> styles;
+}
+
+final class FfiDictStyles extends Struct {
+  external Pointer<FfiDictStyle> items;
+  @Int32()
+  external int count;
+}
+
+final class FfiMediaFile extends Struct {
+  external Pointer<Uint8> data;
+  @Int32()
+  external int size;
+}
+
+final class FfiKanjiResult extends Struct {
+  external Pointer<Utf8> character;
+  external Pointer<Utf8> onyomi;
+  external Pointer<Utf8> kunyomi;
+  external Pointer<Utf8> radical;
+  @Int32()
+  external int strokes;
+  external Pointer<Pointer<Utf8>> meanings;
+  @Int32()
+  external int meaningCount;
+  // v2 词典的完整 stats 键值对（JLPT/grade 等）；与 native FfiKanjiResult 字段
+  // 顺序严格镜像（stat_keys/stat_values 平行数组，长度 statCount）。
+  external Pointer<Pointer<Utf8>> statKeys;
+  external Pointer<Pointer<Utf8>> statValues;
+  @Int32()
+  external int statCount;
+  external Pointer<Utf8> dictName;
+}
+
+final class FfiKanjiResults extends Struct {
+  external Pointer<FfiKanjiResult> results;
+  @Int32()
+  external int count;
+}
+
+// ── native function typedefs ────────────────────────────────────────
+
+typedef _ImportDart = FfiImportResult Function(Pointer<Utf8> zipPath,
+    Pointer<Utf8> outputDir, Pointer<Utf8> breadcrumbDir);
+
+typedef _ProbeDictContentNative = Int32 Function(Pointer<Utf8> dir);
+typedef _ProbeDictContentDart = int Function(Pointer<Utf8> dir);
+
+typedef _FreeImportResultDart = void Function(Pointer<FfiImportResult> r);
+
+typedef _CreateDart = Pointer<Void> Function();
+
+typedef _DestroyDart = void Function(Pointer<Void> handle);
+
+typedef _AddDictNative = Void Function(
+    Pointer<Void> handle, Pointer<Utf8> path);
+typedef _AddDictDart = void Function(Pointer<Void> handle, Pointer<Utf8> path);
+
+typedef _LoadTransformsDart = void Function(
+    Pointer<Void> handle, Pointer<Utf8> json);
+
+typedef _QueryDart = FfiQueryResult Function(
+    Pointer<Void> handle, Pointer<Utf8> expression);
+
+typedef _FreeQueryResultDart = void Function(Pointer<FfiQueryResult> r);
+
+typedef _LookupDart = FfiLookupResults Function(
+    Pointer<Void> handle, Pointer<Utf8> text, int maxResults, int scanLength);
+
+typedef _LookupWithOptionsDart = FfiLookupResults Function(
+    Pointer<Void> handle,
+    Pointer<Utf8> text,
+    int maxResults,
+    int scanLength,
+    Pointer<Utf8> freqDict,
+    int freqOrder,
+    Pointer<Utf8> primaryReading);
+
+typedef _FreeLookupResultsDart = void Function(Pointer<FfiLookupResults> r);
+
+typedef _GetStylesDart = FfiDictStyles Function(Pointer<Void> handle);
+
+typedef _FreeStylesDart = void Function(Pointer<FfiDictStyles> r);
+
+typedef _GetMediaDart = FfiMediaFile Function(
+    Pointer<Void> handle, Pointer<Utf8> dictName, Pointer<Utf8> mediaPath);
+
+typedef _FreeMediaDart = void Function(Pointer<FfiMediaFile> r);
+
+typedef _QueryKanjiDart = FfiKanjiResults Function(
+    Pointer<Void> handle, Pointer<Utf8> character);
+
+typedef _FreeKanjiResultsDart = void Function(Pointer<FfiKanjiResults> r);
+
+typedef _LookupPopupJsonDart = Pointer<Utf8> Function(Pointer<Void> handle,
+    Pointer<Utf8> text, int maxResults, int scanLength, int maxTerms);
+
+typedef _FreeStringDart = void Function(Pointer<Utf8> s);
+
+// ── bindings class ──────────────────────────────────────────────────
+
+class FushidictsFfiBindings {
+  /// 原生库的绝对路径覆盖（null = 各平台默认的裸名 / exe 旁 `lib/` 搜索）。
+  ///
+  /// isolate 局部：后台 isolate（`FushiDicts.importDictionary`）由调用方带过去。
+  /// 必须在首次创建绑定（首个 `FushiDicts` 实例 / 导入 / 探测）之前设好——绑定
+  /// 一旦创建就缓存，之后改它不会换库。
+  static String? libraryPathOverride;
+
+  FushidictsFfiBindings() {
+    _lib = _openNativeLib();
+
+    import_ = _lib.lookupFunction<
+        FfiImportResult Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>),
+        _ImportDart>('fushidicts_import');
+    probeDictContent =
+        _lib.lookupFunction<_ProbeDictContentNative, _ProbeDictContentDart>(
+            'fushidicts_probe_dict_content');
+    freeImportResult = _lib.lookupFunction<
+        Void Function(Pointer<FfiImportResult>),
+        _FreeImportResultDart>('fushidicts_free_import_result');
+    create = _lib.lookupFunction<Pointer<Void> Function(), _CreateDart>(
+        'fushidicts_create');
+    destroy = _lib.lookupFunction<Void Function(Pointer<Void>), _DestroyDart>(
+        'fushidicts_destroy');
+    addTermDict = _lib.lookupFunction<_AddDictNative, _AddDictDart>(
+        'fushidicts_add_term_dict');
+    addFreqDict = _lib.lookupFunction<_AddDictNative, _AddDictDart>(
+        'fushidicts_add_freq_dict');
+    addPitchDict = _lib.lookupFunction<_AddDictNative, _AddDictDart>(
+        'fushidicts_add_pitch_dict');
+    addKanjiDict = _lib.lookupFunction<_AddDictNative, _AddDictDart>(
+        'fushidicts_add_kanji_dict');
+    loadTransforms = _lib.lookupFunction<
+        Void Function(Pointer<Void>, Pointer<Utf8>),
+        _LoadTransformsDart>('fushidicts_load_transforms');
+    query = _lib.lookupFunction<
+        FfiQueryResult Function(Pointer<Void>, Pointer<Utf8>),
+        _QueryDart>('fushidicts_query');
+    freeQueryResult = _lib.lookupFunction<
+        Void Function(Pointer<FfiQueryResult>),
+        _FreeQueryResultDart>('fushidicts_free_query_result');
+    lookup = _lib.lookupFunction<
+        FfiLookupResults Function(Pointer<Void>, Pointer<Utf8>, Int32, Int32),
+        _LookupDart>('fushidicts_lookup');
+    lookupWithOptions = _lib.lookupFunction<
+        FfiLookupResults Function(Pointer<Void>, Pointer<Utf8>, Int32, Int32,
+            Pointer<Utf8>, Int32, Pointer<Utf8>),
+        _LookupWithOptionsDart>('fushidicts_lookup_with_options');
+    freeLookupResults = _lib.lookupFunction<
+        Void Function(Pointer<FfiLookupResults>),
+        _FreeLookupResultsDart>('fushidicts_free_lookup_results');
+    getStyles = _lib.lookupFunction<FfiDictStyles Function(Pointer<Void>),
+        _GetStylesDart>('fushidicts_get_styles');
+    freeStyles = _lib.lookupFunction<Void Function(Pointer<FfiDictStyles>),
+        _FreeStylesDart>('fushidicts_free_styles');
+    getMedia = _lib.lookupFunction<
+        FfiMediaFile Function(Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>),
+        _GetMediaDart>('fushidicts_get_media');
+    freeMedia = _lib.lookupFunction<Void Function(Pointer<FfiMediaFile>),
+        _FreeMediaDart>('fushidicts_free_media');
+    queryKanji = _lib.lookupFunction<
+        FfiKanjiResults Function(Pointer<Void>, Pointer<Utf8>),
+        _QueryKanjiDart>('fushidicts_query_kanji');
+    freeKanjiResults = _lib.lookupFunction<
+        Void Function(Pointer<FfiKanjiResults>),
+        _FreeKanjiResultsDart>('fushidicts_free_kanji_results');
+    lookupPopupJson = _lib.lookupFunction<
+        Pointer<Utf8> Function(
+            Pointer<Void>, Pointer<Utf8>, Int32, Int32, Int32),
+        _LookupPopupJsonDart>('fushidicts_lookup_popup_json');
+    freeString =
+        _lib.lookupFunction<Void Function(Pointer<Utf8>), _FreeStringDart>(
+            'fushidicts_free_string');
+  }
+  late final DynamicLibrary _lib;
+
+  late final _ImportDart import_;
+  late final _ProbeDictContentDart probeDictContent;
+  late final _FreeImportResultDart freeImportResult;
+  late final _CreateDart create;
+  late final _DestroyDart destroy;
+  late final _AddDictDart addTermDict;
+  late final _AddDictDart addFreqDict;
+  late final _AddDictDart addPitchDict;
+  late final _AddDictDart addKanjiDict;
+  late final _LoadTransformsDart loadTransforms;
+  late final _QueryDart query;
+  late final _FreeQueryResultDart freeQueryResult;
+  late final _LookupDart lookup;
+  late final _LookupWithOptionsDart lookupWithOptions;
+  late final _FreeLookupResultsDart freeLookupResults;
+  late final _GetStylesDart getStyles;
+  late final _FreeStylesDart freeStyles;
+  late final _GetMediaDart getMedia;
+  late final _FreeMediaDart freeMedia;
+  late final _QueryKanjiDart queryKanji;
+  late final _FreeKanjiResultsDart freeKanjiResults;
+  late final _LookupPopupJsonDart lookupPopupJson;
+  late final _FreeStringDart freeString;
+}
+
+// ── zstd 文件解压（按需解析） ───────────────────────────────────────
+
+typedef _ZstdDecompressFileNative = Int32 Function(
+    Pointer<Utf8> inPath, Pointer<Utf8> outPath);
+typedef ZstdDecompressFileDart = int Function(
+    Pointer<Utf8> inPath, Pointer<Utf8> outPath);
+
+/// `fushidicts_zstd_decompress_file` 的绑定，**用到时才解析**。
+///
+/// 不放进 [FushidictsFfiBindings] 的构造函数：那里是急切查找，某个平台上随包
+/// 的原生库若还是没有这个导出的旧版本，整套查词绑定会在构造时一起抛。单独解析
+/// 让缺符号只影响这一个功能（返回 null，调用方报「本平台不支持」）。
+ZstdDecompressFileDart? lookupZstdDecompressFile() {
+  try {
+    return _openNativeLib()
+        .lookupFunction<_ZstdDecompressFileNative, ZstdDecompressFileDart>(
+            'fushidicts_zstd_decompress_file');
+  } on ArgumentError {
+    return null;
+  }
+}

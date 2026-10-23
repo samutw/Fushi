@@ -1,0 +1,151 @@
+package app.fushi.reader.mihon
+
+import org.json.JSONObject
+import okhttp3.Authenticator
+import okhttp3.Credentials
+import okhttp3.ConnectionPool
+import okhttp3.OkHttpClient
+import okhttp3.Route
+import okhttp3.internal.connection.RealConnection
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.ProtocolException
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.SocketAddress
+import java.net.URI
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
+
+/** The host owns proxy modes, local bypass and credentials; never duplicate them here. */
+object HostProxyPolicy : ProxySelector() {
+    private data class CredentialScope(val host: String, val port: Int)
+    private data class Endpoint(val port: Int, val token: String) {
+        override fun toString() = "Host proxy endpoint"
+    }
+    @Volatile private var endpoint: Endpoint? = null
+
+    fun configure(port: Int, token: String) {
+        require(port in 1..65535 && token.length >= 32) { "Invalid host proxy policy endpoint" }
+        endpoint = Endpoint(port, token)
+    }
+
+    data class Policy(val directive: String, val username: String = "", val password: String = "") {
+        // Do not let diagnostic interpolation disclose credentials.
+        override fun toString() = "Host proxy policy"
+    }
+
+    private fun lookup(uri: URI): Policy {
+        val configured = endpoint ?: throw IOException("Host proxy policy is not configured")
+        val port = configured.port
+        val token = configured.token
+        val query = URLEncoder.encode(uri.toString(), "UTF-8")
+        val connection = URI("http://127.0.0.1:$port/proxy-policy?url=$query").toURL()
+            .openConnection(Proxy.NO_PROXY) as HttpURLConnection
+        try {
+            connection.connectTimeout = 3000
+            connection.readTimeout = 3000
+            connection.setRequestProperty("Authorization", "Bearer $token")
+            if (connection.responseCode != 200) throw IOException("Host proxy policy is unavailable")
+            val json = connection.inputStream.bufferedReader().use { JSONObject(it.readText()) }
+            return Policy(json.getString("directive"), json.optString("username"), json.optString("password"))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    internal fun proxies(directive: String): List<Proxy> = directive.split(';').map { raw ->
+        val part = raw.trim()
+        when {
+            part.equals("DIRECT", ignoreCase = true) -> Proxy.NO_PROXY
+            part.startsWith("PROXY ", ignoreCase = true) -> {
+                val endpoint = URI("http://${part.substring(6).trim()}")
+                require(!endpoint.host.isNullOrBlank() && endpoint.port in 1..65535 && endpoint.rawUserInfo == null)
+                Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(endpoint.host, endpoint.port))
+            }
+            else -> throw IOException("Unsupported host proxy directive")
+        }
+    }
+
+    override fun select(uri: URI): List<Proxy> = proxies(lookup(uri).directive)
+
+    override fun connectFailed(uri: URI, sa: SocketAddress, ioe: IOException) = Unit
+
+    fun configureClient(builder: OkHttpClient.Builder, selector: ProxySelector = this): OkHttpClient.Builder = builder
+        .connectionPool(ConnectionPool(0, 1, TimeUnit.NANOSECONDS))
+        .proxySelector(selector)
+        .proxyAuthenticator(authenticator)
+        .addNetworkInterceptor { chain ->
+            val request = chain.request()
+            val route = chain.connection()?.route()
+            // HTTP/2 stays negotiable: Cloudflare WAF rules on some sources (Miruro's
+            // /api/secure/pipe) block every HTTP/1.1 request outright. The price is that
+            // a live HTTP/2 connection takes new streams without asking the selector, so
+            // the route is re-checked here, per exchange, instead of per connection.
+            if (route != null && !routeAllowedByCurrentPolicy(route, request.url.toUri())) {
+                (chain.connection() as? RealConnection)?.noNewExchanges()
+                throw StaleProxyRouteException()
+            }
+            // A redirect can retain the authenticator's header while changing
+            // to a DIRECT route. Never deliver proxy credentials to the origin.
+            val proxy = route?.proxy
+            val address = proxy?.address() as? InetSocketAddress
+            val scope = request.tag(CredentialScope::class.java)
+            val credentialRouteMatches = proxy?.type() == Proxy.Type.HTTP && address != null && scope != null &&
+                scope.host.equals(address.hostString, ignoreCase = true) && scope.port == address.port
+            val outbound = if (!credentialRouteMatches) {
+                request.newBuilder().removeHeader("Proxy-Authorization").build()
+            } else request
+            chain.proceed(outbound)
+        }
+
+    /**
+     * Whether [route] is still one its client's own selector picks for [uri] right now.
+     *
+     * A client pinned to an explicit proxy is not policy-managed. A selector that fails, or
+     * answers with a different route, means the connection was opened under a policy the
+     * host no longer holds: the exchange must not ride it (that would leak past a proxy the
+     * user just enabled, or keep using one they just removed).
+     */
+    internal fun routeAllowedByCurrentPolicy(route: Route, uri: URI): Boolean {
+        if (route.address.proxy != null) return true
+        val allowed = runCatching { route.address.proxySelector.select(uri) }.getOrNull() ?: return false
+        // OkHttp routes an empty answer DIRECT; compare against what it would have used.
+        return allowed.ifEmpty { listOf(Proxy.NO_PROXY) }.any { sameRoute(it, route.proxy) }
+    }
+
+    private fun sameRoute(a: Proxy, b: Proxy): Boolean {
+        if (a.type() != b.type()) return false
+        if (a.type() == Proxy.Type.DIRECT) return true
+        val x = a.address() as? InetSocketAddress ?: return false
+        val y = b.address() as? InetSocketAddress ?: return false
+        return x.hostString.equals(y.hostString, ignoreCase = true) && x.port == y.port
+    }
+
+    /**
+     * A [ProtocolException] on purpose: OkHttp treats it as unrecoverable. Any other
+     * IOException sends the call into its route retry, which reconnects over the very route
+     * this check just rejected.
+     */
+    internal class StaleProxyRouteException : ProtocolException("Proxy policy changed since this connection was routed")
+
+    val authenticator = authenticatorFor(::lookup)
+
+    internal fun authenticatorFor(policyLookup: (URI) -> Policy) = Authenticator { route, response ->
+        if (route == null || response.code != 407 || response.request.header("Proxy-Authorization") != null ||
+            response.challenges().none { it.scheme.equals("Basic", ignoreCase = true) || it.scheme == "OkHttp-Preemptive" }) {
+            null
+        } else {
+            val policy = policyLookup(response.request.url.toUri())
+            val address = route.proxy.address() as? InetSocketAddress
+            val matches = address != null && proxies(policy.directive).any { candidate ->
+                val expected = candidate.address() as? InetSocketAddress
+                expected != null && expected.hostString.equals(address.hostString, ignoreCase = true) && expected.port == address.port
+            }
+            if (!matches || policy.username.isEmpty()) null else response.request.newBuilder()
+                .tag(CredentialScope::class.java, CredentialScope(address!!.hostString, address.port))
+                .header("Proxy-Authorization", Credentials.basic(policy.username, policy.password)).build()
+        }
+    }
+}

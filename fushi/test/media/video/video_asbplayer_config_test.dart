@@ -1,0 +1,237 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/media/video/video_asbplayer_config.dart';
+import 'package:fushi/src/media/video/video_horizontal_seek_gesture.dart';
+
+void main() {
+  test('defaults mirror asbplayer playback preferences', () {
+    expect(VideoAsbplayerConfig.defaults.seekSeconds, 3);
+    expect(VideoAsbplayerConfig.defaults.speedStep, 0.1);
+    expect(VideoAsbplayerConfig.defaults.longPressSpeed, 2.0);
+    // TODO-173/BUG-231: 双击行为默认 0=关（向后兼容，双击仍走暂停/全屏，不分区）。
+    expect(VideoAsbplayerConfig.defaults.doubleTapSeekSeconds, 0);
+    // BUG-1485: 横滑 seek 默认中档（拖过整屏 ≈ 90 秒），比旧的比例制钝一个数量级。
+    expect(
+      VideoAsbplayerConfig.defaults.dragSeekSensitivity,
+      VideoSeekSensitivity.medium,
+    );
+    // 「点击画面播放/暂停」默认开 = 保持既有行为（桌面单击 / 移动端双击中带）。
+    expect(VideoAsbplayerConfig.defaults.tapTogglesPlayback, isTrue);
+    // issue #1525: 竖滑调亮度 / 音量默认开 = 保持既有手势行为。
+    expect(VideoAsbplayerConfig.defaults.brightnessSwipeGesture, isTrue);
+    expect(VideoAsbplayerConfig.defaults.volumeSwipeGesture, isTrue);
+  });
+
+  test('issue #1525: 竖滑手势开关旧档/脏值回落 true，关态两侧独立往返', () {
+    // 升级前写下的配置没有这两个键——不得把既有竖滑手势悄悄关掉。
+    final VideoAsbplayerConfig legacy = VideoAsbplayerConfig.decode(
+      '{"seekSeconds":5,"speedStep":0.2,"pauseAtSubtitleEnd":false}',
+    );
+    expect(legacy.brightnessSwipeGesture, isTrue);
+    expect(legacy.volumeSwipeGesture, isTrue);
+    final VideoAsbplayerConfig dirty = VideoAsbplayerConfig.decode(
+      '{"brightnessSwipeGesture":0,"volumeSwipeGesture":"off"}',
+    );
+    expect(dirty.brightnessSwipeGesture, isTrue);
+    expect(dirty.volumeSwipeGesture, isTrue);
+
+    // 只关亮度：音量不受牵连（两侧是独立开关）。
+    final VideoAsbplayerConfig brightnessOff = VideoAsbplayerConfig.decode(
+      VideoAsbplayerConfig.encode(
+        VideoAsbplayerConfig.defaults.copyWith(brightnessSwipeGesture: false),
+      ),
+    );
+    expect(brightnessOff.brightnessSwipeGesture, isFalse);
+    expect(brightnessOff.volumeSwipeGesture, isTrue);
+    // 只关音量：亮度不受牵连。
+    final VideoAsbplayerConfig volumeOff = VideoAsbplayerConfig.decode(
+      VideoAsbplayerConfig.encode(
+        VideoAsbplayerConfig.defaults.copyWith(volumeSwipeGesture: false),
+      ),
+    );
+    expect(volumeOff.brightnessSwipeGesture, isTrue);
+    expect(volumeOff.volumeSwipeGesture, isFalse);
+  });
+
+  test('旧档（无 tapTogglesPlayback 键）与脏值都回落 true（既有行为不变）', () {
+    // 升级前写下的配置里没有这个键——不得抛、不得把点击暂停悄悄关掉。
+    expect(
+      VideoAsbplayerConfig.decode(
+        '{"seekSeconds":5,"speedStep":0.2,"pauseAtSubtitleEnd":false}',
+      ).tapTogglesPlayback,
+      isTrue,
+    );
+    // 脏值（类型不对）同样回落，不进手势分流逻辑。
+    expect(
+      VideoAsbplayerConfig.decode('{"tapTogglesPlayback":"no"}')
+          .tapTogglesPlayback,
+      isTrue,
+    );
+    // 关态必须真的写进 JSON（否则重开播放页又变回开）。
+    expect(
+      VideoAsbplayerConfig.encode(
+        VideoAsbplayerConfig.defaults.copyWith(tapTogglesPlayback: false),
+      ),
+      contains('"tapTogglesPlayback":false'),
+    );
+    expect(
+      VideoAsbplayerConfig.decode(
+        VideoAsbplayerConfig.encode(
+          VideoAsbplayerConfig.defaults.copyWith(tapTogglesPlayback: false),
+        ),
+      ).tapTogglesPlayback,
+      isFalse,
+    );
+  });
+
+  test('BUG-3310: 旧档关了鼠标单击暂停（常经同步自电脑），双击暂停仍为开', () {
+    // 反馈 #lGxHvuULXI：电脑上关掉「点击画面播放/暂停」后整份配置同步到 iPhone，
+    // 手机双击中带就静默不再暂停。新字段不得从 tapTogglesPlayback 继承。
+    final VideoAsbplayerConfig synced =
+        VideoAsbplayerConfig.decode('{"tapTogglesPlayback":false}');
+    expect(synced.tapTogglesPlayback, isFalse);
+    expect(synced.doubleTapTogglesPlayback, isTrue);
+    expect(VideoAsbplayerConfig.defaults.doubleTapTogglesPlayback, isTrue);
+    expect(
+      VideoAsbplayerConfig.decode('{"doubleTapTogglesPlayback":"no"}')
+          .doubleTapTogglesPlayback,
+      isTrue,
+    );
+  });
+
+  test('encode/decode round trips user playback preferences', () {
+    const VideoAsbplayerConfig config = VideoAsbplayerConfig(
+      seekSeconds: 5,
+      speedStep: 0.2,
+      doubleTapSeekSeconds: 10,
+      longPressSpeed: 2.5,
+      dragSeekSensitivity: VideoSeekSensitivity.low,
+      tapTogglesPlayback: false,
+      doubleTapTogglesPlayback: false,
+      brightnessSwipeGesture: false,
+      volumeSwipeGesture: false,
+    );
+
+    final VideoAsbplayerConfig decoded =
+        VideoAsbplayerConfig.decode(VideoAsbplayerConfig.encode(config));
+
+    expect(decoded.seekSeconds, 5);
+    expect(decoded.speedStep, 0.2);
+    expect(decoded.doubleTapSeekSeconds, 10);
+    expect(decoded.longPressSpeed, 2.5);
+    expect(decoded.dragSeekSensitivity, VideoSeekSensitivity.low);
+    expect(decoded.tapTogglesPlayback, isFalse);
+    expect(decoded.doubleTapTogglesPlayback, isFalse);
+    expect(decoded.brightnessSwipeGesture, isFalse);
+    expect(decoded.volumeSwipeGesture, isFalse);
+  });
+
+  test('已删除的「字幕暂停播放模式」：旧档里的键被忽略，encode 不再写出', () {
+    final VideoAsbplayerConfig legacy = VideoAsbplayerConfig.decode(
+      '{"seekSeconds":5,"pauseAtSubtitleEnd":true}',
+    );
+    expect(legacy.seekSeconds, 5, reason: '旧键不得让整份配置回落默认');
+    expect(
+      VideoAsbplayerConfig.encode(legacy),
+      isNot(contains('pauseAtSubtitleEnd')),
+    );
+  });
+
+  test('BUG-1485: 旧档（无 dragSeekSensitivity 键）与脏值都回落默认档', () {
+    // 升级前写下的配置里没有这个键——不得抛、不得变成别的档。
+    expect(
+      VideoAsbplayerConfig.decode(
+        '{"seekSeconds":5,"speedStep":0.2,"pauseAtSubtitleEnd":false}',
+      ).dragSeekSensitivity,
+      VideoSeekSensitivity.medium,
+    );
+    // 脏值：类型不对（数字，例如误存了枚举 index）/ 不认识的档名。
+    expect(
+      VideoAsbplayerConfig.decode('{"dragSeekSensitivity":2}')
+          .dragSeekSensitivity,
+      VideoSeekSensitivity.medium,
+    );
+    expect(
+      VideoAsbplayerConfig.decode('{"dragSeekSensitivity":"turbo"}')
+          .dragSeekSensitivity,
+      VideoSeekSensitivity.medium,
+    );
+    // 存的是枚举 name 而非 index，改枚举顺序不串档。
+    expect(
+      VideoAsbplayerConfig.encode(
+        VideoAsbplayerConfig.defaults
+            .copyWith(dragSeekSensitivity: VideoSeekSensitivity.high),
+      ),
+      contains('"dragSeekSensitivity":"high"'),
+    );
+  });
+
+  test('decode tolerates empty and clamps unsupported values', () {
+    expect(VideoAsbplayerConfig.decode('').seekSeconds, 3);
+
+    final VideoAsbplayerConfig decoded = VideoAsbplayerConfig.decode(
+      '{"seekSeconds":0,"speedStep":2,"pauseAtSubtitleEnd":true}',
+    );
+
+    expect(decoded.seekSeconds, 1);
+    expect(decoded.speedStep, 0.5);
+    expect(decoded.longPressSpeed, 2.0);
+    // 旧档无 doubleTapSeekSeconds 键 → 回默认 0=关。
+    expect(decoded.doubleTapSeekSeconds, 0);
+  });
+
+  group('doubleTapSeekSeconds (TODO-173/BUG-231)', () {
+    test('copyWith carries the double-tap behavior', () {
+      final VideoAsbplayerConfig next =
+          VideoAsbplayerConfig.defaults.copyWith(doubleTapSeekSeconds: 5);
+      expect(next.doubleTapSeekSeconds, 5);
+      // 其它字段不受影响。
+      expect(next.seekSeconds, VideoAsbplayerConfig.defaults.seekSeconds);
+      expect(next.speedStep, VideoAsbplayerConfig.defaults.speedStep);
+    });
+
+    test('subtitle-jump sentinel round trips', () {
+      final VideoAsbplayerConfig config =
+          VideoAsbplayerConfig.defaults.copyWith(
+        doubleTapSeekSeconds: VideoAsbplayerConfig.kDoubleTapSubtitle,
+      );
+      final VideoAsbplayerConfig decoded =
+          VideoAsbplayerConfig.decode(VideoAsbplayerConfig.encode(config));
+      expect(decoded.doubleTapSeekSeconds,
+          VideoAsbplayerConfig.kDoubleTapSubtitle);
+      expect(VideoAsbplayerConfig.kDoubleTapSubtitle, -1);
+    });
+
+    test('every option value survives encode/decode', () {
+      for (final int v in VideoAsbplayerConfig.doubleTapSeekOptions) {
+        final VideoAsbplayerConfig decoded = VideoAsbplayerConfig.decode(
+          VideoAsbplayerConfig.encode(
+            VideoAsbplayerConfig.defaults.copyWith(doubleTapSeekSeconds: v),
+          ),
+        );
+        expect(decoded.doubleTapSeekSeconds, v, reason: 'option $v 应往返不变');
+      }
+    });
+
+    test('decode rejects out-of-whitelist values back to default', () {
+      // 非白名单值（脏持久化 / 旧档异常值）兜底回默认 0，不进手势分流逻辑。
+      for (final String raw in <String>[
+        '{"doubleTapSeekSeconds":4}',
+        '{"doubleTapSeekSeconds":-5}',
+        '{"doubleTapSeekSeconds":99}',
+        '{"doubleTapSeekSeconds":"5"}',
+      ]) {
+        expect(VideoAsbplayerConfig.decode(raw).doubleTapSeekSeconds, 0,
+            reason: '非法值 $raw 应兜底回 0=关');
+      }
+    });
+
+    test('option whitelist is the expected discrete set', () {
+      expect(
+        VideoAsbplayerConfig.doubleTapSeekOptions,
+        containsAll(
+            <int>[VideoAsbplayerConfig.kDoubleTapSubtitle, 0, 3, 5, 10]),
+      );
+      expect(VideoAsbplayerConfig.doubleTapSeekOptions.length, 5);
+    });
+  });
+}

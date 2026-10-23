@@ -1,0 +1,476 @@
+/// 「跑一卷漫画 OCR」的事件流，与任何 UI 无关。
+///
+/// 这段编排以前住在 `MangaOcrWizardDialog` 的 State 里，于是「想跑 OCR」在结构上
+/// 等价于「先弹一个对话框」。导入向导是这样，阅读器的整卷按钮也是这样——而阅读器
+/// 里「点一下气泡就查词」的按需路径根本不该弹任何东西。把编排搬到这里之后，
+/// 对话框只剩下「选参数」这一件事，跑任务的能力谁都能直接调。
+///
+/// 四个引擎（本地 ONNX / Google Lens / 外部 mokuro CLI / 已配对主机）在这里各占
+/// 一个分支，输出统一成 [MangaOcrBackgroundEvent]：逐页 progress（带该页的
+/// [MokuroImage] 供 UI 热替换文字层）+ 末尾 finished（带 manga.json 路径）。
+library;
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
+import 'package:fushi/src/media/manga/external_mokuro_runner.dart';
+import 'package:fushi/src/media/manga/manga_ocr_background_job.dart';
+import 'package:fushi/src/media/manga/manga_ocr_wizard_engines.dart';
+import 'package:fushi_engine/media/manga/mokuro_payload.dart';
+import 'package:fushi/src/media/manga/ocr/google_lens_ocr_service.dart';
+import 'package:fushi/src/media/manga/ocr/google_lens_protocol.dart';
+import 'package:fushi/src/media/manga/ocr/manga_ai_ocr_stream.dart';
+import 'package:fushi/src/media/manga/ocr/manga_ocr_engine.dart';
+import 'package:fushi/src/media/manga/ocr/system_ocr_manga_service.dart';
+import 'package:fushi_engine/ocr/manga_ai_ocr_refiner.dart';
+import 'package:fushi_engine/ocr/manga_ocr_folder_job.dart';
+import 'package:fushi_engine/ocr/manga_ocr_local_model.dart';
+import 'package:fushi_engine/ocr/manga_ocr_pipeline.dart'
+    show mangaOcrPageOrder;
+import 'package:fushi_engine/ocr/manga_ocr_service.dart';
+import 'package:fushi_engine/ocr/ocr_types.dart';
+import 'package:fushi/src/sync/interconnect_manga_ocr_client.dart';
+import 'package:fushi/utils.dart';
+
+/// 一次 OCR 任务的全部输入。
+///
+/// 刻意做成值对象而不是一串位置参数：四个引擎分支需要的东西不同（Lens 要语言、
+/// 远程要 target、本地一个都不要），散成参数表就会重演「某个入口抄漏一项」那类
+/// 编译期无痕的遗漏（[MangaOcrWizardEngines] 的文档里记着同形的 BUG-1418）。
+class MangaOcrJobSpec {
+  const MangaOcrJobSpec({
+    required this.engine,
+    required this.engines,
+    required this.imageDirPath,
+    required this.lensLanguage,
+    this.startPage = 0,
+    this.onlyMissing = true,
+    this.volumeTitle,
+    this.remoteTarget,
+    this.focus,
+  });
+
+  final MangaOcrEngineId engine;
+
+  /// 四个引擎的 runner 集合（唯一装配点：[MangaOcrWizardEngines.resolve]）。
+  final MangaOcrWizardEngines engines;
+
+  /// 待识别的图片目录（已入库漫画就是它的 extractDir）。
+  final String imageDirPath;
+
+  /// Lens 识别语言；其他引擎忽略。
+  final String lensLanguage;
+
+  /// 从哪一页开始跑。Lens 会绕回开头补齐前面的页，「当前页优先」正是靠它。
+  final int startPage;
+
+  /// 跳过已有结果的页。
+  ///
+  /// false = **重新识别**：本地 / Lens 路径先丢掉本引擎签名下的逐页缓存再跑，
+  /// 「整卷已缓存 → 直接回放」的短路随之失效。作品页「识别本章」对已有结果的章
+  /// 传 false（用户点它就是要重跑，不是要看一遍旧结果）；没结果的章保持 true，
+  /// 中断过的任务还能从缓存续跑。
+  final bool onlyMissing;
+
+  final String? volumeTitle;
+
+  /// 已配对主机目标；`pairedHost` 引擎必填（由 `remoteRunner.probe()` 得到）。
+  final MangaOcrRemoteTarget? remoteTarget;
+
+  /// 读者当前页：运行中跟着读者改道（本地 / Lens / 系统 OCR；远端与外部 CLI
+  /// 不按页序处理，忽略）。阅读器经 `MangaOcrRunningJob.focusPage` 写入。
+  final MangaOcrPageFocus? focus;
+}
+
+/// 重新识别前丢掉某个引擎签名下的逐页缓存目录（不存在则无事）。
+///
+/// 只删本签名的目录：别的引擎 / 别的模型版本的缓存与本次重跑无关，留着。
+Future<void> discardMangaOcrPageCache(Directory cacheDir) async {
+  if (await cacheDir.exists()) {
+    await cacheDir.delete(recursive: true);
+  }
+}
+
+/// 按引擎分发，产出统一的后台事件流。
+Stream<MangaOcrBackgroundEvent> mangaOcrBackgroundEvents(MangaOcrJobSpec spec) {
+  switch (spec.engine) {
+    case MangaOcrEngineId.localOnnx:
+      return mangaOcrLocalEvents(spec);
+    case MangaOcrEngineId.systemOcr:
+      return mangaOcrSystemEvents(spec);
+    case MangaOcrEngineId.googleLens:
+      return mangaOcrLensEvents(spec);
+    case MangaOcrEngineId.externalMokuro:
+      return mangaOcrExternalEvents(spec);
+    case MangaOcrEngineId.pairedHost:
+      return mangaOcrRemoteEvents(spec);
+  }
+}
+
+/// 设置里开了大模型识别时，给这个任务配一个跟随步骤（[MangaAiOcrJobFollower]，
+/// 与引擎无关：框是谁检测的都行）；没开 / 没指派提供商时 null。
+///
+/// 和 [mangaOcrBackgroundEvents] 用同一个 [spec] 构造、一起交给
+/// [MangaOcrBackgroundJob]——由注册表驱动，任务结束（释放名额）后它仍可收尾。
+/// [MangaOcrJobSpec.onlyMissing] 为 false（重新识别）时先清掉本卷大模型缓存。
+MangaOcrJobFollower? mangaOcrJobFollower(MangaOcrJobSpec spec) {
+  final MangaAiOcrRefiner? refiner = spec.engines.aiRefinerFactory?.call();
+  if (refiner == null) return null;
+  return MangaAiOcrJobFollower(
+    imageDirPath: spec.imageDirPath,
+    refiner: refiner,
+    discardCache: !spec.onlyMissing,
+  );
+}
+
+Stream<MangaOcrBackgroundEvent> mangaOcrLocalEvents(
+  MangaOcrJobSpec spec,
+) async* {
+  final String dir = spec.imageDirPath;
+  final List<MangaOcrPageFile> pages = enumerateMangaPages(Directory(dir));
+  // 「整卷已缓存 → 直接产出、跳过 OCR」的探测必须与真实任务用同一个签名，
+  // 否则换模型后会拿旧模型的缓存冒充新结果（BUG-1173）。
+  final MangaOcrService service = spec.engines.service;
+  final String? serviceCachePath = service is MangaOcrPageService
+      ? await (service as MangaOcrPageService).resolvePageCacheDirPath(
+          imageDirPath: dir,
+        )
+      : null;
+  final String engineSignature = serviceCachePath == null
+      ? await resolveInstalledLocalMangaOcrEngineSignature(
+          model: spec.engines.localModel ?? kDefaultMangaOcrLocalModel,
+        )
+      : p.basename(serviceCachePath);
+  final Directory cacheDir = Directory(
+    serviceCachePath ??
+        p.join(
+          dir,
+          kMangaOcrOutDirName,
+          kMangaOcrPagesCacheDirName,
+          engineSignature,
+        ),
+  );
+  if (!spec.onlyMissing) {
+    await discardMangaOcrPageCache(cacheDir);
+    // 用户要的是整卷重新识别：同模型「只缺行几何」的旧版缓存也作废，否则任务会
+    // 拿它们只补几何、文字一个不重认（BUG-2813）。
+    for (final String legacy in relayoutableMangaOcrEngineSignatures(
+      engineSignature,
+    )) {
+      await discardMangaOcrPageCache(
+        Directory(p.join(p.dirname(cacheDir.path), legacy)),
+      );
+    }
+  }
+  final MangaOcrFilePageCache cache = MangaOcrFilePageCache(
+    cacheDir: cacheDir,
+    pageNames: <String>[
+      for (final MangaOcrPageFile page in pages) page.relativeUrl,
+    ],
+    pageFiles: <File>[for (final MangaOcrPageFile page in pages) page.file],
+  );
+  final List<OcrPageResult> cachedResults = <OcrPageResult>[];
+  for (int pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+    final OcrPageResult? cached = await cache.read('manga_ocr', pageIndex);
+    if (cached == null) {
+      cachedResults.clear();
+      break;
+    }
+    cachedResults.add(cached);
+  }
+  if (cachedResults.length == pages.length && pages.isNotEmpty) {
+    final MokuroPayload generated = buildMangaPayloadFromResults(
+      pages,
+      cachedResults,
+    );
+    final MokuroPayload payload = MokuroPayload(
+      images: generated.images,
+      ocr: MangaOcrMetadata(
+        engine: 'local_onnx',
+        engineSignature: engineSignature,
+        schemaVersion: 1,
+      ),
+    );
+    final String output = await writeMangaOcrCachedOutput(dir, payload);
+    final List<int> order = mangaOcrPageOrder(pages.length, spec.startPage);
+    for (int orderIndex = 0; orderIndex < order.length; orderIndex++) {
+      final int pageIndex = order[orderIndex];
+      yield MangaOcrBackgroundEvent.progress(
+        pagesDone: orderIndex + 1,
+        pagesTotal: pages.length,
+        pageIndex: pageIndex,
+        page: payload.images[pageIndex],
+      );
+    }
+    yield MangaOcrBackgroundEvent.finished(
+      pagesTotal: pages.length,
+      resultPath: output,
+      external: false,
+    );
+    return;
+  }
+  final MangaOcrPageFocus? focus = spec.focus;
+  final Stream<MangaOcrVolumeEvent> events =
+      focus != null && service is MangaOcrFocusableService
+      ? (service as MangaOcrFocusableService).ocrFolder(
+          imageDirPath: dir,
+          volumeTitle: spec.volumeTitle,
+          startPage: spec.startPage,
+          focus: focus,
+        )
+      : service.ocrFolder(
+          imageDirPath: dir,
+          volumeTitle: spec.volumeTitle,
+          startPage: spec.startPage,
+        );
+  await for (final MangaOcrVolumeEvent event in events) {
+    if (event.finished) {
+      yield MangaOcrBackgroundEvent.finished(
+        pagesTotal: event.pagesTotal,
+        resultPath: event.mangaJsonPath!,
+        external: false,
+        acceleration: event.acceleration,
+      );
+      continue;
+    }
+    // 本地引擎从 startPage 旋转处理：完成计数不是页号，页号以事件为准。
+    // 只有不报页号的实现（没按起点重排）才退回「第 N 个完成的就是第 N 页」。
+    final int pageIndex = event.pageIndex ?? event.pagesDone - 1;
+    MokuroImage? page;
+    if (pageIndex >= 0 && pageIndex < pages.length) {
+      final OcrPageResult? result = await cache.read('manga_ocr', pageIndex);
+      if (result != null) {
+        page = buildMangaPayloadFromResults(
+          <MangaOcrPageFile>[pages[pageIndex]],
+          <OcrPageResult>[result],
+        ).images.single;
+      }
+    }
+    yield MangaOcrBackgroundEvent.progress(
+      pagesDone: event.pagesDone,
+      pagesTotal: event.pagesTotal,
+      pageIndex: pageIndex,
+      page: page,
+      acceleration: event.acceleration,
+    );
+  }
+}
+
+Stream<MangaOcrBackgroundEvent> mangaOcrLensEvents(
+  MangaOcrJobSpec spec,
+) async* {
+  final String dir = spec.imageDirPath;
+  final List<MangaOcrPageFile> pages = enumerateMangaPages(Directory(dir));
+  final List<int> order = mangaOcrPageOrder(pages.length, spec.startPage);
+  final Directory lensCacheDir = Directory(
+    p.join(
+      dir,
+      kMangaOcrOutDirName,
+      kMangaOcrPagesCacheDirName,
+      googleLensEngineSignature(spec.lensLanguage),
+    ),
+  );
+  if (!spec.onlyMissing) {
+    await discardMangaOcrPageCache(lensCacheDir);
+  }
+  final GoogleLensPageCache cache = GoogleLensPageCache(lensCacheDir);
+  final List<MokuroImage> cachedPages = <MokuroImage>[];
+  for (int pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+    final MokuroImage? cached = await cache.read(pageIndex, pages[pageIndex]);
+    if (cached == null) {
+      cachedPages.clear();
+      break;
+    }
+    cachedPages.add(cached);
+  }
+  if (cachedPages.length == pages.length && pages.isNotEmpty) {
+    final MokuroPayload payload = MokuroPayload(
+      images: cachedPages,
+      ocr: MangaOcrMetadata(
+        engine: 'google_lens',
+        engineSignature: googleLensEngineSignature(spec.lensLanguage),
+        schemaVersion: 1,
+      ),
+    );
+    final String output = await writeMangaOcrCachedOutput(dir, payload);
+    for (int orderIndex = 0; orderIndex < order.length; orderIndex++) {
+      final int pageIndex = order[orderIndex];
+      yield MangaOcrBackgroundEvent.progress(
+        pagesDone: orderIndex + 1,
+        pagesTotal: pages.length,
+        pageIndex: pageIndex,
+        page: cachedPages[pageIndex],
+      );
+    }
+    yield MangaOcrBackgroundEvent.finished(
+      pagesTotal: pages.length,
+      resultPath: output,
+      external: false,
+    );
+    return;
+  }
+  await for (final MangaOcrVolumeEvent event
+      in spec.engines.lensRunner!.ocrFolder(
+        imageDirPath: dir,
+        volumeTitle: spec.volumeTitle,
+        startPage: spec.startPage,
+        onlyMissing: spec.onlyMissing,
+        language: spec.lensLanguage,
+        focus: spec.focus,
+      )) {
+    if (event.finished) {
+      yield MangaOcrBackgroundEvent.finished(
+        pagesTotal: event.pagesTotal,
+        resultPath: event.mangaJsonPath!,
+        external: false,
+      );
+      continue;
+    }
+    // 执行器如实报页号（跟着读者改道后完成序不再是固定顺序）；不报页号的实现
+    // 才退回「第 N 个完成的就是处理顺序里第 N 页」。
+    final int orderIndex = event.pagesDone - 1;
+    final int? pageIndex =
+        event.pageIndex ??
+        (orderIndex >= 0 && orderIndex < order.length
+            ? order[orderIndex]
+            : null);
+    final MokuroImage? page =
+        pageIndex == null || pageIndex < 0 || pageIndex >= pages.length
+        ? null
+        : await cache.read(pageIndex, pages[pageIndex]);
+    yield MangaOcrBackgroundEvent.progress(
+      pagesDone: event.pagesDone,
+      pagesTotal: event.pagesTotal,
+      pageIndex: pageIndex,
+      page: page,
+    );
+  }
+}
+
+/// 设备自带 OCR。编排与 Lens 同构（当前页优先 + 逐页发布 + per-page 缓存），
+/// 差别只在识别发给谁。
+Stream<MangaOcrBackgroundEvent> mangaOcrSystemEvents(
+  MangaOcrJobSpec spec,
+) async* {
+  final String dir = spec.imageDirPath;
+  final List<MangaOcrPageFile> pages = enumerateMangaPages(Directory(dir));
+  final List<int> order = mangaOcrPageOrder(pages.length, spec.startPage);
+  final GoogleLensPageCache cache = GoogleLensPageCache(
+    Directory(
+      p.join(
+        dir,
+        kMangaOcrOutDirName,
+        kMangaOcrPagesCacheDirName,
+        systemOcrEngineSignature(spec.lensLanguage),
+      ),
+    ),
+  );
+  await for (final MangaOcrVolumeEvent event
+      in spec.engines.systemOcrRunner!.ocrFolder(
+        imageDirPath: dir,
+        volumeTitle: spec.volumeTitle,
+        startPage: spec.startPage,
+        onlyMissing: spec.onlyMissing,
+        language: spec.lensLanguage,
+        focus: spec.focus,
+      )) {
+    if (event.finished) {
+      yield MangaOcrBackgroundEvent.finished(
+        pagesTotal: event.pagesTotal,
+        resultPath: event.mangaJsonPath!,
+        external: false,
+      );
+      continue;
+    }
+    // 执行器如实报页号（跟着读者改道后完成序不再是固定顺序）；不报页号的实现
+    // 才退回「第 N 个完成的就是处理顺序里第 N 页」。
+    final int orderIndex = event.pagesDone - 1;
+    final int? pageIndex =
+        event.pageIndex ??
+        (orderIndex >= 0 && orderIndex < order.length
+            ? order[orderIndex]
+            : null);
+    final MokuroImage? page =
+        pageIndex == null || pageIndex < 0 || pageIndex >= pages.length
+        ? null
+        : await cache.read(pageIndex, pages[pageIndex]);
+    yield MangaOcrBackgroundEvent.progress(
+      pagesDone: event.pagesDone,
+      pagesTotal: event.pagesTotal,
+      pageIndex: pageIndex,
+      page: page,
+    );
+  }
+}
+
+Stream<MangaOcrBackgroundEvent> mangaOcrExternalEvents(
+  MangaOcrJobSpec spec,
+) async* {
+  await for (final MokuroRunEvent event in spec.engines.externalRunner!.run(
+    spec.imageDirPath,
+  )) {
+    if (event.finished) {
+      yield MangaOcrBackgroundEvent.finished(
+        pagesTotal: event.total,
+        resultPath: event.mokuroPath!,
+        external: true,
+      );
+    } else {
+      yield MangaOcrBackgroundEvent.progress(
+        pagesDone: event.done,
+        pagesTotal: event.total,
+      );
+    }
+  }
+}
+
+Stream<MangaOcrBackgroundEvent> mangaOcrRemoteEvents(
+  MangaOcrJobSpec spec,
+) async* {
+  final MangaOcrRemoteTarget? target = spec.remoteTarget;
+  if (target == null) {
+    throw StateError(t.manga_remote_ocr_no_host);
+  }
+  await for (final MangaOcrRemoteEvent event in spec.engines.remoteRunner!.run(
+    target: target,
+    imageDirPath: spec.imageDirPath,
+    volumeTitle: spec.volumeTitle,
+  )) {
+    if (event.finished) {
+      yield MangaOcrBackgroundEvent.finished(
+        pagesTotal: event.total,
+        resultPath: event.mangaJsonPath!,
+        external: false,
+      );
+    } else {
+      yield MangaOcrBackgroundEvent.progress(
+        pagesDone: event.done,
+        pagesTotal: event.total,
+      );
+    }
+  }
+}
+
+/// 把「整卷已缓存」这条快路径的结果落成 manga.json（原子写）。
+Future<String> writeMangaOcrCachedOutput(
+  String dir,
+  MokuroPayload payload,
+) async {
+  final File output = File(
+    p.join(dir, kMangaOcrOutDirName, kMangaOcrOutputFileName),
+  );
+  await output.parent.create(recursive: true);
+  final File temporary = File('${output.path}.tmp');
+  await temporary.writeAsString(
+    jsonEncode(mangaPayloadToJson(payload)),
+    flush: true,
+  );
+  if (output.existsSync()) {
+    await output.delete();
+  }
+  await temporary.rename(output.path);
+  return output.path;
+}

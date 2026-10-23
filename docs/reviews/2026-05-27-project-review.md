@@ -1,0 +1,264 @@
+# 2026-05-27 Project Review
+
+## Round 1 - Seal-style MD3 ordinary chrome repair
+
+### Scope
+
+- Reference target:
+  - Seal phone screenshots 1-9 from `JunkFood02/Seal` fastlane metadata.
+- Runtime/shared component files:
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+- Repaired page families:
+  - `hibiki/lib/src/media/audiobook/book_import_dialog.dart`
+  - `hibiki/lib/src/media/audiobook/audiobook_import_dialog.dart`
+  - `hibiki/lib/src/pages/implementations/reader_hibiki_history_page.dart`
+  - `hibiki/lib/src/pages/implementations/dictionary_dialog_page.dart`
+
+### Findings
+
+#### HBK-AUDIT-007 - Import dialogs still hand-built file rows and switches
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/media/audiobook/book_import_dialog.dart`
+  - `hibiki/lib/src/media/audiobook/audiobook_import_dialog.dart`
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+- root cause:
+  - File-picking UI was repeated as local `Row`/`Column` blocks with literal 11/13 point text and direct switch-list widgets. That made these dialogs look like old dense Flutter chrome while the rest of the app was moving to shared MD3 rows.
+- impact:
+  - Book and audiobook import are high-friction workflows. Inconsistent file slots and matching controls make the app feel half-migrated even though the business logic is fine.
+- fix:
+  - Added `HibikiFilePickerRow` as the shared row data structure for selectable files/directories.
+  - Migrated book import and audiobook import file slots into `AdaptiveSettingsSection` plus `HibikiFilePickerRow`.
+  - Migrated the auto-window switch to `AdaptiveSettingsSwitchRow`.
+- verification:
+  - Static guard now requires the import dialogs to use shared rows and blocks the old hand-sized row text.
+  - Focused dialog layout tests are part of this round's final verification gate.
+
+#### HBK-AUDIT-008 - Reader history book cards bypassed the shared MD3 card shell
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/reader_hibiki_history_page.dart`
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+- root cause:
+  - `_bookCardShell` still built its own `Material`, hard-coded `surfaceContainerLow`, and fixed a 12px radius locally. It also needed long-press support, which the shared card did not expose yet.
+- impact:
+  - Reader history is a primary app surface. Local card shells weaken the Seal-style MD3 target because selected state, radius, and surface roles drift away from the shared token layer.
+- fix:
+  - Added optional `onLongPress` to `HibikiCard`.
+  - Migrated `_bookCardShell` to `HibikiCard`, preserving tap, long-press, selection overlay, aspect ratio, and reorder/selection behavior.
+- verification:
+  - Static guard narrows the ban to `_bookCardShell` and blocks local `Material(`, `surfaceContainerLow`, and `BorderRadius.circular(12)` in that shell.
+
+#### HBK-AUDIT-009 - Dictionary download selection used MD2 expansion and checkbox rows
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/dictionary_dialog_page.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+- root cause:
+  - The download catalog mixed data state and framework-default UI through `ExpansionTile` and `CheckboxListTile`. That bypassed `HibikiCard` and `HibikiListItem`, so the chooser looked like a stock MD2 list inside an otherwise tokenized dialog.
+- impact:
+  - Dictionary setup is a high-visibility onboarding/management path. The old expansion/list rows were visually inconsistent and hard to keep aligned with the Seal-style grouped row grammar.
+- fix:
+  - Replaced category expansion with explicit `expandedCategories` state and a `HibikiCard` category group.
+  - Replaced each dictionary checkbox row with `HibikiListItem` plus a `Checkbox`, preserving checked indices, installed-state styling, language changes, and default expanded Japanese categories.
+- verification:
+  - The static guard was written failing-first, then passed after migration.
+  - Final verification must include the static design-system test before commit.
+
+#### HBK-AUDIT-010 - Tag picker used framework-default checkbox rows
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/tag_picker_page.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+  - `hibiki/test/pages/tag_picker_page_static_test.dart`
+- root cause:
+  - Tag selection used `CheckboxListTile`, which hard-coded the page into framework-default list styling instead of the shared MD3 row/card grammar.
+- impact:
+  - Tag selection is launched from reader history and book management flows. Leaving it as a stock checkbox list made the page visually inconsistent with the repaired reader history cards.
+- fix:
+  - Replaced the checkbox list with `ListView.separated`, `HibikiCard`, `HibikiListItem`, and a trailing `Checkbox`.
+  - Moved the empty state into a shared `HibikiCard` plus `HibikiPlaceholderMessage`.
+  - Added a compile guard that imports and instantiates `TagPickerPage`.
+- verification:
+  - Static guard was written failing-first and failed on `CheckboxListTile`.
+  - Passed after migration with the focused tag picker verification command listed below.
+
+#### HBK-AUDIT-011 - Reader hover and illustration grid still hard-coded surfaces
+
+- severity: LOW
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/reader_hibiki_history_page.dart`
+  - `hibiki/lib/src/pages/implementations/illustrations_viewer_page.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+  - `hibiki/test/pages/illustrations_viewer_page_static_test.dart`
+- root cause:
+  - Reader tag-drop hover overlay used a local `BorderRadius.circular(12)`.
+  - Illustration thumbnails used local `surfaceContainerLow` and `BorderRadius.circular(8)` instead of the shared card surface.
+- impact:
+  - These were small but visible remnants of page-local visual decisions. They weakened the Seal-style rule that cards and state overlays should use one token layer.
+- fix:
+  - Reader tag-drop overlay now reads `HibikiDesignTokens.of(context)` and uses `tokens.radii.cardRadius`.
+  - Illustration grid items now use `HibikiCard` with zero padding and preserve tap-to-fullscreen image behavior.
+  - Added a compile guard for `IllustrationsViewerPage`.
+- verification:
+  - Static guard was written failing-first and failed on `surfaceContainerLow`, missing `HibikiCard`, and missing design tokens in the reader hover overlay.
+  - Passed after migration with the focused verification command listed below.
+
+#### HBK-AUDIT-012 - Default reader history fallback tile used raw Material and local surface roles
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/base_history_page.dart`
+  - `hibiki/lib/src/pages/implementations/history_reader_page.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+  - `hibiki/test/pages/history_reader_page_static_test.dart`
+- root cause:
+  - `BaseHistoryPage.buildMediaItem()` wrapped history items in raw `Material` and `InkWell`.
+  - The fallback `HistoryReaderPage` tile used `surfaceContainerLowest` and hand-scaled `bodySmall` typography for ordinary shelf chrome.
+- impact:
+  - `ReaderHibikiHistoryPage` already owns the main Hoshi shelf, but `ReaderMediaSource` still exposes this fallback path. If used, it would reopen the exact old card/list grammar the MD3 pass is trying to close.
+- fix:
+  - Moved default history item interaction to `HibikiCard` with `onTap`/`onLongPress`.
+  - Kept the default reader tile content as image/title/progress only, so the shared card shell owns the surface and clipping.
+  - Replaced hand-scaled title text with `HibikiDesignTokens.type.metadata`.
+  - Added a compile guard for `HistoryReaderPage`.
+- verification:
+  - Static guard was written failing-first and failed on raw `Material`/`InkWell`, `surfaceContainerLowest`, and local font sizing.
+  - Passed after migration with the focused verification command listed below.
+
+#### HBK-AUDIT-013 - Diagnostic log pages duplicated raw scrollable text chrome
+
+- severity: LOW
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/debug_log_page.dart`
+  - `hibiki/lib/src/pages/implementations/error_log_page.dart`
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+  - `hibiki/test/pages/log_pages_static_test.dart`
+- root cause:
+  - Debug and error log pages duplicated `SingleChildScrollView`, raw padding, `SelectableText`, selection controls, and local monospace sizes.
+  - The monospace log text is content, but the container chrome should still use the shared MD3 surface grammar.
+- impact:
+  - Settings diagnostics still looked like old utility pages even after the main settings chrome was migrated.
+- fix:
+  - Added `HibikiLogPanel`, which owns safe-area padding, `HibikiCard`, scrolling, selectable log text, and selection controls.
+  - Replaced both log page bodies with the shared panel while preserving copy, share, refresh, and clear actions.
+  - Kept the monospace text decision inside the shared panel as a content-specific exception.
+- verification:
+  - Static guard was written failing-first and failed on missing `HibikiLogPanel`, direct `SingleChildScrollView`, direct `SelectableText`, and page-local font sizes.
+  - Passed after migration with the focused verification command listed below.
+
+#### HBK-AUDIT-014 - Popup dictionary shells kept local input and surface styling
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/popup_dictionary_page.dart`
+  - `hibiki/lib/src/pages/implementations/floating_dict_page.dart`
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+  - `hibiki/test/pages/popup_dictionary_page_test.dart`
+  - `hibiki/test/pages/floating_dict_page_static_test.dart`
+- root cause:
+  - Popup dictionary and floating dictionary shells both hand-built rounded surfaces, search text fields, icon buttons, local font sizes, and local radius values.
+  - Dictionary entry typography is rendered content and can remain specialized; the shell/search chrome is ordinary app UI and should not fork the MD3 grammar.
+- impact:
+  - The popup lookup flows still looked and behaved like separate mini-apps after the main dictionary/search chrome had been migrated.
+- fix:
+  - Added `HibikiPopupSurface` for compact bordered popup windows.
+  - Added `HibikiCompactSearchRow` for close/search controls with stable keys, trim-submit behavior, and shared token typography.
+  - Migrated `PopupDictionarySearchBar` and `FloatingDictPage` shell/search UI to those shared primitives without changing lookup, nested popup, drag, resize, or mining behavior.
+- verification:
+  - Static guard was written failing-first and failed on missing shared popup primitives, local `TextField`, local `DecoratedBox`, local radius, and page-local font sizes.
+  - Existing popup widget tests plus a floating dictionary compile guard passed after migration.
+
+#### HBK-AUDIT-015 - Native Android popup dictionary shell used pre-MD3 widgets and colors
+
+- severity: MEDIUM
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/android/app/src/main/java/app/hibiki/reader/PopupDictActivity.kt`
+  - `hibiki/android/app/src/main/res/drawable/ic_popup_close_24.xml`
+  - `hibiki/android/app/src/main/res/drawable/ic_popup_search_24.xml`
+  - `hibiki/test/pages/native_popup_dictionary_static_test.dart`
+- root cause:
+  - The native PROCESS_TEXT popup built its search row with framework default `EditText`, `android.R.drawable.ic_menu_search`, transparent root styling, and hard-coded light/dark content colors.
+  - Native popup rendering lives outside Flutter, so Flutter MD3 token work did not automatically reach this shell.
+- impact:
+  - Android's native lookup entry point visually diverged from the Seal-style MD3 target and from the repaired Flutter popup dictionary shell.
+  - The initial lookup term was also set after layout creation, leaving a timing hole before WebView callbacks.
+- fix:
+  - Added a native `PopupMaterialColors` token layer with light/dark MD3-style surface, outline, primary, and text colors.
+  - Rebuilt the root container and search bar as rounded MD3-style surfaces with close/search icon buttons.
+  - Injected MD3 CSS variables into the popup WebView and marked the shell as loaded.
+  - Set `currentSearchTerm` before layout construction and preserved it through new intents.
+  - Added vector close/search drawables; they are intentionally force-added because the repository ignores `*.xml`.
+- verification:
+  - Static guard passed for initial-text ordering, native shell MD3 surface/search controls, and injected CSS tokens.
+  - `:app:assembleRelease` reached `:app:compileReleaseKotlin`; the native Kotlin file compiled with only existing deprecated WebView-setting warnings.
+  - Full Android release build remains blocked later at `:app:compileReleaseJavaWithJavac` by generated registration of `dev.flutter.plugins.integration_test.IntegrationTestPlugin`, caused by the current integration-test dependency state rather than this popup Kotlin code.
+
+#### HBK-AUDIT-016 - Book CSS editor kept page-local editor chrome
+
+- severity: LOW
+- status: resolved in working tree
+- files/lines:
+  - `hibiki/lib/src/pages/implementations/book_css_editor_page.dart`
+  - `hibiki/lib/src/utils/components/hibiki_material_components.dart`
+  - `hibiki/test/settings/md3_design_system_static_test.dart`
+- root cause:
+  - The CSS editor page still owned its own empty state, editor padding, outlined input border, and monospace text size.
+  - CSS text is content and can stay monospace, but the editor shell is ordinary app chrome and should not fork the MD3 surface grammar.
+- impact:
+  - The in-book CSS editing workflow looked like a utility form instead of the same Seal-style surface system used by the repaired settings, popup, and history pages.
+- fix:
+  - Added `HibikiEditorPanel`, a shared MD3 editor surface that owns page padding, `HibikiCard`, token typography, and borderless text editing.
+  - Replaced the CSS editor's raw `TextField`/`OutlineInputBorder` with the shared panel.
+  - Replaced the empty state with `HibikiPlaceholderMessage`.
+  - Preserved tab switching, unsaved-change guarding, reset, and save behavior.
+- verification:
+  - Static guard was written failing-first and failed on missing `HibikiEditorPanel`, direct `fontSize: 13`, `OutlineInputBorder`, and `Center(child: Text(...))`.
+  - Passed after migration with the focused verification command listed below.
+
+### Verification
+
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\utils\components\hibiki_material_components.dart lib\src\media\audiobook\book_import_dialog.dart lib\src\media\audiobook\audiobook_import_dialog.dart lib\src\pages\implementations\reader_hibiki_history_page.dart lib\src\pages\implementations\dictionary_dialog_page.dart test\settings\md3_design_system_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format test\pages\dictionary_dialog_layout_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\media\audiobook\book_import_dialog_test.dart test\pages\dictionary_dialog_layout_static_test.dart test\pages\book_profile_dialog_page_test.dart test\pages\reader_history_delete_dialog_test.dart --reporter expanded`
+- Blocked: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat analyze ...` timed out twice, once at 180 seconds and once at 300 seconds. A compile guard was added to `dictionary_dialog_layout_static_test.dart` to import and instantiate `DictionaryDialogPage` directly.
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\pages\implementations\tag_picker_page.dart test\settings\md3_design_system_static_test.dart test\pages\tag_picker_page_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\tag_picker_page_static_test.dart --reporter expanded`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\pages\implementations\illustrations_viewer_page.dart lib\src\pages\implementations\reader_hibiki_history_page.dart test\settings\md3_design_system_static_test.dart test\pages\illustrations_viewer_page_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\illustrations_viewer_page_static_test.dart test\pages\book_profile_dialog_page_test.dart test\pages\reader_history_delete_dialog_test.dart --reporter expanded`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\pages\base_history_page.dart lib\src\pages\implementations\history_reader_page.dart test\settings\md3_design_system_static_test.dart test\pages\history_reader_page_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\history_reader_page_static_test.dart --reporter expanded`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\utils\components\hibiki_material_components.dart lib\src\pages\implementations\debug_log_page.dart lib\src\pages\implementations\error_log_page.dart test\settings\md3_design_system_static_test.dart test\pages\log_pages_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\log_pages_static_test.dart --reporter expanded`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\utils\components\hibiki_material_components.dart lib\src\pages\implementations\popup_dictionary_page.dart lib\src\pages\implementations\floating_dict_page.dart test\settings\md3_design_system_static_test.dart test\pages\floating_dict_page_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\popup_dictionary_page_test.dart test\pages\floating_dict_page_static_test.dart --reporter expanded`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format test\pages\native_popup_dictionary_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\pages\native_popup_dictionary_static_test.dart --reporter expanded`
+- Blocked: `.\gradlew.bat :app:assembleRelease` initially failed inside the sandbox while downloading Gradle 8.12 (`SSLHandshakeException`). After approved network escalation, Gradle downloaded and the build reached `:app:compileReleaseKotlin`, but the full release build failed later at `:app:compileReleaseJavaWithJavac` because `GeneratedPluginRegistrant.java` references `dev.flutter.plugins.integration_test.IntegrationTestPlugin` while the release Java classpath does not contain that package.
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\dart.bat format lib\src\pages\implementations\book_css_editor_page.dart lib\src\utils\components\hibiki_material_components.dart test\settings\md3_design_system_static_test.dart`
+- Passed: `D:\flutter_sdk\flutter_extracted\flutter\bin\flutter.bat test test\settings\md3_design_system_static_test.dart test\pages\book_css_editor_page_test.dart --reporter expanded`
+- Passed: `git diff --cached --check`
+
+### Next Scope
+
+1. Continue with the remaining ordinary chrome debt: in-book quick-settings controls, settings form fields, and any non-content `CheckboxListTile`/`ExpansionTile` use.
+2. Keep direct typography exceptions limited to rendered content, theme previews, logs, code/CSS editors, and reader content; ordinary rows must use shared component typography.
+3. After each page-family migration, add or extend a failing static/widget guard first, then migrate to `HibikiCard`, `HibikiListItem`, `HibikiSearchField`, `HibikiOverflowMenu`, `HibikiFilePickerRow`, `HibikiEditorPanel`, or a new shared primitive only if the data shape genuinely differs.

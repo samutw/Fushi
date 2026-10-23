@@ -1,0 +1,215 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
+import 'package:flutter_test/flutter_test.dart';
+
+import '../../helpers/win32_interactivity_guard.dart';
+
+/// Source-scan guards for the desktop floating-subtitle strip's click-through
+/// contract (TODO-038). The native Win32 window cannot run on the host, so
+/// these guards pin the load-bearing wiring that makes the strip both
+/// non-blocking to other apps AND tappable for word lookup. A refactor that
+/// silently drops any of these would re-introduce the rejected "steals focus /
+/// blocks other apps" behaviour.
+void main() {
+  late String cpp;
+  late String header;
+  late String flutterWindow;
+
+  setUpAll(() {
+    cpp = File('windows/runner/floating_lyric_window.cpp').readAsStringSync();
+    header = File('windows/runner/floating_lyric_window.h').readAsStringSync();
+    flutterWindow =
+        File('windows/runner/flutter_window.cpp').readAsStringSync();
+  });
+
+  group('desktop floating-lyric click-through guards', () {
+    test(
+        'strip is created mouse-interactive so first clicks cannot fall through',
+        () {
+      final int createWindow = cpp.indexOf('CreateWindowExW(');
+      final int className = cpp.indexOf('kWindowClassName', createWindow);
+      final String createFlags = cpp.substring(createWindow, className);
+
+      // The native strip must be interactive from the first hit-test. Keeping
+      // WS_EX_TRANSPARENT in the creation flags reopens the race where a fast
+      // first click reaches the app underneath before a timer clears the bit.
+      expect(
+        createFlags.contains('WS_EX_TRANSPARENT'),
+        isFalse,
+        reason: 'The strip must not be born mouse-transparent.',
+      );
+      // It must still not steal keyboard focus.
+      expect(createFlags.contains('WS_EX_NOACTIVATE'), isTrue);
+      // And it must float over every app, not just the Fushi window.
+      expect(createFlags.contains('WS_EX_TOPMOST'), isTrue);
+    });
+
+    test('no timer can flip interactivity (PR#460 invariant)', () {
+      // A timer-driven transparent/interactive flip is inherently racy: a fast
+      // mouse-enter + click can arrive while WS_EX_TRANSPARENT is still set.
+      // This is the invariant that killed PR#460 and it still holds.
+      //
+      // PR#749 UPDATE — this used to be four token bans
+      // (`PollCursorInteractivity` / `ApplyInteractive` / `SetTimer(` /
+      // `KillTimer(`). Banning the KEYWORD instead of the BEHAVIOUR was wrong
+      // in both directions: `SetCoalescableTimer` / a `TIMERPROC` callback /
+      // `SetWindowsHookEx` all rebuild PR#460 verbatim while dodging the
+      // literal `SetTimer(`, and any timer unrelated to interactivity was
+      // failed on sight — which is what happened when the hook overlay grew a
+      // 60ms Shift-hover lookup poll that only reads the cursor and dispatches
+      // a word lookup (and explicitly stands down under `pass_through_`).
+      //
+      // The predicate is now the invariant itself: walk the real call graph out
+      // of every timer callback and fail if anything reachable WRITES the
+      // window's mouse interactivity. Information may flow pass-through ->
+      // timer (a timer may read the state and stop itself), never the reverse.
+      expectTimerCannotFlipInteractivity(
+        cpp,
+        className: 'FloatingLyricWindow',
+        label: 'floating_lyric_window.cpp',
+      );
+
+      // BUG-951 UPDATE — this test used to also forbid touching
+      // WS_EX_TRANSPARENT at all. That blanket ban was the reason the overlay
+      // shipped a pass-through mode that did nothing across processes: the bit
+      // is the ONLY cross-process click-through mechanism Win32 has. What was
+      // actually unsafe was flipping it by cursor position on a timer, which
+      // the reachability predicate above already forbids.
+      //
+      // The bit is now applied statically for as long as the user keeps
+      // pass-through on, with the toolbar moved into its own always-clickable
+      // window so there is nothing to be locked out of. The full contract —
+      // one applier, escape hatch shown first, refuse the toggle if it cannot
+      // be — is pinned by
+      // test/tools/gal_overlay_passthrough_dual_window_guard_test.dart.
+      expect(cpp.contains('ApplyPassThroughExStyle'), isTrue,
+          reason: 'Pass-through must go through the single applier that also '
+              'puts the escape-hatch toolbar on screen.');
+      expect(cpp.contains('pass_through_toolbar_.Show('), isTrue);
+    });
+
+    test('word lookup is preserved — taps still report a char index', () {
+      // The whole point of the redo: lookup must survive the click-through
+      // rework. A tap is hit-tested to a character and sent up as on_lookup_.
+      expect(cpp.contains('CharIndexAt'), isTrue);
+      expect(cpp.contains('on_lookup_'), isTrue);
+      expect(cpp.contains('click_lookup_enabled_'), isTrue);
+      expect(header.contains('SetClickLookupEnabled'), isTrue);
+    });
+
+    test('control buttons are still hit-tested and reported', () {
+      expect(cpp.contains('ControlActionAt'), isTrue);
+      expect(cpp.contains('on_control_'), isTrue);
+    });
+
+    test('padlock glyphs are drawn as full UTF-16 strings', () {
+      // 这条守卫原本把缩进写死在断言里（负向断言匹配的是 'DrawTextW(' + 换行 +
+      // 10 个空格 + 'glyph, 1,'）。后来新增的 hook 工具栏把同样的调用写成单行，
+      // 于是整个从它旁边溜了过去。改成「按调用点计数」：任何一个 glyph 绘制不走
+      // GlyphLength 就红，与缩进、换行、参数换行位置全部无关。
+      expect(cpp.contains('GlyphLength'), isTrue,
+          reason: 'Emoji glyphs need their full UTF-16 code-unit length.');
+      final Iterable<RegExpMatch> glyphDraws =
+          RegExp(r'DrawTextW\(\s*glyph,\s*([^,]+),').allMatches(cpp);
+      expect(glyphDraws, isNotEmpty,
+          reason: 'The glyph draw call must still exist.');
+      for (final RegExpMatch m in glyphDraws) {
+        expect(
+          m.group(1)!.trim(),
+          'GlyphLength(glyph)',
+          reason: 'Every glyph DrawTextW must pass the full UTF-16 length; a '
+              'literal length truncates U+1F512/U+1F513-class glyphs.',
+        );
+      }
+    });
+  });
+
+  // ── TODO-136: desktop strip lock button + resize + draggable-from-text ──
+  group('desktop floating-lyric lock / resize / drag-fix guards', () {
+    test('the "lock" control slot exists and is hit-tested', () {
+      // 有声书悬浮字幕原本是自绘 5 槽歌词条（kControlSlotCount + 硬编码 switch +
+      // emoji 挂锁字形）。它改跑与 galgame hook 台词浮窗同一套富文本形态之后，
+      // 按钮来自 hook_toolbar 的 kAudiobook 槽表，字形走 Material Symbols /
+      // 矢量画法 —— 旧的那几个字面量是被**有意**删掉的，不是回归。
+      //
+      // 这条守卫因此改成检查新形态下的等价事实：锁定键仍在这张槽表里，命中仍走
+      // 单一真相的槽表，且锁定 / 未锁定两种状态各有自己的字形。
+      final String header =
+          File(p.join('windows', 'runner', 'hook_toolbar_window.h'))
+              .readAsStringSync();
+      final int tableStart = header.indexOf('kAudiobookSlotActions[');
+      expect(tableStart, greaterThan(0), reason: '找不到有声书槽表');
+      final String table =
+          header.substring(tableStart, header.indexOf('};', tableStart));
+      expect(table.contains('"lock"'), isTrue,
+          reason: '有声书槽表必须仍有锁定键');
+
+      expect(cpp.contains('hook_toolbar::SlotAction(toolbar_profile_, slot)'),
+          isTrue,
+          reason: 'ControlActionAt must resolve the lock button through the '
+              'single source of truth slot table.');
+
+      // 锁定 / 未锁定必须是两个字形（Material Symbols lock / lock_open），
+      // 否则用户看不出自己锁没锁。
+      final String toolbarCpp =
+          File(p.join('windows', 'runner', 'hook_toolbar_window.cpp'))
+              .readAsStringSync();
+      expect(
+        toolbarCpp.contains(r'states.locked ? L"\uE899" : L"\uE898"'),
+        isTrue,
+        reason: 'Locked / unlocked glyphs must both be drawn.',
+      );
+    });
+
+    test('the lock is a real state that gates dragging (not a no-op)', () {
+      // Native side owns a locked_ flag and toggles it; a locked strip must
+      // refuse to start a drag (the press->drag promotion is gated on !locked_).
+      expect(cpp.contains('locked_'), isTrue);
+      expect(header.contains('void SetLocked(bool locked);'), isTrue);
+      expect(header.contains('bool IsLocked()'), isTrue);
+      expect(cpp.contains('if (pressed_ && !locked_)'), isTrue,
+          reason: 'Drag promotion must be suppressed while locked.');
+      // The lock button toggle reports back to Dart via the lock callback.
+      expect(cpp.contains('on_lock_'), isTrue);
+      expect(header.contains('SetLockCallback'), isTrue);
+    });
+
+    test('flutter_window wires setLocked to the real native lock', () {
+      // The old desktop strip stubbed setLocked as a no-op; it must now drive
+      // the window and surface user toggles back over "lockChanged".
+      expect(
+          flutterWindow.contains('floating_lyric_window_->SetLocked('), isTrue);
+      expect(flutterWindow.contains('"lockChanged"'), isTrue);
+      // And it must NOT still carry the old no-op excuse comment.
+      expect(flutterWindow.contains('desktop strip has no lock affordance'),
+          isFalse,
+          reason: 'The lock no-op was removed; setLocked is now real.');
+    });
+
+    test('the bar is draggable from the text, not only blank margins', () {
+      // Root-cause fix for "can\'t drag": a press no longer immediately fires a
+      // lookup-or-drag decision. A still press is a lookup on button-up; a
+      // moving press is promoted to a drag past a threshold.
+      expect(cpp.contains('press_was_text_'), isTrue);
+      expect(cpp.contains('kDragThresholdDip'), isTrue);
+      expect(cpp.contains('dragging_ = true;'), isTrue);
+    });
+
+    test('the bottom-right grip resizes via the system NC hit-test', () {
+      // WM_NCHITTEST hands the corner to the system resize loop (QQ-Music
+      // style); WM_SIZE re-syncs the logical strip size so text + controls
+      // follow, clamped by WM_GETMINMAXINFO.
+      expect(cpp.contains('case WM_NCHITTEST'), isTrue);
+      expect(cpp.contains('HTBOTTOMRIGHT'), isTrue);
+      expect(cpp.contains('ResizeGripContains'), isTrue);
+      expect(cpp.contains('case WM_SIZE'), isTrue);
+      expect(cpp.contains('SyncStripSizeFromWindow'), isTrue);
+      expect(cpp.contains('case WM_GETMINMAXINFO'), isTrue);
+      // The strip size must be a mutable member, not a fixed constant.
+      expect(header.contains('strip_width_dip_'), isTrue);
+      expect(header.contains('strip_height_dip_'), isTrue);
+    });
+  });
+}

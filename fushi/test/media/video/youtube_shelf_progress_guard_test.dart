@@ -1,0 +1,114 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import '../../helpers/source_guard.dart' show compactCode;
+
+/// 书架流媒体书（YouTube/直链，TODO-1157）进度写穿源码守卫。
+///
+/// 根因背景：流媒体书**有** VideoBooks 行却走互联远端（无行）的持久化路径，位置只写
+/// prefs 不写 `lastPositionMs`/`lastPlayedAt`，观看统计采集器也被 `!_isRemote` 一刀切
+/// 关掉——书架「继续观看 / 在看筛选 / 看完角标 / 合集续播选集」与观看统计对在 app 内
+/// 看 YouTube 全部失明。修复统一判据 `_bookRow != null`（= 书架书）：
+/// ① [_persistRemotePosition] 对书架流媒体书补写 DB 行（updatePosition）；
+/// ② 观看统计采集器按 `_bookRow != null` 建（互联远端仍不采集）。
+///
+/// 页面依赖 media_kit 原生播放器，widget 层不可离线测试 → 落最强可落地层：源码切片守卫
+/// （删掉任一步即红），与 TODO-1307 守卫同构。
+/// 源码扫描的归一化：压掉全部空白，并把 tall-style 拆行补出来的尾随逗号
+/// （`,)`）收回 `)`。钉的是调用形态本身，不是它当天被 dart format 排成什么样。
+String _flat(String v) => compactCode(v).replaceAll(',)', ')');
+
+void main() {
+  final String pageSrc = File(
+    'lib/src/pages/implementations/video_fushi_page.dart',
+  ).readAsStringSync().replaceAll(String.fromCharCode(13), '');
+
+  // [_persistRemotePosition] 函数体切片（到下一个方法 doc 注释为止的窄窗口，避免同形
+  // token 在别处抢匹配）。
+  String persistRemoteSlice() {
+    final int start = pageSrc.indexOf(
+      'Future<void> _persistRemotePosition(String uid',
+    );
+    expect(start, greaterThan(0), reason: '_persistRemotePosition 必须存在');
+    final int end = pageSrc.indexOf('Future<void> _loadSingle', start);
+    expect(end, greaterThan(start));
+    return pageSrc.substring(start, end);
+  }
+
+  test('① 书架流媒体书位置写穿 DB：_persistRemotePosition 含 _bookRow 门 + updatePosition', () {
+    final String slice = persistRemoteSlice();
+    expect(
+      slice.contains('if (_bookRow != null)'),
+      isTrue,
+      reason: '书架书判据必须是 _bookRow != null（本地/流媒体书有行，互联远端无行）',
+    );
+    expect(
+      // dart format 会按行宽折行，**并在拆行时补尾随逗号**——所以归一化要同时
+      // 压掉空白和把 `,)` 收成 `)`，否则「差一个逗号」就让守卫假红（实测过一次）。
+      // PR #1707（9036953d68b）：在线视频源入库集合集连播时写当前成员自己那一行
+      // （keyUid），非合集经 _activeBookUid；无原盘选片时回落 widget.bookUid。两路都在 _bookRow 门内。
+      _flat(slice).contains(
+        'if(_bookRow!=null){'
+        'finalStringrowUid=_isRemoteCollection?keyUid:_activeBookUid;'
+        'awaitwidget.repo.updatePosition(rowUid,clamped,playedAt:nowMs);',
+      ),
+      isTrue,
+      reason:
+          '书架流媒体书必须把断点写穿 VideoBooks（lastPositionMs/lastPlayedAt），'
+          '否则书架「继续观看/在看筛选/合集续播」对流媒体书失明；'
+          '非合集写当前视频身份，远端合集写当前成员行',
+    );
+    expect(
+      _flat(pageSrc),
+      contains(
+        _flat('String get _activeBookUid => _discBookUid ?? widget.bookUid;'),
+      ),
+      reason:
+          'YouTube / remote entries have no disc override and keep their original row identity',
+    );
+    // DB 写必须在「真观看」阈值之后（BUG-996 同款考虑：近起点假进度不落 DB）。
+    final int iThreshold = slice.indexOf('kMeaningfulRemoteWatchMs');
+    // 折行安全锚：方法名带左括号（widget.repo 与 .updatePosition 可能被 format 拆行）。
+    final int iDbWrite = slice.indexOf('.updatePosition(');
+    expect(iThreshold, greaterThan(0));
+    expect(
+      iDbWrite,
+      greaterThan(iThreshold),
+      reason: 'DB 写穿必须在 5s 真观看阈值之后（避免慢流 resume 未落地时的 ~0 假进度）',
+    );
+  });
+
+  test('② 观看统计采集器不按 _bookRow / !_isRemote 门控（BUG-2587：远端也采集）', () {
+    // BUG-2587：媒体服务器 / 互联远端播放无 VideoBooks 行，旧门 `_bookRow != null`
+    // 让它们一秒不进学习统计。现在采集器按本页身份 [_watchStatsIdentity] 建，
+    // 书架流媒体书（有行、走远端路径）身份仍是 widget.bookUid，看完标记只对有行的书。
+    expect(
+      pageSrc.contains('if (_bookRow != null && _watchTracker == null)'),
+      isFalse,
+      reason: '不得再用 _bookRow 门控统计采集器（会把媒体服务器 / 互联远端一并关掉）',
+    );
+    expect(
+      pageSrc.contains('if (!_isRemote && _watchTracker == null)'),
+      isFalse,
+      reason: '不得再用 !_isRemote 门控统计采集器（会把书架流媒体书一并关掉）',
+    );
+    expect(
+      pageSrc.contains(
+        'final (String uid, int episodeIndex) = _watchStatsIdentity;',
+      ),
+      isTrue,
+      reason: '采集器身份只经 _watchStatsIdentity（远端 = 断点键同口径）',
+    );
+    expect(
+      pageSrc.contains('markVideoCompleted('),
+      isFalse,
+      reason: 'BUG-3491：播放不再自动给库条目打「已看」勾（所有者拍板）',
+    );
+    expect(
+      _flat(pageSrc).contains(_flat('onEpisodeCompleted: hasLibraryRow')),
+      isTrue,
+      reason: '单集看完的媒体追踪上报只对有 VideoBooks 行的书架书（含流媒体书）',
+    );
+  });
+}

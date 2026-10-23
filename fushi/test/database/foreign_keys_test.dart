@@ -1,0 +1,171 @@
+import 'dart:io';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+Future<FushiDatabase> _openRealDb() async {
+  final dir = await Directory.systemTemp.createTemp('fushi_fk_test_');
+  addTearDown(() async {
+    await dir.delete(recursive: true);
+  });
+
+  final db = FushiDatabase(dir.path);
+  addTearDown(db.close);
+  return db;
+}
+
+Future<int> _count(FushiDatabase db, String table) async {
+  final row =
+      await db.customSelect('SELECT COUNT(*) AS c FROM $table').getSingle();
+  return row.read<int>('c');
+}
+
+void main() {
+  test('real database connection enables sqlite foreign key enforcement',
+      () async {
+    final db = await _openRealDb();
+
+    final row = await db.customSelect('PRAGMA foreign_keys').getSingle();
+
+    expect(row.read<int>('foreign_keys'), 1);
+  });
+
+  test('deleting a profile cascades profile-owned rows', () async {
+    final db = await _openRealDb();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final profileId = await db.insertProfile(
+      ProfilesCompanion.insert(
+        name: 'Temp',
+        createdAt: now,
+        updatedAt: now,
+      ),
+    );
+    await db.upsertProfileSetting(
+      ProfileSettingsCompanion.insert(
+        profileId: profileId,
+        category: 'pref',
+        key: 'reader',
+        value: 'vertical',
+      ),
+    );
+    await db.setMediaTypeProfile('reader', profileId);
+    await db.setBookProfile('reader_fushi/fushi://book/1', profileId);
+
+    await db.deleteProfile(profileId);
+
+    expect(await _count(db, 'profile_settings'), 0);
+    expect(await _count(db, 'media_type_profiles'), 0);
+    expect(await _count(db, 'book_profiles'), 0);
+  });
+
+  test(
+      'deleting an epub book clears its tag assignments (v77 逻辑外键：'
+      '删除路径显式清理，不再依赖 DB cascade)', () async {
+    final db = await _openRealDb();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    const String bookKey = 'Book';
+    await db.into(db.epubBooks).insert(
+          EpubBooksCompanion.insert(
+            bookKey: bookKey,
+            title: 'Book',
+            epubPath: '/tmp/book.epub',
+            extractDir: '/tmp/book',
+            chapterCount: 1,
+            chaptersJson: '[]',
+            importedAt: now,
+          ),
+        );
+    final tagId = await db.into(db.bookTags).insert(
+          BookTagsCompanion.insert(
+            name: 'Tag',
+            createdAt: now,
+          ),
+        );
+    await db.addTagToBook(bookKey, tagId);
+    expect(await _count(db, 'tag_assignments'), 1);
+
+    await db.deleteEpubBook(bookKey);
+
+    expect(await _count(db, 'tag_assignments'), 0);
+  });
+
+  test('deleting a tag cascades its assignments (tag_id 真 FK 保留)', () async {
+    final db = await _openRealDb();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final tagId = await db.into(db.bookTags).insert(
+          BookTagsCompanion.insert(name: 'T', createdAt: now),
+        );
+    await db.addTagToGame('game-1', tagId);
+    expect(await _count(db, 'tag_assignments'), 1);
+
+    await db.deleteTag(tagId);
+
+    expect(await _count(db, 'tag_assignments'), 0);
+  });
+
+  test(
+      'deleting a media source sets source_id NULL on its books (setNull, '
+      'not cascade)', () async {
+    // TODO-817 M0: this is the repo's FIRST onDelete:setNull FK. _openRealDb is
+    // mandatory because only the on-disk DB has PRAGMA foreign_keys=ON enforced
+    // (forTesting memory DBs do not). Removing a source must KEEP the media
+    // rows and null out their source_id — the opposite of cascade.
+    final db = await _openRealDb();
+    final now = DateTime.now().millisecondsSinceEpoch;
+
+    final sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Drive',
+        mediaKind: 'book',
+        rootPath: '/srv/media',
+        createdAt: now,
+      ),
+    );
+
+    const String bookKey = 'SourcedBook';
+    await db.into(db.epubBooks).insert(
+          EpubBooksCompanion.insert(
+            bookKey: bookKey,
+            title: 'SourcedBook',
+            epubPath: '/tmp/sb.epub',
+            extractDir: '/tmp/sb',
+            chapterCount: 1,
+            chaptersJson: '[]',
+            importedAt: now,
+            sourceId: Value(sourceId),
+          ),
+        );
+    const String bookUid = 'video/sourced';
+    await db.upsertVideoBook(
+      VideoBooksCompanion.insert(
+        bookUid: bookUid,
+        title: 'SourcedVideo',
+        videoPath: '/tmp/sv.mp4',
+        sourceId: Value(sourceId),
+      ),
+    );
+
+    // Precondition: both rows point at the source.
+    final epubBefore = await (db.select(db.epubBooks)
+          ..where((t) => t.bookKey.equals(bookKey)))
+        .getSingle();
+    expect(epubBefore.sourceId, sourceId);
+    final videoBefore = await db.getVideoBookByBookUid(bookUid);
+    expect(videoBefore!.sourceId, sourceId);
+
+    final removed = await db.deleteMediaSource(sourceId);
+    expect(removed, 1);
+
+    // setNull: the media rows SURVIVE; only source_id is nulled.
+    expect(await _count(db, 'epub_books'), 1);
+    expect(await _count(db, 'video_books'), 1);
+    final epubAfter = await (db.select(db.epubBooks)
+          ..where((t) => t.bookKey.equals(bookKey)))
+        .getSingle();
+    expect(epubAfter.sourceId, isNull);
+    final videoAfter = await db.getVideoBookByBookUid(bookUid);
+    expect(videoAfter!.sourceId, isNull);
+  });
+
+}

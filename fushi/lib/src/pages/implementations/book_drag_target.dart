@@ -1,0 +1,88 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+import 'package:fushi/utils.dart';
+
+@visibleForTesting
+class BookDragTarget extends StatefulWidget {
+  const BookDragTarget({
+    required this.bookId,
+    required this.onTagDropped,
+    required this.child,
+    super.key,
+  });
+
+  /// Drag-target identity marker (EPUB bookKey String, SRT srtBookId int, or
+  /// video bookUid String). Only used to distinguish targets; the drop action is
+  /// carried by [onTagDropped], so the concrete type is irrelevant here.
+  final Object bookId;
+  final void Function(BookTagRow tag) onTagDropped;
+  final Widget child;
+
+  @override
+  State<BookDragTarget> createState() => _BookDragTargetState();
+}
+
+class _BookDragTargetState extends State<BookDragTarget> {
+  bool _isHovering = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final Color hoverColor = tokens.surfaces.primary;
+    return DragTarget<BookTagRow>(
+      onWillAcceptWithDetails: (_) => true,
+      onAcceptWithDetails: (DragTargetDetails<BookTagRow> details) {
+        setState(() => _isHovering = false);
+        widget.onTagDropped(details.data);
+      },
+      onMove: (_) {
+        if (!_isHovering) setState(() => _isHovering = true);
+      },
+      onLeave: (_) {
+        if (_isHovering) setState(() => _isHovering = false);
+      },
+      builder: (
+        BuildContext context,
+        List<BookTagRow?> candidateData,
+        List<dynamic> rejectedData,
+      ) {
+        return Stack(
+          fit: StackFit.expand,
+          children: <Widget>[
+            widget.child,
+            if (_isHovering)
+              Positioned.fill(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    // eink：半透明罩在墨水屏上合成抖动灰；只留描边 + 图标
+                    // （CollectionDropTarget / CollectionShelfRow 同款处理）。
+                    // MD3 primary 12% 状态层；Apple 中性 systemFill 灰罩 +
+                    // 强调色描边（三处拖放落点同一口径）。
+                    color: isEinkTheme(context)
+                        ? null
+                        : isGlassDesign(context)
+                            ? appleColorsOf(context).fill
+                            : hoverColor.withValues(alpha: 0.12),
+                    borderRadius: tokens.radii.cardRadius,
+                    border: Border.all(
+                      color: hoverColor,
+                      width: tokens.spacing.gap / 4,
+                    ),
+                  ),
+                  child: Center(
+                    child: FushiIcon(
+                      Icons.add_circle_outline,
+                      color: hoverColor,
+                      size: tokens.spacing.gap * 4,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+}

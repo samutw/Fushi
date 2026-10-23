@@ -1,0 +1,1391 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:fushi_core/fushi_core.dart';
+
+import 'package:fushi_engine/media/external_provider.dart';
+import 'package:fushi_engine/media/metadata/credential_redaction.dart';
+import 'package:fushi_engine/media/torrent/video_resource_provider.dart';
+import 'package:fushi_engine/media/video/discovery/video_discovery_provider.dart';
+import 'package:fushi_engine/media/video/download/video_download_backend_identity.dart';
+import 'package:fushi_engine/media/video/download/subscription_check_schedule.dart';
+import 'package:fushi_engine/media/video/download/subscription_release_scope.dart';
+import 'package:fushi_engine/media/video/download/video_download_pipeline_service.dart';
+import 'package:fushi_engine/media/video/download/video_library_presence.dart';
+import 'package:fushi_engine/media/video/download/video_media_reference_codec.dart';
+import 'package:fushi_engine/media/video/download/video_resource_registry.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_models.dart';
+import 'package:fushi_engine/media/video/video_filename_parser.dart';
+import 'package:fushi_engine/foundation/engine_log.dart';
+
+typedef VideoDownloadSubscriptionEnqueue = Future<String> Function(
+  VideoDownloadEnqueueRequest request,
+);
+
+// Nyaa's upstream RESULTS_PER_PAGE default is 75. Keeping the subscription
+// window aligned lets a 75-item first page continue instead of being mistaken
+// for a short page.
+const int _subscriptionResourcePageSize = 75;
+
+// Bound a single 15-minute check to 1,500 provider rows. Duplicate-page
+// detection normally stops much earlier, including mirrors that ignore paging.
+const int _subscriptionResourceMaxPages = 20;
+
+/// 订阅自动重派同一个任务的持久上限。
+///
+/// 账本不在内存里——进程重启就归零的计数等于没有上限。它落在任务自己的
+/// `attemptCount` 上，见 `FushiDatabase.reviveVideoDownloadJobForSubscription`。
+/// 借满之后这一集停在 `failed` / `needsAttention` 等用户处理：面板对这两个状态
+/// 就是显示重试按钮的（`video_download_jobs_panel.dart` 的 `_canRetry`），用户
+/// 按一次会把 `attemptCount` 清零，自动预算随之恢复。
+const int kVideoDownloadSubscriptionAutoRetryBudget = 3;
+
+class VideoDownloadSubscriptionConfigurationError implements Exception {
+  const VideoDownloadSubscriptionConfigurationError(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// v78 订阅调度器。
+///
+/// 每次检查先用数据库 lease 独占订阅，再把逻辑集的资源选择写入
+/// `video_download_subscription_items`，最后才调用持久下载流水线 enqueue。
+/// 因此搜索重试、应用重启和多 worker 都不会把同一 `movie` / `SxxExx`
+/// 重复变成下载任务。
+/// 一个下载任务的下场还算不算数——即「这一集已经有人管了，订阅不用再派」。
+///
+/// BUG-1746 的根因是把「曾经派过任务」（`jobId != null`）当成了「任务成功了」。
+/// 两者不是一回事：任务被取消或失败之后 jobId 依然留在订阅条目上，旧判据据此
+/// 每轮都 `continue`，那一集就再也不会被下载——用户看到的是「订阅只下了中间
+/// 几集」，而面板上什么异常都不显示。
+///
+/// 分界线按**是谁决定不下的**划：
+/// - `cancelled` 是用户明确说「不要这一集」，尊重它，不自动重下（否则用户取消
+///   一次、订阅补回来一次，永远取消不掉）；
+/// - `failed` / `needsAttention` 是系统故障（实测例：内置下载引擎运行时缺失、
+///   种子源暂时不可达），故障排除之后本该继续下，不能让这一集永久卡死；
+/// - `active` / `completed` 显然还算数。
+///
+/// [lifecycle] 为 null 表示任务记录已经不在了（被清理/库被换过），此时没有任何
+/// 东西在管这一集，应当允许重新派。
+///
+/// 注意「重新派」不等于「再造一份」：`failed` / `needsAttention` 的既有任务是被
+/// **恢复**的（见 [VideoDownloadSubscriptionService._enqueueItem]），只有真的一
+/// 条任务都没有时才会走 pipeline enqueue。
+bool videoDownloadJobLifecycleStillCounts(String? lifecycle) {
+  if (lifecycle == null) return false;
+  return lifecycle != VideoDownloadJobLifecycle.failed &&
+      lifecycle != VideoDownloadJobLifecycle.needsAttention;
+}
+
+/// 这一集是否已经被一个「仍然算数」的任务认领。判据的唯一真相源——
+/// 入队去重与复用既有任务都走它，别再在别处写第二份 `jobId != null`。
+bool subscriptionItemStillClaimed(
+  VideoDownloadSubscriptionItemRow item,
+  Map<String, String> lifecycleByJobId,
+) {
+  // processed / skipped 是入队之外的终态：已经落库、或被明确判定为不用下。
+  // 它们与任务无关，不看 lifecycle。
+  if (item.status == VideoDownloadSubscriptionItemStatus.processed ||
+      item.status == VideoDownloadSubscriptionItemStatus.skipped) {
+    return true;
+  }
+  final String? jobId = item.jobId;
+  if (jobId == null) {
+    // 没有 jobId 却标着 queued 只可能是历史遗留行（_markItemQueued 必定同时写
+    // 两者）。保持旧行为不重复入队，避免给存量库凭空造重复任务。
+    return item.status == VideoDownloadSubscriptionItemStatus.queued;
+  }
+  return videoDownloadJobLifecycleStillCounts(lifecycleByJobId[jobId]);
+}
+
+class VideoDownloadSubscriptionService {
+  VideoDownloadSubscriptionService({
+    required this.database,
+    required this.resourceRegistry,
+    required VideoDownloadSubscriptionEnqueue enqueue,
+    String? workerId,
+    Duration checkInterval = const Duration(minutes: 15),
+    this.leaseDuration = const Duration(minutes: 2),
+    this.autoRetryBudget = kVideoDownloadSubscriptionAutoRetryBudget,
+    SubscriptionCheckCadence? cadence,
+    DateTime Function()? now,
+  })  : cadence = cadence ??
+            SubscriptionCheckCadence(
+              baseInterval: checkInterval,
+            ),
+        _enqueue = enqueue,
+        workerId =
+            workerId ?? 'video-sub-${generateVideoDownloadInstallationId()}',
+        _now = now ?? DateTime.now {
+    // `cadence` 一旦给了，`checkInterval` 就被**静默忽略**（它只用来兜底造一个默认
+    // cadence）。两个都传 = 调用方以为自己设了基准间隔、实际一点没生效 —— 正是
+    // 「同一个数字两层两语义」那种运行期谜题。构造时就拒绝，别留到线上去猜。
+    assert(
+      cadence == null || checkInterval == const Duration(minutes: 15),
+      'checkInterval 与 cadence 同传时前者被忽略；把基准间隔写进 '
+      'SubscriptionCheckCadence(baseInterval: ...)。',
+    );
+    if (leaseDuration <= Duration.zero) {
+      throw ArgumentError.value(leaseDuration, 'leaseDuration');
+    }
+    if (autoRetryBudget <= 0) {
+      throw ArgumentError.value(autoRetryBudget, 'autoRetryBudget');
+    }
+    // cadence 与上面三个参数同等对待。漏掉它的代价不是崩溃而是**静默失效**：
+    // 例如 maxSamples = 0 会让每次取样都抛 ArgumentError，被 _successDelay 的
+    // 降级吞掉，整个节奏特性退回均匀间隔且外部完全不可观测。
+    _validateCadence(this.cadence);
+  }
+
+  static void _validateCadence(SubscriptionCheckCadence cadence) {
+    void positive(Duration value, String name) {
+      if (value <= Duration.zero) throw ArgumentError.value(value, name);
+    }
+
+    positive(cadence.baseInterval, 'cadence.baseInterval');
+    positive(cadence.hotInterval, 'cadence.hotInterval');
+    positive(cadence.coldInterval, 'cadence.coldInterval');
+    positive(cadence.minInterval, 'cadence.minInterval');
+    if (cadence.minSamples <= 0) {
+      throw ArgumentError.value(cadence.minSamples, 'cadence.minSamples');
+    }
+    if (cadence.maxSamples < cadence.minSamples) {
+      throw ArgumentError.value(cadence.maxSamples, 'cadence.maxSamples');
+    }
+    if (cadence.coldInterval < cadence.hotInterval) {
+      throw ArgumentError.value(
+        cadence.coldInterval,
+        'cadence.coldInterval',
+        'cold window must not be denser than the hot window',
+      );
+    }
+  }
+
+  final FushiDatabase database;
+  final VideoResourceRegistry resourceRegistry;
+  final VideoDownloadSubscriptionEnqueue _enqueue;
+  final String workerId;
+  final Duration leaseDuration;
+
+  /// 检查节奏参数，**均匀间隔与各窗口取值的唯一真相源**。
+  final SubscriptionCheckCadence cadence;
+
+  /// 均匀间隔。同名构造参数只是建默认 [cadence] 的快捷方式；这里刻意是 getter
+  /// 而不是独立字段——两份可以各自分叉的「均匀间隔」就是同一个数字两层两语义，
+  /// 而且默认路径下两者恰好相等，测试也照不出分叉。
+  Duration get checkInterval => cadence.baseInterval;
+  final int autoRetryBudget;
+  final DateTime Function() _now;
+
+  Timer? _timer;
+  Future<void>? _activeCheck;
+  bool _disposed = false;
+  bool _stopped = false;
+
+  /// 重排代次。每次 [_scheduleNextWake] 进入时自增，写 `_timer` 前比对。
+  ///
+  /// 两次重排可以并发在途（`checkNow` 在 whenComplete 里先清 `_activeCheck`
+  /// 再发起重排，于是下一轮检查能在上一轮的重排还挂在 await 上时起跑）。没有
+  /// 这个令牌，胜负就是「谁最后完成谁赢」而不是「谁读到的 DB 状态最新谁赢」，
+  /// 一次陈旧的读会把新排好的定时器覆盖掉。
+  ///
+  /// 它防的是**唤醒变晚**，不是停摆：即使陈旧的一次赢了，`dueAt == null` 分支的
+  /// 兜底重排也保证最多迟一个 [SubscriptionCheckCadence.coldInterval] 就会重新
+  /// 探到。正因如此，去掉这个令牌不会让任何测试变红——要确定性地构造「陈旧的读
+  /// 晚于新的读完成」，得能控制两次 DB 查询各自的完成时机，而 [FushiDatabase]
+  /// 是具体类，注入不进去。这里如实记下：令牌是零成本的正确性防御，覆盖它的
+  /// 不是单测而是上面这段推理。
+  int _wakeGeneration = 0;
+  VideoDownloadLeaseGuard? _activeLease;
+
+  /// 启动时立刻领取所有当前到期订阅，之后睡到「下一条订阅真正到期」再醒。
+  ///
+  /// 这里刻意不是 [Timer.periodic]：固定脉冲既是加密的硬下限（把 nextCheckAt
+  /// 设到 3 分钟后也得等下一拍），也是冷窗的固定开销（一条订阅都不到期照样
+  /// 每 15 分钟醒一次）。改成按到期时刻重排的单次定时器后两头一起解决。
+  void start() {
+    if (_disposed || _timer != null) return;
+    _stopped = false;
+    unawaited(checkNow());
+  }
+
+  Future<void> checkNow() {
+    if (_disposed) return Future<void>.value();
+    final Future<void>? active = _activeCheck;
+    if (active != null) return active;
+    late final Future<void> run;
+    run = _drain().whenComplete(() {
+      if (identical(_activeCheck, run)) _activeCheck = null;
+      // 所有入口（启动、定时器、面板里的手动检查与新建订阅）都汇到这里重排，
+      // 新订阅不会卡在上一轮排好的长睡眠里。
+      unawaited(_scheduleNextWake());
+    });
+    _activeCheck = run;
+    return run;
+  }
+
+  /// 按 DB 里最早的到期时刻重排唤醒。
+  Future<void> _scheduleNextWake() async {
+    if (_disposed || _stopped) return;
+    final int generation = ++_wakeGeneration;
+    Duration delay;
+    try {
+      final int? dueAt = await database.nextVideoDownloadSubscriptionDueAt();
+      final int nowAt = _now().millisecondsSinceEpoch;
+      // 没有启用中的订阅时**照样排一次兜底唤醒**。不排的话，「调度器还活着」
+      // 就押在「每个新建 / 启用 / 导入 / 恢复订阅的入口都记得调 checkNow」这个
+      // 分散在多个调用点的口头约定上——漏一个就是永久停摆，而且静默。旧的
+      // Timer.periodic 对此免疫，兜底重排把这条保证换个形式留住。
+      delay = dueAt == null
+          ? cadence.coldInterval
+          : Duration(milliseconds: dueAt - nowAt);
+    } on Object catch (error, stack) {
+      // 降级不等于静默：查不出下一次到期就退回均匀间隔，但必须留痕，否则 DB
+      // 持续故障时整个节奏特性会无声无息地变成 no-op。
+      engineLog.log(
+        'VideoDownloadSubscriptionService.scheduleNextWake',
+        error,
+        stack,
+      );
+      delay = cadence.baseInterval;
+    }
+    // await 期间服务可能已经停掉，或已有更晚的一次重排读到了更新的 DB 状态。
+    if (_disposed || _stopped || generation != _wakeGeneration) return;
+    // 唤醒下限刻意用 hotInterval 而不是 minInterval：后者的语义是「同一条订阅
+    // 两次检查的最小间隔」，小到 1 分钟是为了让冷窗尾巴精确停在热窗起点上。
+    // 把它当成调度器的唤醒下限会让「已到期但领不走」的行触发每分钟空转。
+    if (delay < cadence.hotInterval) delay = cadence.hotInterval;
+    if (delay > cadence.coldInterval) delay = cadence.coldInterval;
+    _timer?.cancel();
+    _timer = Timer(delay, () => unawaited(checkNow()));
+  }
+
+  Future<void> stop() async {
+    // 必须先立标志：whenComplete 里的重排是 unawaited 的，它会在 _activeCheck
+    // 完成之后才从 await 恢复——晚于本函数返回。只取消定时器停不住服务。
+    _stopped = true;
+    _timer?.cancel();
+    _timer = null;
+    await _activeCheck;
+  }
+
+  Future<void> dispose() async {
+    _disposed = true;
+    await stop();
+  }
+
+  Future<void> _drain() async {
+    for (int processed = 0; processed < 64 && !_disposed; processed++) {
+      final int nowAt = _now().millisecondsSinceEpoch;
+      final VideoDownloadSubscriptionRow? subscription =
+          await database.claimNextVideoDownloadSubscription(
+        workerId: workerId,
+        nowAt: nowAt,
+        leaseDurationMs: leaseDuration.inMilliseconds,
+      );
+      if (subscription == null) return;
+      await _process(subscription);
+    }
+  }
+
+  Future<void> _process(VideoDownloadSubscriptionRow subscription) async {
+    final VideoDownloadLeaseGuard lease = VideoDownloadLeaseGuard(
+      leaseDuration: leaseDuration,
+      renew: () => database.renewVideoDownloadSubscriptionClaim(
+        subscriptionId: subscription.subscriptionId,
+        workerId: workerId,
+        nowAt: _now().millisecondsSinceEpoch,
+        leaseDurationMs: leaseDuration.inMilliseconds,
+      ),
+    );
+    _activeLease = lease;
+    lease.start();
+    try {
+      await _processWithLease(subscription);
+    } on VideoDownloadLeaseLost {
+      // A later worker owns the subscription now. Its persisted item outbox is
+      // sufficient to reconcile any job created before ownership was lost.
+    } finally {
+      if (identical(_activeLease, lease)) _activeLease = null;
+      await lease.stop();
+    }
+  }
+
+  Future<void> _processWithLease(
+    VideoDownloadSubscriptionRow subscription,
+  ) async {
+    try {
+      final _SubscriptionCheckOutcome outcome = await _check(subscription);
+      final int checkedAt = _now().millisecondsSinceEpoch;
+      final Duration nextDelay = await _successDelay(subscription, checkedAt);
+      await _releaseLeaseWith(
+        () => database.completeVideoDownloadSubscriptionCheck(
+          subscriptionId: subscription.subscriptionId,
+          workerId: workerId,
+          checkedAt: checkedAt,
+          nextCheckAt: checkedAt + nextDelay.inMilliseconds,
+          matchedAt: outcome.matched ? checkedAt : null,
+          fulfillOneShot:
+              subscription.mode == 'oneShot' && outcome.hasPersistentJob,
+        ),
+      );
+    } on Object catch (error) {
+      _ensureLeaseHeld();
+      final int failedAt = _now().millisecondsSinceEpoch;
+      final Duration retryDelay = _retryDelay(subscription, error);
+      await _releaseLeaseWith(
+        () => database.retryVideoDownloadSubscriptionCheck(
+          subscriptionId: subscription.subscriptionId,
+          workerId: workerId,
+          error: _safeSubscriptionError(error),
+          failedAt: failedAt,
+          nextCheckAt: failedAt + retryDelay.inMilliseconds,
+        ),
+      );
+    }
+  }
+
+  Future<_SubscriptionCheckOutcome> _check(
+    VideoDownloadSubscriptionRow subscription,
+  ) async {
+    _ensureLeaseHeld();
+    _validateSubscription(subscription);
+    final List<VideoDownloadSubscriptionItemRow> existingItems =
+        await database.getVideoDownloadSubscriptionItems(
+      subscription.subscriptionId,
+    );
+    // 一次性订阅「已经下过了」的判据只能看**整包那一条**（`batch` / 电影的
+    // `movie`）。订阅 id 按作品稳定、`upsertVideoDownloadSubscription` 整行覆盖
+    // 但**不清 items**：用户追更过某番（items 里已有带 jobId 的 `S01E01…`）、番完结
+    // 后改从 BD 全集包重新订阅，mode 被改写成 oneShot，若这里看「任意 item 有 job」
+    // 就会直接 fulfil——订阅显示「已完成」，整包一个字节都没下（BUG-2619 的同族
+    // 静默失败）。换发布组重订同一个整包同理。
+    if (subscription.mode == 'oneShot' &&
+        existingItems.any(
+          (VideoDownloadSubscriptionItemRow item) =>
+              item.jobId != null &&
+              (item.logicalItemKey == kBatchSubscriptionItemKey ||
+                  item.logicalItemKey == 'movie'),
+        )) {
+      return const _SubscriptionCheckOutcome(
+        matched: true,
+        hasPersistentJob: true,
+      );
+    }
+
+    final String selectedProvider = subscription.resourceProvider.trim();
+    final String providerBase = _providerBase(selectedProvider);
+    if (!resourceRegistry.providers.any(
+      (VideoResourceProvider provider) => provider.id == providerBase,
+    )) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The selected resource provider is not configured on this device',
+      );
+    }
+    final _SubscriptionFilter filter = _SubscriptionFilter.parse(
+      subscription.filterJson,
+      providerBase: providerBase,
+    );
+    final VideoMediaReference media = _mediaReference(subscription);
+    final List<VideoResourceCandidate> providerCandidates =
+        await _searchSubscriptionCandidates(
+      media: media,
+      query: subscription.searchQuery,
+      season: subscription.season,
+      selectedProvider: selectedProvider,
+      providerBase: providerBase,
+    );
+
+    final Map<String, List<_SubscriptionRelease>> releasesByItem =
+        <String, List<_SubscriptionRelease>>{};
+    for (final VideoResourceCandidate candidate in providerCandidates) {
+      if (!filter.matches(candidate)) continue;
+      final _SubscriptionLogicalItem? logicalItem =
+          _logicalItem(subscription, candidate.title);
+      if (logicalItem == null) continue;
+      releasesByItem
+          .putIfAbsent(
+            logicalItem.key,
+            () => <_SubscriptionRelease>[],
+          )
+          .add(_SubscriptionRelease(candidate, logicalItem));
+    }
+    if (releasesByItem.isEmpty) {
+      return const _SubscriptionCheckOutcome(
+        matched: false,
+        hasPersistentJob: false,
+      );
+    }
+
+    final Map<String, VideoDownloadSubscriptionItemRow> existingByKey =
+        <String, VideoDownloadSubscriptionItemRow>{
+      for (final VideoDownloadSubscriptionItemRow item in existingItems)
+        item.logicalItemKey: item,
+    };
+    final Set<String> managedEpisodeKeys =
+        await _managedEpisodeKeys(subscription);
+    // BUG-1746：判「这一集还用不用管」必须看任务的真实下场，不能只看 jobId 在不在。
+    final Map<String, String> lifecycleByJobId = <String, String>{
+      for (final VideoDownloadJobRow job
+          in await database.getVideoDownloadJobs())
+        job.jobId: job.lifecycle,
+    };
+    final List<String> keys = releasesByItem.keys.toList()
+      ..sort(_compareLogicalItemKeys);
+    bool hasPersistentJob = false;
+    Object? firstError;
+    for (final String key in keys) {
+      final VideoDownloadSubscriptionItemRow? existing = existingByKey[key];
+      if (existing != null &&
+          subscriptionItemStillClaimed(existing, lifecycleByJobId)) {
+        hasPersistentJob = hasPersistentJob || existing.jobId != null;
+        continue;
+      }
+      final List<_SubscriptionRelease> choices = releasesByItem[key]!;
+      final _SubscriptionRelease? release = existing == null
+          ? _bestRelease(choices)
+          : _findPersistedRelease(existing, choices);
+      if (release == null) {
+        firstError ??= ExternalProviderFailure(
+          providerId: providerBase,
+          operation: 'subscription-search',
+          kind: ExternalProviderFailureKind.notFound,
+          message: 'the persisted subscription release is unavailable',
+          retryable: true,
+        );
+        continue;
+      }
+      try {
+        final VideoDownloadSubscriptionItemRow item =
+            existing ?? await _persistDiscoveredItem(subscription, release);
+        if (managedEpisodeKeys.contains(release.logicalItem.key)) {
+          await _markItemSkipped(item.id);
+          continue;
+        }
+        hasPersistentJob =
+            await _enqueueItem(subscription, media, release.candidate, item) ||
+                hasPersistentJob;
+      } on VideoDownloadLeaseLost {
+        rethrow;
+      } on Object catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (firstError != null) _throwSubscriptionError(firstError);
+    return _SubscriptionCheckOutcome(
+      matched: true,
+      hasPersistentJob: hasPersistentJob,
+    );
+  }
+
+  /// 「这一集已经有人管了，订阅不用再派」的判据；实现与 AI 下载流程共用，
+  /// 在 [resolveVideoLibraryPresence]（含 needsAttention 为何不算数的说明）。
+  Future<Set<String>> _managedEpisodeKeys(
+    VideoDownloadSubscriptionRow subscription,
+  ) async {
+    final VideoLibraryPresence presence = await resolveVideoLibraryPresence(
+      database,
+      metadataProvider: subscription.metadataProvider ?? '',
+      externalId: subscription.externalId ?? '',
+      mediaKind: _mediaKind(subscription.mediaKind),
+    );
+    return presence.managedEpisodeKeys;
+  }
+
+  Future<List<VideoResourceCandidate>> _searchSubscriptionCandidates({
+    required VideoMediaReference media,
+    required String query,
+    required int? season,
+    required String selectedProvider,
+    required String providerBase,
+  }) async {
+    final List<VideoResourceProvider> providers = resourceRegistry.providers
+        .where((VideoResourceProvider provider) => provider.id == providerBase)
+        .toList(growable: false);
+    final Map<String, VideoResourceCandidate> candidatesByIdentity =
+        <String, VideoResourceCandidate>{};
+
+    for (int page = 1; page <= _subscriptionResourceMaxPages; page++) {
+      _ensureLeaseHeld();
+      final VideoResourceSearchRequest request = VideoResourceSearchRequest(
+        media: media,
+        query: query,
+        season: season,
+        page: page,
+        limit: _subscriptionResourcePageSize,
+      );
+      final List<ProviderBatchResult<VideoResourceCandidate>> batches =
+          await Future.wait(
+        providers.map(
+          (VideoResourceProvider provider) async {
+            try {
+              return await provider.search(request);
+            } on Object catch (error) {
+              return ProviderBatchResult<VideoResourceCandidate>.failure(
+                ExternalProviderFailure.fromException(
+                  providerId: provider.id,
+                  operation: 'subscription-search',
+                  error: error,
+                ),
+              );
+            }
+          },
+        ),
+      );
+      _ensureLeaseHeld();
+      final ProviderBatchResult<VideoResourceCandidate> result =
+          ProviderBatchResult.merge<VideoResourceCandidate>(batches);
+      final List<VideoResourceCandidate> pageCandidates = result.items
+          .where(
+            (VideoResourceCandidate candidate) =>
+                _candidateBelongsToProvider(candidate, selectedProvider),
+          )
+          .toList(growable: false);
+      if (pageCandidates.isEmpty) {
+        for (final ExternalProviderFailure failure in result.failures) {
+          if (_failureBelongsToProvider(failure, selectedProvider)) {
+            throw failure;
+          }
+        }
+        if (result.isTotalFailure && result.failures.isNotEmpty) {
+          throw result.failures.first;
+        }
+        break;
+      }
+
+      int newCandidateCount = 0;
+      for (final VideoResourceCandidate candidate in pageCandidates) {
+        if (candidatesByIdentity.containsKey(candidate.identityKey)) continue;
+        candidatesByIdentity[candidate.identityKey] = candidate;
+        newCandidateCount++;
+      }
+      if (pageCandidates.length < _subscriptionResourcePageSize ||
+          newCandidateCount == 0) {
+        break;
+      }
+    }
+    return List<VideoResourceCandidate>.unmodifiable(
+      candidatesByIdentity.values,
+    );
+  }
+
+  Future<VideoDownloadSubscriptionItemRow> _persistDiscoveredItem(
+    VideoDownloadSubscriptionRow subscription,
+    _SubscriptionRelease release,
+  ) async {
+    _ensureLeaseHeld();
+    final VideoResourceCandidate candidate = release.candidate;
+    final int nowAt = _now().millisecondsSinceEpoch;
+    await database.upsertVideoDownloadSubscriptionItem(
+      VideoDownloadSubscriptionItemsCompanion.insert(
+        subscriptionId: subscription.subscriptionId,
+        logicalItemKey: release.logicalItem.key,
+        resourceProvider: persistedVideoResourceProviderId(candidate),
+        selectedResourceId: candidate.remoteId,
+        torrentHash: Value<String?>(candidate.infoHash?.toLowerCase()),
+        title: candidate.title,
+        season: Value<int?>(release.logicalItem.season),
+        episode: Value<int?>(release.logicalItem.episode),
+        publishedAt: Value<int?>(candidate.publishedAt?.millisecondsSinceEpoch),
+        status: const Value<String>(
+          VideoDownloadSubscriptionItemStatus.discovered,
+        ),
+        discoveredAt: nowAt,
+        updatedAt: nowAt,
+      ),
+    );
+    _ensureLeaseHeld();
+    final List<VideoDownloadSubscriptionItemRow> items =
+        await database.getVideoDownloadSubscriptionItems(
+      subscription.subscriptionId,
+    );
+    return items.firstWhere(
+      (VideoDownloadSubscriptionItemRow item) =>
+          item.logicalItemKey == release.logicalItem.key,
+    );
+  }
+
+  Future<bool> _enqueueItem(
+    VideoDownloadSubscriptionRow subscription,
+    VideoMediaReference media,
+    VideoResourceCandidate candidate,
+    VideoDownloadSubscriptionItemRow item,
+  ) async {
+    _ensureLeaseHeld();
+    // 前置条件：调用方已用 [subscriptionItemStillClaimed] 判过这一集还用不用管。
+    // 这里**不再**重复写一遍 `item.jobId != null` —— 那份副本正是 BUG-1746 的
+    // 第二道锁：放开上面的判定后它会照旧把重试挡在门外。判据只留一处。
+    final String providerId = persistedVideoResourceProviderId(candidate);
+    final List<VideoDownloadJobRow> jobs =
+        await database.getVideoDownloadJobs();
+    _ensureLeaseHeld();
+    for (final VideoDownloadJobRow job in jobs) {
+      if (job.fingerprint != subscription.fingerprint ||
+          job.resourceProvider != providerId ||
+          job.selectedResourceId != candidate.remoteId) {
+        continue;
+      }
+      if (videoDownloadJobLifecycleStillCounts(job.lifecycle)) {
+        await _markItemQueued(item.id, job.jobId);
+        return true;
+      }
+      // failed / needsAttention：**恢复**这一条既有任务，不再 enqueue 一份新的。
+      //
+      // `pipeline.enqueue` 每次调用都 `generateVideoDownloadInstallationId()`
+      // 生成全新 jobId，而 `VideoDownloadJobs` 对
+      // (fingerprint, resourceProvider, selectedResourceId) / torrentHash
+      // 没有任何唯一约束。生产 checkInterval 是 15 分钟，一个持续性故障
+      // （实测例：内置下载引擎运行时缺失）下这等于每集每天往下载面板堆约 96 条
+      // 死任务行，永不收敛。`needsAttention` 更糟：它是「需要用户处理的可恢复
+      // 状态」，backendTaskId 还在、后端 torrent 可能仍在跑，再派一份同 magnet
+      // 的任务会让两条持久工作流指向同一个 infohash，各自 organize/import。
+      // BUG-2755：旧任务的目标来源被删了（FK 清空）或不可用时，恢复前先改绑到
+      // 订阅的当前来源，否则恢复后整理阶段照样撞「受管来源不存在」。
+      await _rebindUnusableJobSource(job, subscription);
+      _ensureLeaseHeld();
+      final bool revived = await database.reviveVideoDownloadJobForSubscription(
+        jobId: job.jobId,
+        autoRetryBudget: autoRetryBudget,
+        nowAt: _now().millisecondsSinceEpoch,
+      );
+      _ensureLeaseHeld();
+      if (revived) await _markItemQueued(item.id, job.jobId);
+      // 预算借满时任务原样停在 failed / needsAttention 等用户处理。即便如此它
+      // 仍然是这一集的持久任务，不能当成「没人管」再派一份 —— 所以这里一律
+      // 返回 true，不落到下面的 enqueue。
+      return true;
+    }
+
+    try {
+      final String jobId = await _enqueue(
+        VideoDownloadEnqueueRequest(
+          media: VideoMediaReference(
+            providerId: media.providerId,
+            mediaId: media.mediaId,
+            mediaKind: media.mediaKind,
+            discoveryCategory: media.discoveryCategory,
+            title: media.title,
+            originalTitle: media.originalTitle,
+            aliases: media.aliases,
+            year: media.year,
+            season: item.season ?? media.season,
+            episode: item.episode,
+            anidbId: media.anidbId,
+            tmdbId: media.tmdbId,
+            imdbId: media.imdbId,
+            tvdbId: media.tvdbId,
+            anilistId: media.anilistId,
+            bangumiId: media.bangumiId,
+            externalIds: media.externalIds,
+          ),
+          resource: candidate,
+          backendTarget: VideoDownloadBackendTarget(
+            identity: VideoDownloadBackendIdentity(
+              kind: subscription.backendKind,
+              profileId: subscription.backendProfileId!,
+              fingerprint: subscription.fingerprint,
+            ),
+            // 订阅自己记录的投放分类，不读当前设置：订阅派生出的每一集都落在
+            // 订阅创建时选定的分类里（BUG-1879）。
+            category: subscription.category!,
+          ),
+          targetSourceId: subscription.targetSourceId!,
+          subtitlePolicy: _subtitlePolicy(subscription.subtitlePolicy),
+          coverUrl: subscription.coverUrl,
+        ),
+      );
+      _ensureLeaseHeld();
+      await _markItemQueued(item.id, jobId);
+      return true;
+    } on VideoDownloadLeaseLost {
+      rethrow;
+    } on Object catch (error) {
+      _ensureLeaseHeld();
+      await database.updateVideoDownloadSubscriptionItem(
+        item.id,
+        VideoDownloadSubscriptionItemsCompanion(
+          status: const Value<String>(
+            VideoDownloadSubscriptionItemStatus.failed,
+          ),
+          error: Value<String?>(_safeSubscriptionError(error)),
+          updatedAt: Value<int>(_now().millisecondsSinceEpoch),
+        ),
+      );
+      rethrow;
+    }
+  }
+
+  Future<void> _rebindUnusableJobSource(
+    VideoDownloadJobRow job,
+    VideoDownloadSubscriptionRow subscription,
+  ) async {
+    final int? target = subscription.targetSourceId;
+    if (target == null ||
+        target == job.targetSourceId ||
+        !videoDownloadJobTargetSourceRebindable(job)) {
+      return;
+    }
+    final int? current = job.targetSourceId;
+    if (current != null &&
+        isUsableManagedVideoSource(await database.getMediaSourceById(current))) {
+      return;
+    }
+    if (!isUsableManagedVideoSource(await database.getMediaSourceById(target))) {
+      return;
+    }
+    _ensureLeaseHeld();
+    await database.updateVideoDownloadJob(
+      job.jobId,
+      VideoDownloadJobsCompanion(
+        targetSourceId: Value<int?>(target),
+        updatedAt: Value<int>(_now().millisecondsSinceEpoch),
+      ),
+    );
+  }
+
+  Future<void> _markItemQueued(int itemId, String jobId) async {
+
+    _ensureLeaseHeld();
+    await database.updateVideoDownloadSubscriptionItem(
+      itemId,
+      VideoDownloadSubscriptionItemsCompanion(
+        jobId: Value<String?>(jobId),
+        status: const Value<String>(
+          VideoDownloadSubscriptionItemStatus.queued,
+        ),
+        error: const Value<String?>(null),
+        updatedAt: Value<int>(_now().millisecondsSinceEpoch),
+      ),
+    );
+    _ensureLeaseHeld();
+  }
+
+  Future<void> _markItemSkipped(int itemId) async {
+    _ensureLeaseHeld();
+    await database.updateVideoDownloadSubscriptionItem(
+      itemId,
+      VideoDownloadSubscriptionItemsCompanion(
+        status: const Value<String>(
+          VideoDownloadSubscriptionItemStatus.skipped,
+        ),
+        error: const Value<String?>(null),
+        updatedAt: Value<int>(_now().millisecondsSinceEpoch),
+      ),
+    );
+    _ensureLeaseHeld();
+  }
+
+  Future<void> _releaseLeaseWith(Future<bool> Function() transition) async {
+    final VideoDownloadLeaseGuard? lease = _activeLease;
+    if (lease == null) throw const VideoDownloadLeaseLost();
+    lease.ensureHeld();
+    final bool changed = await transition();
+    if (!changed) {
+      lease.markLost();
+      throw const VideoDownloadLeaseLost();
+    }
+    lease.markReleased();
+  }
+
+  void _ensureLeaseHeld() {
+    final VideoDownloadLeaseGuard? lease = _activeLease;
+    if (lease == null) throw const VideoDownloadLeaseLost();
+    lease.ensureHeld();
+  }
+
+  void _validateSubscription(VideoDownloadSubscriptionRow subscription) {
+    if (subscription.mode != 'oneShot' && subscription.mode != 'ongoing') {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription mode is invalid',
+      );
+    }
+    if (subscription.targetSourceId == null) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription target source is unavailable',
+      );
+    }
+    if (subscription.backendProfileId?.trim().isEmpty != false ||
+        subscription.category?.trim().isEmpty != false) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription download backend binding is incomplete',
+      );
+    }
+    if (subscription.organizationPolicy != 'library') {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'Legacy organization subscriptions require the legacy scheduler',
+      );
+    }
+    _mediaKind(subscription.mediaKind);
+    _discoveryCategory(subscription);
+    _subtitlePolicy(subscription.subtitlePolicy);
+  }
+
+  /// 一次成功检查之后隔多久再查。
+  ///
+  /// 连载订阅按自己的历史发布时刻学出每周更新点，热窗加密、冷窗拉长；样本不足
+  /// 或没有稳定周期时退回均匀间隔，与改动前行为一致。样本必须在 `_check` **之后**
+  /// 重新读：本轮新命中的那一集刚刚写进 items，而它恰恰是最有价值的一个样本。
+  Future<Duration> _successDelay(
+    VideoDownloadSubscriptionRow subscription,
+    int checkedAt,
+  ) async {
+    // oneShot 没有周期语义，学不出也不该学。这个判断只编码在这里一处：它作为
+    // weekly 传进纯函数，由后者统一决定退化取值，避免同一策略两处各写一遍、
+    // 各自返回不同变量。
+    final bool weekly = subscription.mode != 'oneShot';
+    try {
+      final List<int> publishedAt = weekly
+          ? await database.getVideoDownloadSubscriptionPublishedAt(
+              subscription.subscriptionId,
+              limit: cadence.maxSamples,
+            )
+          : const <int>[];
+      return nextSubscriptionCheckDelay(
+        recentPublishedAtMs: publishedAt,
+        nowMs: checkedAt,
+        weekly: weekly,
+        cadence: cadence,
+      );
+    } on Object catch (error, stack) {
+      // 读不出历史不影响这一轮的检查结果，退回均匀间隔即可——但要留痕，否则
+      // 取样恒失败时节奏特性会静默退化成改动前的行为，没有任何人知道。
+      engineLog.log(
+        'VideoDownloadSubscriptionService.successDelay',
+        error,
+        stack,
+      );
+      return cadence.baseInterval;
+    }
+  }
+
+  Duration _retryDelay(
+    VideoDownloadSubscriptionRow subscription,
+    Object error,
+  ) {
+    final int exponent = subscription.retryCount.clamp(0, 5);
+    final int multiplier = 1 << exponent;
+    int milliseconds = checkInterval.inMilliseconds * multiplier;
+    final int maximum = const Duration(hours: 6).inMilliseconds;
+    if (milliseconds > maximum) milliseconds = maximum;
+    if (error is ExternalProviderFailure && error.retryAfter != null) {
+      final int requested = error.retryAfter!.inMilliseconds;
+      if (requested > milliseconds) milliseconds = requested;
+    }
+    return Duration(milliseconds: milliseconds);
+  }
+}
+
+class _SubscriptionCheckOutcome {
+  const _SubscriptionCheckOutcome({
+    required this.matched,
+    required this.hasPersistentJob,
+  });
+
+  final bool matched;
+  final bool hasPersistentJob;
+}
+
+class _SubscriptionLogicalItem {
+  const _SubscriptionLogicalItem({
+    required this.key,
+    this.season,
+    this.episode,
+  });
+
+  final String key;
+  final int? season;
+  final int? episode;
+}
+
+class _SubscriptionRelease {
+  const _SubscriptionRelease(this.candidate, this.logicalItem);
+
+  final VideoResourceCandidate candidate;
+  final _SubscriptionLogicalItem logicalItem;
+}
+
+class _SubscriptionFilter {
+  const _SubscriptionFilter({
+    required this.releaseGroups,
+    required this.resolutions,
+    required this.qualities,
+    required this.sources,
+    required this.codecs,
+    required this.languages,
+    required this.categories,
+    required this.trusted,
+    required this.trustedOnly,
+    this.titleIncludes = const <String>[],
+    this.titleExcludes = const <String>[],
+  });
+
+  factory _SubscriptionFilter.parse(
+    String raw, {
+    required String providerBase,
+  }) {
+    final Object? decoded;
+    try {
+      decoded = jsonDecode(raw);
+    } on FormatException {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription version filter is invalid',
+      );
+    }
+    if (decoded is! Map<String, dynamic>) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription version filter is invalid',
+      );
+    }
+    if (decoded.containsKey('strict') && decoded['strict'] != true) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription version filter must remain strict',
+      );
+    }
+    final List<String> releaseGroups = _filterValues(
+      decoded,
+      'releaseGroup',
+    );
+    final List<String> resolutions = _filterValues(decoded, 'resolution');
+    final List<String> qualities = _filterValues(decoded, 'quality');
+    final List<String> sources = _filterValues(decoded, 'source');
+    final List<String> codecs = _filterValues(decoded, 'codec');
+    final List<String> languages = <String>{
+      ..._filterValues(decoded, 'language'),
+      ..._filterValues(decoded, 'languages'),
+    }.toList();
+    final List<String> categories = <String>{
+      ..._filterValues(decoded, 'category'),
+      ..._filterValues(decoded, 'nyaaCategory'),
+    }.toList();
+    final bool? trusted = _optionalBool(decoded, 'trusted');
+    final bool? trustedOnly = _optionalBool(decoded, 'trustedOnly');
+    // 用户在「编辑订阅」里填的标题关键词（包含全部 / 一个都不含），不算版本证据：
+    // 下面「Nyaa / Torznab 至少要有一条版本规则」的门不认它们。
+    final List<String> titleIncludes =
+        _filterValues(decoded, kVideoSubscriptionTitleIncludeKey);
+    final List<String> titleExcludes =
+        _filterValues(decoded, kVideoSubscriptionTitleExcludeKey);
+    if (providerBase == 'nyaa' &&
+        (releaseGroups.isEmpty ||
+            (resolutions.isEmpty && qualities.isEmpty) ||
+            (trusted == null && trustedOnly == null))) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'Nyaa subscriptions require release group, resolution, and trust rules',
+      );
+    }
+    if (providerBase == 'torznab' &&
+        releaseGroups.isEmpty &&
+        resolutions.isEmpty &&
+        qualities.isEmpty &&
+        sources.isEmpty &&
+        codecs.isEmpty &&
+        languages.isEmpty) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'Torznab subscriptions require at least one strict version rule',
+      );
+    }
+    return _SubscriptionFilter(
+      releaseGroups: releaseGroups,
+      resolutions: resolutions,
+      qualities: qualities,
+      sources: sources,
+      codecs: codecs,
+      languages: languages,
+      categories: categories,
+      trusted: trusted,
+      trustedOnly: trustedOnly ?? false,
+      titleIncludes: titleIncludes,
+      titleExcludes: titleExcludes,
+    );
+  }
+
+  final List<String> releaseGroups;
+  final List<String> resolutions;
+  final List<String> qualities;
+  final List<String> sources;
+  final List<String> codecs;
+  final List<String> languages;
+  final List<String> categories;
+  final bool? trusted;
+  final bool trustedOnly;
+  final List<String> titleIncludes;
+  final List<String> titleExcludes;
+
+  bool matches(VideoResourceCandidate candidate) {
+    if (titleIncludes.isNotEmpty || titleExcludes.isNotEmpty) {
+      final String title = _foldExact(candidate.title);
+      for (final String word in titleIncludes) {
+        if (!title.contains(_foldExact(word))) return false;
+      }
+      for (final String word in titleExcludes) {
+        if (title.contains(_foldExact(word))) return false;
+      }
+    }
+    if (releaseGroups.isNotEmpty &&
+        !_matchesExact(releaseGroups, candidate.releaseGroup)) {
+      return false;
+    }
+    if (resolutions.isNotEmpty &&
+        !_matchesVersionEvidence(
+          resolutions,
+          <String?>[candidate.resolution, candidate.title],
+        )) {
+      return false;
+    }
+    if (qualities.isNotEmpty &&
+        !_matchesVersionEvidence(
+          qualities,
+          <String?>[candidate.resolution, candidate.title],
+        )) {
+      return false;
+    }
+    if (sources.isNotEmpty &&
+        !_matchesVersionEvidence(sources, <String?>[candidate.title])) {
+      return false;
+    }
+    if (codecs.isNotEmpty &&
+        !_matchesVersionEvidence(codecs, <String?>[candidate.title])) {
+      return false;
+    }
+    if (languages.isNotEmpty &&
+        !_matchesVersionEvidence(languages, <String?>[candidate.title])) {
+      return false;
+    }
+    if (categories.isNotEmpty &&
+        !_matchesExact(categories, candidate.category)) {
+      return false;
+    }
+    if (trusted != null && candidate.trusted != trusted) return false;
+    if (trustedOnly && !candidate.trusted) return false;
+    return true;
+  }
+}
+
+VideoMediaReference _mediaReference(
+  VideoDownloadSubscriptionRow subscription,
+) {
+  // v94（BUG-2003）：优先入队快照，保留日文原名、罗马字别名和外部身份。
+  // Nyaa 轮询使用持久化的 searchQuery，别名仅供未指定查询时选默认词。订阅列
+  // （title/year/season/kind）仍是流程真值。旧行（NULL 快照）走修前重建。
+  final VideoMediaReference? stored =
+      decodeVideoMediaReference(subscription.identityJson);
+  if (stored != null) {
+    return VideoMediaReference(
+      providerId: stored.providerId,
+      mediaId: stored.mediaId,
+      mediaKind: _mediaKind(subscription.mediaKind),
+      discoveryCategory: _discoveryCategory(subscription),
+      title: subscription.title,
+      originalTitle: stored.originalTitle,
+      aliases: stored.aliases,
+      year: subscription.year ?? stored.year,
+      season: subscription.season ?? stored.season,
+      tmdbId: stored.tmdbId,
+      imdbId: stored.imdbId,
+      tvdbId: stored.tvdbId,
+      anidbId: stored.anidbId,
+      anilistId: stored.anilistId,
+      bangumiId: stored.bangumiId,
+      externalIds: stored.externalIds,
+    );
+  }
+  final String provider =
+      subscription.metadataProvider?.trim().isNotEmpty == true
+          ? subscription.metadataProvider!.trim()
+          : 'subscription';
+  final String mediaId = subscription.externalId?.trim().isNotEmpty == true
+      ? subscription.externalId!.trim()
+      : subscription.subscriptionId;
+  return VideoMediaReference(
+    providerId: provider,
+    mediaId: mediaId,
+    mediaKind: _mediaKind(subscription.mediaKind),
+    discoveryCategory: _discoveryCategory(subscription),
+    title: subscription.title,
+    year: subscription.year,
+    season: subscription.season,
+    anidbId: provider == 'anidb' ? int.tryParse(mediaId) : null,
+    tmdbId: provider == 'tmdb' ? int.tryParse(mediaId) : null,
+    anilistId: provider == 'anilist' ? int.tryParse(mediaId) : null,
+    bangumiId: provider == 'bangumi' ? int.tryParse(mediaId) : null,
+  );
+}
+
+VideoMetadataMediaKind _mediaKind(String raw) {
+  for (final VideoMetadataMediaKind value in VideoMetadataMediaKind.values) {
+    if (value.name == raw) return value;
+  }
+  throw const VideoDownloadSubscriptionConfigurationError(
+    'The subscription media kind is invalid',
+  );
+}
+
+VideoDiscoveryCategory _discoveryCategory(
+  VideoDownloadSubscriptionRow subscription,
+) {
+  final String? raw = subscription.discoveryCategory;
+  for (final VideoDiscoveryCategory value in VideoDiscoveryCategory.values) {
+    if (value.name == raw) return value;
+  }
+  if (_providerBase(subscription.resourceProvider) == 'nyaa') {
+    return VideoDiscoveryCategory.anime;
+  }
+  return _mediaKind(subscription.mediaKind) == VideoMetadataMediaKind.movie
+      ? VideoDiscoveryCategory.movie
+      : VideoDiscoveryCategory.tv;
+}
+
+VideoDownloadSubtitlePolicy _subtitlePolicy(String raw) {
+  for (final VideoDownloadSubtitlePolicy value
+      in VideoDownloadSubtitlePolicy.values) {
+    if (value.name == raw) return value;
+  }
+  throw const VideoDownloadSubscriptionConfigurationError(
+    'The subscription subtitle policy is invalid',
+  );
+}
+
+_SubscriptionLogicalItem? _logicalItem(
+  VideoDownloadSubscriptionRow subscription,
+  String title,
+) {
+  if (_mediaKind(subscription.mediaKind) == VideoMetadataMediaKind.movie) {
+    return const _SubscriptionLogicalItem(key: 'movie');
+  }
+  final VideoNameInfo parsed = parseVideoFilename(title);
+  if (subscriptionReleaseIsBatch(title)) {
+    // 整包（合集 / 全集 / 认不出集号的 BD 打包）没有逐集身份。
+    //
+    // 追更订阅按定义只处理「新的一集」，整包对它永远不是新集，照旧丢弃——否则
+    // 每出一版合集就会把整季重下一遍。一次性订阅相反：用户选中的**就是**这一
+    // 整包，把它丢掉等于这条订阅永远不可能命中（BUG-2619）。整包落成一个固定
+    // 键的逻辑条目，下载后由流水线逐文件识别每一集，订阅随即 fulfil 并停用。
+    if (subscription.mode != 'oneShot') return null;
+    if (subscription.season != null &&
+        parsed.season != null &&
+        subscription.season != parsed.season) {
+      return null;
+    }
+    return _SubscriptionLogicalItem(
+      key: kBatchSubscriptionItemKey,
+      season: subscription.season ?? parsed.season,
+    );
+  }
+  // 一次性订阅只要那一个整包：创建端靠「整组全是整包」（`batchOnly`）才建 oneShot，
+  // 但那个前提在检查端不成立——创建端只发一次默认分页的搜索，检查端无条件深翻页到
+  // `_subscriptionResourceMaxPages`。同一 filter 组里的单集发布只要出现在 UI 没看到
+  // 的后续页，就会被 oneShot 订阅当成「要下的一集」，于是整包 + 每一集各入队一次，
+  // 一次检查就把整季下两遍。与 ongoing 丢弃整包对称，这里丢弃单集。
+  if (subscription.mode == 'oneShot') return null;
+  final int? episode = parsed.episode;
+  final int season = parsed.season ?? subscription.season ?? 1;
+  if (episode == null || season <= 0 || episode <= 0) {
+    return null;
+  }
+  if (subscription.season != null && subscription.season != season) {
+    return null;
+  }
+  if (subscription.startAfterEpisode != null) {
+    // BUG-1513：新版发现订阅页会用用户选中的 release 集数预填此字段，且不会
+    // 另外把该 release 直接入队。旧判断 `episode <= anchor` 因而必然跳过用户
+    // 选中的首集（选第 1 集，卡片变成“第 1 集之后”，实际从第 2 集开始）。
+    // `library` 是新版持久流水线创建的订阅，字段按“从该集开始”解释；legacy
+    // 订阅是在已推送当前种子后创建，仍保持“该集之后”的历史契约。
+    final bool inclusiveStart = subscription.organizationPolicy == 'library';
+    final bool beforeWindow = inclusiveStart
+        ? episode < subscription.startAfterEpisode!
+        : episode <= subscription.startAfterEpisode!;
+    if (beforeWindow) return null;
+  }
+  return _SubscriptionLogicalItem(
+    key: videoEpisodeKey(season, episode),
+    season: season,
+    episode: episode,
+  );
+}
+
+
+_SubscriptionRelease? _bestRelease(List<_SubscriptionRelease> releases) {
+  if (releases.isEmpty) return null;
+  final List<_SubscriptionRelease> sorted = List<_SubscriptionRelease>.of(
+    releases,
+  )..sort((_SubscriptionRelease a, _SubscriptionRelease b) {
+      final VideoResourceCandidate left = a.candidate;
+      final VideoResourceCandidate right = b.candidate;
+      if (left.trusted != right.trusted) return left.trusted ? -1 : 1;
+      final int bySeeders = right.seeders.compareTo(left.seeders);
+      if (bySeeders != 0) return bySeeders;
+      final int byDate = (right.publishedAt?.millisecondsSinceEpoch ?? 0)
+          .compareTo(left.publishedAt?.millisecondsSinceEpoch ?? 0);
+      if (byDate != 0) return byDate;
+      final int byPriority =
+          left.providerPriority.compareTo(right.providerPriority);
+      if (byPriority != 0) return byPriority;
+      return left.remoteId.compareTo(right.remoteId);
+    });
+  return sorted.first;
+}
+
+_SubscriptionRelease? _findPersistedRelease(
+  VideoDownloadSubscriptionItemRow item,
+  List<_SubscriptionRelease> releases,
+) {
+  for (final _SubscriptionRelease release in releases) {
+    if (persistedVideoResourceProviderId(release.candidate) ==
+            item.resourceProvider &&
+        release.candidate.remoteId == item.selectedResourceId) {
+      return release;
+    }
+  }
+  return null;
+}
+
+int _compareLogicalItemKeys(String left, String right) {
+  if (left == 'movie') return right == 'movie' ? 0 : -1;
+  if (right == 'movie') return 1;
+  return left.compareTo(right);
+}
+
+String _providerBase(String providerId) =>
+    providerId.trim().toLowerCase().split(':').first;
+
+bool _candidateBelongsToProvider(
+  VideoResourceCandidate candidate,
+  String selectedProvider,
+) {
+  final String selected = selectedProvider.trim().toLowerCase();
+  final String persisted =
+      persistedVideoResourceProviderId(candidate).toLowerCase();
+  return selected.contains(':')
+      ? selected == persisted
+      : selected == candidate.providerId.toLowerCase();
+}
+
+bool _failureBelongsToProvider(
+  ExternalProviderFailure failure,
+  String selectedProvider,
+) {
+  final String selected = selectedProvider.trim().toLowerCase();
+  final String failed = failure.providerId.trim().toLowerCase();
+  return selected.contains(':')
+      ? failed == selected
+      : failed == selected || failed.startsWith('$selected:');
+}
+
+List<String> _filterValues(Map<String, dynamic> raw, String key) {
+  if (!raw.containsKey(key) || raw[key] == null) return const <String>[];
+  final Object value = raw[key]!;
+  final Iterable<Object?> values = value is List<Object?>
+      ? value
+      : value is String
+          ? <Object?>[value]
+          : throw const VideoDownloadSubscriptionConfigurationError(
+              'The subscription version filter is invalid',
+            );
+  final List<String> result = <String>[];
+  for (final Object? item in values) {
+    if (item is! String || item.trim().isEmpty) {
+      throw const VideoDownloadSubscriptionConfigurationError(
+        'The subscription version filter is invalid',
+      );
+    }
+    result.add(item.trim());
+  }
+  return List<String>.unmodifiable(result);
+}
+
+/// 订阅版本规则（`filterJson`）里「标题必须包含」的关键词列表键（全部都要出现，
+/// 不区分大小写）。由「编辑订阅」写入。
+const String kVideoSubscriptionTitleIncludeKey = 'titleInclude';
+
+/// 订阅版本规则里「标题不得包含」的关键词列表键（出现任意一个即排除）。
+const String kVideoSubscriptionTitleExcludeKey = 'titleExclude';
+
+bool? _optionalBool(Map<String, dynamic> raw, String key) {
+  if (!raw.containsKey(key) || raw[key] == null) return null;
+  final Object value = raw[key]!;
+  if (value is bool) return value;
+  throw const VideoDownloadSubscriptionConfigurationError(
+    'The subscription version filter is invalid',
+  );
+}
+
+bool _matchesExact(List<String> expected, String? actual) {
+  if (actual == null || actual.trim().isEmpty) return false;
+  final String foldedActual = _foldExact(actual);
+  return expected.any((String value) => _foldExact(value) == foldedActual);
+}
+
+String _foldExact(String value) =>
+    value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), ' ');
+
+bool _matchesVersionEvidence(
+  List<String> expected,
+  List<String?> evidence,
+) {
+  for (final String value in expected) {
+    final String needle = _canonicalVersionText(value);
+    for (final String? source in evidence) {
+      if (source == null || source.trim().isEmpty) continue;
+      final String haystack = _canonicalVersionText(source);
+      if (' $haystack '.contains(' $needle ')) return true;
+    }
+  }
+  return false;
+}
+
+String _canonicalVersionText(String value) {
+  String normalized = value.toLowerCase();
+  normalized = normalized.replaceAll(
+    RegExp(r'\b(?:h[ ._-]?265|x265|hevc)\b'),
+    ' hevc ',
+  );
+  normalized = normalized.replaceAll(
+    RegExp(r'\b(?:h[ ._-]?264|x264|avc)\b'),
+    ' avc ',
+  );
+  normalized = normalized.replaceAll(
+    RegExp(r'\bweb[ ._-]?dl\b'),
+    ' webdl ',
+  );
+  normalized = normalized.replaceAll(
+    RegExp(r'\bweb[ ._-]?rip\b'),
+    ' webrip ',
+  );
+  normalized = normalized.replaceAll(
+    RegExp(r'\bblu[ ._-]?ray\b'),
+    ' bluray ',
+  );
+  normalized = normalized.replaceAll(
+    RegExp(r'\bdual[ ._-]?audio\b'),
+    ' dualaudio ',
+  );
+  normalized = normalized.replaceAll(RegExp(r'\b4k\b'), ' 2160p ');
+  return normalized
+      .replaceAll(RegExp(r'[^a-z0-9\u3400-\u9fff]+'), ' ')
+      .trim()
+      .replaceAll(RegExp(r'\s+'), ' ');
+}
+
+String _safeSubscriptionError(Object error) {
+  if (error is VideoDownloadSubscriptionConfigurationError) {
+    return error.message;
+  }
+  if (error is ExternalProviderFailure) {
+    final String provider = _providerBase(error.providerId);
+    final String message = redactCredentialsInText(error.message);
+    return '$provider ${error.kind.name}: $message';
+  }
+  return 'subscription check failed';
+}
+
+Never _throwSubscriptionError(Object error) {
+  if (error is Exception) throw error;
+  if (error is Error) throw error;
+  throw StateError('subscription check failed');
+}

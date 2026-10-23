@@ -1,0 +1,142 @@
+import 'dart:io';
+
+import 'package:flutter/services.dart' hide ModifierKey;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/shortcuts/input_binding.dart';
+import 'package:fushi/src/shortcuts/shortcut_action.dart';
+import 'package:fushi/src/shortcuts/shortcut_defaults.dart';
+
+// TODO-1093 guards for the window-level ("app 级") fullscreen toggle shortcut.
+// Distinct from videoToggleFullscreen (which only toggles the video surface):
+// this flips the whole desktop window via WindowManager.setFullScreen and lives
+// in the remappable registry (global scope, default F11).
+void main() {
+  group('globalToggleFullscreen exists in the global scope', () {
+    test('enum has globalToggleFullscreen, scope=global, stable key', () {
+      expect(
+        ShortcutAction.values.map((ShortcutAction a) => a.name),
+        contains('globalToggleFullscreen'),
+      );
+      expect(
+        ShortcutAction.globalToggleFullscreen.scope,
+        ShortcutScope.global,
+      );
+      expect(
+        ShortcutAction.globalToggleFullscreen.key,
+        'global_toggle_fullscreen',
+      );
+      // It is listed under the global scope so the settings page renders it.
+      expect(
+        ShortcutAction.actionsForScope(ShortcutScope.global),
+        contains(ShortcutAction.globalToggleFullscreen),
+      );
+    });
+
+    test('it is a separate action from the video-surface fullscreen toggle',
+        () {
+      expect(
+        ShortcutAction.globalToggleFullscreen,
+        isNot(ShortcutAction.videoToggleFullscreen),
+      );
+      expect(
+        ShortcutAction.videoToggleFullscreen.scope,
+        ShortcutScope.video,
+      );
+    });
+  });
+
+  group('defaults', () {
+    test('desktop default keyboard binding == F11', () {
+      for (final TargetPlatform platform in <TargetPlatform>[
+        TargetPlatform.windows,
+        TargetPlatform.linux,
+      ]) {
+        final ShortcutBindingSet set = ShortcutDefaults.forPlatform(
+            platform)[ShortcutAction.globalToggleFullscreen]!;
+        expect(set.keyboardBindings, hasLength(1));
+        final InputBinding binding = set.keyboardBindings.first;
+        expect(binding.key, LogicalKeyboardKey.f11);
+        expect(binding.modifiers, isEmpty);
+      }
+    });
+
+    // BUG-2948：F11 在 macOS 是「显示桌面」（系统先截走），macOS 用标准全屏键。
+    test('macOS default keyboard binding == Ctrl+Cmd+F', () {
+      final ShortcutBindingSet set = ShortcutDefaults.forPlatform(
+          TargetPlatform.macOS)[ShortcutAction.globalToggleFullscreen]!;
+      expect(set.keyboardBindings, const <InputBinding>[
+        InputBinding(
+          key: LogicalKeyboardKey.keyF,
+          modifiers: <ModifierKey>{ModifierKey.ctrl, ModifierKey.meta},
+        ),
+      ]);
+    });
+
+    test('all 3 platform tables register the action', () {
+      for (final TargetPlatform platform in <TargetPlatform>[
+        TargetPlatform.windows,
+        TargetPlatform.macOS,
+        TargetPlatform.android,
+      ]) {
+        expect(
+          ShortcutDefaults.forPlatform(platform)
+              .containsKey(ShortcutAction.globalToggleFullscreen),
+          isTrue,
+        );
+      }
+    });
+
+    test('mobile drops the F11 keyboard binding (window-level, no-op there)',
+        () {
+      for (final TargetPlatform platform in <TargetPlatform>[
+        TargetPlatform.android,
+        TargetPlatform.iOS,
+      ]) {
+        final ShortcutBindingSet set = ShortcutDefaults.forPlatform(
+            platform)[ShortcutAction.globalToggleFullscreen]!;
+        expect(set.keyboardBindings, isEmpty);
+        expect(set.gamepadBindings, isEmpty);
+      }
+    });
+  });
+
+  group('executor wiring source guard', () {
+    final String navSrc = File(
+      'lib/src/shortcuts/global_navigation.dart',
+    ).readAsStringSync();
+
+    test('global_navigation dispatches globalToggleFullscreen', () {
+      expect(
+        navSrc.contains('ShortcutAction.globalToggleFullscreen'),
+        isTrue,
+      );
+    });
+
+    test('executor toggles through the shared desktop fullscreen owner', () {
+      expect(navSrc.contains('readDesktopWindowFullscreen()'), isTrue);
+      expect(
+        navSrc.contains('setDesktopWindowFullscreen(!current)'),
+        isTrue,
+      );
+    });
+
+    test('the toggle is fired from the global-navigation key handler', () {
+      expect(navSrc.contains('_handleGlobalToggleFullscreen'), isTrue);
+    });
+  });
+
+  group('settings page label exhaustiveness', () {
+    // Labels moved into the shared shortcut_labels extensions (shortcut
+    // settings refactor); the page renders via `action.label`.
+    final String labelsSrc = File(
+      'lib/src/shortcuts/shortcut_labels.dart',
+    ).readAsStringSync();
+
+    test('ShortcutActionLabel covers globalToggleFullscreen', () {
+      expect(
+        labelsSrc.contains('case ShortcutAction.globalToggleFullscreen:'),
+        isTrue,
+      );
+    });
+  });
+}

@@ -1,0 +1,663 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/sync/manual_sync_ui.dart';
+import 'package:fushi/src/sync/sync_backend.dart';
+import 'package:fushi/src/sync/sync_error_messages.dart';
+import 'package:fushi/src/sync/sync_orchestrator.dart';
+import 'package:fushi/src/sync/webdav_ops.dart';
+
+import '../helpers/source_guard.dart';
+
+/// BUG-1323 / BUG-1324：同步层两处「把错误压平」的独立缺陷。
+///
+/// - BUG-1323：`WebDavOps.checkStatus` 把 401（凭据不被接受）和 403（凭据没问题，
+///   服务端按策略拒绝这一次请求）一律压成 `SyncAuthError('Authentication failed')`，
+///   服务端在响应体里写的真实原因被整个丢弃。后果有两层：文案把用户引去重配一个
+///   根本没问题的凭据；`manual_sync_ui` 还会据此把好端端的会话 signOut 掉。
+/// - BUG-1324：`SyncRunReport.errors` 是扁平字符串，鉴权失败在拼进字符串那一刻就
+///   没法再分辨，UI 只数了个 `errors.length` 变成「N 项失败」。
+///
+/// 这里逐条钉住**用户在两种情况下分别看到什么**。文案一律与 i18n getter 比较
+/// （语言无关），不硬编码英文。
+void main() {
+  group('BUG-1323 checkStatus：401 与 403 不再是同一件事', () {
+    final WebDavOps ops = WebDavOps(
+      baseUrl: 'http://127.0.0.1:1/dav',
+      username: 'u',
+      password: 'p',
+    );
+
+    test('401 保持 credentials，措辞与改动前逐字相同', () {
+      SyncAuthError? caught;
+      try {
+        ops.checkStatus(401, 'GET /x');
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.kind, SyncAuthFailureKind.credentials);
+      expect(caught.isForbidden, isFalse);
+      expect(caught.message, 'Authentication failed');
+      expect(caught.serverReason, isNull);
+      expect(caught.toString(), 'SyncAuthError: Authentication failed');
+    });
+
+    test('403 变 forbidden，且把以前被丢掉的操作上下文带上', () {
+      SyncAuthError? caught;
+      try {
+        ops.checkStatus(403, 'GET /api/interconnect/service-config');
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.kind, SyncAuthFailureKind.forbidden);
+      expect(caught.isForbidden, isTrue);
+      expect(caught.message, contains('403'));
+      expect(caught.message, contains('/api/interconnect/service-config'));
+      expect(caught.message, isNot(equals('Authentication failed')));
+    });
+
+    test('403 的服务端原因原样保留，并进 toString', () {
+      SyncAuthError? caught;
+      try {
+        ops.checkStatus(403, 'GET /svc',
+            serverReason:
+                const SyncErrorBody.text('HTTPS required for service config'));
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.serverReason, 'HTTPS required for service config');
+      expect(caught.toString(), contains('HTTPS required for service config'));
+    });
+
+    test('404 / 5xx / 2xx 契约不变（都不是鉴权错误）', () {
+      expect(
+        () => ops.checkStatus(404, 'GET /x'),
+        throwsA(isA<SyncBackendError>().having(
+            (SyncBackendError e) => e.isRetryable, 'isRetryable', isTrue)),
+      );
+      expect(() => ops.checkStatus(500, 'GET /x'),
+          throwsA(isA<SyncBackendError>()));
+      expect(() => ops.checkStatus(207, 'PROPFIND /x'), returnsNormally);
+    });
+  });
+
+  group('BUG-1323 真实 HTTP 响应：服务端说的原因必须活着到达上层', () {
+    late HttpServer server;
+    late String base;
+    late int status;
+    late String body;
+
+    setUp(() async {
+      status = 403;
+      body = 'HTTPS required for service config';
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      base = 'http://127.0.0.1:${server.port}/dav';
+      server.listen((HttpRequest req) async {
+        req.response.statusCode = status;
+        req.response.write(body);
+        await req.response.close();
+      });
+    });
+
+    tearDown(() async => server.close(force: true));
+
+    WebDavOps opsFor() =>
+        WebDavOps(baseUrl: base, username: 'u', password: 'p');
+
+    test('testConnection 的 403 把响应体当拒绝原因带回来', () async {
+      SyncAuthError? caught;
+      try {
+        await opsFor().testConnection();
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.isForbidden, isTrue);
+      expect(caught.serverReason, 'HTTPS required for service config');
+    });
+
+    test('testConnection 的 401 仍是 credentials，措辞不变', () async {
+      status = 401;
+      SyncAuthError? caught;
+      try {
+        await opsFor().testConnection();
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.kind, SyncAuthFailureKind.credentials);
+      expect(caught.message, 'Authentication failed');
+    });
+
+    test('propfindChildren 的 403 同样带回原因', () async {
+      SyncAuthError? caught;
+      try {
+        await opsFor().propfindChildren('$base/sub');
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.isForbidden, isTrue);
+      expect(caught.serverReason, 'HTTPS required for service config');
+    });
+
+    test('403 但服务端一个字都没说：serverReason 为 null，不编造原因', () async {
+      body = '   ';
+      SyncAuthError? caught;
+      try {
+        await opsFor().testConnection();
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.isForbidden, isTrue);
+      expect(caught.serverReason, isNull);
+    });
+
+    test('超长错误体被截断，不把整页 HTML 灌进提示', () async {
+      body = 'x' * 5000;
+      SyncAuthError? caught;
+      try {
+        await opsFor().testConnection();
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.serverReason, isNotNull);
+      expect(caught.serverReason!.length, lessThan(400));
+      expect(caught.serverReason, endsWith('...'));
+    });
+  });
+
+  group('BUG-2631 403 的响应体是网页：只取标题，换一套文案', () {
+    const String cloudflare = '<!DOCTYPE html><html lang="en-US"><head>'
+        '<title>Just a moment...</title>'
+        '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">'
+        '<meta name="robots" content="noindex,nofollow"></head>'
+        '<body><div id="challenge">Verifying you are human</div></body></html>';
+
+    late HttpServer server;
+    late String base;
+    late String body;
+    late String contentType;
+
+    setUp(() async {
+      body = cloudflare;
+      contentType = 'text/html; charset=UTF-8';
+      server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      base = 'http://127.0.0.1:${server.port}/anime';
+      server.listen((HttpRequest req) async {
+        req.response.statusCode = 403;
+        req.response.headers.set('content-type', contentType);
+        req.response.write(body);
+        await req.response.close();
+      });
+    });
+
+    tearDown(() async => server.close(force: true));
+
+    WebDavOps opsFor() =>
+        WebDavOps(baseUrl: base, username: 'u', password: 'p');
+
+    Future<SyncAuthError> probe() async {
+      try {
+        await opsFor().testConnection();
+      } on SyncAuthError catch (e) {
+        return e;
+      }
+      fail('403 必须抛 SyncAuthError');
+    }
+
+    test('Cloudflare 挑战页：kind=htmlPage，serverReason 只剩 <title>', () async {
+      final SyncAuthError e = await probe();
+      expect(e.kind, SyncAuthFailureKind.htmlPage);
+      expect(e.serverReason, 'Just a moment...');
+      expect(e.message, 'Server refused (403): PROPFIND $base');
+    });
+
+    test('用户看到的文案：说「回的是网页、核对地址」，一个尖括号都没有', () async {
+      final SyncAuthError e = await probe();
+      final String shown = friendlySyncError(e);
+      expect(shown, t.sync_err_html_page_detail(title: 'Just a moment...'));
+      expect(shown, isNot(contains('<')));
+      expect(shown, isNot(equals(t.sync_err_auth_expired)));
+      expect(shown, isNot(contains(t.sync_err_forbidden)));
+      expect(friendlySyncErrorDetail(e), shown);
+    });
+
+    test('没有 Content-Type 也凭正文形状识别；没有 <title> 就用无标题文案', () async {
+      contentType = 'text/plain';
+      body = '<html><body><h1>403 Forbidden</h1></body></html>';
+      final SyncAuthError e = await probe();
+      expect(e.kind, SyncAuthFailureKind.htmlPage);
+      expect(e.serverReason, isNull);
+      expect(friendlySyncError(e), t.sync_err_html_page);
+    });
+
+    test('纯文本 403 一字不变：仍是 forbidden + 原文', () async {
+      contentType = 'text/plain';
+      body = 'HTTPS required for service config';
+      final SyncAuthError e = await probe();
+      expect(e.kind, SyncAuthFailureKind.forbidden);
+      expect(e.serverReason, 'HTTPS required for service config');
+    });
+
+    test('网页型 403 不登出：凭据根本没被评估过', () async {
+      final SyncAuthError e = await probe();
+      expect(shouldSignOutOnAuthError(e), isFalse);
+    });
+
+    test('parseSyncErrorBody：标题折叠空白、解实体、长标题截断；XML 不算网页', () {
+      final SyncErrorBody? multi = parseSyncErrorBody(
+          '<html><head><title>\n  Access &amp; Denied  \n</title></head></html>');
+      expect(multi!.isHtmlPage, isTrue);
+      expect(multi.reason, 'Access & Denied');
+
+      final SyncErrorBody? long =
+          parseSyncErrorBody('<!doctype html><title>${'t' * 500}</title>');
+      expect(long!.reason!.length, lessThan(130));
+      expect(long.reason, endsWith('...'));
+
+      final SyncErrorBody? xml = parseSyncErrorBody(
+          '<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"></D:multistatus>');
+      expect(xml!.isHtmlPage, isFalse);
+      expect(xml.reason, startsWith('<?xml'));
+
+      expect(parseSyncErrorBody('   '), isNull);
+      expect(parseSyncErrorBody('', declaredHtml: true)!.isHtmlPage, isTrue);
+    });
+
+    test('nginx / Apache 默认 403 页：标题是「NNN 状态语」→ 仍是 forbidden，原因取标题',
+        () {
+      // 这是真 WebDAV 服务端经反代给出的拒绝（ACL / 目录无 DAV 权限），不是「地址
+      // 填成了网站」；归成网页会让用户去核对一个本来就对的地址。
+      const String nginx = '<html><head><title>403 Forbidden</title></head>'
+          '<body><center><h1>403 Forbidden</h1></center><hr>'
+          '<center>nginx</center></body></html>';
+      final SyncErrorBody? body = parseSyncErrorBody(nginx, declaredHtml: true);
+      expect(body!.isHtmlPage, isFalse);
+      expect(body.reason, '403 Forbidden');
+      expect(body.forbiddenKind, SyncAuthFailureKind.forbidden);
+
+      const String apache =
+          '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n<html><head>\n'
+          '<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\n'
+          "<p>You don't have permission to access this resource.</p>\n"
+          '</body></html>';
+      expect(parseSyncErrorBody(apache)!.isHtmlPage, isFalse);
+      expect(parseSyncErrorBody(apache)!.reason, '403 Forbidden');
+
+      // Cloudflare 挑战页与网站首页的标题不是这个形状，仍归网页。
+      expect(parseSyncErrorBody(cloudflare)!.isHtmlPage, isTrue);
+      expect(
+          parseSyncErrorBody('<!doctype html><title>4033 ways</title>')!
+              .isHtmlPage,
+          isTrue,
+          reason: '只认「三位数 + 空白 / 结尾」，四位数开头的标题不是状态语');
+    });
+
+    test('checkStatus 拿到网页体：kind 随体走，纯文本仍是 forbidden', () {
+      final WebDavOps ops = opsFor();
+      SyncAuthError? caught;
+      try {
+        ops.checkStatus(403, 'GET /svc',
+            serverReason: parseSyncErrorBody(cloudflare));
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.kind, SyncAuthFailureKind.htmlPage);
+      expect(caught.serverReason, 'Just a moment...');
+    });
+
+    test('源码守卫：网络源弹窗的「测试连接」走友好文案，不再把异常 toString 裸上屏', () {
+      // 用户截图里的那条 toast 就是这里拼出来的：`'${t.sync_connection_failed}: $e'`
+      // 把 `SyncAuthError: Server refused (403): PROPFIND https://…(<!DOCTYPE html>…`
+      // 整个灌进去。同步设置页早就走 friendlySyncErrorDetail，两处必须同源。
+      final String src = maskComments(
+        File('lib/src/pages/implementations/media_sources_view.dart')
+            .readAsStringSync(),
+      );
+      expect(src, contains('friendlySyncErrorDetail(e)'));
+      expect(src, isNot(contains(r"sync_connection_failed}: $e'")));
+    });
+  });
+
+  group('BUG-1323 用户到底看到什么', () {
+    test('凭据错（401）看到「登录已过期，请重新登录」，逐字未变', () {
+      final SyncAuthError e = SyncAuthError('Authentication failed');
+      expect(friendlySyncError(e), t.sync_err_auth_expired);
+    });
+
+    test('服务端拒绝（403）且说了原因：原因原样出现，且不再谎称登录过期', () {
+      final SyncAuthError e = SyncAuthError(
+        'Server refused (403): GET /api/interconnect/service-config',
+        kind: SyncAuthFailureKind.forbidden,
+        serverReason: 'HTTPS required for service config',
+      );
+      final String shown = friendlySyncError(e);
+      expect(shown, contains('HTTPS required for service config'));
+      expect(shown, isNot(equals(t.sync_err_auth_expired)));
+      expect(
+        shown,
+        t.sync_err_forbidden_detail(
+            reason: 'HTTPS required for service config'),
+      );
+    });
+
+    test('服务端拒绝但没给原因：明说这不是登录问题', () {
+      final SyncAuthError e = SyncAuthError(
+        'Server refused (403): GET /x',
+        kind: SyncAuthFailureKind.forbidden,
+      );
+      expect(friendlySyncError(e), t.sync_err_forbidden);
+      expect(friendlySyncError(e), isNot(equals(t.sync_err_auth_expired)));
+    });
+
+    test('403 的分流按类型走，不靠消息里有没有 auth 字样', () {
+      // 防回归：把类型分支删掉后，这个 message 会被字符串层的
+      // `error is SyncAuthError && l.contains('auth')` 抓成「登录已过期」。
+      final SyncAuthError e = SyncAuthError(
+        'authentication context: refused',
+        kind: SyncAuthFailureKind.forbidden,
+        serverReason: 'policy',
+      );
+      expect(friendlySyncError(e), isNot(equals(t.sync_err_auth_expired)));
+      expect(friendlySyncError(e), contains('policy'));
+    });
+
+    test('Google Drive 的 403 insufficient_scope 仍走重新授权（TODO-836 不回归）', () {
+      // 它不经 checkStatus，kind 保持默认 credentials，故仍落在 scope 分支。
+      final SyncAuthError e = SyncAuthError('insufficient_scope');
+      expect(friendlySyncError(e), t.sync_err_scope_upgrade);
+    });
+  });
+
+  group('BUG-1323 403 不得毁掉一个好端端的会话', () {
+    test('凭据类失败必须登出（TODO-836 契约）', () {
+      expect(shouldSignOutOnAuthError(SyncAuthError('Authentication failed')),
+          isTrue);
+      expect(shouldSignOutOnAuthError(SyncAuthError('insufficient_scope')),
+          isTrue);
+    });
+
+    test('服务端拒绝不得登出', () {
+      expect(
+        shouldSignOutOnAuthError(SyncAuthError(
+          'Server refused (403): GET /svc',
+          kind: SyncAuthFailureKind.forbidden,
+          serverReason: 'HTTPS required for service config',
+        )),
+        isFalse,
+      );
+    });
+
+    test('手动同步的 catch 走的是这个判断，不是自己再写一遍', () {
+      final String src =
+          File('lib/src/sync/manual_sync_ui.dart').readAsStringSync();
+      // BUG-1578 起，登出判断多了一层「这条错误是哪条通道的」（互联通道的 signOut
+      // 会清空整份配对配置，不能由一次 401 触发），但那一层**必须**把 kind 的判断
+      // 委托回 shouldSignOutOnAuthError，而不是在 catch 里自己再写一遍。
+      expect(src, contains('on SyncChannelAuthError catch'));
+      expect(src, contains('if (shouldSignOutChannelOnAuthError(e)) {'));
+      expect(src, contains('return shouldSignOutOnAuthError(e.error);'));
+      expect(src, contains('await backend.signOut(repo: repo)'));
+    });
+
+    test('登出的对象是**出错那条通道**的后端，不是 getBackendType() 猜的那个', () {
+      final String src =
+          File('lib/src/sync/manual_sync_ui.dart').readAsStringSync();
+      expect(src, contains('e.channel.backend'),
+          reason: 'BUG-1578：互联对端的一次 401 曾去登出用户的云盘会话');
+      expect(
+        src,
+        isNot(contains('resolveSyncBackend(await repo.getBackendType())')),
+        reason: '按 backendType 猜通道 = 双通道下必然猜错一半',
+      );
+    });
+  });
+
+  group('BUG-2377 互联没有「登录」这回事', () {
+    // 用户实拍：存储后端 = Fushi 互联，点「立即同步」→ 上次同步「失败」→ toast
+    // 「登录已过期，请重新登录。」互联的凭据是配对时对端发的 per-peer token，
+    // 应用里根本没有互联的登录入口 —— 这句话把用户指向一个不存在的操作。
+    // 根因：WebDavOps 是**传输层**，对 WebDAV（用户名/密码）和互联（配对 token）
+    // 一律抛默认的 credentials，文案层只能按字符串猜，猜成了 OAuth 的措辞。
+
+    test('传输层默认不变：WebDAV 的 401 仍是 credentials（逐字不回归）', () {
+      final WebDavOps dav = WebDavOps(
+        baseUrl: 'http://127.0.0.1:1/dav',
+        username: 'u',
+        password: 'p',
+      );
+      SyncAuthError? caught;
+      try {
+        dav.checkStatus(401, 'GET /x');
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.kind, SyncAuthFailureKind.credentials);
+      expect(friendlySyncError(caught), t.sync_err_auth_expired);
+    });
+
+    test('互联声明的传输层：同一个 401 变成「配对被拒」，不再说登录过期', () {
+      final WebDavOps peer = WebDavOps(
+        baseUrl: 'http://127.0.0.1:1/dav',
+        username: 'hibiki',
+        password: 'per-peer-token',
+        unauthorizedKind: SyncAuthFailureKind.pairingRejected,
+      );
+      SyncAuthError? caught;
+      try {
+        peer.checkStatus(401, 'GET /x');
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught, isNotNull);
+      expect(caught!.kind, SyncAuthFailureKind.pairingRejected);
+      expect(friendlySyncError(caught), t.sync_err_pairing_rejected);
+      expect(friendlySyncError(caught), isNot(equals(t.sync_err_auth_expired)));
+    });
+
+    test('403 的语义不被 unauthorizedKind 抢走（只管 401）', () {
+      final WebDavOps peer = WebDavOps(
+        baseUrl: 'http://127.0.0.1:1/dav',
+        username: 'hibiki',
+        password: 't',
+        unauthorizedKind: SyncAuthFailureKind.pairingRejected,
+      );
+      SyncAuthError? caught;
+      try {
+        peer.checkStatus(403, 'GET /svc',
+            serverReason: const SyncErrorBody.text('HTTPS required'));
+      } on SyncAuthError catch (e) {
+        caught = e;
+      }
+      expect(caught!.kind, SyncAuthFailureKind.forbidden);
+      expect(friendlySyncError(caught), contains('HTTPS required'));
+    });
+
+    test('一台对端都没配对：不再把裸英文原文摔给用户', () {
+      final SyncAuthError e = SyncAuthError(
+        'Fushi server credentials not configured',
+        kind: SyncAuthFailureKind.pairingNotConfigured,
+      );
+      expect(friendlySyncError(e), t.sync_err_not_paired);
+      expect(friendlySyncError(e),
+          isNot(contains('Fushi server credentials not configured')));
+      expect(friendlySyncError(e), isNot(equals(t.sync_err_auth_expired)));
+    });
+
+    test('两条新文案都不得再提「登录」（互联没有登录入口）', () {
+      // 英文与简中双语都钉：措辞跑偏成 "sign in again" 就等于回归。
+      for (final String shown in <String>[
+        t.sync_err_pairing_rejected,
+        t.sync_err_not_paired,
+      ]) {
+        expect(shown, isNot(contains('sign in')));
+        expect(shown, isNot(contains('登录')));
+        expect(shown, isNot(contains('登入')));
+      }
+    });
+
+    test('配对被拒**不得**登出：互联登出会清空整份配对配置', () {
+      expect(
+        shouldSignOutOnAuthError(
+          SyncAuthError('Authentication failed',
+              kind: SyncAuthFailureKind.pairingRejected),
+        ),
+        isFalse,
+        reason: 'BUG-1550/BUG-1578：一台对端的 401 不得株连其余对端的配对',
+      );
+      expect(
+        shouldSignOutOnAuthError(
+          SyncAuthError('not configured',
+              kind: SyncAuthFailureKind.pairingNotConfigured),
+        ),
+        isFalse,
+      );
+    });
+
+    test('互联后端**每一个** WebDavOps 都声明了自己的凭据语义（源码守卫）', () {
+      // 漏一处 = 那条路径上的 401 又变回「登录已过期」。互联侧的构造点会随功能
+      // 增加（探测/暂定句柄/已解析会话/测试连接…），故按出现次数配对扫描，而不是
+      // 钉死行号。
+      final String src = maskComments(
+          File('lib/src/sync/interconnect_sync_backend.dart')
+              .readAsStringSync());
+      final int constructions = 'WebDavOps('.allMatches(src).length;
+      final int declared =
+          'unauthorizedKind: SyncAuthFailureKind.pairingRejected'
+              .allMatches(src)
+              .length;
+      expect(constructions, greaterThanOrEqualTo(5),
+          reason: '互联后端至少有 5 处 WebDavOps 构造点');
+      expect(declared, constructions,
+          reason: '有 WebDavOps 构造点没声明 unauthorizedKind —— '
+              '那条路径上的对端 401 会重新被说成「登录已过期」');
+    });
+
+    test('互联的 POST 传输层同样带类型（远程查词/制卡的 401）', () {
+      final String src = maskComments(
+          File('lib/src/sync/interconnect_post_transport.dart')
+              .readAsStringSync());
+      expect(src, contains('kind: SyncAuthFailureKind.pairingRejected'));
+    });
+
+    test('文案层对互联不再靠字符串猜：按 kind 分派先于任何 contains', () {
+      final String src = maskComments(
+          File('lib/src/sync/sync_error_messages.dart').readAsStringSync());
+      final int typeDispatch =
+          src.indexOf('error.kind != SyncAuthFailureKind.credentials');
+      final int stringGuess = src.indexOf("l.contains('401')");
+      expect(typeDispatch, greaterThanOrEqualTo(0));
+      expect(stringGuess, greaterThan(typeDispatch),
+          reason: '类型分派必须排在字符串猜测之前，否则新 kind 又被 contains 抢走');
+    });
+  });
+
+  group('BUG-1324 鉴权失败必须带类型活到 UI', () {
+    test('日志行与改动前逐字相同（errors 的既有契约不动）', () {
+      final SyncRunReport r = SyncRunReport();
+      r.noteError(
+          'service config live sync', SyncAuthError('Authentication failed'));
+      expect(r.errors, <String>[
+        'service config live sync: SyncAuthError: Authentication failed',
+      ]);
+    });
+
+    test('SyncAuthError 额外留一份带类型的', () {
+      final SyncRunReport r = SyncRunReport();
+      r.noteError(
+        'service config live sync',
+        SyncAuthError('Server refused (403): GET /svc',
+            kind: SyncAuthFailureKind.forbidden,
+            serverReason: 'HTTPS required for service config'),
+      );
+      expect(r.authFailures, hasLength(1));
+      expect(r.authFailures.single.isForbidden, isTrue);
+      expect(r.authFailures.single.label, 'service config live sync');
+      expect(r.authFailures.single.serverReason,
+          'HTTPS required for service config');
+    });
+
+    test('非鉴权错误不进 authFailures（不许扩大化）', () {
+      final SyncRunReport r = SyncRunReport();
+      r.noteError('video assets sync', SyncBackendError('500'));
+      r.noteError('import book "x"', const FormatException('bad json'));
+      expect(r.errors, hasLength(2));
+      expect(r.authFailures, isEmpty);
+    });
+
+    test('同因失败去重：一轮几百本书只留一条', () {
+      final SyncRunReport r = SyncRunReport();
+      for (int i = 0; i < 200; i++) {
+        r.noteError(
+            'import book "b$i"', SyncAuthError('Authentication failed'));
+      }
+      expect(r.errors, hasLength(200));
+      expect(r.authFailures, hasLength(1));
+      expect(r.authFailures.single.label, 'import book "b0"');
+    });
+
+    test('不同原因分别留一条', () {
+      final SyncRunReport r = SyncRunReport();
+      r.noteError('a', SyncAuthError('Authentication failed'));
+      r.noteError(
+          'b',
+          SyncAuthError('Server refused (403): x',
+              kind: SyncAuthFailureKind.forbidden));
+      expect(r.authFailures, hasLength(2));
+    });
+
+    test('mergeFrom 合并双通道的 authFailures 并去重', () {
+      final SyncRunReport cloud = SyncRunReport()
+        ..noteError('a', SyncAuthError('Authentication failed'));
+      final SyncRunReport live = SyncRunReport()
+        ..noteError('b', SyncAuthError('Authentication failed'))
+        ..noteError(
+            'c',
+            SyncAuthError('Server refused (403): x',
+                kind: SyncAuthFailureKind.forbidden));
+      cloud.mergeFrom(live);
+      expect(cloud.errors, hasLength(3));
+      expect(cloud.authFailures, hasLength(2));
+    });
+  });
+
+  group('BUG-1324 「N 项失败」不再是唯一一句话', () {
+    test('零失败时摘要逐字不变', () {
+      expect(summarizeSyncReport(SyncRunReport()),
+          t.sync_now_done(detail: t.sync_now_no_changes));
+    });
+
+    test('非鉴权失败时摘要逐字不变（回归护栏）', () {
+      final SyncRunReport r = SyncRunReport()
+        ..noteError('video assets sync', SyncBackendError('500'));
+      expect(
+        summarizeSyncReport(r),
+        '${t.sync_now_done(detail: t.sync_now_no_changes)}'
+        '${t.sync_now_failed_suffix(count: 1)}',
+      );
+    });
+
+    test('服务端拒绝时摘要把服务端给的原因摆出来', () {
+      final SyncRunReport r = SyncRunReport()
+        ..noteError(
+          'service config live sync',
+          SyncAuthError('Server refused (403): GET /svc',
+              kind: SyncAuthFailureKind.forbidden,
+              serverReason: 'HTTPS required for service config'),
+        );
+      final String shown = summarizeSyncReport(r);
+      expect(shown, contains('HTTPS required for service config'));
+      expect(shown, isNot(contains(t.sync_err_auth_expired)));
+    });
+
+    test('凭据错时摘要说去重新登录', () {
+      final SyncRunReport r = SyncRunReport()
+        ..noteError('import book "x"', SyncAuthError('Authentication failed'));
+      expect(summarizeSyncReport(r), contains(t.sync_err_auth_expired));
+    });
+  });
+}

@@ -1,0 +1,1704 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/mining/galgame_audio_encode.dart';
+import 'package:fushi/src/mining/galgame_audio_source.dart';
+import 'package:fushi/src/mining/galgame_japanese_locale.dart';
+
+/// 造一个最小 PE 文件字节：0x3c 处写 PE 头偏移，PE 头处 'PE\0\0' + COFF Machine。
+Uint8List _craftPe(int machine) {
+  const int peOff = 0x80;
+  final Uint8List b = Uint8List(peOff + 6);
+  final ByteData bd = ByteData.sublistView(b);
+  bd.setUint32(0x3c, peOff, Endian.little);
+  b[peOff] = 0x50; // 'P'
+  b[peOff + 1] = 0x45; // 'E'
+  b[peOff + 2] = 0;
+  b[peOff + 3] = 0;
+  bd.setUint16(peOff + 4, machine, Endian.little);
+  return b;
+}
+
+class _FakeProcess implements Process {
+  _FakeProcess({this.onKill})
+    : stdin = IOSink(StreamController<List<int>>().sink);
+
+  final void Function()? onKill;
+
+  final StreamController<List<int>> stdoutController =
+      StreamController<List<int>>();
+  final StreamController<List<int>> stderrController =
+      StreamController<List<int>>();
+  final Completer<int> _exitCode = Completer<int>();
+
+  @override
+  final int pid = 9876;
+
+  @override
+  final IOSink stdin;
+
+  bool killed = false;
+
+  @override
+  Stream<List<int>> get stdout => stdoutController.stream;
+
+  @override
+  Stream<List<int>> get stderr => stderrController.stream;
+
+  @override
+  Future<int> get exitCode => _exitCode.future;
+
+  @override
+  bool kill([ProcessSignal signal = ProcessSignal.sigterm]) {
+    killed = true;
+    onKill?.call();
+    if (!_exitCode.isCompleted) _exitCode.complete(0);
+    return true;
+  }
+
+  Future<void> dispose() async {
+    await stdoutController.close();
+    await stderrController.close();
+    unawaited(stdin.close());
+  }
+}
+
+/// galgame 一键制卡（docs/specs/galgame-mining）纯逻辑契约：
+/// - WAV 头拼装 / PCM 时长（编码 helper 的可单测部分）。
+/// - loopback MethodChannel 的格式解析与 fail-open 降级。
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  group('PcmFormat', () {
+    test('blockAlign / byteRate 计算', () {
+      const fmt = PcmFormat(
+        sampleRate: 48000,
+        channels: 2,
+        bitsPerSample: 16,
+        isFloat: false,
+      );
+      expect(fmt.blockAlign, 4); // 2ch * 2byte
+      expect(fmt.byteRate, 192000); // 48000 * 4
+    });
+
+    test('float32 立体声 byteRate', () {
+      const fmt = PcmFormat(
+        sampleRate: 48000,
+        channels: 2,
+        bitsPerSample: 32,
+        isFloat: true,
+      );
+      expect(fmt.blockAlign, 8);
+      expect(fmt.byteRate, 384000);
+    });
+  });
+
+  group('parseEngineHookReadyFormat', () {
+    test('常规 PCM ready 返回真实格式', () {
+      final PcmFormat? fmt = parseEngineHookReadyFormat(<Object?, Object?>{
+        'ready': true,
+        'sampleRate': 48000,
+        'channels': 2,
+        'bitsPerSample': 32,
+        'isFloat': true,
+      });
+      expect(fmt, isNotNull);
+      expect(fmt!.sampleRate, 48000);
+      expect(fmt.channels, 2);
+      expect(fmt.isFloat, true);
+    });
+
+    test('Siglus raw-only ready 返回 OVK 解码能力格式', () {
+      final PcmFormat? fmt = parseEngineHookReadyFormat(<Object?, Object?>{
+        'ready': true,
+        'rawVoiceReady': true,
+        'sampleRate': 0,
+        'channels': 0,
+        'bitsPerSample': 0,
+      });
+      expect(fmt, isNotNull);
+      expect(fmt!.sampleRate, 44100);
+      expect(fmt.channels, 1);
+      expect(fmt.bitsPerSample, 16);
+    });
+
+    test('既无 PCM 也无 raw voice 时不误报就绪', () {
+      expect(
+        parseEngineHookReadyFormat(<Object?, Object?>{
+          'ready': false,
+          'rawVoiceReady': false,
+        }),
+        isNull,
+      );
+    });
+
+    test('拒绝 SGRE 现场误报的 4-bit PCM，让控制器降级到 loopback', () {
+      expect(
+        parseEngineHookReadyFormat(<Object?, Object?>{
+          'ready': true,
+          'sampleRate': 47968,
+          'channels': 2,
+          'bitsPerSample': 4,
+          'isFloat': false,
+        }),
+        isNull,
+      );
+    });
+
+    test('拒绝非 float32 的浮点 PCM', () {
+      expect(
+        parseEngineHookReadyFormat(<Object?, Object?>{
+          'ready': true,
+          'sampleRate': 48000,
+          'channels': 2,
+          'bitsPerSample': 16,
+          'isFloat': true,
+        }),
+        isNull,
+      );
+    });
+  });
+
+  group('parseEngineTextHookReady', () {
+    test('hooked + textHooked 在 PCM 未就绪时仍是可用文本能力', () {
+      expect(
+        parseEngineTextHookReady(<Object?, Object?>{
+          'hooked': true,
+          'textHooked': true,
+          'ready': false,
+          'sampleRate': 0,
+        }),
+        isTrue,
+      );
+    });
+
+    test('只有其中一个信号时不误报文本能力', () {
+      expect(
+        parseEngineTextHookReady(<Object?, Object?>{
+          'hooked': true,
+          'textHooked': false,
+        }),
+        isFalse,
+      );
+      expect(
+        parseEngineTextHookReady(<Object?, Object?>{
+          'hooked': false,
+          'textHooked': true,
+        }),
+        isFalse,
+      );
+    });
+  });
+
+  group('parseEngineAudioHooksReady', () {
+    test('文本先到时不能提前结束音频探测', () {
+      expect(
+        parseEngineAudioHooksReady(<Object?, Object?>{
+          'hooked': true,
+          'textHooked': true,
+          'audioHooksReady': false,
+        }),
+        isFalse,
+      );
+    });
+
+    test('原生首轮音频 hook 完成后才允许进入混合模式', () {
+      expect(
+        parseEngineAudioHooksReady(<Object?, Object?>{
+          'hooked': true,
+          'textHooked': true,
+          'audioHooksReady': true,
+        }),
+        isTrue,
+      );
+    });
+  });
+
+  group('pcmDurationMs', () {
+    test('一秒混音字节 -> 1000ms', () {
+      expect(pcmDurationMs(192000, 192000), 1000);
+    });
+    test('半秒', () {
+      expect(pcmDurationMs(96000, 192000), 500);
+    });
+    test('byteRate<=0 或 空 PCM -> 0（不炸）', () {
+      expect(pcmDurationMs(1000, 0), 0);
+      expect(pcmDurationMs(0, 192000), 0);
+    });
+  });
+
+  group('slicePcmByMs', () {
+    // 48k 立体声 16bit：byteRate=192000，blockAlign=4。1000ms=192000 字节。
+    const fmt = PcmFormat(
+      sampleRate: 48000,
+      channels: 2,
+      bitsPerSample: 16,
+      isFloat: false,
+    );
+    // 造 1000ms 的可辨识 PCM：每字节 = (index % 251)，便于断言切片边界。
+    final Uint8List oneSec = Uint8List.fromList(
+      List<int>.generate(192000, (i) => i % 251),
+    );
+
+    test('中段切片按 byteRate 对齐取正确字节区间', () {
+      final s = slicePcmByMs(oneSec, fmt, 250, 500); // [48000,96000)
+      expect(s.length, 48000);
+      expect(s.first, 48000 % 251);
+      expect(s.last, 95999 % 251);
+    });
+
+    test('帧对齐：非整帧的 ms 起点向下对齐到 blockAlign', () {
+      // 1ms=192 字节（已是 4 的倍数）；用一个会产生非对齐偏移的 byteRate 场景：
+      const monoFmt = PcmFormat(
+        sampleRate: 44100,
+        channels: 2,
+        bitsPerSample: 16,
+        isFloat: false,
+      ); // blockAlign=4, byteRate=176400
+      final pcm = Uint8List.fromList(List<int>.filled(176400, 9));
+      final s = slicePcmByMs(pcm, monoFmt, 3, 7);
+      // 起止字节都必须是 blockAlign(4) 的倍数。
+      expect(s.length % monoFmt.blockAlign, 0);
+    });
+
+    test('endMs 超总长 -> clamp 到末尾', () {
+      final s = slicePcmByMs(oneSec, fmt, 500, 5000); // end clamp 到 192000
+      expect(s.length, 96000); // [96000,192000)
+      expect(s.last, 191999 % 251);
+    });
+
+    test('start>=end / 空区间 -> 空 Uint8List', () {
+      expect(slicePcmByMs(oneSec, fmt, 500, 500).isEmpty, true);
+      expect(slicePcmByMs(oneSec, fmt, 600, 500).isEmpty, true);
+      expect(slicePcmByMs(oneSec, fmt, 5000, 6000).isEmpty, true); // 全越界
+    });
+
+    test('空 PCM / 非法格式 -> 空（不炸）', () {
+      expect(slicePcmByMs(Uint8List(0), fmt, 0, 100).isEmpty, true);
+      const bad = PcmFormat(
+        sampleRate: 0,
+        channels: 0,
+        bitsPerSample: 0,
+        isFloat: false,
+      );
+      expect(slicePcmByMs(oneSec, bad, 0, 100).isEmpty, true);
+    });
+
+    test('返回的是拷贝，不与入参共享底层', () {
+      final s = slicePcmByMs(oneSec, fmt, 0, 250);
+      s[0] = 200;
+      expect(oneSec[0], 0); // 原始未被改
+    });
+  });
+
+  group('buildWavBytes', () {
+    const fmt = PcmFormat(
+      sampleRate: 48000,
+      channels: 2,
+      bitsPerSample: 16,
+      isFloat: false,
+    );
+
+    test('总长 = 44 头 + PCM', () {
+      final pcm = Uint8List.fromList(List<int>.filled(200, 7));
+      final wav = buildWavBytes(pcm, fmt);
+      expect(wav.length, 244);
+    });
+
+    test('RIFF/WAVE/fmt/data 魔数与关键小端字段', () {
+      final pcm = Uint8List.fromList(List<int>.filled(100, 0));
+      final wav = buildWavBytes(pcm, fmt);
+      final bd = ByteData.sublistView(wav);
+      String tag(int o) => String.fromCharCodes(wav.sublist(o, o + 4));
+      expect(tag(0), 'RIFF');
+      expect(bd.getUint32(4, Endian.little), 36 + 100); // ChunkSize
+      expect(tag(8), 'WAVE');
+      expect(tag(12), 'fmt ');
+      expect(bd.getUint32(16, Endian.little), 16); // Subchunk1Size
+      expect(bd.getUint16(20, Endian.little), 1); // PCM 整型
+      expect(bd.getUint16(22, Endian.little), 2); // channels
+      expect(bd.getUint32(24, Endian.little), 48000); // sampleRate
+      expect(bd.getUint32(28, Endian.little), 192000); // byteRate
+      expect(bd.getUint16(32, Endian.little), 4); // blockAlign
+      expect(bd.getUint16(34, Endian.little), 16); // bitsPerSample
+      expect(tag(36), 'data');
+      expect(bd.getUint32(40, Endian.little), 100); // data size
+    });
+
+    test('float 格式 -> WAVE 格式码 3', () {
+      const ff = PcmFormat(
+        sampleRate: 48000,
+        channels: 2,
+        bitsPerSample: 32,
+        isFloat: true,
+      );
+      final wav = buildWavBytes(Uint8List(8), ff);
+      final bd = ByteData.sublistView(wav);
+      expect(bd.getUint16(20, Endian.little), 3);
+    });
+
+    test('PCM 数据原样附在头之后', () {
+      final pcm = Uint8List.fromList([10, 20, 30, 40]);
+      final wav = buildWavBytes(pcm, fmt);
+      expect(wav.sublist(44), [10, 20, 30, 40]);
+    });
+  });
+
+  group('LoopbackGalAudioSource', () {
+    const channelName = 'app.fushi.reader/audio_loopback';
+
+    void setHandler(Future<Object?>? Function(MethodCall)? h) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel(channelName), h);
+    }
+
+    tearDown(() => setHandler(null));
+
+    test('start 返回格式 map -> 解析成 PcmFormat', () async {
+      setHandler((call) async {
+        if (call.method == 'start') {
+          return <String, Object?>{
+            'sampleRate': 48000,
+            'channels': 2,
+            'bitsPerSample': 32,
+            'isFloat': true,
+          };
+        }
+        return null;
+      });
+      final src = LoopbackGalAudioSource();
+      final fmt = await src.start();
+      expect(fmt, isNotNull);
+      expect(fmt!.sampleRate, 48000);
+      expect(fmt.channels, 2);
+      expect(fmt.bitsPerSample, 32);
+      expect(fmt.isFloat, true);
+    });
+
+    test('start 返回 error map -> null（降级）', () async {
+      setHandler((call) async => <String, Object?>{'error': 'no device'});
+      expect(await LoopbackGalAudioSource().start(), isNull);
+    });
+
+    test('native 缺失（MissingPluginException）-> 所有方法 fail-open', () async {
+      setHandler(null); // 无 handler = MissingPluginException
+      final src = LoopbackGalAudioSource();
+      expect(await src.start(), isNull);
+      expect(await src.grabRecent(3000), isNull);
+      await src.stop(); // 不抛
+    });
+
+    test('grabRecent 返回 pcm+格式 -> GalAudioSlice', () async {
+      setHandler((call) async {
+        if (call.method == 'grabRecent') {
+          expect(call.arguments, {'backMs': 3000});
+          return <String, Object?>{
+            'pcm': Uint8List.fromList([1, 2, 3, 4]),
+            'sampleRate': 48000,
+            'channels': 2,
+            'bitsPerSample': 16,
+            'isFloat': false,
+          };
+        }
+        return null;
+      });
+      final slice = await LoopbackGalAudioSource().grabRecent(3000);
+      expect(slice, isNotNull);
+      expect(slice!.pcm, [1, 2, 3, 4]);
+      expect(slice.format.sampleRate, 48000);
+      expect(slice.isEmpty, false);
+    });
+
+    test('grabRecent backMs<=0 -> null（不打 native）', () async {
+      var called = false;
+      setHandler((call) async {
+        called = true;
+        return null;
+      });
+      expect(await LoopbackGalAudioSource().grabRecent(0), isNull);
+      expect(called, false);
+    });
+
+    test('grabRecent 缺 pcm 字段 -> null', () async {
+      setHandler(
+        (call) async => <String, Object?>{
+          'sampleRate': 48000,
+          'channels': 2,
+          'bitsPerSample': 16,
+        },
+      );
+      expect(await LoopbackGalAudioSource().grabRecent(3000), isNull);
+    });
+  });
+
+  group('EngineHookGalAudioSource', () {
+    const channelName = 'app.fushi.reader/voice_hook';
+
+    void setHandler(Future<Object?>? Function(MethodCall)? h) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(const MethodChannel(channelName), h);
+    }
+
+    tearDown(() => setHandler(null));
+
+    test('无 injectorPath -> start 返回 null（降级回 loopback，不拉子进程）', () async {
+      final src = EngineHookGalAudioSource(targetPid: 1234, injectorPath: null);
+      expect(await src.start(), isNull);
+    });
+
+    test('capability 不精确匹配时 fail closed，绝不启动注入命令', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_capability_gate_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      var injectionStarts = 0;
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        targetPid: 2468,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String executable) async {
+          expect(executable, injector.path);
+          return GalHookCapabilityProbeResult.unsupported;
+        },
+        processStarter: (String executable, List<String> arguments) async {
+          injectionStarts++;
+          throw StateError('injection must not start');
+        },
+      );
+      try {
+        expect(await source.start(), isNull);
+        expect(injectionStarts, 0);
+        expect(
+          source.lastFailure.failure,
+          GalHookInjectorFailure.protocolMismatch,
+        );
+      } finally {
+        await source.stop();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    test('capability 探测答不上来时报「探测失败」而不是「组件太老」', () async {
+      // 两种失败的处置相反：unsupported 只能换版本，probeFailed 要查杀软/权限/
+      // 挂住的进程。旧实现用一个 bool + `on Object` 把任意错误都翻成
+      // protocolMismatch（「组件太老」），把用户引向一个做了也没用的动作。
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_capability_probe_failed_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      var injectionStarts = 0;
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        targetPid: 2468,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String _) async =>
+            GalHookCapabilityProbeResult.probeFailed,
+        processStarter: (String executable, List<String> arguments) async {
+          injectionStarts++;
+          throw StateError('injection must not start');
+        },
+      );
+      try {
+        expect(await source.start(), isNull);
+        expect(injectionStarts, 0, reason: '仍然 fail closed，绝不启动注入');
+        expect(
+          source.lastFailure.failure,
+          GalHookInjectorFailure.capabilityProbeFailed,
+        );
+        expect(
+          source.lastFailure.failure,
+          isNot(GalHookInjectorFailure.protocolMismatch),
+        );
+      } finally {
+        await source.stop();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    test('capability 探测抛异常也归类成探测失败，且不毒化调用方', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_capability_probe_throw_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        targetPid: 2468,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String _) async =>
+            throw StateError('probe blew up'),
+        processStarter: (String executable, List<String> arguments) async =>
+            throw StateError('injection must not start'),
+      );
+      try {
+        // start() 必须正常返回 null（异常不能穿出去把串行队列毒死），
+        // 同时诊断必须如实说是探测失败。
+        expect(await source.start(), isNull);
+        expect(
+          source.lastFailure.failure,
+          GalHookInjectorFailure.capabilityProbeFailed,
+        );
+      } finally {
+        await source.stop();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    test('capability 探测有硬超时上限（不会让 start() 永不返回）', () {
+      // 探测是目标无关的一次性子进程调用；没有上限，helper 一挂住整条
+      // _audioFallbackPolicyQueue 就永久堵死。
+      expect(kGalHookCapabilityProbeTimeout.inSeconds, greaterThan(0));
+      expect(kGalHookCapabilityProbeTimeout.inMinutes, lessThan(1));
+    });
+
+    test('capability stdout 只接受退出码 0 的 exact single token', () {
+      expect(
+        hasGalNativeLoopbackPolicyCapability(
+          exitCode: 0,
+          stdout: 'native_loopback_policy_v1\r\n',
+        ),
+        isTrue,
+      );
+      expect(
+        hasGalNativeLoopbackPolicyCapability(
+          exitCode: 0,
+          stdout: 'warning\nnative_loopback_policy_v1',
+        ),
+        isFalse,
+      );
+      expect(
+        hasGalNativeLoopbackPolicyCapability(
+          exitCode: 1,
+          stdout: 'native_loopback_policy_v1',
+        ),
+        isFalse,
+      );
+    });
+
+    test('launch PID 就绪后仍持续排空 helper stdout 和 stderr', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_output_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      final File game = File('${temp.path}${Platform.pathSeparator}game.exe');
+      await game.writeAsBytes(_craftPe(0x014c));
+      final _FakeProcess process = _FakeProcess();
+      final StringBuffer stdoutSeen = StringBuffer();
+      var stderrCharacters = 0;
+      const int stderrTarget = 128 * 4096;
+      final Completer<void> postReadyStdout = Completer<void>();
+      final Completer<void> stderrDrained = Completer<void>();
+
+      setHandler((MethodCall call) async {
+        switch (call.method) {
+          case 'open':
+            expect(call.arguments, <String, Object?>{'pid': 4321});
+            return <String, Object?>{'ok': true};
+          case 'requestNativeLoopbackPolicy':
+            expect(call.arguments, <String, Object?>{'policy': 'deny'});
+            return <String, Object?>{
+              'nativeLoopbackRequested': 0,
+              'nativeLoopbackRequestSeq': 1,
+              'nativeLoopbackState': 0,
+              'nativeLoopbackAppliedSeq': 1,
+            };
+          case 'status':
+            return <Object?, Object?>{
+              'hooked': true,
+              'textHooked': true,
+              'audioHooksReady': true,
+              'ready': false,
+              'rawVoiceReady': false,
+            };
+          case 'close':
+            return null;
+        }
+        return null;
+      });
+
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        launchExe: game.path,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String _) async =>
+            GalHookCapabilityProbeResult.supported,
+        // BUG-2047：`auto` 只在证据判为「需要」时转区；本用例的合成 exe 没有任何证据，
+        // 显式注入结论，不让 `--japanese-locale` 取决于探测器与宿主机 ACP。
+        //
+        // 档位也必须显式给：缺省档已经是 off（没选过就不转区），靠缺省值走不到
+        // auto 分支，下面 processStarter 里断言的 `--japanese-locale` 就不会出现。
+        japaneseLocaleMode: GalJapaneseLocaleMode.auto,
+        systemAnsiCodePageProbe: () => 936,
+        japaneseLocaleNeedProbe: (String _, String? __) async =>
+            const GalJapaneseLocaleVerdict(
+              need: GalJapaneseLocaleNeed.needed,
+              evidence: <GalJapaneseLocaleEvidence>[
+                GalJapaneseLocaleEvidence.versionInfoJapanese,
+              ],
+            ),
+        processStarter: (String executable, List<String> arguments) async {
+          expect(executable, injector.path);
+          expect(arguments, <String>[
+            '--launch',
+            game.path,
+            '--hold',
+            '--native-loopback-policy',
+            'deny',
+            // 握手超时与 readyTimeout 同源下发（见 buildEngineHookInjectorArguments）。
+            '--wait-ms',
+            '1000',
+            '--japanese-locale',
+          ]);
+          scheduleMicrotask(() {
+            process.stdoutController.add(
+              ('LAUNCH pid=1111 arch=x86 role=launcher locale=1\n'
+                      'LAUNCH pid=4321 arch=x86 role=game locale=1\n'
+                      'OK hooked pid=4321 mode=launch\n')
+                  .codeUnits,
+            );
+          });
+          return process;
+        },
+        processOutputSink: (bool isStderr, String chunk) {
+          if (isStderr) {
+            stderrCharacters += chunk.length;
+            if (stderrCharacters >= stderrTarget &&
+                !stderrDrained.isCompleted) {
+              stderrDrained.complete();
+            }
+            return;
+          }
+          stdoutSeen.write(chunk);
+          if (stdoutSeen.toString().contains('post-ready') &&
+              !postReadyStdout.isCompleted) {
+            postReadyStdout.complete();
+          }
+        },
+        readyTimeout: const Duration(seconds: 1),
+        pollInterval: Duration.zero,
+      );
+
+      try {
+        expect(await source.start(), isNull);
+        expect(source.gamePid, 4321);
+        expect(source.launchedPid, 4321);
+        expect(source.localeGameLaunchConfirmed, isTrue);
+        process.stdoutController.add('post-ready\n'.codeUnits);
+        final List<int> stderrChunk = List<int>.filled(4096, 0x78);
+        for (var i = 0; i < 128; i++) {
+          process.stderrController.add(stderrChunk);
+        }
+        await Future.wait(<Future<void>>[
+          postReadyStdout.future,
+          stderrDrained.future,
+        ]).timeout(const Duration(seconds: 2));
+        expect(stderrCharacters, stderrTarget);
+      } finally {
+        await source.stop();
+        expect(process.killed, isTrue);
+        await process.dispose();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    // BUG-2891：`--japanese-locale` 只是请求。x64 helper 没有 Locale Emulator 运行时，
+    // injector 退回普通 CreateProcess 并回报 `locale=0`；旧实现照样报「已转区」。
+    for (final (String localeField, bool applied) in <(String, bool)>[
+      ('locale=1', true),
+      ('locale=0', false),
+    ]) {
+      test('转区事实只认 injector 回报：$localeField ⇒ applied=$applied', () async {
+        final Directory temp = await Directory.systemTemp.createTemp(
+          'fushi_locale_fact_test_',
+        );
+        final File injector = File(
+          '${temp.path}${Platform.pathSeparator}fake.exe',
+        );
+        await injector.writeAsBytes(const <int>[0]);
+        final File game = File('${temp.path}${Platform.pathSeparator}game.exe');
+        await game.writeAsBytes(_craftPe(0x8664));
+        final _FakeProcess process = _FakeProcess();
+        setHandler((MethodCall call) async {
+          switch (call.method) {
+            case 'open':
+              return <String, Object?>{'ok': true};
+            case 'requestNativeLoopbackPolicy':
+              return <String, Object?>{
+                'nativeLoopbackRequested': 0,
+                'nativeLoopbackRequestSeq': 1,
+                'nativeLoopbackState': 0,
+                'nativeLoopbackAppliedSeq': 1,
+              };
+            case 'status':
+              return <Object?, Object?>{
+                'hooked': true,
+                'textHooked': true,
+                'audioHooksReady': true,
+                'ready': false,
+                'rawVoiceReady': false,
+              };
+          }
+          return null;
+        });
+        final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+          launchExe: game.path,
+          injectorPath: injector.path,
+          capabilitiesProbe: (String _) async =>
+              GalHookCapabilityProbeResult.supported,
+          japaneseLocaleMode: GalJapaneseLocaleMode.on,
+          systemAnsiCodePageProbe: () => 936,
+          processStarter: (String _, List<String> arguments) async {
+            expect(arguments, contains('--japanese-locale'));
+            scheduleMicrotask(() {
+              process.stdoutController.add(
+                ('LAUNCH pid=4321 arch=x64 role=game $localeField\n'
+                        'OK hooked pid=4321 mode=launch\n')
+                    .codeUnits,
+              );
+            });
+            return process;
+          },
+          readyTimeout: const Duration(seconds: 1),
+          pollInterval: Duration.zero,
+        );
+        try {
+          await source.start();
+          expect(source.japaneseLocaleRequested, isTrue);
+          expect(source.japaneseLocaleApplied, applied);
+          expect(
+            source.japaneseLocaleSkipReason,
+            applied ? isNull : GalJapaneseLocaleSkipReason.runtimeUnavailable,
+          );
+        } finally {
+          await source.stop();
+          await process.dispose();
+          await temp.delete(recursive: true);
+        }
+      });
+    }
+
+    test('attach 等 helper OK 后才打开共享内存', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_attach_ready_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      final _FakeProcess process = _FakeProcess();
+      var openCalls = 0;
+
+      setHandler((MethodCall call) async {
+        switch (call.method) {
+          case 'open':
+            openCalls++;
+            expect(call.arguments, <String, Object?>{'pid': 2468});
+            return <String, Object?>{'ok': true};
+          case 'requestNativeLoopbackPolicy':
+            expect(call.arguments, <String, Object?>{'policy': 'deny'});
+            return <String, Object?>{
+              'nativeLoopbackRequested': 0,
+              'nativeLoopbackRequestSeq': 1,
+              'nativeLoopbackState': 0,
+              'nativeLoopbackAppliedSeq': 1,
+            };
+          case 'status':
+            return <String, Object?>{
+              'hooked': true,
+              'textHooked': true,
+              'audioHooksReady': true,
+              'ready': false,
+              'rawVoiceReady': false,
+            };
+          case 'close':
+            return null;
+        }
+        return null;
+      });
+
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        targetPid: 2468,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String _) async =>
+            GalHookCapabilityProbeResult.supported,
+        processStarter: (String executable, List<String> arguments) async {
+          expect(executable, injector.path);
+          expect(arguments, containsAllInOrder(<String>['--pid', '2468']));
+          return process;
+        },
+        readyTimeout: const Duration(seconds: 1),
+        pollInterval: Duration.zero,
+      );
+
+      try {
+        final Future<PcmFormat?> start = source.start();
+        await Future<void>.delayed(Duration.zero);
+        expect(
+          openCalls,
+          0,
+          reason: 'helper 尚未宣告 hooked 时不能抢跑 OpenFileMapping',
+        );
+
+        process.stdoutController.add(
+          'OK hooked pid=2468 mode=attach\n'.codeUnits,
+        );
+        expect(await start, isNull);
+        expect(openCalls, 1);
+        expect(source.gamePid, 2468);
+        expect(source.textHookReady, isTrue);
+      } finally {
+        await source.stop();
+        await process.dispose();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    test('运行期策略只控制采集，stop 先 deny/ack 再 close/kill', () async {
+      final Directory temp = await Directory.systemTemp.createTemp(
+        'fushi_helper_native_policy_test_',
+      );
+      final File injector = File(
+        '${temp.path}${Platform.pathSeparator}fake.exe',
+      );
+      await injector.writeAsBytes(const <int>[0]);
+      final List<String> events = <String>[];
+      final _FakeProcess process = _FakeProcess(
+        onKill: () => events.add('kill'),
+      );
+      var requestSeq = 0;
+      var requested = 0;
+      var state = 0;
+      Map<Object?, Object?> policyStatus() => <Object?, Object?>{
+        'nativeLoopbackRequested': requested,
+        'nativeLoopbackRequestSeq': requestSeq,
+        'nativeLoopbackState': state,
+        'nativeLoopbackAppliedSeq': requestSeq,
+      };
+
+      setHandler((MethodCall call) async {
+        events.add(call.method);
+        switch (call.method) {
+          case 'open':
+            return <String, Object?>{'ok': true};
+          case 'requestNativeLoopbackPolicy':
+            final String policy =
+                (call.arguments as Map<Object?, Object?>)['policy']! as String;
+            events.add('policy:$policy');
+            requested = policy == 'allow' ? 1 : 0;
+            state = policy == 'allow' ? 2 : 0;
+            requestSeq++;
+            return policyStatus();
+          case 'status':
+            return <Object?, Object?>{
+              ...policyStatus(),
+              'hooked': true,
+              'textHooked': true,
+              'audioHooksReady': true,
+              'ready': false,
+              'rawVoiceReady': false,
+            };
+          case 'close':
+            return null;
+        }
+        fail('policy flow must not call playback/engine method ${call.method}');
+      });
+
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        targetPid: 2468,
+        injectorPath: injector.path,
+        capabilitiesProbe: (String _) async =>
+            GalHookCapabilityProbeResult.supported,
+        processStarter: (String executable, List<String> arguments) async {
+          expect(
+            arguments,
+            containsAllInOrder(<String>['--native-loopback-policy', 'deny']),
+          );
+          scheduleMicrotask(() {
+            process.stdoutController.add(
+              'OK hooked pid=2468 mode=attach\n'.codeUnits,
+            );
+          });
+          return process;
+        },
+        readyTimeout: const Duration(seconds: 1),
+        pollInterval: Duration.zero,
+      );
+
+      try {
+        expect(await source.start(), isNull);
+        expect(
+          await source.requestNativeLoopbackPolicy(
+            GalNativeLoopbackPolicy.allow,
+          ),
+          isTrue,
+        );
+        await source.stop();
+        final int finalDeny = events.lastIndexOf('policy:deny');
+        final int close = events.lastIndexOf('close');
+        final int kill = events.lastIndexOf('kill');
+        expect(finalDeny, greaterThanOrEqualTo(0));
+        expect(close, greaterThan(finalDeny));
+        expect(kill, greaterThan(close));
+      } finally {
+        await source.stop();
+        await process.dispose();
+        await temp.delete(recursive: true);
+      }
+    });
+
+    test('targetPid<=0 -> start null', () async {
+      final src = EngineHookGalAudioSource(
+        targetPid: 0,
+        injectorPath: 'C:/nope.exe',
+      );
+      expect(await src.start(), isNull);
+    });
+
+    test('grabRecent 返回 pcm+格式 -> 干净语音 GalAudioSlice', () async {
+      setHandler((call) async {
+        if (call.method == 'grabRecent') {
+          expect(call.arguments, {'backMs': 5000});
+          return <String, Object?>{
+            'pcm': Uint8List.fromList([9, 8, 7, 6]),
+            'sampleRate': 48000,
+            'channels': 1,
+            'bitsPerSample': 16,
+            'isFloat': false,
+            'hooked': true,
+            'ready': true,
+          };
+        }
+        return null;
+      });
+      final slice = await EngineHookGalAudioSource(
+        targetPid: 1,
+        injectorPath: null,
+      ).grabRecent(5000);
+      expect(slice, isNotNull);
+      expect(slice!.pcm, [9, 8, 7, 6]);
+      expect(slice.format.channels, 1);
+    });
+
+    test('grabRecent error map -> null', () async {
+      setHandler(
+        (call) async => <String, Object?>{'error': 'no voice buffered'},
+      );
+      expect(
+        await EngineHookGalAudioSource(
+          targetPid: 1,
+          injectorPath: null,
+        ).grabRecent(5000),
+        isNull,
+      );
+    });
+
+    test('grabRecent backMs<=0 -> null（不打 native）', () async {
+      var called = false;
+      setHandler((call) async {
+        called = true;
+        return null;
+      });
+      expect(
+        await EngineHookGalAudioSource(
+          targetPid: 1,
+          injectorPath: null,
+        ).grabRecent(0),
+        isNull,
+      );
+      expect(called, false);
+    });
+
+    test('native 缺失 -> grabRecent/stop fail-open 不抛', () async {
+      setHandler(null);
+      final src = EngineHookGalAudioSource(targetPid: 1, injectorPath: null);
+      expect(await src.grabRecent(3000), isNull);
+      await src.stop();
+    });
+
+    test(
+      'pollText keeps Luna thread discovery metadata for the UI selector',
+      () async {
+        setHandler((MethodCall call) async {
+          if (call.method != 'pollText') return null;
+          expect(call.arguments, <String, Object?>{'fromSeq': 7});
+          return <String, Object?>{
+            'count': 8,
+            'lines': <Object?>[
+              <Object?, Object?>{
+                'seq': 8,
+                'ts': 123456,
+                'text': '',
+                'threadId': 0x1234,
+                'threadAddress': 0x5678,
+                'threadContext': 9,
+                'threadContext2': 10,
+                'processId': 42,
+                'sourceKind': 2,
+                'eventKind': 1,
+                'eventFlags': 1,
+                'hookName': 'TextRender',
+                'hookCode': 'HS932@5678',
+              },
+            ],
+          };
+        });
+
+        final GalTextPoll? poll = await EngineHookGalAudioSource(
+          targetPid: 1,
+          injectorPath: null,
+        ).pollText(7);
+        expect(poll, isNotNull);
+        expect(poll!.count, 8);
+        final GalHookedLine line = poll.lines.single;
+        expect(line.textThreadKey, 'luna:1234');
+        expect(line.textThreadLabel, 'TextRender · 0x5678');
+        expect(line.hookCode, 'HS932@5678');
+        expect(line.processId, 42);
+        expect(line.threadContext2, 10);
+        expect(line.eventKind, GalTextEventKind.threadDiscovered);
+        expect(line.eventFlags, 1);
+      },
+    );
+
+    test('Siglus exact text source has a stable selectable thread label', () {
+      const GalHookedLine line = GalHookedLine(
+        seq: 1,
+        timestampMs: 2,
+        text: '「ひょ、とっ、ほあたぁ！」',
+        threadId: 0x44,
+        threadAddress: 0x25c880,
+        sourceKind: 4,
+      );
+      expect(line.textThreadKey, 'siglus:44');
+      expect(line.textThreadLabel, 'Siglus exact · 0x25c880');
+    });
+
+    test('engine exact text sources map to their own thread namespace', () {
+      // native voice_hook_ipc.h: kTextSourceYuris = 9, kTextSourceFvp = 10,
+      // kTextSourceKogadoHy = 11, kTextSourceLuca = 12, kTextSourceMalie = 15.
+      // An unmapped kind falls back to 'hook:' / 'Text hook', which hides the
+      // engine lane from thread selection.
+      const Map<int, (String, String)> expected = <int, (String, String)>{
+        9: ('yuris', 'YU-RIS exact'),
+        10: ('fvp', 'FVP exact'),
+        11: ('kogado', 'Kogado Hy exact'),
+        12: ('luca', 'LucaSystem exact'),
+        15: ('malie', 'Malie exact'),
+      };
+      for (final MapEntry<int, (String, String)> entry in expected.entries) {
+        final GalHookedLine line = GalHookedLine(
+          seq: 1,
+          timestampMs: 2,
+          text: '「テスト」',
+          threadId: 0x2a,
+          threadAddress: 0x1000,
+          sourceKind: entry.key,
+        );
+        expect(line.textThreadKey, '${entry.value.$1}:2a');
+        expect(line.textThreadLabel, '${entry.value.$2} · 0x1000');
+      }
+      // 13–14 are registered in voice_hook_ipc.h as reserved / unassigned.
+      for (int kind = 13; kind <= 14; kind++) {
+        final GalHookedLine line = GalHookedLine(
+          seq: 1,
+          timestampMs: 2,
+          text: '「テスト」',
+          threadId: 0x2a,
+          sourceKind: kind,
+        );
+        expect(line.textThreadKey, 'hook:2a', reason: '$kind');
+      }
+    });
+
+    test(
+      'selectTextThread forwards the native thread id and can reset to auto',
+      () async {
+        final List<Object?> selected = <Object?>[];
+        setHandler((MethodCall call) async {
+          if (call.method != 'selectTextThread') return null;
+          selected.add((call.arguments as Map<Object?, Object?>)['threadId']);
+          return <String, Object?>{'ok': true};
+        });
+        final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+          targetPid: 1,
+          injectorPath: null,
+        );
+
+        expect(await source.selectTextThread(0x1234), isTrue);
+        expect(await source.selectTextThread(null), isTrue);
+        expect(selected, <Object?>[0x1234, 0]);
+      },
+    );
+
+    test('targetIsWow64: native 返回 true -> 32 位（选 x86 注入器）', () async {
+      setHandler((call) async {
+        if (call.method == 'processIsWow64') {
+          expect(call.arguments, {'pid': 4321});
+          return <String, Object?>{'isWow64': true};
+        }
+        return null;
+      });
+      expect(await EngineHookGalAudioSource.targetIsWow64(4321), true);
+    });
+
+    test('targetIsWow64: native 返回 false -> 64 位', () async {
+      setHandler((call) async => <String, Object?>{'isWow64': false});
+      expect(await EngineHookGalAudioSource.targetIsWow64(4321), false);
+    });
+
+    test('targetIsWow64: pid<=0 / error / native 缺失 -> null', () async {
+      setHandler((call) async => <String, Object?>{'error': 'open failed'});
+      expect(
+        await EngineHookGalAudioSource.targetIsWow64(0),
+        isNull,
+      ); // 不打 native
+      expect(
+        await EngineHookGalAudioSource.targetIsWow64(4321),
+        isNull,
+      ); // error
+      setHandler(null);
+      expect(await EngineHookGalAudioSource.targetIsWow64(4321), isNull); // 缺失
+    });
+  });
+
+  group('buildEngineHookInjectorArguments', () {
+    test('x86 launch 可请求日语 CP932，attach 不会误带', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 0,
+          launchExe: r'D:\Games\old-vn.exe',
+          japaneseLocale: true,
+        ),
+        <String>[
+          '--launch',
+          r'D:\Games\old-vn.exe',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+          '--japanese-locale',
+        ],
+      );
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 4567,
+          launchExe: null,
+          japaneseLocale: true,
+        ),
+        <String>[
+          '--pid',
+          '4567',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+        ],
+      );
+    });
+
+    test('launch 模式可追加 Luna PC hooks 参数', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 0,
+          launchExe: r'D:\steam\steamapps\common\manosaba_game\manosaba.exe',
+          lunaPcHooks: true,
+        ),
+        <String>[
+          '--launch',
+          r'D:\steam\steamapps\common\manosaba_game\manosaba.exe',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+          '--luna-pchooks',
+        ],
+      );
+    });
+
+    // 用户配置的游戏启动参数：一个 token 一个 `--arg`。空配置时**一个都不发**，
+    // game argv 仍保持逐字节相同；v16 安全策略 flag 则必须始终显式存在。
+    test('未配置启动参数时不发 --arg / --workdir（逐字节向后兼容）', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 0,
+          launchExe: r'D:\Games\vn.exe',
+        ),
+        <String>[
+          '--launch',
+          r'D:\Games\vn.exe',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+        ],
+      );
+    });
+
+    test('配置了启动参数时逐 token 发 --arg，并带上 --workdir', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 0,
+          launchExe: r'D:\Games\vn.exe',
+          gameArguments: <String>['-windowed', r'--save=D:\My Saves\s'],
+          workdir: r'D:\Games',
+        ),
+        <String>[
+          '--launch',
+          r'D:\Games\vn.exe',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+          '--workdir',
+          r'D:\Games',
+          '--arg',
+          '-windowed',
+          '--arg',
+          r'--save=D:\My Saves\s',
+        ],
+      );
+    });
+
+    // attach 模式游戏已经在跑，进程创建参数无从谈起：给了也必须不发，否则 injector
+    // 会收到一个 launch 专用 flag 而 `--pid` 路径根本不会用它。
+    test('attach 模式忽略启动参数与 workdir', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 4567,
+          launchExe: null,
+          gameArguments: <String>['-windowed'],
+          workdir: r'D:\Games',
+        ),
+        <String>[
+          '--pid',
+          '4567',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+        ],
+      );
+    });
+
+    test('attach 模式保持旧参数，未启用时不带 Luna PC hooks', () {
+      expect(
+        buildEngineHookInjectorArguments(targetPid: 4567, launchExe: null),
+        <String>[
+          '--pid',
+          '4567',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '30000',
+        ],
+      );
+    });
+
+    // 两侧截止时间必须同源：native 默认只等 5000ms，Dart 等 30s。native 先超时时会把
+    // CREATE_SUSPENDED 拉起的游戏丢在挂起态，Dart 侧却还在傻等，最终只报一个没有原因
+    // 的失败——所以握手超时必须由调用方下发给 injector。
+    test('握手超时下发给 injector，与 Dart 侧同源', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 4567,
+          launchExe: null,
+          readyTimeoutMs: 45000,
+        ),
+        <String>[
+          '--pid',
+          '4567',
+          '--hold',
+          '--native-loopback-policy',
+          'deny',
+          '--wait-ms',
+          '45000',
+        ],
+      );
+      // 非正超时=不下发（保留 injector 自身默认），不构造非法参数。
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 4567,
+          launchExe: null,
+          readyTimeoutMs: 0,
+        ),
+        <String>['--pid', '4567', '--hold', '--native-loopback-policy', 'deny'],
+      );
+    });
+
+    test('只有显式 full 策略才下发 allow', () {
+      expect(
+        buildEngineHookInjectorArguments(
+          targetPid: 4567,
+          launchExe: null,
+          nativeLoopbackPolicy: GalNativeLoopbackPolicy.allow,
+        ),
+        containsAllInOrder(<String>['--native-loopback-policy', 'allow']),
+      );
+    });
+  });
+
+  group('classifyGalHookInjectorFailure', () {
+    test('优先认新 helper 的机器可读 ERR reason=', () {
+      expect(
+        classifyGalHookInjectorFailure(
+          '[luna] connected pid=20096\nERR reason=accessDenied exit=1\n',
+        ),
+        GalHookInjectorFailure.accessDenied,
+      );
+      expect(
+        classifyGalHookInjectorFailure(
+          'ERR reason=residentHookMismatch exit=2\n',
+        ),
+        GalHookInjectorFailure.residentHookMismatch,
+      );
+    });
+
+    test('旧 helper 的人类可读诊断仍能归类（向后兼容）', () {
+      expect(
+        classifyGalHookInjectorFailure('位数不匹配：目标是 64 位进程，请改用对应 arch 的注入器\n'),
+        GalHookInjectorFailure.bitnessMismatch,
+      );
+      expect(
+        classifyGalHookInjectorFailure(
+          'OpenProcess(20096) failed: 5 (需管理员/相同完整性级别?)\n',
+        ),
+        GalHookInjectorFailure.accessDenied,
+      );
+      expect(
+        classifyGalHookInjectorFailure('CreateProcessW failed: 740\n'),
+        GalHookInjectorFailure.elevationRequired,
+      );
+      expect(
+        classifyGalHookInjectorFailure('CreateProcessW failed: 2\n'),
+        GalHookInjectorFailure.createProcessFailed,
+      );
+      expect(
+        classifyGalHookInjectorFailure('注入完成但未收到就绪信号（5000ms 超时）；hooked=0\n'),
+        GalHookInjectorFailure.readyTimeout,
+      );
+      expect(
+        classifyGalHookInjectorFailure('已存在但不可复用的 hook 会话（契约不匹配或 hooked=0）\n'),
+        GalHookInjectorFailure.staleSession,
+      );
+      expect(
+        classifyGalHookInjectorFailure('CreateRemoteThread failed: 5\n'),
+        GalHookInjectorFailure.injectionFailed,
+      );
+    });
+
+    test('无法归类时返回调用方给的 fallback，不编造原因', () {
+      expect(
+        classifyGalHookInjectorFailure(
+          '[luna] inserted PC hooks pid=1\n',
+          fallback: GalHookInjectorFailure.handshakeTimeout,
+        ),
+        GalHookInjectorFailure.handshakeTimeout,
+      );
+      expect(
+        classifyGalHookInjectorFailure(''),
+        GalHookInjectorFailure.unknown,
+      );
+    });
+
+    test('只有可能自愈的失败才允许重试', () {
+      // 会自愈：注入竞态 / DLL 加载慢 / 暂时不可复用的旧映射。
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.readyTimeout),
+        isTrue,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.handshakeTimeout),
+        isTrue,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.staleSession),
+        isTrue,
+      );
+      // 不会自愈：重试只会掩盖必须告诉用户的处置。
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.residentHookMismatch),
+        isFalse,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.accessDenied),
+        isFalse,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.bitnessMismatch),
+        isFalse,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.helperMissing),
+        isFalse,
+      );
+      expect(
+        galHookFailureIsRetryable(GalHookInjectorFailure.elevationRequired),
+        isFalse,
+      );
+    });
+  });
+
+  group('parseInjectorLaunchedPid', () {
+    test(
+      'native producer reports launcher/game role and actual locale result',
+      () {
+        final String producer = File(
+          '../native/galgame_hook/injector/injector_main.cpp',
+        ).readAsStringSync();
+        expect(producer, contains('role=%s locale=%d%s\\n'));
+        expect(producer, contains('launcher_layout ? " wait=launcher" : ""'));
+        expect(
+          producer,
+          contains(
+            'follow_children ? "launcher" : "game", locale_launched ? 1 : 0',
+          ),
+        );
+        expect(producer, contains('role=game locale=%d\\n'));
+        expect(
+          producer,
+          contains(
+            'sizeof(void*) == 8 ? "x64" : "x86", locale_launched ? 1 : 0',
+          ),
+        );
+      },
+    );
+    test('latest complete record replaces launcher; partial chunks do not', () {
+      const String first = 'LAUNCH pid=1111 arch=x86 role=launcher locale=1\n';
+      const String child = 'LAUNCH pid=2222 arch=x86 role=game locale=1\n';
+      for (int i = 0; i < child.length; i++) {
+        final GalHookLaunchObservation launch = parseInjectorLaunchObservation(
+          first + child.substring(0, i),
+        )!;
+        expect(launch.pid, 1111);
+        expect(launch.gameTarget, isFalse);
+      }
+      final GalHookLaunchObservation launch = parseInjectorLaunchObservation(
+        first + child,
+      )!;
+      expect(launch.pid, 2222);
+      expect(launch.gameTarget, isTrue);
+      expect(launch.localeLaunch, isTrue);
+    });
+    // BUG-2704：加载器初始化门等用户操作时的 WAIT 记录。两侧同一契约：native 打印格式
+    // 与 Dart 解析器必须一起改。
+    test('native loader gate prints the WAIT records the host parses', () {
+      final String producer = File(
+        '../native/galgame_hook/injector/injector_main.cpp',
+      ).readAsStringSync();
+      expect(producer, contains('"WAIT pid=%lu reason=%s\\n"'));
+      expect(producer, contains('waiting_user ? "user" : "none"'));
+      expect(producer, contains('"WAIT pid=%lu reason=none\\n"'));
+    });
+    test('user-wait records are parsed strictly', () {
+      expect(parseInjectorUserWait('WAIT pid=3333 reason=user\n'), isTrue);
+      expect(parseInjectorUserWait('WAIT pid=3333 reason=none\r\n'), isFalse);
+      expect(
+        parseInjectorUserWait(
+          'WAIT pid=3333 reason=user\nWAIT pid=3333 reason=none\n',
+        ),
+        isFalse,
+      );
+      for (final String malformed in <String>[
+        'WAIT pid=0 reason=user\n',
+        'WAIT pid=3333 reason=launcher\n',
+        'WAIT pid=3333\n',
+        'LAUNCH pid=3333 arch=x86 role=game\n',
+        ' WAIT pid=3333 reason=user\n',
+      ]) {
+        expect(parseInjectorUserWait(malformed), isNull, reason: malformed);
+      }
+    });
+    test('注入结果之前就能拿到已创建的游戏 PID', () {
+      expect(parseInjectorLaunchedPid('LAUNCH pid=20096 arch=x64\n'), 20096);
+    });
+
+    test('旧 helper 不打印该行时返回 null（不猜）', () {
+      expect(parseInjectorLaunchedPid('OK hooked pid=8152 hooked=1\n'), isNull);
+      expect(parseInjectorLaunchedPid('LAUNCH pid=0\n'), isNull);
+    });
+  });
+
+  group('parseInjectorHookedPid', () {
+    test('解析 OK hooked pid=<N>', () {
+      expect(
+        parseInjectorHookedPid(
+          'OK hooked pid=8152 hooked=1 ring=23040000 sr=0 ch=0',
+        ),
+        8152,
+      );
+      expect(
+        parseInjectorHookedPid('noise\nOK hooked pid=42 hooked=1\nmore'),
+        42,
+      );
+    });
+    test('无匹配 / pid=0 -> null', () {
+      expect(parseInjectorHookedPid('inject failed: OpenProcess 5'), isNull);
+      expect(parseInjectorHookedPid(''), isNull);
+      expect(parseInjectorHookedPid('OK hooked pid=0 hooked=0'), isNull);
+    });
+  });
+
+  group('EngineHookGalAudioSource.exeIs32Bit', () {
+    late Directory dir;
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('gal_pe_');
+    });
+    tearDown(() async {
+      if (dir.existsSync()) await dir.delete(recursive: true);
+    });
+
+    Future<String> write(String name, Uint8List bytes) async {
+      final File f = File('${dir.path}/$name');
+      await f.writeAsBytes(bytes, flush: true);
+      return f.path;
+    }
+
+    test('IMAGE_FILE_MACHINE_I386 (0x014c) -> 32 位 true', () async {
+      final String p = await write('x86.exe', _craftPe(0x014c));
+      expect(await EngineHookGalAudioSource.exeIs32Bit(p), true);
+    });
+    test('IMAGE_FILE_MACHINE_AMD64 (0x8664) -> 64 位 false', () async {
+      final String p = await write('x64.exe', _craftPe(0x8664));
+      expect(await EngineHookGalAudioSource.exeIs32Bit(p), false);
+    });
+    test('未知 machine (ARM64 0xAA64) -> null', () async {
+      final String p = await write('arm.exe', _craftPe(0xAA64));
+      expect(await EngineHookGalAudioSource.exeIs32Bit(p), isNull);
+    });
+    test('非 PE（坏签名）-> null', () async {
+      final Uint8List bad = _craftPe(0x014c);
+      bad[0x80] = 0x4d; // 破坏 'PE' 签名
+      final String p = await write('bad.exe', bad);
+      expect(await EngineHookGalAudioSource.exeIs32Bit(p), isNull);
+    });
+    test('文件不存在 -> null', () async {
+      expect(
+        await EngineHookGalAudioSource.exeIs32Bit('${dir.path}/nope.exe'),
+        isNull,
+      );
+    });
+  });
+
+  group('shouldUseLunaPcHooksForExecutable', () {
+    late Directory dir;
+    setUp(() async {
+      dir = await Directory.systemTemp.createTemp('gal_unity_');
+    });
+    tearDown(() async {
+      if (dir.existsSync()) await dir.delete(recursive: true);
+    });
+
+    String join(String a, String b) => '$a${Platform.pathSeparator}$b';
+
+    test('单个游戏 exe 名不触发 PC hooks：没有 Unity 目录结构的 manosaba.exe 不启用', () async {
+      final File exe = File(join(dir.path, 'manosaba.exe'));
+      await exe.writeAsBytes(_craftPe(0x8664), flush: true);
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isFalse);
+    });
+
+    test(
+      'manosaba 按 Unity IL2CPP 目录结构（_Data/il2cpp_data）启用 PC hooks',
+      () async {
+        final File exe = File(join(dir.path, 'manosaba.exe'));
+        await exe.writeAsBytes(_craftPe(0x8664), flush: true);
+        await File(join(dir.path, 'UnityPlayer.dll')).writeAsBytes(<int>[1]);
+        final File metadata = File(
+          join(
+            join(
+              join(join(dir.path, 'manosaba_Data'), 'il2cpp_data'),
+              'Metadata',
+            ),
+            'global-metadata.dat',
+          ),
+        );
+        await metadata.create(recursive: true);
+        await metadata.writeAsBytes(<int>[1]);
+
+        expect(shouldUseLunaPcHooksForExecutable(exe.path), isTrue);
+      },
+    );
+
+    test('只有 UnityPlayer.dll、没有 IL2CPP/Mono 布局的 PE 不启用', () async {
+      final File exe = File(join(dir.path, 'sample.exe'));
+      await exe.writeAsBytes(_craftPe(0x8664), flush: true);
+      await File(join(dir.path, 'UnityPlayer.dll')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isFalse);
+    });
+
+    test('SiglusEngine.exe 启用 PC hooks 以避开 GDI 描边伪影', () async {
+      final File exe = File(join(dir.path, 'SiglusEngine.exe'));
+      await exe.writeAsBytes(_craftPe(0x014c), flush: true);
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isTrue);
+    });
+
+    test('改名 Siglus 按 Gameexe.dat + Scene.pck 目录签名启用 PC hooks', () async {
+      final File exe = File(join(dir.path, 'summer.exe'));
+      await exe.writeAsBytes(_craftPe(0x014c), flush: true);
+      await File(join(dir.path, 'Gameexe.dat')).writeAsBytes(<int>[1]);
+      await File(join(dir.path, 'Scene.pck')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isTrue);
+    });
+
+    test('Steam 语言包 Siglus（GameexeZH.dat + SceneZH.pck）启用 PC hooks', () async {
+      // CLANNAD Steam 版：SiglusEngine_Steam.exe，选简体中文时目录里没有无后缀的那一对。
+      final File exe = File(join(dir.path, 'SiglusEngine_Steam.exe'));
+      await exe.writeAsBytes(_craftPe(0x014c), flush: true);
+      await File(join(dir.path, 'GameexeZH.dat')).writeAsBytes(<int>[1]);
+      await File(join(dir.path, 'SceneZH.pck')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isTrue);
+    });
+
+    test('Siglus 语言后缀必须成对：GameexeEN.dat + SceneZH.pck 不启用', () async {
+      final File exe = File(join(dir.path, 'summer.exe'));
+      await exe.writeAsBytes(_craftPe(0x014c), flush: true);
+      await File(join(dir.path, 'GameexeEN.dat')).writeAsBytes(<int>[1]);
+      await File(join(dir.path, 'SceneZH.pck')).writeAsBytes(<int>[1]);
+      await File(join(dir.path, 'Scene_old.pck')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isFalse);
+    });
+
+    test('改名普通 PE 只有一个 Siglus 数据文件时不启用 PC hooks', () async {
+      final File exe = File(join(dir.path, 'summer.exe'));
+      await exe.writeAsBytes(_craftPe(0x014c), flush: true);
+      await File(join(dir.path, 'Gameexe.dat')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isFalse);
+    });
+
+    test('Unity IL2CPP 布局启用 Luna PC hooks', () async {
+      final File exe = File(join(dir.path, 'sample.exe'));
+      await exe.writeAsBytes(_craftPe(0x8664), flush: true);
+      await File(join(dir.path, 'UnityPlayer.dll')).writeAsBytes(<int>[1]);
+      await File(join(dir.path, 'GameAssembly.dll')).writeAsBytes(<int>[1]);
+
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isTrue);
+    });
+
+    test('普通 PE 不启用 Luna PC hooks', () async {
+      final File exe = File(join(dir.path, 'plain.exe'));
+      await exe.writeAsBytes(_craftPe(0x8664), flush: true);
+      expect(shouldUseLunaPcHooksForExecutable(exe.path), isFalse);
+    });
+  });
+}

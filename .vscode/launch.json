@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Fushi (debug)",
+      "type": "dart",
+      "request": "launch",
+      "program": "fushi/lib/main.dart"
+    },
+    {
+      "name": "Fushi (profile)",
+      "type": "dart",
+      "request": "launch",
+      "program": "fushi/lib/main.dart",
+      "flutterMode": "profile"
+    },
+    {
+      "name": "Fushi (release)",
+      "type": "dart",
+      "request": "launch",
+      "program": "fushi/lib/main.dart",
+      "flutterMode": "release"
+    }
+  ]
+}

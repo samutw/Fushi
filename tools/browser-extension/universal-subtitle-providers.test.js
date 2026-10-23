@@ -1,0 +1,974 @@
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+// TODO-1363 行为守卫：content.js 的通用字幕轨 provider。
+// 在受控 vm 里真加载 subtitle-adapters.js + content.js（manifest 同序），断言：
+//   1) 接收端注册后立刻请求 replayCues（TODO-1219「勾选要刷新/列表空」的注入时序竞态修复）；
+//   2) DOM 采样 live 轨：句子出现即入轨（勾选立刻有内容）、结束定格真实 end、倒退回看去重；
+//   3) HTML5 video.textTracks 全量收割：原生字幕轨站点直接得到整集列表（含标签清洗与增量刷新）。
+
+const ADAPTERS = path.join(__dirname, 'subtitle-adapters.js');
+const PROVIDERS = path.join(__dirname, 'subtitle-providers.js');
+const CONTENT = process.env.FUSHI_CONTENT_UNDER_TEST ||
+  path.join(__dirname, 'content.js');
+
+// BUG-1718：真实运行时（manifest content_scripts / side-panel.html）里 vendor/dict-media.js
+// 恒在 content.js / side-panel.js 之前加载，后者依赖它导出的 applyFushiPopupCss 与
+// installDictMediaPlaceholderResolver。测试沙箱必须照同样顺序装，否则跑的是一个真实
+// 世界里不存在的、缺半个脚本集的环境。
+const FUSHI_DICT_MEDIA = path.join(__dirname, 'vendor', 'dict-media.js');
+function loadFushiDictMedia(ctx) {
+  vm.runInContext(fs.readFileSync(FUSHI_DICT_MEDIA, 'utf8'), ctx,
+    { filename: 'vendor/dict-media.js' });
+}
+
+// 极简节点树：文本段 → 文本节点；带 reading 的段 → <ruby>base<rt>reading</rt></ruby>。
+// 只实现 content.js 采样真正用到的那几个属性（nodeType / childNodes / tagName /
+// textContent / querySelectorAll('rt')）。
+function textNode(value) {
+  return { nodeType: 3, nodeValue: value, textContent: value };
+}
+
+function elementNode(tag, children) {
+  return {
+    nodeType: 1,
+    tagName: tag.toUpperCase(),
+    childNodes: children,
+    get textContent() {
+      return children.map((c) => c.textContent).join('');
+    },
+    querySelectorAll(sel) {
+      if (sel !== 'rt') return [];
+      return children.filter((c) => c.nodeType === 1 && c.tagName === 'RT');
+    },
+  };
+}
+
+function makeSubtitleNode(segments) {
+  const children = [];
+  for (const seg of segments) {
+    // bare:true = 不裹 <ruby> 的孤立 <rt>（站点把注音拆平时的真实形态）。
+    if (seg.bare) { children.push(elementNode('rt', [textNode(seg.text)])); continue; }
+    if (!seg.reading) { children.push(textNode(seg.text)); continue; }
+    children.push(elementNode('ruby', [
+      textNode(seg.text),
+      elementNode('rt', [textNode(seg.reading)]),
+    ]));
+  }
+  return elementNode('div', children);
+}
+
+function loadContent(opts) {
+  const events = []; // 时序记录：listener 注册 / postMessage
+  const intervals = []; // {fn, ms}
+  const storageWrites = []; // chrome.storage.local.set 落盘记录（制卡队列真相源）
+  const state = { subText: '', subRuby: null, videoPresent: true, video: null };
+  function createVideo(currentTime, textTracks) {
+    const listeners = Object.create(null);
+    return {
+      currentTime: currentTime || 0,
+      paused: true,
+      seeking: false,
+      textTracks: textTracks || [],
+      addEventListener(type, listener) {
+        (listeners[type] || (listeners[type] = new Set())).add(listener);
+      },
+      removeEventListener(type, listener) {
+        if (listeners[type]) listeners[type].delete(listener);
+      },
+      emit(type) {
+        for (const listener of listeners[type] || []) listener.call(this);
+      },
+    };
+  }
+  const video = createVideo(0, opts.textTracks);
+  state.video = video;
+  const windowObj = {
+    addEventListener: (t) => events.push({ type: 'listener', t }),
+    postMessage: (msg) => events.push({ type: 'post', msg }),
+    innerWidth: 1200,
+    innerHeight: 800,
+  };
+  const sandbox = {
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout: () => 0,
+    clearTimeout() {},
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
+    clearInterval() {},
+    URL,
+    Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+    location: {
+      hostname: opts.hostname || 'example.com',
+      href: 'https://' + (opts.hostname || 'example.com') + (opts.pathname || '/p') + (opts.search || ''),
+      pathname: opts.pathname || '/p',
+      origin: 'https://' + (opts.hostname || 'example.com'),
+      search: opts.search || '',
+    },
+    window: windowObj,
+    document: {
+      documentElement: { dataset: {}, setAttribute() {} },
+      head: { appendChild() {} },
+      body: { appendChild() {}, style: {} },
+      fullscreenElement: null,
+      addEventListener() {},
+      getElementById: () => null,
+      querySelector: (sel) => (
+        sel === 'video' && state.videoPresent ? state.video : null
+      ),
+      querySelectorAll: (sel) => {
+        if (sel !== '.player-timedtext') return [];
+        if (Array.isArray(state.subRuby) && state.subRuby.length) {
+          return [makeSubtitleNode(state.subRuby)];
+        }
+        if (state.subText) return [makeSubtitleNode([{ text: state.subText, reading: '' }])];
+        return [];
+      },
+      createElement: () => ({
+        style: {},
+        addEventListener() {},
+        appendChild() {},
+        setAttribute() {},
+        remove() {},
+        classList: { add() {} },
+      }),
+    },
+    chrome: {
+      runtime: {
+        id: 'test-ext-id',
+        lastError: null,
+        onMessage: { addListener() {} },
+        sendMessage() {},
+      },
+      storage: {
+        local: { get: () => {}, set(obj) { storageWrites.push(obj); } },
+        onChanged: { addListener() {} },
+      },
+    },
+  };
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(ADAPTERS, 'utf8'), ctx, { filename: 'subtitle-adapters.js' });
+  loadFushiDictMedia(ctx);
+  // manifest 里 popup-size.js 排在 content.js 之前（同隔离世界的顶层函数），
+  // content.js 的 fushiApplyTheme 直接调它的 fushiResolvePopupBox。
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'popup-size.js'), 'utf8'), sandbox,
+    { filename: 'popup-size.js' });
+  // manifest 顺序：subtitle-providers.js（store + provider）先于 content.js
+  vm.runInContext(fs.readFileSync(PROVIDERS, 'utf8'), ctx, { filename: 'subtitle-providers.js' });
+  vm.runInContext(fs.readFileSync(CONTENT, 'utf8'), ctx, { filename: 'content.js' });
+  const sampler = intervals.find((i) => i.ms === 200);
+  const harvester = intervals.find((i) => i.ms === 1200);
+  return {
+    events,
+    state,
+    storageWrites,
+    video,
+    windowObj,
+    location: sandbox.location,
+    sampler,
+    harvester,
+    seekTo(seconds) {
+      state.video.seeking = true;
+      state.video.emit('seeking');
+      state.video.currentTime = seconds;
+      state.video.seeking = false;
+      state.video.emit('seeked');
+    },
+    remountVideo(seconds) {
+      state.video = createVideo(seconds, state.video.textTracks);
+      state.videoPresent = true;
+      return state.video;
+    },
+    destroyVideo() {
+      state.videoPresent = false;
+    },
+  };
+}
+
+test('接收端注册后立刻请求 replayCues（先注册后请求，消除注入时序竞态）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  const listenerIdx = h.events.findIndex((e) => e.type === 'listener' && e.t === 'message');
+  const replayIdx = h.events.findIndex(
+    (e) => e.type === 'post' && e.msg && e.msg.__fushiNf === 'replayCues');
+  assert.ok(listenerIdx >= 0, '必须注册 message 接收端');
+  assert.ok(replayIdx >= 0, '必须发出 replayCues 请求');
+  assert.ok(replayIdx > listenerIdx, 'replayCues 必须在接收端注册之后（否则重放也会丢）');
+});
+
+test('live 轨：句子出现即入轨、结束定格 end、倒退回看去重（通用站点）', () => {
+  const h = loadContent({ hostname: 'example.com', pathname: '/p' });
+  assert.ok(h.sampler, '缺 200ms 采样器');
+  const notified = [];
+  h.windowObj.fushiSubtitlePanelOnCues = (key) => notified.push(key);
+
+  // 句子出现（t=1.0s）：立刻入轨（暂定 end）——勾选开关此刻就有内容可显示。
+  h.video.currentTime = 1.0;
+  h.state.subText = 'konnichiwa';
+  h.sampler.fn();
+  const key = 'example.com/p|live';
+  const store = h.windowObj.fushiEpisodeCues;
+  assert.ok(store, 'content.js 必须暴露 fushiEpisodeCues');
+  assert.strictEqual(store[key].length, 1, '句子出现即入 live 轨');
+  assert.strictEqual(store[key][0].startMs, 1000);
+  assert.strictEqual(store[key][0].text, 'konnichiwa');
+  assert.deepStrictEqual(notified, [key], '新句必须通知面板');
+
+  // 同句持续显示：不重复入轨。
+  h.video.currentTime = 1.5;
+  h.sampler.fn();
+  assert.strictEqual(store[key].length, 1);
+
+  // 句子结束（t=3.0s 字幕清空）：定格真实 end。
+  h.video.currentTime = 3.0;
+  h.state.subText = '';
+  h.sampler.fn();
+  assert.strictEqual(store[key][0].endMs, 3000, '句子结束必须定格真实 end');
+
+  // 倒退回看同一句（seek 回 t=0.9s）：同文本句首相近 → 去重不重复入轨。
+  h.video.currentTime = 0.9;
+  h.state.subText = 'konnichiwa';
+  h.sampler.fn();
+  assert.strictEqual(store[key].length, 1, '倒退回看不得重复入轨');
+
+  // 新句（t=5s）：有序追加。
+  h.video.currentTime = 5.0;
+  h.state.subText = 'sayounara';
+  h.sampler.fn();
+  assert.strictEqual(store[key].length, 2);
+  assert.strictEqual(store[key][1].startMs, 5000);
+});
+
+test('live 轨：YouTube 同一句逐字扩长时就地更新，不把每个快照追加成重复行', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=rolling' });
+  const notified = [];
+  h.windowObj.fushiSubtitlePanelOnCues = (key) => notified.push(key);
+  const key = 'yt-rolling|live';
+
+  h.video.currentTime = 25.0;
+  h.state.subText = '自価総額およそ';
+  h.sampler.fn();
+
+  h.video.currentTime = 25.2;
+  h.state.subText = '自価総額およそ800';
+  h.sampler.fn();
+  h.video.currentTime = 25.4;
+  h.state.subText = '自価総額およそ800兆円。';
+  h.sampler.fn();
+  h.video.currentTime = 25.6;
+  h.state.subText = '自価総額およそ800兆円。NIAはAIブーム';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues[key];
+  assert.strictEqual(track.length, 1, '同一句的逐字扩长快照必须合并到一行');
+  assert.strictEqual(track[0].startMs, 25000, '就地更新不得改变原句起点');
+  assert.strictEqual(track[0].text, '自価総額およそ800兆円。NIAはAIブーム');
+  assert.ok(track[0].endMs > 25600, '仍在显示时暂定 end 必须随快照延长');
+  assert.strictEqual(notified.length, 4, '每次就地更新仍需通知面板刷新现有行');
+
+  h.video.currentTime = 25.8;
+  h.state.subText = '次の文';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 2, '真正换句仍应新增一行');
+  assert.strictEqual(track[0].endMs, 25800, '换句时上一句必须定格真实 end');
+  assert.strictEqual(track[1].text, '次の文');
+});
+
+test('BUG-1270：YouTube 累积 DOM 分段，回跳同一时间不再插入短快照', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=seek-back' });
+  const key = 'yt-seek-back|live';
+
+  const growingParts = [
+    '工場です。', 'パイプ', 'ラインです。', 'その中に', '赤と', '白の', '煙突が',
+    '見えます。', 'その', '先端', '部分に', '向かって', '折れて', 'いく',
+  ];
+  let cumulative = '';
+  for (let i = 0; i < growingParts.length; i++) {
+    cumulative += growingParts[i];
+    h.video.currentTime = 193.0 + i;
+    h.state.subText = cumulative;
+    h.sampler.fn();
+  }
+
+  const track = h.windowObj.fushiEpisodeCues[key];
+  assert.strictEqual(track.length, 2, '累积 DOM 必须按时间切成有界 cue');
+  assert.strictEqual(track[0].startMs, 193000);
+  assert.strictEqual(track[0].endMs, 205000);
+  assert.strictEqual(track[0].text, growingParts.slice(0, 12).join(''));
+  assert.strictEqual(track[1].startMs, 205000);
+  assert.strictEqual(track[1].text, '折れていく');
+
+  // 从 3:29 回跳到 3:13：YouTube 先给旧 cue 的短前缀，再继续逐字扩长。
+  // 两次采样都只能进入 replay 状态，不能生成截图中第二条 3:13。
+  h.seekTo(193.0);
+  h.state.subText = '工場です。';
+  h.sampler.fn();
+  h.video.currentTime = 193.2;
+  h.state.subText = '工場です。パイプラインです。';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 2, '回跳旧区间不得插入同时间短快照');
+  assert.strictEqual(track.filter((c) => c.startMs === 193000).length, 1);
+});
+
+test('短采样停顿：1.6 秒正向增长不是 seek，新增后缀不丢', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=pause' });
+  h.video.currentTime = 10;
+  h.state.subText = 'A';
+  h.sampler.fn();
+  h.video.currentTime = 11.6;
+  h.state.subText = 'AB';
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues['yt-pause|live'];
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track[0].text, 'AB');
+});
+
+test('非前缀更正与缩短各自成句，不回写上一 cue', () => {
+  const correction = loadContent({
+    hostname: 'www.youtube.com',
+    pathname: '/watch',
+    search: '?v=correction',
+  });
+  correction.video.currentTime = 20;
+  correction.state.subText = 'alpha';
+  correction.sampler.fn();
+  correction.video.currentTime = 20.2;
+  correction.state.subText = 'alpX';
+  correction.sampler.fn();
+  assert.strictEqual(
+    correction.windowObj.fushiEpisodeCues['yt-correction|live']
+      .map((cue) => cue.text)
+      .join('|'),
+    'alpha|alpX',
+  );
+
+  const shortening = loadContent({
+    hostname: 'www.youtube.com',
+    pathname: '/watch',
+    search: '?v=shortening',
+  });
+  shortening.video.currentTime = 30;
+  shortening.state.subText = 'abcdef';
+  shortening.sampler.fn();
+  shortening.video.currentTime = 30.2;
+  shortening.state.subText = 'abc';
+  shortening.sampler.fn();
+  assert.strictEqual(
+    shortening.windowObj.fushiEpisodeCues['yt-shortening|live']
+      .map((cue) => cue.text)
+      .join('|'),
+    'abcdef|abc',
+  );
+});
+
+test('SPA 换视频：同文也建新轨，前缀增长不得污染旧视频 cue', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=one' });
+  h.video.currentTime = 10;
+  h.state.subText = 'same';
+  h.sampler.fn();
+
+  h.location.search = '?v=two';
+  h.location.href = 'https://www.youtube.com/watch?v=two';
+  h.state.subText = 'same';
+  h.sampler.fn();
+  h.video.currentTime = 10.2;
+  h.state.subText = 'same-new';
+  h.sampler.fn();
+
+  const store = h.windowObj.fushiEpisodeCues;
+  assert.strictEqual(store['yt-one|live'][0].text, 'same');
+  assert.strictEqual(store['yt-two|live'].length, 1);
+  assert.strictEqual(store['yt-two|live'][0].text, 'same-new');
+});
+
+test('SPA A→B→A：回访已有轨的短前缀只读 replay，不追加重复 cue', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=A' });
+  h.video.currentTime = 10;
+  h.state.subText = 'line-full';
+  h.sampler.fn();
+
+  h.location.search = '?v=B';
+  h.location.href = 'https://www.youtube.com/watch?v=B';
+  h.state.subText = 'other';
+  h.sampler.fn();
+
+  h.location.search = '?v=A';
+  h.location.href = 'https://www.youtube.com/watch?v=A';
+  h.state.subText = 'line';
+  h.sampler.fn();
+  h.state.video.currentTime = 10.2;
+  h.state.subText = 'line-full';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-A|live'];
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track.map((cue) => cue.text).join('|'), 'line-full');
+});
+
+test('SPA A→B→A：回访已有短轨的长前缀快照也只读 replay', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=A-long' });
+  h.video.currentTime = 10;
+  h.state.subText = 'line';
+  h.sampler.fn();
+
+  h.location.search = '?v=B-long';
+  h.location.href = 'https://www.youtube.com/watch?v=B-long';
+  h.state.subText = 'other';
+  h.sampler.fn();
+
+  h.location.search = '?v=A-long';
+  h.location.href = 'https://www.youtube.com/watch?v=A-long';
+  h.state.subText = 'line-full';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-A-long|live'];
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track.map((cue) => cue.text).join('|'), 'line');
+});
+
+test('player 销毁：定格当前代且不凭空插入 t=0 cue', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=gone' });
+  h.video.currentTime = 10;
+  h.state.subText = 'line-full';
+  h.sampler.fn();
+  h.destroyVideo();
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues['yt-gone|live'];
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track.filter((cue) => cue.startMs === 0).length, 0);
+
+  // 同 key 播放器稍后重建：短前缀与后续增长仍是旧窗 replay，不造第二条。
+  h.remountVideo(10);
+  h.state.subText = 'line';
+  h.sampler.fn();
+  h.state.video.currentTime = 10.2;
+  h.state.subText = 'line-full';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track[0].text, 'line-full');
+});
+
+test('同视频 remount：旧代引用清空、旧轨稳定，离开 replay 后恢复新增', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=remount' });
+  h.video.currentTime = 10;
+  h.state.subText = 'same';
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues['yt-remount|live'];
+
+  h.remountVideo(10);
+  h.sampler.fn();
+  h.state.video.currentTime = 10.2;
+  h.state.subText = 'same-new';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 1, 'remount 的同窗快照只能只读 replay');
+  assert.strictEqual(track[0].text, 'same', '新代不得持有并改写旧代 liveCue 引用');
+
+  h.state.video.currentTime = 12;
+  h.state.subText = 'fresh';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 2, '离开 replay 后正常字幕必须恢复写轨');
+  assert.strictEqual(track[1].text, 'fresh');
+});
+
+test('真实 seeking/seeked：seek 前定格，多次前后跳不重复旧轨', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=multi-seek' });
+  h.video.currentTime = 10;
+  h.state.subText = 'A';
+  h.sampler.fn();
+  h.video.currentTime = 11;
+  h.sampler.fn();
+  h.seekTo(20);
+  h.state.subText = 'B';
+  h.sampler.fn();
+  h.video.currentTime = 21;
+  h.state.subText = '';
+  h.sampler.fn();
+  h.seekTo(10);
+  h.state.subText = 'A';
+  h.sampler.fn();
+  h.seekTo(20);
+  h.state.subText = 'B';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-multi-seek|live'];
+  assert.strictEqual(track.find((cue) => cue.text === 'A').endMs, 11000);
+  assert.strictEqual(track.filter((cue) => cue.text === 'A').length, 1);
+  assert.strictEqual(track.filter((cue) => cue.text === 'B').length, 1);
+});
+
+test('只观察到 seeked 时仍按末次真实采样定格旧 cue', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=seeked-only' });
+  h.video.currentTime = 10;
+  h.state.subText = 'A';
+  h.sampler.fn();
+  h.video.currentTime = 11;
+  h.sampler.fn();
+
+  // 模拟 content script 绑定较晚/站点封装只让隔离世界观察到 seeked。
+  h.video.currentTime = 20;
+  h.video.emit('seeked');
+  h.state.subText = 'B';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-seeked-only|live'];
+  assert.strictEqual(track.find((cue) => cue.text === 'A').endMs, 11000);
+  assert.strictEqual(track.find((cue) => cue.text === 'B').startMs, 20000);
+});
+
+test('seek 后空白帧不消费 replay 门，短前缀稍后到达仍不重复', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=blank-seek' });
+  h.video.currentTime = 1;
+  h.state.subText = 'AB';
+  h.sampler.fn();
+  h.video.currentTime = 2;
+  h.state.subText = '';
+  h.sampler.fn();
+
+  h.seekTo(1);
+  h.sampler.fn();
+  h.state.subText = 'A';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-blank-seek|live'];
+  assert.strictEqual(track.length, 1);
+  assert.strictEqual(track[0].text, 'AB');
+});
+
+test('replay 窗口与文本关系保持窄匹配，窗外/仅子串相似均不得抑制', () => {
+  const h = loadContent({ hostname: 'www.youtube.com', pathname: '/watch', search: '?v=boundary' });
+  h.video.currentTime = 1;
+  h.state.subText = 'xxsameyy';
+  h.sampler.fn();
+  h.video.currentTime = 2;
+  h.state.subText = '';
+  h.sampler.fn();
+
+  h.seekTo(1);
+  h.state.subText = 'same';
+  h.sampler.fn();
+  h.seekTo(10);
+  h.state.subText = 'xxsameyy';
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['yt-boundary|live'];
+  assert.strictEqual(track.filter((cue) => cue.startMs === 1000).length, 2,
+    '仅子串相似不是前缀相关，不能误判 replay');
+  assert.strictEqual(track.filter((cue) => cue.startMs === 10000).length, 1,
+    '同文但落在旧 cue 窗外必须作为新句');
+});
+
+test('textTracks 收割：原生字幕轨整轨读出（清洗标签）并增量刷新', () => {
+  const cues = [
+    { startTime: 1, endTime: 2, text: 'Hello <i>world</i>' },
+    { startTime: 3, endTime: 4.5, text: 'Second line' },
+  ];
+  const h = loadContent({
+    hostname: 'example.com',
+    pathname: '/p',
+    textTracks: [
+      { kind: 'subtitles', mode: 'showing', language: 'en', cues },
+      { kind: 'metadata', mode: 'showing', language: 'md', cues },
+    ],
+  });
+  assert.ok(h.harvester, '缺 1200ms textTracks 收割器');
+  const notified = [];
+  h.windowObj.fushiSubtitlePanelOnCues = (key) => notified.push(key);
+  h.harvester.fn();
+  const store = h.windowObj.fushiEpisodeCues;
+  const key = 'example.com/p|en';
+  assert.ok(store[key], '原生字幕轨必须进 store');
+  assert.strictEqual(store[key].length, 2);
+  assert.strictEqual(store[key][0].startMs, 1000);
+  assert.strictEqual(store[key][0].endMs, 2000);
+  assert.strictEqual(store[key][0].text, 'Hello world', '行内标签必须清洗');
+  assert.strictEqual(store[key][1].endMs, 4500);
+  assert.strictEqual(store['example.com/p|md'], undefined, 'metadata 轨不收');
+  assert.deepStrictEqual(notified, [key]);
+
+  // 流媒体渐进加载：cue 变多 → 归并入轨；没变 → 不重复通知。
+  h.harvester.fn();
+  assert.deepStrictEqual(notified, [key], '无增量不得重复通知面板');
+  cues.push({ startTime: 6, endTime: 7, text: 'Third' });
+  h.harvester.fn();
+  assert.strictEqual(store[key].length, 3, 'cue 增多必须增量刷新');
+  assert.deepStrictEqual(notified, [key, key]);
+});
+
+test('textTracks 收割：disabled 语言轨强制升 hidden，下一轮收齐全部语言轨', () => {
+  // 浏览器对 disabled 轨不加载 cues → 以前直接跳过 = 侧边栏语言轨永远只有播放器当前开着
+  // 的那条。现在收割器把 disabled 升为 hidden（加载 cues 但不渲染），下一轮即可收割。
+  const enCues = [{ startTime: 1, endTime: 2, text: 'Hello' }];
+  const frTrack = { kind: 'subtitles', mode: 'disabled', language: 'fr', cues: null };
+  const h = loadContent({
+    hostname: 'example.com',
+    pathname: '/p',
+    textTracks: [
+      { kind: 'subtitles', mode: 'showing', language: 'en', cues: enCues },
+      frTrack,
+    ],
+  });
+  const store = h.windowObj.fushiEpisodeCues;
+  h.harvester.fn();
+  assert.strictEqual(frTrack.mode, 'hidden', 'disabled 字幕轨必须被升为 hidden 以触发 cue 加载');
+  assert.strictEqual(store['example.com/p|fr'], undefined, '升 hidden 当轮 cues 未就绪，先不入 store');
+  // 模拟浏览器在下一轮轮询前加载完 hidden 轨的 cues。
+  frTrack.cues = [{ startTime: 1, endTime: 2, text: 'Bonjour' }];
+  h.harvester.fn();
+  assert.ok(store['example.com/p|fr'], 'hidden 轨 cues 就绪后必须进 store');
+  assert.strictEqual(store['example.com/p|fr'][0].text, 'Bonjour');
+  assert.strictEqual(store['example.com/p|en'].length, 1, 'en 轨不受影响');
+  // 站点播放器（hls.js 等）把 mode 拨回 disabled = 它在管理轨道：同一轨只升一次，
+  // 不得形成 1.2s 轮询的无限翻转拉锯。
+  frTrack.mode = 'disabled';
+  h.harvester.fn();
+  assert.strictEqual(frTrack.mode, 'disabled', '同一轨只尝试升 hidden 一次，站点拨回后尊重站点');
+});
+
+test('textTracks 收割：同语言多轨（English 与 English [CC]）分 key，不得穿插归并', () => {
+  const h = loadContent({
+    hostname: 'example.com',
+    pathname: '/p',
+    textTracks: [
+      {
+        kind: 'subtitles', mode: 'showing', language: 'en', label: 'English',
+        cues: [{ startTime: 1, endTime: 2, text: 'Hello' }],
+      },
+      {
+        kind: 'captions', mode: 'hidden', language: 'en', label: 'English [CC]',
+        cues: [{ startTime: 1, endTime: 2, text: '[door slams] Hello' }],
+      },
+    ],
+  });
+  const store = h.windowObj.fushiEpisodeCues;
+  h.harvester.fn();
+  const keys = Object.keys(store).filter((k) => k.startsWith('example.com/p|'));
+  assert.strictEqual(keys.length, 2, '同语言两条轨必须落成两个独立 key');
+  for (const k of keys) {
+    assert.strictEqual(store[k].length, 1, '每条轨只含自己的 cue，不得互相穿插');
+  }
+});
+
+test('textTracks 收割：分片字幕整批替换按归并合并，旧区间不丢、新区间进得来', () => {
+  // hls.js/Shaka 会随 back-buffer 回收/seek 把 tt.cues 整批换成另一时间窗（条数可能不变或
+  // 变少）。旧实现「条数没长就跳过、长了整轨覆盖」两个方向都丢字幕；归并后轨只增不减。
+  const track = {
+    kind: 'subtitles', mode: 'showing', language: 'en',
+    cues: [
+      { startTime: 1, endTime: 2, text: 'One' },
+      { startTime: 3, endTime: 4, text: 'Two' },
+    ],
+  };
+  const h = loadContent({ hostname: 'example.com', pathname: '/p', textTracks: [track] });
+  const store = h.windowObj.fushiEpisodeCues;
+  const key = 'example.com/p|en';
+  h.harvester.fn();
+  assert.strictEqual(store[key].length, 2);
+  // seek 后整批换窗：条数没变多（旧实现在这里整段跳过 → 新区间永远进不来）。
+  track.cues = [{ startTime: 100, endTime: 101, text: 'Later' }];
+  h.harvester.fn();
+  assert.strictEqual(store[key].length, 3, '换窗后的新 cue 必须并入');
+  assert.ok(store[key].some((c) => c.text === 'One'), '旧区间 cue 不得被整轨覆盖抹掉');
+  assert.ok(store[key].some((c) => c.text === 'Later'), '新区间 cue 必须进 store');
+  // 回看已收割区间：同 cue 重复收割去重，不得翻倍。
+  track.cues = [
+    { startTime: 1, endTime: 2, text: 'One' },
+    { startTime: 3, endTime: 4, text: 'Two' },
+  ];
+  h.harvester.fn();
+  assert.strictEqual(store[key].length, 3, '重复收割必须去重');
+});
+
+test('videoKey 契约：netflix=watch id、youtube=yt-<v>、其它=host+path', () => {
+  const nf = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  assert.strictEqual(nf.windowObj.fushiVideoKey(), '81001');
+  const yt = loadContent({
+    hostname: 'www.youtube.com',
+    pathname: '/watch',
+    search: '?v=abc123',
+  });
+  // fushiYoutubeId 从 location.href 解析 v 参数。
+  assert.strictEqual(yt.windowObj.fushiVideoKey(), 'yt-abc123');
+  const generic = loadContent({ hostname: 'example.com', pathname: '/show/1' });
+  assert.strictEqual(generic.windowObj.fushiVideoKey(), 'example.com/show/1');
+});
+
+// ── 整轨优先仲裁（TODO-1219 收口）──
+// 需求：整集字幕是主路径，DOM 实时采集只能是降级。此前 content.js 只有「面板行点进来」
+// 才用整轨精确窗，画面上直接查词永远退到抖动的 DOM 采样窗，且 live 轨与整轨并行长。
+
+// 取队列里最后一次落盘的最后一项（fushiEnqueue → fushiQueueSave → storage.local.set）。
+function lastQueuedItem(h) {
+  for (let i = h.storageWrites.length - 1; i >= 0; i--) {
+    const q = h.storageWrites[i] && h.storageWrites[i].fushiQueue;
+    if (Array.isArray(q) && q.length) return q[q.length - 1];
+  }
+  return null;
+}
+
+test('整轨优先：整集轨在场时 DOM 采样不再写 live 伪轨（实时采集降级为兜底）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  const store = h.windowObj.fushiEpisodeCues;
+  // 整集拦截已到（netflix-bridge.js document_start hook 的正常时序，早于用户读到字幕）。
+  store['81001|ja'] = [{ startMs: 1000, endMs: 3000, text: '整轨第一句' }];
+
+  h.video.currentTime = 1.6;
+  // DOM 抖动 = 同一句的**部分渲染**（逐字/分块出字），不是另一句台词。整轨认领用
+  // 前缀关系匹配，所以这里必须是整轨那句的前缀；给一句完全无关的文本会让认领失败、
+  // 整轨按设计退位给 DOM（那种情形由「一条整轨都对不上屏幕时回落 DOM 采样」覆盖）。
+  h.state.subText = '整轨第一';
+  h.sampler.fn();
+
+  assert.strictEqual(store['81001|live'], undefined,
+    '已有整轨时不得再往 live 伪轨写——两条来源并存会让面板多出一条重复的抖动轨');
+});
+
+test('整轨优先：没有整轨时 live 采样照常工作（降级路径未被砍掉）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81002' });
+  const store = h.windowObj.fushiEpisodeCues;
+
+  h.video.currentTime = 1.6;
+  h.state.subText = '只有 DOM 有字幕';
+  h.sampler.fn();
+
+  assert.ok(store['81002|live'] && store['81002|live'].length === 1,
+    '整轨缺席时 live 轨仍须照常入轨，否则等于砍掉退路而不是降级');
+});
+
+test('整轨优先：画面上直接查词制卡取整轨精确窗，不再退到 DOM 采样窗', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  const store = h.windowObj.fushiEpisodeCues;
+  store['81001|ja'] = [{ startMs: 1000, endMs: 3000, text: '整轨第一句' }];
+
+  // DOM 采样在 t=1.6s 留下抖动窗；旧行为就是拿它去制卡（startV 会是 1600-200=1400）。
+  // 文本是整轨那句的部分渲染（真实抖动形状），认领得上 → 走整轨精确窗。
+  h.video.currentTime = 1.6;
+  h.state.subText = '整轨第一';
+  h.sampler.fn();
+
+  const r = h.windowObj.fushiEnqueue({ expression: '語' }, '');
+  assert.ok(r && r.ok, '制卡必须入队成功');
+  const item = lastQueuedItem(h);
+  assert.ok(item, '队列必须落盘');
+  assert.strictEqual(item.sentence, '整轨第一句', '句子必须取自整轨，而非 DOM 抖动快照');
+  assert.strictEqual(item.cueStartV, 1000, '句首必须是整轨的精确 startMs');
+  // BUG-2080：卡面 `{clip-timestamp}` 取的是 cueStartV/cueEndV 这对**字幕窗**。
+  // 源码扫描证明不了 w.endV 还是字幕窗（实测：把上游 endV 悄悄加 200，源码断言全绿）；
+  // 这里是真跑入队路径的宿主，值对不上立刻响。
+  assert.strictEqual(item.cueEndV, 3000, '句尾必须是整轨的精确 endMs，不含录制余量');
+  assert.strictEqual(item.startV, 800, '录制窗 = 整轨 startMs - 200 录制边距');
+  assert.strictEqual(item.endV, 3200, '录制窗 = 整轨 endMs + 200 录制边距');
+});
+
+test('整轨优先：当前时刻落在整轨字幕间隙时回落 DOM 采样窗，不吸附邻句', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  const store = h.windowObj.fushiEpisodeCues;
+  store['81001|ja'] = [{ startMs: 1000, endMs: 3000, text: '整轨第一句' }];
+
+  // t=4.0s 在整轨覆盖范围之外（静音段）：整轨查不中，必须回落 DOM 采样窗。
+  h.video.currentTime = 4.0;
+  h.state.subText = 'DOM 兜底句';
+  h.sampler.fn();
+
+  const r = h.windowObj.fushiEnqueue({ expression: '語' }, '');
+  assert.ok(r && r.ok, '间隙处仍须能制卡（兜底路径还在）');
+  const item = lastQueuedItem(h);
+  assert.strictEqual(item.sentence, 'DOM 兜底句', '间隙处必须用 DOM 采样句');
+  assert.strictEqual(item.cueStartV, 4000,
+    '绝不能吸附到邻句 1000——那会录到一段与所查词无关的画面');
+});
+
+test('整轨优先：多语言 store 里必须认领「与屏幕上这句对得上」的那条轨，而不是字典序第一条', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81003' });
+  const store = h.windowObj.fushiEpisodeCues;
+  // netflix-bridge 对 manifest 里的 timedtexttracks **全量** fetchCues：一集下来
+  // store 里躺着几十种语言。字典序兜底会选到 'ar'，而用户读的是 'ja'。
+  store['81003|ar'] = [{ startMs: 1000, endMs: 3000, text: 'مرحبا بالعالم' }];
+  store['81003|cs'] = [{ startMs: 1000, endMs: 3000, text: 'Ahoj svete' }];
+  store['81003|ja'] = [{ startMs: 1000, endMs: 3000, text: '世界の言葉' }];
+
+  h.video.currentTime = 1.6;
+  h.state.subText = '世界の言葉'; // 屏幕上显示的就是日文轨那句
+  h.sampler.fn();
+
+  const r = h.windowObj.fushiEnqueue({ expression: '世界' }, '');
+  assert.ok(r && r.ok, '制卡必须入队成功');
+  const item = lastQueuedItem(h);
+  assert.strictEqual(item.sentence, '世界の言葉',
+    '句子必须取自与屏幕一致的那条轨；取到 ar/cs 说明选轨判据是字典序而不是身份');
+});
+
+test('整轨优先：一条整轨都对不上屏幕时回落 DOM 采样（认领失败必须退回改造前的行为）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81004' });
+  const store = h.windowObj.fushiEpisodeCues;
+  // 用户读的那条轨 fetch 失败了（netflix-bridge 的 CORS/网络静默失败），
+  // store 里只剩看不懂的语言。
+  store['81004|ar'] = [{ startMs: 1000, endMs: 3000, text: 'مرحبا بالعالم' }];
+  store['81004|cs'] = [{ startMs: 1000, endMs: 3000, text: 'Ahoj svete' }];
+
+  h.video.currentTime = 1.6;
+  h.state.subText = '画面に出ている日本語';
+  h.sampler.fn();
+
+  const r = h.windowObj.fushiEnqueue({ expression: '日本語' }, '');
+  assert.ok(r && r.ok, '认领不上时仍须能制卡');
+  const item = lastQueuedItem(h);
+  assert.strictEqual(item.sentence, '画面に出ている日本語',
+    '一条都认领不上时必须用 DOM 采样句，不能拿一条对不上的整轨去凑');
+  assert.ok(store['81004|live'] && store['81004|live'].length === 1,
+    '没有可用整轨 = live 采样不得被掐掉（否则面板会一条跟屏幕一致的轨都没有）');
+});
+
+test('整轨优先：用户中途换字幕语言后必须重新认领（认领不得只在成功路径写）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81005' });
+  const store = h.windowObj.fushiEpisodeCues;
+  store['81005|ja'] = [{ startMs: 1000, endMs: 3000, text: '日本語のセリフ' }];
+  store['81005|en'] = [{ startMs: 1000, endMs: 3000, text: 'An English line' }];
+
+  h.video.currentTime = 1.6;
+  h.state.subText = '日本語のセリフ';
+  h.sampler.fn();
+  let item = (h.windowObj.fushiEnqueue({ expression: '語' }, ''), lastQueuedItem(h));
+  assert.strictEqual(item.sentence, '日本語のセリフ', '前置：先认领到日文轨');
+
+  // 用户在播放器里把字幕切成英文：屏幕上这句变了，认领必须跟着走。
+  h.state.subText = 'An English line';
+  h.sampler.fn();
+  item = (h.windowObj.fushiEnqueue({ expression: 'English' }, ''), lastQueuedItem(h));
+  assert.strictEqual(item.sentence, 'An English line',
+    '认领粘在旧语言上 = 「只在成功路径写、失败路径不复位」的老坑');
+});
+
+test('整轨优先：面板暴露的活动轨（已应用时轴偏移）优先于自取第一条轨', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81001' });
+  const store = h.windowObj.fushiEpisodeCues;
+  store['81001|ja'] = [{ startMs: 1000, endMs: 3000, text: '未偏移的日文轨' }];
+  // 面板在场：用户选了英文轨并设了 +500ms 偏移，面板给出的就是偏移后的 cue。
+  h.windowObj.fushiActiveFullTrack = () => ({
+    lang: 'en',
+    cues: [{ startMs: 1500, endMs: 3500, text: '面板选中的英文轨' }],
+  });
+
+  h.video.currentTime = 2.0;
+  h.state.subText = 'DOM 抖动快照';
+  h.sampler.fn();
+
+  const r = h.windowObj.fushiEnqueue({ expression: 'word' }, '');
+  assert.ok(r && r.ok);
+  const item = lastQueuedItem(h);
+  assert.strictEqual(item.sentence, '面板选中的英文轨',
+    '面板在场时必须跟随它选中的语言与偏移，否则制卡句与用户正在读的对不上');
+  assert.strictEqual(item.cueStartV, 1500, '必须用面板给出的偏移后时间轴');
+});
+
+// 用户报（截图）：来回跳转后实时采集轨里同一句出现两条，时间戳都停在同一秒。
+// 成因链：cue 的 startMs 记的是「这句在 DOM 里被我们看到的时刻」——先前那次经过若是 seek 落在
+// 句子中段，它就比真实句首晚了一截；下一次从句首正常播放采到同一句，两个起点差出旧判据的
+// 750ms 窄窗（且新起点更早，正好从窗口前沿漏出去），于是同一句被当成两句入轨。
+test('seek 落在句中先采到这句，回跳后从句首经过不得再插一条同句', () => {
+  const h = loadContent({
+    hostname: 'www.youtube.com',
+    pathname: '/watch',
+    search: '?v=seek-mid',
+  });
+  const key = 'yt-seek-mid|live';
+
+  // ① 用户直接跳到 12:49.9（句子已经在屏幕上）：这句第一次被看到，起点只能记成落点。
+  h.video.currentTime = 769.9;
+  h.state.subText = '（玲琳）よく効く熱さましが…';
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues[key];
+  assert.strictEqual(track.length, 1, '前置：落点处这句应入轨');
+  assert.strictEqual(track[0].startMs, 769900, '前置：起点就是落点（比真实句首晚）');
+
+  // ② 往回跳到 12:44 的另一句。
+  h.seekTo(764.0);
+  h.state.subText = '（慧月）せいせい 死の足音におびえて過ごすといいわ';
+  h.sampler.fn();
+  assert.strictEqual(track.length, 2, '前置：回跳处的另一句是新句，应入轨');
+
+  // ③ 正常播放推进到 12:49.0——同一句的真实句首，比 ① 记下的起点早 900ms。
+  h.video.currentTime = 769.0;
+  h.state.subText = '（玲琳）よく効く熱さましが…';
+  h.sampler.fn();
+
+  const sameLine = track.filter((cue) => cue.text === '（玲琳）よく効く熱さましが…');
+  assert.strictEqual(sameLine.length, 1,
+    '同一句入轨两次（用户截图里 12:49 那两行重复字幕）');
+  assert.strictEqual(track.length, 2, '轨里只该有这两句');
+});
+
+// 用户报：字幕列表的振假名没正常显示，变成和文字一个层级了。
+// DOM 采样此前用 `textContent` 取字幕，`<ruby>熱<rt>ねつ</rt></ruby>さまし` 直接被取成
+// 「熱ねつさまし」——读音以同级文字的身份混进正文，列表、查词、制卡 sentence 全被污染。
+test('live 轨：<rt> 的读音不进正文，另行留给渲染端画振假名', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81002' });
+  h.video.currentTime = 12;
+  h.state.subRuby = [
+    { text: '（玲琳）', reading: '' },
+    { text: '熱', reading: 'ねつ' },
+    { text: 'さましが…', reading: '' },
+  ];
+  h.sampler.fn();
+
+  const track = h.windowObj.fushiEpisodeCues['81002|live'];
+  assert.ok(track && track.length === 1, '这句应入 live 轨');
+  assert.strictEqual(track[0].text, '（玲琳）熱さましが…',
+    '读音被拼进了正文（用户看到的「和文字一个层级」）');
+  // vm 沙箱里造的对象跨 realm，deepStrictEqual 会比原型；这里比结构。
+  assert.strictEqual(JSON.stringify(track[0].ruby), JSON.stringify([
+    { text: '（玲琳）', reading: '' },
+    { text: '熱', reading: 'ねつ' },
+    { text: 'さましが…', reading: '' },
+  ]), '读音必须单独留下来，否则列表画不出振假名');
+});
+
+test('live 轨：整句没有注音时不带 ruby 数据（不给每条 cue 挂无用负担）', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81003' });
+  h.video.currentTime = 5;
+  h.state.subText = '注音のない字幕';
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues['81003|live'];
+  assert.strictEqual(track[0].text, '注音のない字幕');
+  assert.strictEqual(track[0].ruby, undefined);
+});
+
+test('live 轨：字幕容器里的孤立 <rt>（注音被拆平）同样不算正文', () => {
+  const h = loadContent({ hostname: 'www.netflix.com', pathname: '/watch/81004' });
+  h.video.currentTime = 8;
+  h.state.subRuby = [
+    { text: '熱', reading: '' },
+    { text: 'ねつ', bare: true },   // 与正文平级的读音节点
+    { text: 'さまし', reading: '' },
+  ];
+  h.sampler.fn();
+  const track = h.windowObj.fushiEpisodeCues['81004|live'];
+  assert.strictEqual(track[0].text, '熱さまし', '拆平的读音仍被当成了正文');
+});
+
+test('切行后段与正文错位时不挂 ruby（宁可不画，也不把振假名标到别的字上）', () => {
+  const h = loadContent({
+    hostname: 'www.youtube.com',
+    pathname: '/watch',
+    search: '?v=ruby-split',
+  });
+  // YouTube 式累积 DOM：同一节点逐段加长，超过 12 秒上限被切成第二行。DOM 快照始终是**整句**，
+  // 而第二行的 cue.text 只是后缀——此时段序列与正文对不上，绝不能照挂。
+  const parts = ['工場', 'です。', 'パイプ', 'ライン', 'です。', 'その', '中に', '赤と',
+    '白の', '煙突が', '見えます。', 'その', '先端', '部分に'];
+  let cumulative = '';
+  for (let i = 0; i < parts.length; i++) {
+    cumulative += parts[i];
+    h.video.currentTime = 193.0 + i;
+    h.state.subRuby = [
+      { text: '工場', reading: 'こうじょう' },
+      { text: cumulative.slice('工場'.length), reading: '' },
+    ];
+    h.sampler.fn();
+  }
+  const track = h.windowObj.fushiEpisodeCues['yt-ruby-split|live'];
+  assert.ok(track.length >= 2, '累积 DOM 应被切成多行');
+  assert.ok(track[0].ruby, '第一行与整句一致，应带振假名');
+  assert.strictEqual(track[track.length - 1].ruby, undefined,
+    '后缀行的段与正文对不上，不得挂 ruby（否则振假名标到别的字上）');
+});

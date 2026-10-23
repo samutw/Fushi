@@ -1,0 +1,469 @@
+// Instance-level channel wrapper for a bare-WebView2 overlay window. Extracted
+// from the static GlobalLookupChannel (TODO-617, which stays as a zero-churn
+// delegating facade for the 1700-line controller) so any second overlay
+// window instance can reuse the exact same method contract on its own
+// MethodChannel instead of copy-pasting ~250 lines.
+//
+// Native counterpart: windows/runner/global_lookup_window.cpp +
+// FlutterWindow::RegisterGlobalLookupChannel.
+
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/services.dart';
+import 'package:fushi/src/lookup/global_lookup_log.dart';
+import 'package:fushi/src/utils/misc/error_log_service.dart';
+
+/// Immutable identity of one lookup render.  It is deliberately carried on
+/// every forward call instead of being read from a process-wide mutable
+/// target: Futures and Timers created by an older lookup therefore keep their
+/// original destination.
+class GlobalLookupRoute {
+  const GlobalLookupRoute.desktop({this.routeEpoch = 0, this.lookupEpoch = 0})
+    : source = 'desktop',
+      target = '';
+
+  const GlobalLookupRoute.galCard({
+    required this.routeEpoch,
+    required this.lookupEpoch,
+  }) : source = 'galCard',
+       target = 'galCard';
+
+  final String source;
+  final String target;
+  final int routeEpoch;
+  final int lookupEpoch;
+
+  @override
+  bool operator ==(Object other) =>
+      other is GlobalLookupRoute &&
+      other.source == source &&
+      other.routeEpoch == routeEpoch &&
+      other.lookupEpoch == lookupEpoch;
+
+  @override
+  int get hashCode => Object.hash(source, routeEpoch, lookupEpoch);
+}
+
+class OverlayReverseEvent {
+  const OverlayReverseEvent({required this.route, this.message});
+
+  final GlobalLookupRoute route;
+  final Map<String, Object?>? message;
+}
+
+/// Native reply for [OverlayWindowChannel.showAt]: window-created flag plus the
+/// anchor monitor's work area in PHYSICAL px (0 when unavailable). Divide the
+/// work dimensions by the device pixel ratio to get CSS px for the cascade
+/// layout (TODO-893 symptom 2).
+class GlobalLookupShowResult {
+  const GlobalLookupShowResult({
+    required this.ok,
+    required this.workWidth,
+    required this.workHeight,
+    this.cursorWorkX = 0,
+    this.cursorWorkY = 0,
+    this.monitorDpr = 0,
+  });
+
+  /// Whether the native overlay window was created.
+  final bool ok;
+
+  /// Anchor monitor work-area width in PHYSICAL px (0 when unavailable).
+  final double workWidth;
+
+  /// Anchor monitor work-area height in PHYSICAL px (0 when unavailable).
+  final double workHeight;
+
+  /// TODO-893 v2 (symptom 3) — the overlay window-local origin's offset from
+  /// the anchor monitor work-area origin, in PHYSICAL px (0 when unavailable).
+  /// The window-local (0,0) maps to (cursorWorkX, cursorWorkY) inside the work
+  /// area; divide by the device pixel ratio for CSS px.
+  final double cursorWorkX;
+
+  /// See [cursorWorkX]: the vertical component (PHYSICAL px).
+  final double cursorWorkY;
+
+  /// BUG-859 — the ANCHOR MONITOR's device pixel ratio (effective DPI / 96;
+  /// 0 when the native side could not query the monitor). The physical-px
+  /// values above must be divided by THIS dpr — not the main window's — to
+  /// land in the same CSS px scale the overlay page measures in: on a
+  /// mixed-scale multi-monitor setup the overlay WebView2 rasterizes at its
+  /// own monitor's scale, so converting with the main-window dpr put the
+  /// cascade layout's work-area domain in the wrong scale (mis-placed nested
+  /// cards, broken reserve-to-edge clamp invariant).
+  final double monitorDpr;
+}
+
+class OverlayWindowChannel {
+  const OverlayWindowChannel(
+    this._channel, {
+    this.target = '',
+    this.routeEpoch = 0,
+    this.lookupEpoch = 0,
+    bool Function()? routeIsValid,
+  }) : _routeIsValid = routeIsValid;
+
+  final MethodChannel _channel;
+
+  /// 目标窗口标识。空 = 该通道自己的默认窗口（桌面浮窗 / 剪贴板面板）。
+  ///
+  /// `'galCard'` 指向游戏内查词专用的**离屏**卡片窗：同一条 MethodChannel、同一套
+  /// 方法契约，只是 native 侧按这个字段解析成另一个 GlobalLookupWindow 实例。
+  /// 这样游戏内查词能整条复用既有渲染管线（查词 → popupJson → 渲染 → 定尺寸），
+  /// 而不必把 1700 行控制器复制一份；也不会像之前那样"渲染器建好却没人往里塞内容"。
+  final String target;
+  final int routeEpoch;
+  final int lookupEpoch;
+  final bool Function()? _routeIsValid;
+
+  /// 所有调用的唯一出口：把 [target] 注入参数表。逐个方法手动加，迟早漏一个，
+  /// 而漏掉的那个会静默打到错误的窗口上。
+  Future<T?> _invoke<T>(String method, [Map<String, Object?>? args]) {
+    // An invalidated lookup may still have Futures/Timers queued in its zone.
+    // Drop those forward calls before they can resurrect an old desktop/gal
+    // surface after a newer lookup (or a gal session shutdown) took ownership.
+    if (_routeIsValid?.call() == false) {
+      return Future<T?>.value();
+    }
+    return _send<T>(method, args);
+  }
+
+  /// 不看 route 是否作废、直接发往 [target] 的那一层。只有 [resolveBridge] 绕过
+  /// [_invoke] 用它，理由见那里。
+  Future<T?> _send<T>(String method, [Map<String, Object?>? args]) {
+    // 🔴 这里必须调 `_channel.invokeMethod`，**不能**调 `_invoke` / `_send` —— 那是
+    // 自递归。（本文件的调用点是用整文件替换从 `_channel.invokeMethod<` 改成 `_invoke<`
+    // 的，那次替换把这个 helper 自己体内的两处也换掉了，结果是无限自递归、栈溢出，
+    // 且异常被 main.dart 的 `catch { debugPrint }` 吞掉——release 下整条桌面查词
+    // 启动链静默中断，表现为"galgame 查词就是不工作"。）
+    return _channel.invokeMethod<T>(method, <String, Object?>{
+      ...?args,
+      if (target.isNotEmpty) 'target': target,
+      'source': target == 'galCard' ? 'galCard' : 'desktop',
+      'routeEpoch': routeEpoch,
+      'lookupEpoch': lookupEpoch,
+    });
+  }
+
+  /// Sets the absolute folder that holds popup.html / popup.js / popup.css and
+  /// popup_bridge_adapter.js (flutter_assets/assets/popup at runtime). Must be
+  /// called once before the first [showAt].
+  Future<void> prepare(String assetsDir) =>
+      _invoke<void>('prepare', <String, Object?>{'assetsDir': assetsDir});
+
+  /// TODO-1079 — builds the overlay window + WebView2 OFF-SCREEN and navigates
+  /// to host.html at startup so the first lookup hits a WARM surface.
+  /// Idempotent natively (no-op once warm).
+  Future<void> prewarmWebView({int width = 420, int height = 600}) =>
+      _invoke<void>('prewarmWebView', <String, Object?>{
+        'width': width,
+        'height': height,
+      });
+
+  /// TODO-1079 — whether the overlay WebView2 finished its initial navigation
+  /// (host document + popup iframes loaded). False on any non-bool reply.
+  Future<bool> isWebViewReady() async =>
+      (await _invoke<bool>('isWebViewReady')) ?? false;
+
+  /// Shows the overlay at screen coordinates (physical pixels) without
+  /// stealing focus. Returns the native reply (see [GlobalLookupShowResult]).
+  /// [capWidth]/[capHeight]：**布局工作区**的物理像素尺寸（0 = 不覆盖，使用显示器
+  /// 工作区）；[capOriginX]/[capOriginY] 是窗口本地原点（根卡左上角）在该工作区内
+  /// 的物理像素坐标。
+  ///
+  /// 游戏内查词必须传：卡片最终是画在游戏画面里的，可用空间是**游戏视口**而不是
+  /// 显示器工作区。不传的话弹窗按 2560x1440 排版、排完再被缩到卡片尺寸，而 runner
+  /// 超尺寸时是**裁不是缩**——真机表现就是工具栏和第三栏词典被切在画面外，看起来
+  /// 像"少了很多功能"，其实只是没进画面。
+  Future<GlobalLookupShowResult> showAt({
+    required int x,
+    required int y,
+    int width = 420,
+    int height = 600,
+    bool atCursor = false,
+    int capWidth = 0,
+    int capHeight = 0,
+    int capOriginX = 0,
+    int capOriginY = 0,
+  }) async {
+    final Object? reply = await _invoke<Object?>('showAt', <String, Object?>{
+      'x': x,
+      'y': y,
+      'width': width,
+      'height': height,
+      'atCursor': atCursor,
+      'capW': capWidth,
+      'capH': capHeight,
+      'capX': capOriginX,
+      'capY': capOriginY,
+    });
+    if (reply is Map) {
+      double num2(Object? v) => (v is num) ? v.toDouble() : 0;
+      return GlobalLookupShowResult(
+        ok: reply['ok'] == true,
+        workWidth: num2(reply['workW']),
+        workHeight: num2(reply['workH']),
+        cursorWorkX: num2(reply['cursorWorkX']),
+        cursorWorkY: num2(reply['cursorWorkY']),
+        monitorDpr: num2(reply['monitorDpr']),
+      );
+    }
+    // Legacy/native fallback (bool reply): no work-area reported.
+    return GlobalLookupShowResult(
+      ok: reply == true,
+      workWidth: 0,
+      workHeight: 0,
+    );
+  }
+
+  /// Injects [popupJson] and calls window.renderPopup() in the overlay WebView.
+  Future<void> render(String popupJson) =>
+      _invoke<void>('render', <String, Object?>{'json': popupJson});
+
+  /// 手柄重设计 P5：把一枚 Dart 侧解析好的手柄动作转发进 host
+  /// （window.__globalLookupHost.gamepadAction → 顶层卡片帧的 popup.js 入口）。
+  /// [action] 只接受 native 白名单里的 'next'/'prev'/'mine'/'audio'/'scroll'；
+  /// [dy] 仅 scroll 用（CSS 像素，正=向下）。
+  Future<void> gamepadAction(String action, {double dy = 0}) => _invoke<void>(
+    'gamepadAction',
+    <String, Object?>{'action': action, 'dy': dy},
+  );
+
+  /// Resizes the overlay window (physical px), clamped to the work area by
+  /// native. Keeps the current top-left anchor.
+  Future<void> resize({required int width, required int height}) =>
+      _invoke<void>('resize', <String, Object?>{
+        'width': width,
+        'height': height,
+      });
+
+  /// Resolves a deferred JS bridge promise. The overlay adapter does
+  /// `JSON.parse(arg)` on the second argument of
+  /// window.__fushiBridgeResolve(id, arg) — i.e. it expects a JS *string*
+  /// containing the reply's JSON. So we double-encode: the inner jsonEncode
+  /// produces the reply JSON text, the outer jsonEncode turns that into a JS
+  /// string literal native can splice in verbatim.
+  ///
+  /// 应答**不受 route 作废影响**（BUG-2859）：[_invoke] 丢弃作废 route 的调用，防的是
+  /// 旧查词排队的前向调用复活旧卡面；应答只兑现页面自己还在 await 的那颗 promise，
+  /// 不碰卡面——宿主 `installBridgeRouter` 按发起 frame 投递，popup.js 用
+  /// epoch/version 自己挡陈旧装饰。丢掉它，那颗 promise 永远挂起；而 popup.js 按
+  /// 词条复用在途查重，于是查重比关卡慢一步（AnkiConnect 不在线时要挂满连接超时）
+  /// 的那个词，在这个 WebView 的生命周期内再也点不出卡。
+  Future<void> resolveBridge(int id, Object? value) => _send<void>(
+    'resolveBridge',
+    <String, Object?>{'id': id, 'value': jsonEncode(jsonEncode(value))},
+  );
+
+  /// Moves the off-screen-rendered overlay to its pending anchor at the final
+  /// size and makes it visible.
+  Future<void> reveal({required int width, required int height}) =>
+      _invoke<void>('reveal', <String, Object?>{
+        'width': width,
+        'height': height,
+      });
+
+  /// TODO-867 P3c E1 — reveals/resizes the overlay to the nested-stack union
+  /// bounding box. See GlobalLookupChannel.revealStack for the full geometry
+  /// contract (dx/dy physical px window offset; left/top window-local CSS px
+  /// forwarded to the host's commitLayerShift after SetWindowPos).
+  Future<void> revealStack({
+    required int dx,
+    required int dy,
+    required int width,
+    required int height,
+    required int geometryEpoch,
+    double left = 0,
+    double top = 0,
+    // BUG-2921 — root card's measured height (physical px, 0 = unknown). The
+    // in-game direct card anchors the ROOT to the glyph with it; anchoring the
+    // whole nested union moved the root whenever a child appeared.
+    int rootHeight = 0,
+  }) => _invoke<void>('revealStack', <String, Object?>{
+    'dx': dx,
+    'dy': dy,
+    'width': width,
+    'height': height,
+    'geometryEpoch': geometryEpoch,
+    'left': left,
+    'top': top,
+    'rootHeight': rootHeight,
+  });
+
+  /// Hides the overlay. [notify] true (default) = a genuine dismissal that
+  /// fires the native `overlayHidden` callback; false = the programmatic reset
+  /// before a fresh lookup (must not look like a user dismissal, TODO-1233).
+  Future<void> hide({bool notify = true}) =>
+      _invoke<void>('hide', <String, Object?>{'notify': notify});
+
+  Future<bool> isShowing() async => (await _invoke<bool>('isShowing')) ?? false;
+
+  /// Temporarily removes the routed card (and its native shadow) from DWM while
+  /// a galgame frame is captured.  This is deliberately distinct from [hide]:
+  /// the WebView, route and dictionary state remain live and can be restored by
+  /// the matching generation only.
+  Future<bool> suspendForCapture(int captureGeneration) async =>
+      (await _invoke<bool>('suspendForCapture', <String, Object?>{
+        'captureGeneration': captureGeneration,
+      })) ??
+      false;
+
+  Future<bool> restoreAfterCapture(int captureGeneration) async =>
+      (await _invoke<bool>('restoreAfterCapture', <String, Object?>{
+        'captureGeneration': captureGeneration,
+      })) ??
+      false;
+
+  /// 防截屏 — SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)：窗口对用户可见
+  /// 但从截图 / 录屏 / 屏幕共享里排除（pref lookupBlockCapture）。
+  Future<void> setBlockCapture(bool block) =>
+      _invoke<void>('setBlockCapture', <String, Object?>{'block': block});
+
+  /// attached 校准字形表面（通用回退）打开的桌面弹窗：把游戏 HWND 记给 native，
+  /// 随后的 reveal/revealStack 走与 direct galCard 同款的同步吞点击 Arm——
+  /// 「点卡外关闭」那一记 down/up 成对吞掉，不再穿透到游戏推进台词。
+  /// 只活一次查词：native `Hide()` 自清；[hwnd] 为 0 = 清空。普通桌面查词
+  /// （热键 / 浮窗点词）**从不**调用本方法，行为零变化。
+  Future<void> setOutsideClickOwner(int hwnd) =>
+      _invoke<void>('setOutsideClickOwner', <String, Object?>{'hwnd': hwnd});
+
+  /// TODO-1066 — 让 native 侧开始/停止监听全局鼠标侧键（RawInput +
+  /// `RIDEV_INPUTSINK`）。[button] 用 DOM `MouseEvent.button` 号：3=侧键后退
+  /// （XBUTTON1）/ 4=侧键前进（XBUTTON2）；**0 = 注销**，native 侧不留任何监听。
+  ///
+  /// 这是**进程级**设置，与 overlay 的 route/epoch 无关（它在没有任何卡片显示时
+  /// 也必须生效——那正是它的用途）。
+  Future<void> setGlobalMouseTrigger(int button) => _invoke<void>(
+    'setGlobalMouseTrigger',
+    <String, Object?>{'button': button},
+  );
+
+  /// Wires the overlay's reverse calls. [onGetMedia] resolves gaiji bytes for
+  /// an `image://` url; [onJsMessage] receives raw bridge messages decoded
+  /// from JSON; [onOverlayHidden] fires on a genuine native dismissal.
+  ///
+  /// [onGlobalMouseTrigger] 是 TODO-1066 的全局鼠标侧键触发：与上面几个不同，
+  /// 它**不带 route**——它是"用户在别的程序里按了侧键"，此刻通常一张卡片都没有。
+  void setHandlers({
+    required Future<Uint8List> Function(String url) onGetMedia,
+    required void Function(Map<String, Object?> message) onJsMessage,
+    void Function()? onOverlayHidden,
+    void Function(OverlayReverseEvent event)? onRoutedJsMessage,
+    void Function(OverlayReverseEvent event)? onRoutedOverlayHidden,
+    void Function()? onGlobalMouseTrigger,
+  }) {
+    _channel.setMethodCallHandler((MethodCall call) async {
+      switch (call.method) {
+        case 'getMedia':
+          final Map<Object?, Object?> args =
+              call.arguments as Map<Object?, Object?>;
+          final String url = args['url'] as String;
+          return await onGetMedia(url);
+        case 'jsMessage':
+          final Object? arguments = call.arguments;
+          final Map<Object?, Object?>? envelope =
+              arguments is Map<Object?, Object?> ? arguments : null;
+          final Object? raw = envelope?['payload'] ?? arguments;
+          if (raw is String) {
+            final Object? decoded = jsonDecode(raw);
+            if (decoded is Map) {
+              final message = decoded.cast<String, Object?>();
+              final Object? embeddedSource = message['__source'];
+              final Object? embeddedRoute = message['__routeEpoch'];
+              final Object? embeddedLookup = message['__lookupEpoch'];
+              // BUG-1982：The JSON fields are stamped when the browser event is emitted;
+              // the native envelope reads a mutable HWND route later. Consume
+              // the embedded identity only as one complete tuple so malformed
+              // content cannot mix old/new fields across those two clocks.
+              //
+              // 这四个局部必须保持 `final` 且不得重新赋值：`hasEmbeddedRoute` 的
+              // true 分支靠 Dart 的布尔局部变量提升把三个 `Object?` 提升成
+              // String/num/num，所以下面读它们时不需要 cast（写了反而是
+              // `unnecessary_cast`，CI 的 analyze 直接判红）。改成 `var` 或中途
+              // 赋值会让提升失效，这三行立刻变编译错误——不会静默降级。
+              final bool hasEmbeddedRoute =
+                  embeddedSource is String &&
+                  embeddedRoute is num &&
+                  embeddedLookup is num;
+              final String source = hasEmbeddedRoute
+                  ? embeddedSource
+                  : (envelope?['source'] as String?) ?? 'desktop';
+              final int route = hasEmbeddedRoute
+                  ? embeddedRoute.toInt()
+                  : (envelope?['routeEpoch'] as num?)?.toInt() ?? 0;
+              final int lookup = hasEmbeddedRoute
+                  ? embeddedLookup.toInt()
+                  : (envelope?['lookupEpoch'] as num?)?.toInt() ?? 0;
+              final event = OverlayReverseEvent(
+                route: source == 'galCard'
+                    ? GlobalLookupRoute.galCard(
+                        routeEpoch: route,
+                        lookupEpoch: lookup,
+                      )
+                    : GlobalLookupRoute.desktop(
+                        routeEpoch: route,
+                        lookupEpoch: lookup,
+                      ),
+                message: message,
+              );
+              if (onRoutedJsMessage != null) {
+                onRoutedJsMessage(event);
+              } else {
+                onJsMessage(message);
+              }
+            }
+          }
+          return null;
+        case 'globalMouseTrigger':
+          // TODO-1066 — 全局鼠标侧键按下（native RawInput 监听，见
+          // windows/runner/global_mouse_trigger.cpp）。无 route：这条通知与任何
+          // 已显示的卡片无关，它就是"去开一次新查词"。
+          onGlobalMouseTrigger?.call();
+          return null;
+        case 'nativeError':
+          // TODO-1153 -- the native overlay reported a WebView2 bring-up
+          // failure. Surface it in ErrorLogService AND the glookup diagnostic
+          // file so "no popup shows" is diagnosable rather than swallowed.
+          final Object? message = call.arguments;
+          if (message is String && message.isNotEmpty) {
+            glog('nativeError(${_channel.name}): $message');
+            ErrorLogService.instance.log(
+              'OverlayWindowChannel(${_channel.name}).nativeError',
+              message,
+            );
+          }
+          return null;
+        case 'overlayHidden':
+          // TODO-1233 -- genuine native dismissal (foreground hook /
+          // click-outside / JS dismiss).
+          final Object? arguments = call.arguments;
+          if (onRoutedOverlayHidden != null) {
+            final Map<Object?, Object?>? envelope =
+                arguments is Map<Object?, Object?> ? arguments : null;
+            final source = envelope?['source'] as String? ?? 'desktop';
+            final route = (envelope?['routeEpoch'] as num?)?.toInt() ?? 0;
+            final lookup = (envelope?['lookupEpoch'] as num?)?.toInt() ?? 0;
+            onRoutedOverlayHidden(
+              OverlayReverseEvent(
+                route: source == 'galCard'
+                    ? GlobalLookupRoute.galCard(
+                        routeEpoch: route,
+                        lookupEpoch: lookup,
+                      )
+                    : GlobalLookupRoute.desktop(
+                        routeEpoch: route,
+                        lookupEpoch: lookup,
+                      ),
+              ),
+            );
+          } else {
+            onOverlayHidden?.call();
+          }
+          return null;
+        default:
+          return null;
+      }
+    });
+  }
+}

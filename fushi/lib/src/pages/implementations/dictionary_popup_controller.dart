@@ -1,0 +1,838 @@
+import 'dart:async';
+import 'dart:collection';
+
+import 'package:flutter/widgets.dart';
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:fushi/src/diagnostics/lookup_perf_trace.dart';
+import 'package:fushi/src/diagnostics/video_diag_log.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_webview.dart';
+import 'package:fushi/src/shortcuts/dictionary_popup_gamepad.dart';
+
+/// Shared empty result used to mount the popup WebView during the search phase
+/// (BUG-080), so popup.html + JS + CSS cold-load in parallel with the FFI
+/// lookup instead of serially after it, **and** to seed / re-park the resident
+/// warm slot ([DictionaryPopupController.seedWarmSlot] / dismiss restore).
+///
+/// 必须是**同一个单例**：`DictionaryPopupWebView.didUpdateWidget` 按 result 对象
+/// 身份判断是否重推（`oldWidget.result != widget.result`）。热槽 seed、关栈复位、
+/// 搜索期占位（[DictionaryPopupController.beginTop] 的 `initialResult` 与
+/// dictionary_popup_layer 的 `result ?? kPopupSearchingPlaceholderResult` 兜底）
+/// 若各持一个空结果实例，空→空的身份变化也会触发一整次 `renderPopup()` no-results
+/// 重画——每次查词凭空多一遍 WebView 渲染。canonical 实例放本文件（controller 是
+/// 唯一内部消费者且保持纯逻辑可测），dictionary_popup_layer.dart re-export 供各宿主用。
+final DictionarySearchResult kPopupSearchingPlaceholderResult =
+    DictionarySearchResult(searchTerm: '');
+
+/// 宿主注入弹窗页 `window.lookupPending` 的**唯一派生点**（popup.js 只在它为 true 且
+/// 文档可见时，150ms 后插入循环加载动画）。
+///
+/// 「占位 / 空闲」与「查询进行中」是两件事：热槽 seed、关栈复位、停驻 realm 挂的都是
+/// [kPopupSearchingPlaceholderResult]，但那是**空闲**——旧实现按「结果是占位单例」推
+/// pending=true，停驻在屏外的热槽页里加载动画就无限循环（Windows WebView2 停驻仍
+/// `IsVisible(true)`、文档仍 visible，纹理合成持续出帧）。所以 pending 只由查询状态与
+/// 层可见性决定，与结果对象身份无关：
+/// - [layerVisible]：这一层当前真的画在屏上（非停驻、未被对话框挪到屏外）；
+/// - [isSearching]：这一层确实有一次查询在进行中（[DictionaryPopupEntry.isSearching]）；
+/// - 还没有可渲染内容——分页 load-more 期间 `isSearching` 也为 true，但页面已有词条，
+///   此时翻 pending 只会触发一次无意义的全量重渲染（滚回顶）。
+bool popupLookupPending({
+  required bool layerVisible,
+  required bool isSearching,
+  required DictionarySearchResult? result,
+}) {
+  if (!layerVisible || !isSearching) return false;
+  return result == null ||
+      (result.entries.isEmpty && result.kanjiResults.isEmpty);
+}
+
+/// 弹窗**原地跳转**历史里的一页（对齐 Hoshi Reader iOS `popup.js` 的
+/// `backStack/forwardStack` 快照：条目 + 滚动位）。
+///
+/// 点弹窗内的词头 / 交叉引用链接 / 汉字（`onLinkClick` 通道）不再叠一层子弹窗，
+/// 而是把本层正在显示的这一页存进后退栈、在**同一个** WebView 里换成新词；顶栏
+/// ← → 在栈间来回。Hoshi 存的是渲染好的 DOM 节点，这里存 Dart 侧真值
+/// （[result]）：Dart 才是 `entry.result` / load-more / 面包屑 / 制卡上下文的
+/// 事实源，JS 单独换 DOM 会让这些全部指向旧词。回到某页 = 重推该页 result（同一
+/// 对象身份 ⇒ `didUpdateWidget` 全量 renderPopup）+ 渲染完把滚动位恢复到
+/// [scrollTop]。
+class DictionaryPopupHistoryPage {
+  const DictionaryPopupHistoryPage({
+    required this.searchTerm,
+    required this.result,
+    required this.allLoaded,
+    required this.scrollTop,
+  });
+
+  final String searchTerm;
+  final DictionarySearchResult? result;
+  final bool allLoaded;
+
+  /// 离开该页时弹窗内容的 `scrollTop`（CSS px，WebView 局部）；回来时恢复。
+  final double scrollTop;
+}
+
+/// 统一的查词弹窗条目（合并旧 `_PopupStackItem`（base_source_page）与
+/// `NestedPopupEntry`（dictionary_page_mixin）两份近乎重复的类型）。
+class DictionaryPopupEntry {
+  DictionaryPopupEntry({
+    required this.searchTerm,
+    required this.selectionRect,
+    this.result,
+    this.visible = true,
+    this.isWarmSlot = false,
+    this.allLoaded = false,
+    GlobalKey<DictionaryPopupWebViewState>? webViewKey,
+  }) : webViewKey = webViewKey ?? GlobalKey<DictionaryPopupWebViewState>();
+
+  String searchTerm;
+  Rect selectionRect;
+  DictionarySearchResult? result;
+
+  /// 该层是否被绘制/可交互。常驻热槽在两次查词之间 `visible=false` 隐身，
+  /// 但 WebView 仍挂载预热；一次查词把它翻为可见。
+  bool visible;
+
+  /// TODO-058：结果已就绪、但故意保持 `visible=false`，等其 WebView 真正把内容
+  /// 渲染进 DOM（`popupRendered` → `onRendered`）后才翻可见——消除「冷加载 WebView
+  /// 一翻可见就露白屏一瞬」。仅冷启动（新建 WebView）的嵌套/非热槽层需要：热槽
+  /// WebView 已预热渲染就绪，立即可见无白屏。[revealRendered] 命中后清回 false。
+  bool revealOnRender = false;
+
+  /// 本层这一次翻可见时，屏上正画着的搜索期加载占位卡已经显示了多久；null = 翻可见时
+  /// 没有占位卡（嵌套查词等）。
+  ///
+  /// 占位卡已经是「弹窗出现」本身（它自带入场淡入）；真弹窗接替它时若再从透明度 0
+  /// 淡入，占位卡同一帧撤掉、真弹窗还半透明，中间就露出一段透底的空框——视频页换词时
+  /// 用户看到的「先闪一个半透明空壳」；直接满不透明又会让快速查词「跳」一下。宿主据此
+  /// 让本层接着占位卡的淡入进度淡完（`popupEntranceProgressAfter`）。每次翻可见
+  /// （[DictionaryPopupController.revealRendered] / 兜底强制翻 / [DictionaryPopupController.show]）
+  /// 都重新判定，不跨查词沿用。
+  Duration? searchPlaceholderShownFor;
+
+  /// 该层是否正在（增量/分页）搜索中。
+  bool isSearching = false;
+
+  /// 按控制器状态，本层页面此刻应收到的 `window.lookupPending`（见
+  /// [popupLookupPending]）。宿主若还有额外的屏外停靠门（对话框期间），实际注入值由
+  /// `parkedPopupLayer` 的最终可见性再收紧一次，派生函数仍是同一个。
+  bool get lookupPending => popupLookupPending(
+        layerVisible: visible,
+        isSearching: isSearching,
+        result: result,
+      );
+
+  /// 是否已无更多结果可加载（分页到底）。
+  bool allLoaded;
+
+  /// BUG-1651：本层按 DOM 内容测量得到的外壳总高度（Flutter 逻辑像素）。null 表示
+  /// 尚未测量，先按用户最大高度布局；每次新顶层查词重置，增量结果则在当前高度上伸缩。
+  double? autoFitHeight;
+
+  /// 查询已结束、且没有任何可渲染结果（无词条也无汉字卡）。与
+  /// `DictionaryPopupLayer` 画「未找到」的判据同口径：搜索期占位单例不算空。
+  bool get isRealEmptyResult {
+    final DictionarySearchResult? r = result;
+    return !isSearching &&
+        r != null &&
+        !identical(r, kPopupSearchingPlaceholderResult) &&
+        r.entries.isEmpty &&
+        r.kanjiResults.isEmpty;
+  }
+
+  /// 宿主排版用的外壳高度：真实空结果收成 [emptyHeight]（「未找到」占位不需要
+  /// 一整块最大高度的面板，且这条路径没有 WebView 内容测量可依），否则按
+  /// [autoFitHeight]。
+  double? layoutAutoFitHeight({required double emptyHeight}) =>
+      isRealEmptyResult ? emptyHeight : autoFitHeight;
+
+  /// 原地跳转的后退 / 前进栈（栈顶在末尾）。只由 [DictionaryPopupController]
+  /// 写；随本层一起消亡（关层 / 热槽复位 / 顶层新查词都清空，不跨查词会话）。
+  final List<DictionaryPopupHistoryPage> _backHistory =
+      <DictionaryPopupHistoryPage>[];
+  final List<DictionaryPopupHistoryPage> _forwardHistory =
+      <DictionaryPopupHistoryPage>[];
+
+  bool get canGoBack => _backHistory.isNotEmpty;
+  bool get canGoForward => _forwardHistory.isNotEmpty;
+
+  /// 本层发生过原地跳转（任一方向还有页可去）。宿主据此决定顶栏是否画 ← →：
+  /// 与 Hoshi iOS 默认（`popupActionBar=false`）同——没跳过就不占顶栏。
+  bool get hasNavigationHistory => canGoBack || canGoForward;
+
+  /// 下一次推本层 result 渲染完成后要恢复到的 `scrollTop`；null = 归零（新词从
+  /// 顶部开始）。只有后退 / 前进回到历史页时非空，由 [DictionaryPopupWebView]
+  /// 经 `window.__fushiPendingScrollTop` 交给 popup.js 在渲染尾批应用。
+  double? restoreScrollTop;
+
+  /// 仅常驻热槽为 true：其 WebView 全程挂载复用，关栈时隐藏而非销毁。
+  final bool isWarmSlot;
+
+  /// 本层 WebView 的身份。BUG-2039 ③：嵌套层被裁掉时这把键不随 entry 一起死——
+  /// 它进 [DictionaryPopupController.parkedRealms]，宿主继续把它渲染在屏外，下一条
+  /// 嵌套层就用它建 entry（同一把 GlobalKey ⇒ 同一个 WebView element ⇒ 静态段、
+  /// 字体、JIT 全部还热）。键复用而不是 entry 复用：仍在途的旧异步查词握着旧 entry，
+  /// `entries.contains(旧 entry)` 恒假，绝不会把旧词的结果灌进新层。
+  final GlobalKey<DictionaryPopupWebViewState> webViewKey;
+}
+
+/// 与 UI 无关的查词弹窗**栈原语**：书内（base_source_page）、视频、首页查词 tab、
+/// 安卓独立查词窗共用同一份栈操作（消除「同一个 bug 两处各修一遍」的根因）。
+///
+/// **设计原则（保各表面现有行为）**：controller 只管「栈/热槽/复用/裁剪/填结果/
+/// 显示/关栈」这些**机制**；「搜索期目标层是否立即可见」由宿主用 [visible] 参数自选——
+/// 视频/首页/独立窗用 `visible:true`（搜索期即显示，空白由 DictionaryPopupLayer 的
+/// 加载盖板兜住），书内用 `visible:false`（就绪才 [show]，搜索期另画轻量占位）。两条
+/// 路径共用同一套原语，零行为变更。
+class DictionaryPopupController extends ChangeNotifier {
+  DictionaryPopupController({
+    required this.lowMemory,
+    this.onLookupStackDepthChanged,
+  }) {
+    // 手柄重设计 P2：每个弹窗栈 controller 把自己登记为 dictionaryPopup scope 手柄
+    // 动作的执行体（GamepadService 在页面 Actions 未消费后按可见性取用）。7 个宿主
+    // （书内/漫画/视频/首页词典/独立查词/歌词浮窗/texthooker）由此免逐个接线。
+    // 纯回调对象，不引入 UI 依赖，controller 保持纯逻辑可测。
+    _gamepadHooks = DictionaryPopupGamepadHooks(
+      hasVisiblePopup: () => hasVisiblePopup,
+      entryMove: (bool forward) async =>
+          _topVisibleWebViewState?.focusEntryMove(forward),
+      mineFirstEntry: () async =>
+          _topVisibleWebViewState?.mineFirstVisibleEntry(),
+      playFirstAudio: () async =>
+          _topVisibleWebViewState?.playFirstVisibleAudio(),
+      scrollBy: (double dy) async =>
+          _topVisibleWebViewState?.scrollContentBy(dy),
+    );
+    DictionaryPopupGamepadRegistry.push(_gamepadHooks);
+  }
+
+  late final DictionaryPopupGamepadHooks _gamepadHooks;
+
+  /// 栈顶**可见**层的 WebView 状态（热槽隐身层不算）；无可见层或 WebView 未挂载
+  /// 返回 null（钩子就地变 no-op，不抛）。
+  DictionaryPopupWebViewState? get _topVisibleWebViewState {
+    final int index = lastVisibleIndex;
+    return index < 0 ? null : _entries[index].webViewKey.currentState;
+  }
+
+  /// TODO-607 P0-2：查词栈「可见深度」变化时的注入回调（书内 / 视频 / 首页 / 安卓独立
+  /// 查词窗各宿主在创建时注入 `ErrorLogService.instance.markLookupStackDepth`）。
+  /// 在此注入而非让 controller 直接调单例，是为了让 controller 保持纯逻辑可测
+  /// （现有 `dictionary_popup_controller_test.dart` 在非 Flutter 环境跑，不能触发
+  /// 文件 IO / path_provider）。回调同步执行，宿主据其同步写查词崩溃面包屑。
+  ///
+  /// 参数：当前**可见**查词栈深度（0=无可见弹窗→清面包屑，1=顶层，>=2=嵌套）+
+  /// 栈顶可见层在查的词（可空）。
+  final void Function(int depth, String? topTerm)? onLookupStackDepthChanged;
+
+  /// 通知注入回调：当前可见栈深度 + 栈顶可见层的词。在所有改变 [_entries] 内容
+  /// 或某层 [DictionaryPopupEntry.visible] 的栈操作尾部统一调用，使查词崩溃面包屑
+  /// 始终反映「崩时第几层 / 在查什么词」。回调缺省（纯逻辑测试）时直接返回。
+  void _notifyLookupStackDepth() {
+    final callback = onLookupStackDepthChanged;
+    if (callback == null) return;
+    int depth = 0;
+    String? topTerm;
+    for (final DictionaryPopupEntry e in _entries) {
+      if (!e.visible) continue;
+      depth++;
+      topTerm = e.searchTerm;
+    }
+    callback(depth, topTerm);
+  }
+
+  /// 低内存模式不保留常驻热槽（关栈即清空，释放 WebView）。可变：宿主在 appModel
+  /// 已初始化的安全时机（seed 前）设入真实值，避免在 State.initState 里过早读
+  /// prefsRepo（未初始化会抛）。
+  bool lowMemory;
+
+  /// TODO-1204：每次「查词开始」的注入回调（每个宿主在安全时机设入，解析本表面的书
+  /// 身份后写 [FushiDatabase.addLookupCount]）。在 [beginTop] / [pushChild] 头部触发，
+  /// **每次查词 +1**（顶层 / 嵌套 / 重复查各算一次，不去重；seed 热槽不算）。与
+  /// [onLookupStackDepthChanged] 同理由用注入回调而非让 controller 直接碰 DB——保持
+  /// controller 纯逻辑可测（纯逻辑测试缺省不设，为空则不触发）。
+  void Function()? onLookupStarted;
+
+  /// TODO-058 fail-safe：挂起层（[markPendingReveal]）等 `popupRendered` 才翻可见。
+  /// 若 WebView 冷加载失败 / `renderPopup()` JS 抛异常 / `callHandler` 因 WebView
+  /// 进程异常失败 → `popupRendered` 永不发，挂起层会**永久** `visible=false`（点查词
+  /// 什么都不出，比白屏一瞬更糟）。该超时是兜底：到时仍未 [revealRendered] 就强制
+  /// 翻可见（退回「最坏白屏一瞬」也好过永不显示）。取足够长，正常渲染远早于它，
+  /// 不影响「就绪才显示」的正常路径。
+  static const Duration kRevealFailsafeTimeout = Duration(milliseconds: 1800);
+
+  /// 每个挂起层一个一次性兜底 Timer。[revealRendered]/[show]/隐藏/裁剪/清栈/[dispose]
+  /// 任何使该层离开挂起态的路径都必须取消并移除其 Timer，避免在已销毁/已显示的
+  /// 条目上回调或泄漏。
+  final Map<DictionaryPopupEntry, Timer> _revealFailsafeTimers =
+      <DictionaryPopupEntry, Timer>{};
+
+  final List<DictionaryPopupEntry> _entries = <DictionaryPopupEntry>[];
+
+  /// BUG-2039 ③：停驻的嵌套 realm 上限。此前每次嵌套查词都新建一个 WebView（约 300KB
+  /// 内联 HTML/CSS/JS 解析 + 全量静态段重注入 + 首次布局 JIT，实测比热 realm 慢两个
+  /// 数量级），关掉就销毁，下一次嵌套再来一遍。常驻热槽只服务第一层，第二层永远是
+  /// 冷的。现在被裁掉的嵌套层把 WebView 键停到这里，宿主继续在屏外挂着它，下一条嵌套
+  /// 层直接接管。上限 1：绝大多数嵌套只有两层，多停一个 realm 就多一份 WebView 进程
+  /// 内存；更深层次仍冷建。低内存模式不停驻（与热槽同一策略）。
+  static const int kMaxParkedRealms = 1;
+
+  final List<GlobalKey<DictionaryPopupWebViewState>> _parkedRealms =
+      <GlobalKey<DictionaryPopupWebViewState>>[];
+
+  late final List<GlobalKey<DictionaryPopupWebViewState>> _parkedRealmsView =
+      UnmodifiableListView<GlobalKey<DictionaryPopupWebViewState>>(
+    _parkedRealms,
+  );
+
+  /// 停驻中的嵌套 realm 键（最近用过的在末尾）。宿主必须把每一把键渲染成一层屏外
+  /// 隐藏弹窗（[parkedRealmPopupLayer]），否则键背后的 WebView element 会被销毁，
+  /// 复用就退化成冷建。
+  List<GlobalKey<DictionaryPopupWebViewState>> get parkedRealms =>
+      _parkedRealmsView;
+
+  /// 把一批离栈的层收尾：取消挂起 Timer；非热槽层的 WebView 键停驻（超上限的、
+  /// 低内存下的直接丢弃）。所有把 entry 移出 [_entries] 的路径都必须经这里。
+  void _retireEntries(Iterable<DictionaryPopupEntry> removed) {
+    _cancelRevealTimers(removed);
+    for (final DictionaryPopupEntry e in removed) {
+      if (e.isWarmSlot || lowMemory) {
+        if (lowMemory && !e.isWarmSlot) {
+          // 诊断（2026-09-22）：低内存下嵌套层的 WebView 键直接丢弃，不停驻。下一次
+          // 嵌套查词必然冷建——这是小内存模式「查词很慢」的第二条来源（第一条是没有
+          // 热槽），两者独立，日志里要分得开。
+          videoDiag(
+            VideoDiagCategory.warmSlot,
+            VideoDiagLevel.v,
+            'realm discarded (low-memory) parked=${_parkedRealms.length}',
+          );
+        }
+        continue;
+      }
+      _parkedRealms.remove(e.webViewKey);
+      _parkedRealms.add(e.webViewKey);
+      if (_parkedRealms.length > kMaxParkedRealms) {
+        _parkedRealms.removeRange(0, _parkedRealms.length - kMaxParkedRealms);
+      }
+    }
+  }
+
+  /// 新建非热槽层用的 WebView 键：有停驻 realm 就接管最近用过的那把，没有就新建。
+  GlobalKey<DictionaryPopupWebViewState> _takeRealmKey() {
+    if (_parkedRealms.isEmpty) {
+      return GlobalKey<DictionaryPopupWebViewState>();
+    }
+    return _parkedRealms.removeLast();
+  }
+
+  /// [_entries] 的常驻不可变 live 视图。此前每次访问 `List.unmodifiable(_entries)`
+  /// 都整表拷贝一份——entries 在宿主 build 循环、`contains` 身份核对里高频调用，
+  /// 每次查词/重建都白分配。[UnmodifiableListView] 包装内部列表：外部依旧不可变
+  /// （写操作抛 UnsupportedError），读实时反映内部变更，零拷贝。
+  late final List<DictionaryPopupEntry> _entriesView =
+      UnmodifiableListView<DictionaryPopupEntry>(_entries);
+
+  List<DictionaryPopupEntry> get entries => _entriesView;
+
+  bool get hasVisiblePopup =>
+      _entries.any((DictionaryPopupEntry e) => e.visible);
+
+  /// 最顶层**可见**条目的下标，无可见层返回 -1（常驻隐藏热槽不算）。
+  int get lastVisibleIndex {
+    for (int i = _entries.length - 1; i >= 0; i--) {
+      if (_entries[i].visible) return i;
+    }
+    return -1;
+  }
+
+  // ── 搜索期 UI（「搜索→就绪才显示」模式）───────────────────────────────
+  // 弹窗目标搜索期隐藏，宿主据这两个字段在选中词位置画轻量加载占位卡，
+  // 全程不显示空 WebView（与书内 base_source_page 同观感）。
+  //
+  // 这里**不存 bool 镜像**。旧实现有一个 `bool _searchingUi`，只有成功路径（宿主
+  // mixin 的 5 处 endSearchUi）会复位它，而 [dismissAt] / [truncateTo] /
+  // [pruneToWarmSlot] / [clear] 四条关栈路径一条都不复位 —— 在「结果已到、WebView
+  // 还没回 popupRendered」的挂起窗口里关掉弹窗，镜像就永久卡在 true：全屏 opaque 的
+  // LookupDismissBarrier 撤不掉（再点、Esc 都只是重走一遍 no-op 的 dismissAt），
+  // 视频页的 _lookupOverlayActive 也恒真、播放控件再也唤不回来。
+  //
+  // 根治办法是让它不再是第二真相源：上面四条路径**本来就已经**把目标 entry 的
+  // isSearching / revealOnRender 清了或把 entry 移出了栈 —— 它们已经表达了「这次
+  // 搜索结束了」，只是从前没人把这个事实翻译给 UI。改成派生值之后这条翻译没有失败
+  // 的可能，将来新增任何关栈路径都自动正确。
+  DictionaryPopupEntry? _searchTarget;
+  Rect? _pendingRectRaw;
+
+  /// 是否处于搜索期盖板态：有一个仍在栈内、且仍在搜索或仍等着渲染后翻出的目标。
+  bool get isSearchingUi {
+    final DictionaryPopupEntry? target = _searchTarget;
+    if (target == null) return false;
+    // identical 比较：热槽复用时 entry 身份不变，但被 _restoreWarmSeed 还原成种子
+    // 后 isSearching / revealOnRender 都是 false，下面的条件自然落 false。
+    if (!_entries.any((DictionaryPopupEntry e) => identical(e, target))) {
+      return false;
+    }
+    return target.isSearching || target.revealOnRender;
+  }
+
+  Rect? get pendingRect => isSearchingUi ? _pendingRectRaw : null;
+
+  /// 上一帧屏上若画着 [e] 的搜索期加载占位卡，返回它已显示多久，否则 null（翻可见前
+  /// 判定，见 [DictionaryPopupEntry.searchPlaceholderShownFor]）。读原始字段而非派生的
+  /// [pendingRect]：空结果路径先 [fillResult] 清掉 `isSearching` 再 [show]，那一刻
+  /// 派生值已落 false，可占位卡要到这次重建才撤。
+  Duration? _searchPlaceholderElapsedFor(DictionaryPopupEntry e) =>
+      identical(_searchTarget, e) && _pendingRectRaw != null
+          ? _searchUiClock.elapsed
+          : null;
+
+  /// [beginSearchUi] 起表：占位卡（及其入场淡入）从那一刻开始画。
+  final Stopwatch _searchUiClock = Stopwatch();
+
+  void beginSearchUi(Rect rect, DictionaryPopupEntry target) {
+    _searchTarget = target;
+    _pendingRectRaw = rect;
+    _searchUiClock
+      ..reset()
+      ..start();
+    notifyListeners();
+  }
+
+  void endSearchUi() {
+    if (_searchTarget == null && _pendingRectRaw == null) return;
+    _searchTarget = null;
+    _pendingRectRaw = null;
+    notifyListeners();
+  }
+
+  /// 开页 seed 一个常驻隐藏热槽，使其 WebView 冷加载一次后全程复用。
+  /// [seedResult] 让宿主放一个占位结果；缺省即 [kPopupSearchingPlaceholderResult]
+  /// canonical 单例（与搜索期占位同一对象，seed→查词的 result 身份不变、不触发重推）。
+  void seedWarmSlot({DictionarySearchResult? seedResult}) {
+    if (lowMemory || _entries.isNotEmpty) {
+      // 诊断（2026-09-22）：不 seed 的两种原因后果完全不同——`low-memory` 是「此后每次
+      // 查词都冷建 WebView」，`already-seeded` 只是重复调用的幂等返回。把原因记下来，
+      // 别让排查时把两者混为一谈。
+      final String reason = lowMemory ? 'low-memory' : 'already-seeded';
+      videoDiag(
+        VideoDiagCategory.warmSlot,
+        VideoDiagLevel.v,
+        'seed skipped reason=$reason',
+      );
+      return;
+    }
+    _entries.add(DictionaryPopupEntry(
+      searchTerm: '',
+      selectionRect: Rect.zero,
+      result: seedResult ?? kPopupSearchingPlaceholderResult,
+      visible: false,
+      isWarmSlot: true,
+    ));
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  void _restoreWarmSeed(DictionaryPopupEntry e) {
+    e
+      ..searchTerm = ''
+      ..selectionRect = Rect.zero
+      ..result = kPopupSearchingPlaceholderResult
+      ..visible = false
+      ..revealOnRender = false
+      ..isSearching = false
+      ..allLoaded = false;
+    e.autoFitHeight = null;
+    _clearHistory(e);
+  }
+
+  /// 清掉 [e] 的原地跳转历史与待恢复滚动位。所有「本层换成一个新查词会话」的路径
+  /// （复用热槽 / 热槽复位）都要经这里，历史绝不跨会话残留。
+  void _clearHistory(DictionaryPopupEntry e) {
+    e._backHistory.clear();
+    e._forwardHistory.clear();
+    e.restoreScrollTop = null;
+  }
+
+  /// 顶层查词目标：能复用常驻热槽（首条且 isWarmSlot）就原地复用并丢弃子层；
+  /// 否则按 [replaceStack] 决定是否清栈再压一条新目标。返回目标条目。
+  /// [visible] 决定搜索期目标是否立即可见（见类注释）。
+  DictionaryPopupEntry beginTop({
+    required String term,
+    required Rect rect,
+    required bool reuseWarmSlot,
+    required bool replaceStack,
+    required bool visible,
+    DictionarySearchResult? initialResult,
+  }) {
+    onLookupStarted?.call();
+    final bool warmHit =
+        reuseWarmSlot && _entries.isNotEmpty && _entries.first.isWarmSlot;
+    final int stackBefore = _entries.length;
+    // 诊断（2026-09-22）：**这一分叉就是「查词为什么卡」的答案所在**。命中热槽 ⇒
+    // 复用已冷加载完的 WebView，只剩注入 + renderPopup；未命中 ⇒ 要么接管一个停驻
+    // realm，要么彻底冷建（解析约 300KB 内联 HTML/CSS/JS + 等 onLoadStop + 全量静态段
+    // 重注入）。后两者的毫秒差是两个数量级，必须能在日志里直接读出来。
+    //
+    // 三态**只能在 [_takeRealmKey] 调用前的那一刻**判定：`replaceStack` 路径会先
+    // [_retireEntries] 把当前这层的键停驻进池，随后 `_takeRealmKey()` 又把它接管回来。
+    // 在方法开头按池空与否判会把这种「先存后取」误报成 cold-create——会撒谎的诊断比
+    // 没有诊断更糟。
+    final String warmMode;
+    final DictionaryPopupEntry e;
+    if (warmHit) {
+      warmMode = 'hit';
+      if (_entries.length > 1) {
+        _retireEntries(_entries.sublist(1));
+        _entries.removeRange(1, _entries.length);
+      }
+      _cancelRevealTimer(_entries.first);
+      e = _entries.first
+        ..searchTerm = term
+        ..selectionRect = rect
+        ..result = initialResult
+        ..allLoaded = false
+        ..autoFitHeight = null
+        ..isSearching = true
+        ..revealOnRender = false
+        ..visible = visible;
+      _clearHistory(e);
+    } else {
+      if (replaceStack) {
+        _retireEntries(_entries);
+        _entries.clear();
+      }
+      warmMode = _parkedRealms.isEmpty ? 'cold-create' : 'parked-realm';
+      e = DictionaryPopupEntry(
+        searchTerm: term,
+        selectionRect: rect,
+        result: initialResult,
+        visible: visible,
+        webViewKey: _takeRealmKey(),
+      )..isSearching = true;
+      _entries.add(e);
+    }
+    videoDiag(
+      VideoDiagCategory.warmSlot,
+      warmHit ? VideoDiagLevel.v : VideoDiagLevel.info,
+      'beginTop warm=$warmMode low-memory=$lowMemory '
+      'stack=$stackBefore parked=${_parkedRealms.length} '
+      'reuse-requested=$reuseWarmSlot',
+    );
+    LookupPerfTrace.current?.mark('warm', detail: 'mode=$warmMode');
+    notifyListeners();
+    _notifyLookupStackDepth();
+    return e;
+  }
+
+  /// 嵌套查词目标：先把 [parentIndex] 之后的更深子层裁掉，再压入一条新目标。
+  DictionaryPopupEntry pushChild({
+    required String term,
+    required Rect rect,
+    required int parentIndex,
+    required bool visible,
+  }) {
+    onLookupStarted?.call();
+    truncateTo(parentIndex + 1);
+    final DictionaryPopupEntry e = DictionaryPopupEntry(
+      searchTerm: term,
+      selectionRect: rect,
+      visible: visible,
+      webViewKey: _takeRealmKey(),
+    )..isSearching = true;
+    _entries.add(e);
+    notifyListeners();
+    _notifyLookupStackDepth();
+    return e;
+  }
+
+  /// 裁到只剩前 [length] 层（用于丢弃更深的嵌套层）。
+  void truncateTo(int length) {
+    if (length < 0) length = 0;
+    if (_entries.length > length) {
+      _retireEntries(_entries.sublist(length));
+      _entries.removeRange(length, _entries.length);
+      notifyListeners();
+      _notifyLookupStackDepth();
+    }
+  }
+
+  /// 顶层新查词前的预清理：保留常驻隐藏热槽、丢弃其余（低内存则清空）。
+  /// 对应 base_source_page 旧 `prunePopupStack(0)`。
+  void pruneToWarmSlot() {
+    if (_entries.isEmpty) return;
+    final DictionaryPopupEntry first = _entries.first;
+    if (first.isWarmSlot && !lowMemory) {
+      _cancelRevealTimer(first);
+      _retireEntries(_entries.sublist(1));
+      _restoreWarmSeed(first);
+      _entries
+        ..clear()
+        ..add(first);
+    } else {
+      _retireEntries(_entries);
+      _entries.clear();
+    }
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  /// 清空整个栈（宿主重置/销毁用；不保留热槽，也不保留停驻 realm）。
+  void clear() {
+    if (_entries.isEmpty && _parkedRealms.isEmpty) return;
+    // 在途的查词计时随栈一起收尾：不收，游标悬着，下一次别的宿主（阅读器家族
+    // 不 begin）的 revealRendered 会把它当自己的收尾——打出一行「视频页旧词
+    // total=几分钟」甚至假 warn，会撒谎的诊断比没有诊断更糟。
+    LookupPerfTrace.current?.finish('dismissed');
+    _cancelRevealTimers(_entries);
+    _entries.clear();
+    _parkedRealms.clear();
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  /// 把结果填进 [e]（不改 visible），供「就绪才显示」与「延迟显示」两条路径。
+  void fillResult(
+    DictionaryPopupEntry e, {
+    required DictionarySearchResult? result,
+    required bool allLoaded,
+  }) {
+    e
+      ..result = result
+      ..allLoaded = allLoaded
+      ..isSearching = false
+      // 新结果 / load-more 都从当前滚动位出发；只有历史页回退才带恢复位
+      //（[goBack] / [goForward] 自己设）。
+      ..restoreScrollTop = null;
+    notifyListeners();
+  }
+
+  // ── 原地跳转历史（Hoshi Reader iOS 的 backStack/forwardStack）────────────
+
+  DictionaryPopupHistoryPage _snapshot(
+      DictionaryPopupEntry e, double scrollTop) {
+    return DictionaryPopupHistoryPage(
+      searchTerm: e.searchTerm,
+      result: e.result,
+      allLoaded: e.allLoaded,
+      scrollTop: scrollTop,
+    );
+  }
+
+  void _applyPage(
+    DictionaryPopupEntry e,
+    DictionaryPopupHistoryPage page, {
+    required double? restoreScrollTop,
+  }) {
+    e
+      ..searchTerm = page.searchTerm
+      ..result = page.result
+      ..allLoaded = page.allLoaded
+      ..isSearching = false
+      ..restoreScrollTop = restoreScrollTop;
+    // 弹窗不动：selectionRect / autoFitHeight 都保留。高度由新内容的
+    // onContentMetrics 再伸缩，先重置会让外壳先跳到最大高再收回来。
+  }
+
+  /// 本层原地跳到 [term]：当前页（连同离开时的 [scrollTop]）压入后退栈、前进栈
+  /// 清空（与浏览器 / Hoshi 同语义），本层换成 [result]。宿主已经查完才调——空
+  /// 结果不跳（Hoshi：`if (count > 0) redirect(count)`），所以这里不存在
+  /// 「搜索期」中间态，`isSearching` 由宿主自己在查询期间置位。
+  ///
+  /// [e] 已不在栈内（查询期间被关掉 / 顶层换词）→ no-op，返回 false。
+  bool navigateInPlace(
+    DictionaryPopupEntry e, {
+    required String term,
+    required DictionarySearchResult result,
+    required bool allLoaded,
+    required double scrollTop,
+  }) {
+    if (!_entries.contains(e)) return false;
+    onLookupStarted?.call();
+    e._backHistory.add(_snapshot(e, scrollTop));
+    e._forwardHistory.clear();
+    _applyPage(
+      e,
+      DictionaryPopupHistoryPage(
+        searchTerm: term,
+        result: result,
+        allLoaded: allLoaded,
+        scrollTop: 0,
+      ),
+      restoreScrollTop: null,
+    );
+    notifyListeners();
+    _notifyLookupStackDepth();
+    return true;
+  }
+
+  /// 后退一页；[scrollTop] 是当前页离开时的滚动位（进前进栈，再前进时恢复）。
+  bool goBack(DictionaryPopupEntry e, {required double scrollTop}) =>
+      _navigate(e,
+          from: e._backHistory, to: e._forwardHistory, scrollTop: scrollTop);
+
+  /// 前进一页；[scrollTop] 同 [goBack]。
+  bool goForward(DictionaryPopupEntry e, {required double scrollTop}) =>
+      _navigate(e,
+          from: e._forwardHistory, to: e._backHistory, scrollTop: scrollTop);
+
+  bool _navigate(
+    DictionaryPopupEntry e, {
+    required List<DictionaryPopupHistoryPage> from,
+    required List<DictionaryPopupHistoryPage> to,
+    required double scrollTop,
+  }) {
+    if (!_entries.contains(e) || from.isEmpty) return false;
+    to.add(_snapshot(e, scrollTop));
+    final DictionaryPopupHistoryPage page = from.removeLast();
+    _applyPage(e, page, restoreScrollTop: page.scrollTop);
+    notifyListeners();
+    _notifyLookupStackDepth();
+    return true;
+  }
+
+  /// 显示 [e]（搜索→就绪才显示路径在 [fillResult] 后调用）。
+  void show(DictionaryPopupEntry e) {
+    _cancelRevealTimer(e);
+    e.searchPlaceholderShownFor = _searchPlaceholderElapsedFor(e);
+    e.visible = true;
+    e.revealOnRender = false;
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  /// BUG-717 ②：把已显示的 [e] 重锚到 [rect] 并触发重定位（弹窗位置在 build 时由
+  /// [DictionaryPopupEntry.selectionRect] 算出，改它 + [notifyListeners] 即重放）。
+  ///
+  /// 用于阅读器查词把「显示弹窗」与「正文高亮 eval」解耦后：弹窗先用原始选区 rect
+  /// 立即显示（不再 await 打在繁忙大 reader WebView 上的高亮 eval），高亮 eval 回来
+  /// 拿到精修后的词 bbox（多字去屈折时比选区宽）再用它重锚，保证弹窗不覆盖被查词
+  /// （BUG-767）。[e] 已被新查词替换/关闭、或 rect 未变 → no-op（不重建、不抖动）。
+  ///
+  /// BUG-2054：门是「**隐身热槽**不动」，不是「不可见就不动」。热槽还没被任何查词
+  /// 认领，迟到回调改它的 rect 毫无意义；但嵌套查词刚 push 的子层已挂上本次结果、
+  /// 正等自己的 WebView 渲染完才翻可见（[markPendingReveal]），而高亮 eval 的往返
+  /// 通常早于那次 reveal —— 用 visible 当门会把这条重锚恒吞掉，子弹窗就永远停在
+  /// 「点击首字符」的锚点上（跨行选区时正好盖住选区的第二行）。条目**显示时**才按
+  /// 当时的 [DictionaryPopupEntry.selectionRect] 定位，所以 reveal 前改反而一次到位、
+  /// 零跳变。
+  void reanchorEntry(DictionaryPopupEntry e, Rect rect) {
+    if (!_entries.contains(e)) return;
+    if (!e.visible && e.isWarmSlot) return;
+    if (e.selectionRect == rect) return;
+    e.selectionRect = rect;
+    notifyListeners();
+  }
+
+  /// TODO-058：结果已就绪但**先不显示**——挂起到该层 WebView 渲染完成。
+  /// 用于冷启动（新建 WebView）的嵌套/非热槽层：让其 WebView 在屏外预渲染，
+  /// 待 [revealRendered] 命中（`onRendered` 信号）再翻可见，杜绝白屏一瞬。
+  /// 热槽/有词条但 WebView 已预热的层不走此路（[show] 立即显示即可）。
+  ///
+  /// [onForcedReveal] 在**超时兜底**强制翻可见后回调（不在正常 [revealRendered]
+  /// 路径调用——那条路有自己的后续）。宿主用它做翻可见后的重建：mixin 路径
+  /// （视频/首页不监听本 controller）传 `setState(() {})`，阅读器路径（监听
+  /// controller，[notifyListeners] 已触发重建）可传 null。[timeout] 默认
+  /// [kRevealFailsafeTimeout]。
+  void markPendingReveal(
+    DictionaryPopupEntry e, {
+    VoidCallback? onForcedReveal,
+    Duration timeout = kRevealFailsafeTimeout,
+  }) {
+    e.visible = false;
+    e.revealOnRender = true;
+    _cancelRevealTimer(e);
+    _revealFailsafeTimers[e] = Timer(timeout, () {
+      // 到时仍挂起（没收到 popupRendered，也没被显示/裁掉）→ 强制翻可见。
+      _revealFailsafeTimers.remove(e);
+      if (!e.revealOnRender || !_entries.contains(e)) return;
+      e.searchPlaceholderShownFor = _searchPlaceholderElapsedFor(e);
+      e.visible = true;
+      e.revealOnRender = false;
+      // 诊断（2026-09-22）：走到这里就是用户说的那个「闪」——渲染信号没在兜底超时内
+      // 到达，弹窗被强制翻可见，内容随后才画上去，于是先露一下空壳再重画。冷建
+      // WebView（小内存模式的必经之路）正是最容易撞上这个兜底的情形。提级到 warn，
+      // grep 一眼可见。
+      videoDiag(
+        VideoDiagCategory.popup,
+        VideoDiagLevel.warn,
+        'forced reveal after ${timeout.inMilliseconds}ms '
+        '(popupRendered never arrived) '
+        'term=${LookupPerfTrace.redactTerm(e.searchTerm)}',
+      );
+      LookupPerfTrace.current?.finish('forced-reveal');
+      notifyListeners();
+      _notifyLookupStackDepth();
+      onForcedReveal?.call();
+    });
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  /// 取消并移除 [e] 的兜底 Timer（离开挂起态的所有路径都要调，防回调/泄漏）。
+  void _cancelRevealTimer(DictionaryPopupEntry e) {
+    _revealFailsafeTimers.remove(e)?.cancel();
+  }
+
+  /// 取消并移除一批被裁/被清条目的兜底 Timer。
+  void _cancelRevealTimers(Iterable<DictionaryPopupEntry> removed) {
+    for (final DictionaryPopupEntry e in removed) {
+      _revealFailsafeTimers.remove(e)?.cancel();
+    }
+  }
+
+  /// TODO-058：某层 WebView 渲染完成（`popupRendered` → `onRendered`）时调用。
+  /// 仅当该层处于挂起状态（[markPendingReveal] 标记的 [revealOnRender]）才翻为可见，
+  /// 并清掉标记；非挂起层（热槽再次渲染、load-more 等）不受影响。返回是否真的翻了可见，
+  /// 让宿主据此决定是否继续后续（如把光标交给刚显示的层）。
+  bool revealRendered(DictionaryPopupEntry e) {
+    if (!e.revealOnRender) return false;
+    _cancelRevealTimer(e);
+    e.searchPlaceholderShownFor = _searchPlaceholderElapsedFor(e);
+    e.visible = true;
+    e.revealOnRender = false;
+    LookupPerfTrace.current?.mark('reveal');
+    LookupPerfTrace.current?.finish('revealed');
+    notifyListeners();
+    _notifyLookupStackDepth();
+    return true;
+  }
+
+  /// 关闭第 [index] 层及其之上。index==0：保留并隐藏常驻热槽（低内存则清空）；
+  /// index>0：裁掉该层及之上，保留下层。
+  void dismissAt(int index) {
+    if (index < 0 || index >= _entries.length) return;
+    // 同 [clear]：fill 之后、popupRendered 之前被关掉（Esc / 点 barrier，冷建路径
+    // 下这窗口有上百 ms ~ 1.8 s），既走不到 abandoned 也走不到 revealed。
+    LookupPerfTrace.current?.finish('dismissed');
+    if (index == 0) {
+      final DictionaryPopupEntry first = _entries.first;
+      if (first.isWarmSlot && !lowMemory) {
+        _cancelRevealTimer(first);
+        _retireEntries(_entries.sublist(1));
+        _restoreWarmSeed(first);
+        _entries
+          ..clear()
+          ..add(first);
+      } else {
+        _retireEntries(_entries);
+        _entries.clear();
+      }
+    } else {
+      _retireEntries(_entries.sublist(index));
+      _entries.removeRange(index, _entries.length);
+    }
+    notifyListeners();
+    _notifyLookupStackDepth();
+  }
+
+  @override
+  void dispose() {
+    DictionaryPopupGamepadRegistry.pop(_gamepadHooks);
+    // 防泄漏：销毁时取消所有挂起的兜底 Timer。
+    for (final Timer t in _revealFailsafeTimers.values) {
+      t.cancel();
+    }
+    _revealFailsafeTimers.clear();
+    super.dispose();
+  }
+}

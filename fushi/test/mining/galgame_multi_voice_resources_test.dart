@@ -1,0 +1,526 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/media/video/ffmpeg_backend.dart';
+import 'package:fushi/src/mining/galgame_audio_encode.dart';
+import 'package:fushi/src/mining/galgame_audio_source.dart';
+import 'package:fushi/src/mining/gal_voice_dump_index.dart';
+
+class _RecordingFfmpegBackend implements FfmpegBackend {
+  /// 查询类命令（BUG-2938 新增原语）：本假件不区分，交给 [run]。
+  @override
+  Future<FfmpegRunResult> runQuery(List<String> args, Duration timeout) =>
+      run(args, timeout);
+
+  final List<List<String>> calls = <List<String>>[];
+
+  @override
+  Future<FfmpegRunResult> run(List<String> args, Duration timeout) async {
+    calls.add(List<String>.of(args));
+    await File(args.last).writeAsBytes(<int>[0xff, 0xf1, 0x50, 0x80]);
+    return const FfmpegRunResult(returnCode: 0, output: '');
+  }
+
+  @override
+  Future<FfmpegRunResult> runProbe(List<String> args, Duration timeout) async =>
+      const FfmpegRunResult(returnCode: 1, output: 'unused');
+}
+
+/// BUG-1605：同一句台词同时有多个角色配音（男女声优同台）时，引擎为同一条文本读入多个
+/// 语音资源、hook 各 dump 一个文件，制卡必须把它们**全部**带进卡里，而不是只留一个。
+///
+/// 但「全取」不是无条件的：只有被证明属于同一句的资源才允许全取，纯时间邻近仍旧单取。
+/// 这条界线是本文件的主要断言面——放宽它会把上一句尾音、旁白、系统音一起塞进卡。
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test('BUG-2351：真实资源制卡沿文本时刻过滤伴音，保留同句多角色', () async {
+    final Directory root = await Directory.systemTemp.createTemp(
+      'gal_companions_',
+    );
+    final GalVoiceDumpIndex index = GalVoiceDumpIndex(directory: root);
+    final _RecordingFfmpegBackend backend = _RecordingFfmpegBackend();
+    const String primary = '201000_fushi_textseq1_primary.ogg';
+    const String partner = '198500_fushi_textseq1_partner.ogg';
+    final List<String> names = <String>[
+      primary,
+      partner,
+      '100000_fushi_textseq1_old.ogg',
+      '201501_fushi_textseq1_outside_text_window.ogg',
+      '200000_fushi_textseq2_other.ogg',
+    ];
+    try {
+      for (final String name in names) {
+        await File('${root.path}/$name').writeAsBytes(<int>[1, 2, 3]);
+      }
+      await index.startSession();
+      setFfmpegBackendForTesting(backend);
+      final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+        injectorPath: '',
+        voiceDumpIndex: index,
+      );
+      final Uint8List? bytes = await source.grabPairedVoiceBytes(
+        200000,
+        outputExtension: 'aac',
+        textEventId: 1,
+        resourceId: primary,
+        allowLatestSessionFallback: false,
+      );
+      expect(bytes, <int>[0xff, 0xf1, 0x50, 0x80, 0xff, 0xf1, 0x50, 0x80]);
+      expect(backend.calls, hasLength(2));
+      expect(
+        backend.calls[0],
+        contains('${root.path}${Platform.pathSeparator}$primary'),
+      );
+      expect(
+        backend.calls[1],
+        contains('${root.path}${Platform.pathSeparator}$partner'),
+      );
+    } finally {
+      setFfmpegBackendForTesting(null);
+      await index.stopSession();
+      await root.delete(recursive: true);
+    }
+  }, skip: !Platform.isWindows);
+
+  test(
+    'Ogg Opus voice reaches event lookup, preview and mining',
+    () async {
+      final Directory root = await Directory.systemTemp.createTemp(
+        'gal_opus_resource_',
+      );
+      final GalVoiceDumpIndex index = GalVoiceDumpIndex(directory: root);
+      final _RecordingFfmpegBackend backend = _RecordingFfmpegBackend();
+      const String voice = '10000_fushi_textseq7_voice.opus';
+      const String bgm = '10001_fushi_textseq7_bgm_theme.opus';
+      const String other = '10000_fushi_textseq8_other.opus';
+      const String unmarked = '9780_voice_unmarked.opus';
+      try {
+        for (final String name in <String>[voice, bgm, other, unmarked]) {
+          await File(
+            '${root.path}/$name',
+          ).writeAsBytes(<int>[0x4f, 0x67, 0x67, 0x53]);
+        }
+        await index.startSession();
+        setFfmpegBackendForTesting(backend);
+        final EngineHookGalAudioSource source = EngineHookGalAudioSource(
+          injectorPath: '',
+          voiceDumpIndex: index,
+        );
+        expect(
+          index.findEventOwnedResourceNames(textTsMs: 10020, textEventId: 7),
+          <String>[voice],
+        );
+        expect(source.findPairedVoiceResourceId(10020, textEventId: 7), voice);
+        expect(index.findPairedResourceNames(textTsMs: 10000), <String>[
+          unmarked,
+        ]);
+        expect(
+          source.pairedVoiceFilePathForResourceId(voice),
+          '${root.path}${Platform.pathSeparator}$voice',
+        );
+        expect(
+          await source.grabPairedVoiceBytes(
+            10020,
+            outputExtension: 'aac',
+            textEventId: 7,
+            resourceId: voice,
+            allowLatestSessionFallback: false,
+          ),
+          <int>[0xff, 0xf1, 0x50, 0x80],
+        );
+        expect(backend.calls, hasLength(1));
+        expect(
+          backend.calls.single,
+          contains('${root.path}${Platform.pathSeparator}$voice'),
+        );
+      } finally {
+        setFfmpegBackendForTesting(null);
+        await index.stopSession();
+        await root.delete(recursive: true);
+      }
+    },
+    skip: !Platform.isWindows,
+  );
+
+  group('pickPairedVoiceOggs（事件 ID 层全取）', () {
+    test('同一事件 ID 的多个资源全部返回，按与文本时间戳的距离排序', () {
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32147150_fushi_textseq16_otoko_020.ogg',
+          '32147187_fushi_textseq16_onna_015.ogg',
+        ],
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      // 距离：onna 13ms < otoko 50ms → 主语音是 onna，otoko 是同句伴音。
+      expect(picked, <String>[
+        '32147187_fushi_textseq16_onna_015.ogg',
+        '32147150_fushi_textseq16_otoko_020.ogg',
+      ]);
+    });
+
+    test('别的事件 ID 不会被顺带收进来', () {
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32147187_fushi_textseq16_onna_015.ogg',
+          '32147188_fushi_textseq17_next_line.ogg',
+        ],
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      expect(picked, <String>['32147187_fushi_textseq16_onna_015.ogg']);
+    });
+
+    test('事件层命中后不再看精确 tick / 偏移窗层', () {
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32147200_same_tick_but_unmarked.ogg',
+          '32147187_fushi_textseq16_onna_015.ogg',
+        ],
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      expect(picked, <String>['32147187_fushi_textseq16_onna_015.ogg']);
+    });
+
+    test('同距离时按文件名排序，结果不随目录枚举顺序漂', () {
+      const List<String> names = <String>[
+        '32147200_fushi_textseq16_b_voice.ogg',
+        '32147200_fushi_textseq16_a_voice.ogg',
+      ];
+      final List<String> forward = pickPairedVoiceOggs(
+        oggFileNames: names,
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      final List<String> reversed = pickPairedVoiceOggs(
+        oggFileNames: names.reversed.toList(),
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      expect(forward, <String>[
+        '32147200_fushi_textseq16_a_voice.ogg',
+        '32147200_fushi_textseq16_b_voice.ogg',
+      ]);
+      expect(reversed, forward);
+    });
+
+    test('BGM/SE 即使带同一事件 ID 也不算配音', () {
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32147187_fushi_textseq16_onna_015.ogg',
+          '32147188_fushi_textseq16_bgm_theme.ogg',
+          '32147189_fushi_textseq16_se_door.ogg',
+        ],
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      expect(picked, <String>['32147187_fushi_textseq16_onna_015.ogg']);
+    });
+  });
+
+  group('pickPairedVoiceOggs（精确 tick 层全取）', () {
+    test('同一毫秒读入的多个资源全部返回', () {
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32147200_onna_015.ogg',
+          '32147200_otoko_020.ogg',
+        ],
+        textTsMs: 32147200,
+      );
+      expect(picked, <String>[
+        '32147200_onna_015.ogg',
+        '32147200_otoko_020.ogg',
+      ]);
+    });
+  });
+
+  group('pickPairedVoiceOggs（偏移窗层仍然单取）', () {
+    test('纯时间猜测层只返回最接近期望偏移的那一个', () {
+      // 期望偏移 T-220；窗口 [T-330, T-130]。两个都在窗内，但没有任何归属证据，
+      // 把它们都塞进卡等于把别句的语音一起带走。
+      final List<String> picked = pickPairedVoiceOggs(
+        oggFileNames: const <String>[
+          '32146980_onna_015.ogg', // T-220，正中期望
+          '32147050_otoko_020.ogg', // T-150
+        ],
+        textTsMs: 32147200,
+      );
+      expect(picked, <String>['32146980_onna_015.ogg']);
+    });
+  });
+
+  group('pickPairedUnityVoiceWavs', () {
+    test('带同一事件 ID 的 WAV 全取', () {
+      final List<String> picked = pickPairedUnityVoiceWavs(
+        wavFileNames: const <String>[
+          '32147100_fushi_textseq7_onna.wav',
+          '32147300_fushi_textseq7_otoko.wav',
+        ],
+        textTsMs: 32147200,
+        textEventId: 7,
+      );
+      expect(picked, <String>[
+        '32147100_fushi_textseq7_onna.wav',
+        '32147300_fushi_textseq7_otoko.wav',
+      ]);
+    });
+
+    test('无事件 ID 时仍旧只取时间窗内最近的一个', () {
+      final List<String> picked = pickPairedUnityVoiceWavs(
+        wavFileNames: const <String>['32147100_onna.wav', '32147190_otoko.wav'],
+        textTsMs: 32147200,
+      );
+      expect(picked, <String>['32147190_otoko.wav']);
+    });
+
+    test('BUG-2349 带标 WAV 事件 ID 不匹配必须拒绝，不能退回时间窗', () {
+      final List<String> picked = pickPairedUnityVoiceWavs(
+        wavFileNames: const <String>['32147190_fushi_textseq99_otoko.wav'],
+        textTsMs: 32147200,
+        textEventId: 7,
+      );
+      expect(picked, isEmpty);
+    });
+  });
+
+  group('pickPairedGameResources / 单值版兼容', () {
+    test('WAV 层命中时不再看 OGG 层', () {
+      final List<String> picked = pickPairedGameResources(
+        oggFileNames: const <String>['32147200_onna_015.ogg'],
+        wavFileNames: const <String>['32147190_otoko.wav'],
+        textTsMs: 32147200,
+      );
+      expect(picked, <String>['32147190_otoko.wav']);
+    });
+
+    test('没有文本时间戳时只认会话内最新资源兜底', () {
+      expect(
+        pickPairedGameResources(
+          oggFileNames: const <String>['32147200_onna_015.ogg'],
+          wavFileNames: const <String>[],
+          textTsMs: 0,
+          latestSessionVoiceName: '32147200_onna_015.ogg',
+        ),
+        <String>['32147200_onna_015.ogg'],
+      );
+      expect(
+        pickPairedGameResources(
+          oggFileNames: const <String>['32147200_onna_015.ogg'],
+          wavFileNames: const <String>[],
+          textTsMs: 0,
+        ),
+        isEmpty,
+      );
+    });
+
+    test('单值版恒等于全量版的首元素（不许出现第二套判据）', () {
+      const List<String> oggs = <String>[
+        '32147150_fushi_textseq16_otoko_020.ogg',
+        '32147187_fushi_textseq16_onna_015.ogg',
+      ];
+      final List<String> all = pickPairedGameResources(
+        oggFileNames: oggs,
+        wavFileNames: const <String>[],
+        textTsMs: 32147200,
+        textEventId: 16,
+      );
+      expect(
+        pickPairedGameResource(
+          oggFileNames: oggs,
+          wavFileNames: const <String>[],
+          textTsMs: 32147200,
+          textEventId: 16,
+        ),
+        all.first,
+      );
+      expect(all.length, 2, reason: '这组样本必须真的命中多资源，否则本用例没在测东西');
+    });
+  });
+
+  group('companionVoiceResourceNames', () {
+    test('BUG-2351：旧会话重复编号不进入已冻结主资源的制卡伴音', () {
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '200000_fushi_textseq1_current.ogg',
+          candidateNames: const <String>[
+            '100000_fushi_textseq1_old.ogg',
+            '300000_fushi_textseq1_later.ogg',
+            '199963_fushi_textseq1_partner.ogg',
+            '200000_fushi_textseq2_other.ogg',
+          ],
+        ),
+        <String>['199963_fushi_textseq1_partner.ogg'],
+      );
+    });
+
+    test('主资源带事件 ID：收同一事件 ID 的其余资源，不含自己', () {
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147187_fushi_textseq16_onna_015.ogg',
+          candidateNames: const <String>[
+            '32147187_fushi_textseq16_onna_015.ogg',
+            '32147150_fushi_textseq16_otoko_020.ogg',
+            '32147188_fushi_textseq17_next.ogg',
+          ],
+        ),
+        <String>['32147150_fushi_textseq16_otoko_020.ogg'],
+      );
+    });
+
+    test('主资源无事件 ID：只收 tick 完全相同的', () {
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147200_onna_015.ogg',
+          candidateNames: const <String>[
+            '32147200_otoko_020.ogg',
+            '32147201_almost_same.ogg',
+          ],
+        ),
+        <String>['32147200_otoko_020.ogg'],
+      );
+    });
+
+    test('无事件 ID 的主资源不会把带标资源按同 tick 收走', () {
+      // 带标资源已被 native 绑给某条具体文本，凑巧同 tick 不构成归属证据。
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147200_onna_015.ogg',
+          candidateNames: const <String>[
+            '32147200_fushi_textseq16_otoko_020.ogg',
+          ],
+        ),
+        isEmpty,
+      );
+    });
+
+    test('BGM/SE 不算伴音；主资源本身是 BGM 时直接空', () {
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147200_onna_015.ogg',
+          candidateNames: const <String>['32147200_bgm_theme.ogg'],
+        ),
+        isEmpty,
+      );
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147200_bgm_theme.ogg',
+          candidateNames: const <String>['32147200_onna_015.ogg'],
+        ),
+        isEmpty,
+      );
+    });
+
+    test('结果按文件名升序，不随枚举顺序漂', () {
+      const List<String> candidates = <String>[
+        '32147200_fushi_textseq16_c.ogg',
+        '32147200_fushi_textseq16_a.ogg',
+        '32147200_fushi_textseq16_b.ogg',
+      ];
+      final List<String> forward = companionVoiceResourceNames(
+        primaryName: '32147200_fushi_textseq16_b.ogg',
+        candidateNames: candidates,
+      );
+      expect(forward, <String>[
+        '32147200_fushi_textseq16_a.ogg',
+        '32147200_fushi_textseq16_c.ogg',
+      ]);
+      expect(
+        companionVoiceResourceNames(
+          primaryName: '32147200_fushi_textseq16_b.ogg',
+          candidateNames: candidates.reversed.toList(),
+        ),
+        forward,
+      );
+    });
+
+    test('主资源名不可解析时返回空（不猜）', () {
+      expect(
+        companionVoiceResourceNames(
+          primaryName: 'not_a_dump_name.ogg',
+          candidateNames: const <String>['32147200_onna_015.ogg'],
+        ),
+        isEmpty,
+      );
+    });
+  });
+
+  group('多段音频合成', () {
+    test('只有自同步容器（ADTS/.aac）允许字节接续', () {
+      expect(isSelfSynchronizingAudioContainer('aac'), isTrue);
+      expect(isSelfSynchronizingAudioContainer('AAC'), isTrue);
+      // m4a/mp4 有全局 moov，接起来是废文件。
+      expect(isSelfSynchronizingAudioContainer('m4a'), isFalse);
+      expect(isSelfSynchronizingAudioContainer('mp4'), isFalse);
+    });
+
+    test('concatAudioStreams 按顺序首尾相接', () {
+      final Uint8List joined = concatAudioStreams(<Uint8List>[
+        Uint8List.fromList(<int>[1, 2]),
+        Uint8List.fromList(<int>[]),
+        Uint8List.fromList(<int>[3, 4, 5]),
+      ]);
+      expect(joined, <int>[1, 2, 3, 4, 5]);
+    });
+
+    test('concatAudioStreams 空输入给空结果，不抛', () {
+      expect(concatAudioStreams(const <Uint8List>[]), isEmpty);
+    });
+
+    test('没有可用资源时不产出音频', () async {
+      expect(
+        await transcodeVoiceResourcesToMiningAudio(
+          resourcePaths: const <String>[],
+          tempDir: '.',
+          outputExtension: 'aac',
+        ),
+        isNull,
+      );
+    });
+
+    test('单个 xWMA 也经 ffmpeg 转成 AAC，不把原始字节写进卡片', () async {
+      final Directory root = await Directory.systemTemp.createTemp(
+        'gal_xwma_transcode_',
+      );
+      final File xwma = File('${root.path}/voice.xwma');
+      final Uint8List original = Uint8List.fromList(<int>[
+        0x52,
+        0x49,
+        0x46,
+        0x46,
+        0,
+        0,
+        0,
+        0,
+        0x58,
+        0x57,
+        0x4d,
+        0x41,
+      ]);
+      await xwma.writeAsBytes(original);
+      final _RecordingFfmpegBackend backend = _RecordingFfmpegBackend();
+      setFfmpegBackendForTesting(backend);
+      try {
+        final Uint8List? encoded = await transcodeVoiceResourcesToMiningAudio(
+          resourcePaths: <String>[xwma.path],
+          tempDir: root.path,
+          outputExtension: 'aac',
+        );
+
+        expect(encoded, <int>[0xff, 0xf1, 0x50, 0x80]);
+        expect(encoded, isNot(equals(original)));
+        expect(backend.calls, hasLength(1));
+        expect(
+          backend.calls.single,
+          containsAllInOrder(<String>['-i', xwma.path, '-c:a', 'aac']),
+        );
+        expect(backend.calls.single.last, endsWith('voice.aac'));
+      } finally {
+        setFfmpegBackendForTesting(null);
+        await root.delete(recursive: true);
+      }
+    });
+  });
+}

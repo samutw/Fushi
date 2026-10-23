@@ -1,0 +1,2999 @@
+#include "floating_lyric_window.h"
+
+#include "low_level_mouse_hook.h"
+#include "window_activation_policy.h"
+
+#include <d2d1helper.h>
+#include <dwrite_3.h>
+#include <dwmapi.h>
+#include <windowsx.h>
+
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+namespace {
+
+constexpr wchar_t kWindowClassName[] = L"FushiFloatingLyricWindow";
+
+// Logical (96-DPI) strip metrics; scaled per-monitor in Render(). The width /
+// height defaults seed the initial window; the live size lives in
+// strip_width_dip_ / strip_height_dip_ so the resize grip can change it.
+constexpr float kStripWidthDip = 720.0f;
+constexpr float kStripHeightDip = 96.0f;
+constexpr float kCornerRadiusDip = 14.0f;
+constexpr float kHorizontalPaddingDip = 20.0f;
+constexpr float kButtonSizeDip = 30.0f;
+constexpr float kButtonGapDip = 10.0f;
+// Hook toolbar: 32dp hit areas with a compact 4dp rhythm. Keeping these
+// separate from the audiobook/clipboard controls lets the nine-icon row use a
+// deliberate 320dp width instead of inheriting the old sparse 350dp layout.
+constexpr float kHookTextButtonSizeDip = 32.0f;
+constexpr float kHookTextButtonGapDip = 4.0f;
+constexpr float kControlsTopDip = 8.0f;
+// Bottom-right resize grip and the min / max the user may drag the bar to.
+constexpr float kResizeGripDip = 18.0f;
+constexpr float kMinStripWidthDip = 280.0f;
+// Hook mode draws a centred toolbar whose slot count depends on the profile
+// (gal hook 9 槽 = 9 * 32 + 8 * 4 = 320dip，有声书 8 槽更窄). The generic 280dip
+// floor would let the user drag the window narrower than its own controls,
+// clipping the leading buttons; hook mode therefore floors at the widest
+// toolbar's width plus a small margin. Bump this whenever
+// hook_toolbar::kMaxSlotCount grows — the floor is derived from that row width,
+// not from a taste-based round number（守卫按 kMaxSlotCount 复核）。
+constexpr float kHookTextMinStripWidthDip = 340.0f;
+// Shift-悬停查词的轮询表（只在鼠标停在浮窗里时挂着，见
+// StartHoverLookupPolling）。 60ms ≈
+// 一次按键的最短可感知延迟，且远低于用户「按下 Shift 想看词」的心理预期；
+// 只在窗口内轮询，代价是一次 GetAsyncKeyState + 一次 DWrite 命中测试。
+constexpr UINT_PTR kHoverLookupTimerId = 1;
+// 工具条揭示轮询（自动隐藏）。120ms 对「鼠标滑到台词框上」够跟手，又不会像悬停
+// 查词那样需要 60ms 级精度——它只决定一个窗口显不显示。
+constexpr UINT_PTR kToolbarRevealTimerId = 2;
+constexpr UINT kToolbarRevealPollMs = 120;
+// 正文窗置顶守卫（BUG-2365）。与查词卡的 BUG-1479 守卫同一形状、同一间隔：
+// galgame 切全屏时会把自己抬进置顶带（KiriKiri / Siglus 等引擎的常规动作），同一
+// 置顶带内是「最后一次 SetWindowPos 的赢」，而正文窗只在 show / clamp / DPI 变化时
+// 设过一次，于是被压到游戏底下再也上不来。独立工具条窗有自己的按帧重申
+//（HookToolbarWindow::Sync 无条件 HWND_TOPMOST，BUG-951 的逃生口），所以用户看到的
+// 正是「顶条还在、文字没了」。800ms 取自 BUG-1479 的同一权衡。
+constexpr UINT_PTR kTopmostGuardTimerId = 3;
+constexpr UINT kTopmostGuardIntervalMs = 800;
+// 揭示区在正文窗 ∪ 工具条矩形之外再放宽这么多，避免指针刚离开边缘一像素就消失，
+// 以及「从工具条移向正文」的途中出现空档。
+constexpr float kToolbarRevealMarginDip = 24.0f;
+constexpr UINT kHoverLookupPollMs = 60;
+constexpr float kMinStripHeightDip = 64.0f;
+constexpr float kMaxStripWidthDip = 2400.0f;
+constexpr float kMaxStripHeightDip = 480.0f;
+// A press must travel this far (logical px) before it becomes a drag rather
+// than a word-lookup tap — lets the bar be dragged from anywhere on the text.
+constexpr float kDragThresholdDip = 6.0f;
+// 振假名相对基准字的字号比例，以及为它加高的行盒比例（相对注音字号）。
+// 0.45 是日文排版里 ruby 的常用比例（约基准的一半再收一点），行盒留 1.25 倍
+// 注音高度，假名与基准字之间因此有一条细缝，不会贴在一起。
+constexpr float kRubyFontScale = 0.45f;
+constexpr float kRubyLineGapScale = 1.25f;
+// 桌面歌词式文字渲染（仅 hook 台词浮窗）：文字自带「投影 + 描边」，可读性不再
+// 依赖底板，于是背景可以像音乐播放器桌面歌词一样默认全透明。
+//
+// 描边不走自定义 DirectWrite 文本渲染器（overlay_ruby_render_guard 明确禁止
+// ——它会让绘制路径与 CharIndexAt / 高亮 / 滚动共用的那份 text_layout_ 几何
+// 分叉），而是把**同一个**
+// text_layout_ 按 8 个方向偏移多画几遍：几何天然逐像素一致，点字 index、折行、
+// 滚动、注音全部不动。8 遍 + 阴影 + 填充共 10 次 DrawTextLayout，只在文本 /
+// 悬停 / 拖动变化时重绘，代价可忽略。
+constexpr float kLyricShadowOffsetDip = 2.0f;
+constexpr uint32_t kLyricShadowColor = 0x59000000;   // 35% 黑投影
+// 投影只服务「透明底板上的桌面歌词」：底板不透明度达到这个 alpha 时（M3E 卡片
+// 默认 92%）投影只会在实底上叠一层灰色重影，让字发虚，所以不画。
+constexpr uint32_t kLyricShadowMaxBodyAlpha = 0x80;
+// 灰度抗锯齿下的增强对比度下限（DirectWrite 默认约 0.5）。
+constexpr float kTextEnhancedContrast = 1.0f;
+// Base logical font size the lyric text was authored at; the rendered font
+// scales with the bar height so growing the bar enlarges the text too.
+constexpr float kBaseStripHeightForFontDip = 96.0f;
+// BUG-1095 — hook mode does NOT scale its font with the window height.
+//
+// It used to: the caption font was style_.font_size * clamp(height / 140dip,
+// 0.9, 2.5). Because strip_height_dip_ is read straight back off the live
+// window rect (SyncStripSizeFromWindow on every WM_SIZE), "drag the overlay
+// taller" and "enlarge the caption" were the SAME gesture. Dragging from the
+// 140dip default to the 480dip ceiling (3.4x taller) also multiplied the font
+// by 2.5, so the visible line count only crept from ~2.3 to ~4.3 — which is
+// exactly the user report: "it doesn't fit, and dragging it taller STILL
+// doesn't fit". Height and font size are two independent things the user
+// wants to control, so they are now two independent inputs: the window rect
+// stays the drag target, and the font size comes from its own preference
+// (gal_hook_text_font_size -> Style::font_size). At the authored default
+// height the old formula evaluated to exactly 1.0, so a user who never
+// dragged the overlay sees pixel-identical text.
+// Control row slots, in draw / hit-test order: previous, play-pause, next,
+// lock, close. The lock button (slot 3) is the TODO-136 addition; both Render()
+// and ControlActionAt() derive their geometry from this single count so the
+// hit areas can never drift from what is drawn.
+// 工具条槽数不再是编译期常量：同一个窗口类现在服务两张槽表（galgame hook 9 槽 /
+// 有声书 8 槽），槽数只能在运行时按 toolbar_profile_ 问 hook_toolbar::SlotCount。
+// 几何（RowWidth）、命中（SlotAt）、绘制三处一律走它，谁也不许自己数。
+// BUG-951: padding between the standalone pass-through toolbar window's edge
+// and its button row. Small on purpose — this window sits ON TOP of the game
+// and every pixel of it is a pixel the player cannot click — but non-zero so
+// there is a background strip to grab when dragging the overlay.
+constexpr float kToolbarWindowMarginDip = 5.0f;
+// 工具条文字标签模式：每槽加宽到 60dip（放得下「工作台」/ "Workbench"），图标下
+// 加一条 14dip 的文字带。台词窗比整排窄时退回纯图标。
+constexpr float kToolbarLabelSlotDip = 60.0f;
+constexpr float kToolbarLabelHeightDip = 14.0f;
+
+// Text-only hook window (Luna-style hover toolbar). A thin top strip is
+// ALWAYS a mouse catch (drawn at ~2% alpha across the full width) so the fully
+// transparent window can always be grabbed to move + can reveal its toolbar,
+// while the body below stays truly transparent (click-through to the game). At
+// rest only a small centre grip pill hints the handle; on hover the strip
+// brightens and the lock + one-click-transparency buttons appear. Text-only
+// hit-testing / drawing derive geometry from these so the hit areas can never
+// drift from what is drawn.
+constexpr float kTextGripWidthDip = 40.0f;
+constexpr float kTextGripHeightDip = 4.0f;
+constexpr float kTextGripTopDip = 9.0f;
+constexpr float kTextStripRestAlpha = 0.02f;   // near-invisible, still catchable
+constexpr float kTextStripHoverAlpha = 0.16f;  // subtle catch band on hover
+
+// BUG-1046: hook-text overlay body alpha floor. UpdateLayeredWindow windows are
+// hit-tested per PIXEL — alpha-0 pixels pass clicks through to the window
+// below no matter what WM_NCHITTEST returns. With the background hidden
+// (opacity 0) the whole body painted at alpha 0 made the caption text
+// unclickable (only the thin glyph pixels ever hit). Clamp the body fill to a
+// near-invisible minimum while the window is interactive; an explicit
+// pass-through toggle keeps true alpha 0 (clicks are MEANT to fall through).
+constexpr uint32_t kHookTextMinCatchAlpha = 5;  // ~2%, invisible but hittable
+
+// BUG-1095 (第二阶段) — hook 台词的滚动条 / 滚轮步长（逻辑 96-DPI px）。
+//
+// 轨道画在文本区**右侧的留白**里：text_rect_ 只占 [pad, width - pad]，所以这条
+// 指示条压不到任何一个字，也就不必为它缩窄换行宽度——缩窄宽度会反过来改变
+// metrics.height，从而改变可滚行程，形成回环。轨道底端让开右下角 resize grip，
+// 免得两个可拖拽的东西叠在同一块像素上。
+constexpr float kScrollBarWidthDip = 4.0f;
+constexpr float kScrollBarMinThumbDip = 16.0f;
+constexpr float kScrollWheelStepDip = 40.0f;
+// 滚动条的**命中带**比画出来的 4dp 细条宽：4dp 是指示用的视觉宽度，按 Fitts
+// 定律根本抓不住。命中带以细条为中心对称展开，只管鼠标按下 / 拖 thumb，
+// 不影响绘制，也不影响文本换行宽度。
+constexpr float kScrollBarHitWidthDip = 14.0f;
+
+// ARGB (0xAARRGGBB) -> D2D1_COLOR_F (straight alpha).
+D2D1_COLOR_F ColorFromArgb(uint32_t argb) {
+  const float a = ((argb >> 24) & 0xFF) / 255.0f;
+  const float r = ((argb >> 16) & 0xFF) / 255.0f;
+  const float g = ((argb >> 8) & 0xFF) / 255.0f;
+  const float b = (argb & 0xFF) / 255.0f;
+  return D2D1::ColorF(r, g, b, a);
+}
+
+UINT32 GlyphLength(const wchar_t* glyph) {
+  if (glyph == nullptr) {
+    return 0;
+  }
+  return static_cast<UINT32>(std::char_traits<wchar_t>::length(glyph));
+}
+
+}  // namespace
+
+FloatingLyricWindow::FloatingLyricWindow() = default;
+
+FloatingLyricWindow::~FloatingLyricWindow() {
+  // 先退订再拆窗：下面这次 DestroyWindow 会同步走一遍 WM_NCDESTROY，而本对象
+  // 正在析构、宿主（FlutterWindow）的 MethodChannel 成员可能已经先一步没了。
+  // 拆自己的窗口不需要通知任何人。
+  on_destroyed_ = nullptr;
+  if (hwnd_ != nullptr) {
+    DestroyWindow(hwnd_);
+    hwnd_ = nullptr;
+  }
+  if (class_registered_) {
+    UnregisterClassW(kWindowClassName, GetModuleHandle(nullptr));
+  }
+}
+
+void FloatingLyricWindow::EnsureWindowClass() {
+  if (class_registered_) {
+    return;
+  }
+  WNDCLASSEXW wc = {};
+  wc.cbSize = sizeof(wc);
+  wc.style = CS_HREDRAW | CS_VREDRAW;
+  wc.lpfnWndProc = FloatingLyricWindow::WndProc;
+  wc.hInstance = GetModuleHandle(nullptr);
+  wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  wc.lpszClassName = kWindowClassName;
+  RegisterClassExW(&wc);
+  class_registered_ = true;
+}
+
+bool FloatingLyricWindow::OwnsLiveWindow() const {
+  if (hwnd_ == nullptr || !IsWindow(hwnd_)) {
+    return false;
+  }
+  // IsWindow alone is insufficient because HWND values are recycled. The
+  // WM_NCCREATE back-pointer proves that this handle still names our body.
+  return reinterpret_cast<FloatingLyricWindow*>(
+             GetWindowLongPtr(hwnd_, GWLP_USERDATA)) == this;
+}
+
+// 窗口没了以后必须归零的**全部**每窗口交互状态。只此一份。
+//
+// BUG-1981 初版在 Show() 的死句柄分支和 WM_NCDESTROY 里各写了一份复位表，两份
+// 还互不相等，都漏了 `tracking_mouse_leave_`：它卡在 true 之后，WM_MOUSEMOVE 里
+// 的 `if (!tracking_mouse_leave_)` 恒假 → 新 HWND 上永远不再调 TrackMouseEvent
+// → 永远收不到 WM_MOUSELEAVE → `hovered_` 也清不掉，悬停效果和工具条自动隐藏
+// 本会话整个作废。逐路径补复位早晚会再漏一项，所以收成这一个原语。
+//
+// 与 Hide() 的状态复位半段逐项一致；Hide() 另有窗口操作（ApplyPassThroughExStyle /
+// ShowWindow）和「窗口还活着，只是藏起来」的语义，故不并入这里。
+void FloatingLyricWindow::ResetWindowInteractionState() {
+  visible_ = false;
+  hovered_ = false;
+  tracking_mouse_leave_ = false;
+  toolbar_revealed_ = false;
+  pass_through_toolbar_.Hide();
+  slot_tooltip_.Hide();
+  CancelPointerGesture();
+  StopHoverLookupPolling();
+  StopToolbarRevealPolling();
+  StopTopmostGuard();
+  ResetHoverLookupAnchor();
+}
+
+// 句柄已不是我方活窗（外部 WM_CLOSE、teardown，或被系统回收）时把它彻底忘掉，
+// 让下一次 Show() 从零重建。活窗时是 no-op，可以无条件在 Show() 开头调。
+void FloatingLyricWindow::ForgetDeadWindow() {
+  if (OwnsLiveWindow()) {
+    return;
+  }
+  hwnd_ = nullptr;
+  ResetWindowInteractionState();
+}
+
+bool FloatingLyricWindow::EnsureDeviceResources() {
+  if (d2d_factory_ == nullptr) {
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                   d2d_factory_.GetAddressOf());
+    if (FAILED(hr)) {
+      return false;
+    }
+  }
+  if (render_target_ == nullptr) {
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        0, 0, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_FEATURE_LEVEL_DEFAULT);
+    HRESULT hr = d2d_factory_->CreateDCRenderTarget(
+        &props, render_target_.GetAddressOf());
+    if (FAILED(hr)) {
+      render_target_.Reset();
+      return false;
+    }
+    text_rendering_params_applied_ = false;
+  }
+  if (!EnsureTextResources()) {
+    return false;
+  }
+  // 字形清晰度：分层窗（逐像素 alpha）只能走灰度抗锯齿，系统默认渲染参数的
+  // 增强对比度偏低，CJK 笔画边缘在浅色底上显得发虚。按系统默认 gamma / 渲染
+  // 模式克隆一份，只把增强对比度抬到不低于 1.0、ClearType 级别归 0（灰度下
+  // 本就不用），让边缘更实。失败不影响绘制（沿用默认参数）。
+  if (!text_rendering_params_applied_) {
+    render_target_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    Microsoft::WRL::ComPtr<IDWriteRenderingParams> defaults;
+    if (SUCCEEDED(dwrite_factory_->CreateRenderingParams(
+            defaults.GetAddressOf())) &&
+        defaults != nullptr) {
+      Microsoft::WRL::ComPtr<IDWriteRenderingParams> crisp;
+      if (SUCCEEDED(dwrite_factory_->CreateCustomRenderingParams(
+              defaults->GetGamma(),
+              std::max(defaults->GetEnhancedContrast(), kTextEnhancedContrast),
+              0.0f, DWRITE_PIXEL_GEOMETRY_FLAT, defaults->GetRenderingMode(),
+              crisp.GetAddressOf()))) {
+        render_target_->SetTextRenderingParams(crisp.Get());
+      }
+    }
+    text_rendering_params_applied_ = true;
+  }
+  return true;
+}
+
+void FloatingLyricWindow::DiscardDeviceResources() {
+  render_target_.Reset();
+  text_rendering_params_applied_ = false;
+}
+
+bool FloatingLyricWindow::EnsureTextResources() {
+  if (dwrite_factory_ == nullptr) {
+    HRESULT hr = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+        reinterpret_cast<IUnknown**>(dwrite_factory_.GetAddressOf()));
+    if (FAILED(hr)) {
+      return false;
+    }
+  }
+  if (icon_font_collection_ == nullptr) {
+    hook_toolbar::LoadMaterialSymbolsRoundedFontCollection(
+        dwrite_factory_.Get(), icon_font_collection_.GetAddressOf());
+  }
+  if (font_collection_dirty_) {
+    RebuildFontCollection();
+  }
+  return true;
+}
+
+const wchar_t* FloatingLyricWindow::DefaultFontFamily() const {
+  // 「Yu Gothic UI」的假名是为界面窄栏压窄过的半宽字形，整句日文台词排下来又挤
+  // 又断气；「Yu Gothic」是同一套设计的正文版，假名全宽。hook 台词浮窗是唯一
+  // 在读整句日文的表面，所以只有它换。有声书歌词条 / 剪贴板文字窗共用同一个
+  // FloatingLyricWindow 类，必须继续拿 Yu Gothic UI —— 它们逐像素不变是
+  // gal_overlay_lyric_style_guard_test ② 的前提。
+  return hook_text_mode_ ? L"Yu Gothic" : L"Yu Gothic UI";
+}
+
+void FloatingLyricWindow::RebuildFontCollection() {
+  font_collection_dirty_ = false;
+  custom_font_collection_.Reset();
+  // 用户显式选了字族就用用户的，兜底只在没选时兜。
+  resolved_font_family_ = style_.font_family.empty()
+                              ? std::wstring(DefaultFontFamily())
+                              : style_.font_family;
+  if (dwrite_factory_ == nullptr || style_.font_path.empty()) {
+    return;
+  }
+
+  Microsoft::WRL::ComPtr<IDWriteFactory5> factory5;
+  Microsoft::WRL::ComPtr<IDWriteFontSetBuilder1> builder;
+  Microsoft::WRL::ComPtr<IDWriteFontFile> font_file;
+  if (FAILED(dwrite_factory_.As(&factory5)) ||
+      FAILED(factory5->CreateFontSetBuilder(builder.GetAddressOf())) ||
+      FAILED(factory5->CreateFontFileReference(
+          style_.font_path.c_str(), nullptr, font_file.GetAddressOf())) ||
+      FAILED(builder->AddFontFile(font_file.Get()))) {
+    return;
+  }
+
+  // Keep the imported face first (so a catalog display-name mismatch can fall
+  // back to family 0), then append the system set for missing-glyph fallback.
+  Microsoft::WRL::ComPtr<IDWriteFontSet> system_fonts;
+  if (SUCCEEDED(factory5->GetSystemFontSet(system_fonts.GetAddressOf()))) {
+    builder->AddFontSet(system_fonts.Get());
+  }
+  Microsoft::WRL::ComPtr<IDWriteFontSet> font_set;
+  Microsoft::WRL::ComPtr<IDWriteFontCollection1> collection;
+  if (FAILED(builder->CreateFontSet(font_set.GetAddressOf())) ||
+      FAILED(factory5->CreateFontCollectionFromFontSet(
+          font_set.Get(), collection.GetAddressOf()))) {
+    return;
+  }
+  custom_font_collection_ = collection;
+
+  UINT32 family_index = 0;
+  BOOL family_exists = FALSE;
+  collection->FindFamilyName(resolved_font_family_.c_str(), &family_index,
+                             &family_exists);
+  if (family_exists || collection->GetFontFamilyCount() == 0) {
+    return;
+  }
+
+  // Imported catalog names are intentionally human-editable and may be based
+  // on the file name. Resolve the real OpenType family from the custom face so
+  // DirectWrite still renders it when those names differ.
+  Microsoft::WRL::ComPtr<IDWriteFontFamily> first_family;
+  Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> family_names;
+  if (FAILED(collection->GetFontFamily(0, first_family.GetAddressOf())) ||
+      FAILED(first_family->GetFamilyNames(family_names.GetAddressOf())) ||
+      family_names->GetCount() == 0) {
+    return;
+  }
+  UINT32 name_length = 0;
+  if (FAILED(family_names->GetStringLength(0, &name_length))) {
+    return;
+  }
+  std::vector<wchar_t> name(name_length + 1, L'\0');
+  if (SUCCEEDED(family_names->GetString(0, name.data(), name_length + 1))) {
+    resolved_font_family_.assign(name.data(), name_length);
+  }
+}
+
+float FloatingLyricWindow::ScaleForDpi(float value) const {
+  return value * (static_cast<float>(dpi_) / 96.0f);
+}
+
+POINT FloatingLyricWindow::ClampOriginToWorkArea(int x, int y, int width,
+                                                 int height,
+                                                 const RECT& work) const {
+  // TODO-832: keep at least |margin| px of the strip inside the work area on
+  // every edge so it can never be dragged / restored fully off-screen. All
+  // quantities here are screen physical px (margin already DPI-scaled), the
+  // same unit system as Dart clampFloatingWindowOrigin.
+  const int margin_x =
+      static_cast<int>(ScaleForDpi(kMinVisibleMarginDip));
+  // A strip narrower than the margin can at most show its whole width.
+  const int margin = margin_x < width ? margin_x : width;
+  const int margin_v = margin_x < height ? margin_x : height;
+
+  const int min_x = work.left - (width - margin);
+  const int max_x = work.right - margin;
+  const int min_y = work.top - (height - margin_v);
+  const int max_y = work.bottom - margin_v;
+
+  // When the strip is bigger than the work area min > max; anchor to the lower
+  // bound (top-left) instead of ejecting it.
+  int clamped_x = x;
+  if (min_x > max_x) {
+    clamped_x = min_x;
+  } else if (clamped_x < min_x) {
+    clamped_x = min_x;
+  } else if (clamped_x > max_x) {
+    clamped_x = max_x;
+  }
+
+  int clamped_y = y;
+  if (min_y > max_y) {
+    clamped_y = min_y;
+  } else if (clamped_y < min_y) {
+    clamped_y = min_y;
+  } else if (clamped_y > max_y) {
+    clamped_y = max_y;
+  }
+
+  return POINT{clamped_x, clamped_y};
+}
+
+void FloatingLyricWindow::ClampCurrentPositionToWindowMonitor() {
+  if (hwnd_ == nullptr) {
+    return;
+  }
+  RECT rc;
+  if (!GetWindowRect(hwnd_, &rc)) {
+    return;
+  }
+  const int width = rc.right - rc.left;
+  const int height = rc.bottom - rc.top;
+  HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO mi = {};
+  mi.cbSize = sizeof(mi);
+  if (!GetMonitorInfo(monitor, &mi)) {
+    return;
+  }
+  const POINT clamped =
+      ClampOriginToWorkArea(rc.left, rc.top, width, height, mi.rcWork);
+  if (clamped.x != rc.left || clamped.y != rc.top) {
+    SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, clamped.x, clamped.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE);
+    // Same invariant as MoveBodyTo: anything that relocates the body must
+    // re-push the toolbar geometry, or WM_EXITSIZEMOVE's clamp strands it.
+    SyncPassThroughToolbar();
+  }
+}
+
+bool FloatingLyricWindow::Show(HWND owner) {
+  EnsureWindowClass();
+  if (!EnsureDeviceResources()) {
+    return false;
+  }
+
+  // BUG-1981：WM_CLOSE/外部 teardown 会销毁 HWND，但旧对象仍跨 gal 会话复用。
+  // 对失效（或已被系统复用）的句柄调用 ShowWindow/SetWindowPos 都不会抛，旧实现却
+  // 无条件返回 true，Dart 因而永久把一个不存在的窗口记成“已显示”。
+  ForgetDeadWindow();
+
+  if (hwnd_ == nullptr) {
+    // Initial position: bottom-centre of the active monitor, like a desktop
+    // lyric bar. WS_EX_LAYERED for per-pixel alpha, WS_EX_TOPMOST to float over
+    // other apps, WS_EX_TOOLWINDOW to keep it off the taskbar / Alt+Tab.
+    HMONITOR monitor = MonitorFromWindow(
+        owner != nullptr ? owner : GetDesktopWindow(), MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfo(monitor, &mi);
+
+    dpi_ = GetDpiForSystem();
+    // TODO-708 P2: 首次创建即用设置宽度（>0，夹到拖拽边界），否则历史 720dip 起始宽。
+    strip_width_dip_ = style_.window_width > 0.0
+                           ? std::clamp(static_cast<float>(style_.window_width),
+                                        MinStripWidthDip(), kMaxStripWidthDip)
+                           : kStripWidthDip;
+    strip_height_dip_ = style_.window_height > 0.0
+                            ? std::clamp(
+                                  static_cast<float>(style_.window_height),
+                                  kMinStripHeightDip, kMaxStripHeightDip)
+                            : kStripHeightDip;
+    const int width = static_cast<int>(ScaleForDpi(strip_width_dip_));
+    const int height = static_cast<int>(ScaleForDpi(strip_height_dip_));
+    const int work_w = mi.rcWork.right - mi.rcWork.left;
+    const int x = mi.rcWork.left + (work_w - width) / 2;
+    const int y = mi.rcWork.bottom - height - static_cast<int>(ScaleForDpi(48));
+
+    // The strip must be mouse-interactive immediately so the first click after
+    // entering the bar cannot fall through to the app below. WS_EX_NOACTIVATE
+    // keeps that click from stealing keyboard focus. WS_EX_TOOLWINDOW keeps
+    // both the lyric strip and the hook text window off the taskbar / Alt+Tab.
+    hwnd_ = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        kWindowClassName,
+        hook_text_mode_ ? L"Fushi Hook Text" : window_title_.c_str(),
+        WS_POPUP, x, y, width, height,
+        nullptr, nullptr, GetModuleHandle(nullptr), this);
+    if (hwnd_ == nullptr) {
+      return false;
+    }
+    if (has_initial_bounds_) {
+      const int restored_width = initial_bounds_.right - initial_bounds_.left;
+      const int restored_height = initial_bounds_.bottom - initial_bounds_.top;
+      if (restored_width > 0 && restored_height > 0) {
+        // 存下来的宽度可能比**今天**的工具栏还窄（老版本槽位少、下限也低）。不夹
+        // 一下，恢复出来的窗口会把首尾按钮裁掉；下限本身就是按当前槽数算的。
+        const int min_width =
+            static_cast<int>(ScaleForDpi(MinStripWidthDip()));
+        SetWindowPos(hwnd_, HWND_TOPMOST, initial_bounds_.left,
+                     initial_bounds_.top, std::max(restored_width, min_width),
+                     restored_height, SWP_NOACTIVATE);
+        SyncStripSizeFromWindow();
+        ClampCurrentPositionToWindowMonitor();
+      }
+    }
+  }
+
+  ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+  if (!SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0,
+                    0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                           SWP_SHOWWINDOW)) {
+    visible_ = false;
+    return false;
+  }
+  visible_ = true;
+  // BUG-2613 — 正文窗压在游戏上：落在它上面的物理左键（点字查词 / 拖动 / 滚动条）
+  // 要向注入侧发布 Popup 护盾请求，采样型引擎才不会把这一下当成点游戏推进台词。
+  // 没有 galgame 会话时（有声书歌词条 / 剪贴板文本窗）登记是空操作。
+  fushi::RegisterOverlayClickShield(hwnd_);
+  // BUG-951: a re-show while pass-through is still on must re-create the
+  // escape-hatch toolbar and re-arm the body's click-through in one place.
+  ApplyPassThroughExStyle();
+  StartTopmostGuard();
+  RequestRender();
+  return true;
+}
+
+void FloatingLyricWindow::CancelPointerGesture() {
+  pressed_ = false;
+  dragging_ = false;
+  press_was_text_ = false;
+  // 拖 thumb 与拖窗 / 查词按压是互斥的同一笔事务：终结者也走同一个出口
+  //（WM_LBUTTONUP / WM_CAPTURECHANGED / Hide / SetLocked 一个都不会漏）。
+  scroll_thumb_dragging_ = false;
+  if (hwnd_ != nullptr && GetCapture() == hwnd_) {
+    ReleaseCapture();
+  }
+}
+
+void FloatingLyricWindow::Hide() {
+  visible_ = false;
+  hovered_ = false;
+  tracking_mouse_leave_ = false;
+  // 隐藏后收不到 WM_MOUSELEAVE：提示留着就是一块浮在桌面上的孤儿。
+  slot_tooltip_.Hide();
+  // BUG-1471: a hidden window never receives the WM_LBUTTONUP that would end an
+  // in-flight press. Clearing only `dragging_` here left `pressed_` stuck true
+  // across the hide, and MaybeHoverLookup bails on `pressed_` -- hover lookup
+  // then stayed dead for the rest of the session while the text kept updating.
+  CancelPointerGesture();
+  // 隐藏后收不到 WM_MOUSELEAVE：定时器留着就是后台空转。
+  StopHoverLookupPolling();
+  StopToolbarRevealPolling();
+  StopTopmostGuard();
+  toolbar_revealed_ = false;
+  ResetHoverLookupAnchor();
+  // BUG-951: hand clicks back unconditionally and take the toolbar down with
+  // the body. A hidden window that is still WS_EX_TRANSPARENT would come back
+  // click-through even if pass-through was switched off while hidden.
+  ApplyPassThroughExStyle();
+  if (hwnd_ != nullptr) {
+    fushi::UnregisterOverlayClickShield(hwnd_);
+    ShowWindow(hwnd_, SW_HIDE);
+  }
+}
+
+bool FloatingLyricWindow::IsShowing() const {
+  // 裸 `hwnd_ != nullptr` 是 BUG 回归 signature：HWND 会被系统回收给别的窗口，
+  // 那时 IsWindowVisible(回收句柄) 照样返 true，Dart 侧镜像便永远不复位、
+  // 自动重开和工具栏按钮双双失灵（BUG-1981）。身份判据只能是 OwnsLiveWindow()。
+  return visible_ && OwnsLiveWindow() && IsWindowVisible(hwnd_);
+}
+
+void FloatingLyricWindow::UpdateText(const std::wstring& text,
+                                    int current_line_start,
+                                    int current_line_length,
+                                    const std::string& context_id,
+                                    const std::vector<RubySpan>& ruby_spans) {
+  text_ = text;
+  // 注音区间只信任落在新文本范围内的那些：越界的一律丢掉，绝不让一段错位的
+  // 振假名飘在别的字上面（宁可不显示）。
+  ruby_spans_.clear();
+  const int text_length = static_cast<int>(text.size());
+  for (const RubySpan& span : ruby_spans) {
+    if (span.start < 0 || span.length <= 0 || span.ruby.empty()) continue;
+    if (span.start + span.length > text_length) continue;
+    ruby_spans_.push_back(span);
+  }
+  context_id_ = context_id;
+  current_line_start_ = current_line_start;
+  current_line_length_ = current_line_length;
+  follow_current_line_ = current_line_start >= 0 && current_line_length > 0;
+  highlight_start_ = -1;
+  highlight_length_ = 0;
+  text_layout_.Reset();
+  // BUG-1095 (第二阶段) — 新台词一律回到顶部。
+  //
+  // 这里换掉的是**整句**，不是往下追加：保留旧偏移只会把用户直接扔到一句他还
+  // 没读过的话的中间，比「跳回开头」糟得多。所以没有「用户正在往下看就别动」
+  // 的分支——那个分支要成立，前提是新旧文本连续，而 hook 台词从来不是。
+  scroll_offset_px_ = 0.0f;
+  scroll_max_px_ = 0.0f;
+  // 换了台词，去重锚指的那个下标已经是另一个字了：不清就会出现「新句子里鼠标下
+  // 的字正好同号 → 悬停不查」。
+  ResetHoverLookupAnchor();
+  // BUG-2613 — 每行台词顺手刷新一次覆盖窗口登记：绑定的游戏 HWND 是登记时解出
+  // 的，会话换局 / 游戏重建主窗（全屏切换）之后只有这条路能把它换成活的。
+  if (visible_ && OwnsLiveWindow()) {
+    fushi::RegisterOverlayClickShield(hwnd_);
+  }
+  RequestRender();
+}
+
+void FloatingLyricWindow::Highlight(int start, int length) {
+  highlight_start_ = start;
+  highlight_length_ = length;
+  RequestRender();
+}
+
+void FloatingLyricWindow::UpdateStyle(const Style& style) {
+  const bool font_changed = style.font_family != style_.font_family ||
+                            style.font_path != style_.font_path;
+  style_ = style;
+  if (font_changed) {
+    font_collection_dirty_ = true;
+    if (dwrite_factory_ != nullptr) {
+      RebuildFontCollection();
+    }
+  }
+  text_format_.Reset();
+  ruby_format_.Reset();
+  text_layout_.Reset();
+  ApplyStyleWidth();
+  RequestRender();
+}
+
+// TODO-708 P2: 悬浮窗宽度可调。style_.window_width > 0 时把窗口调到该逻辑 dp 宽（夹到
+// 与拖拽相同的 [kMinStripWidthDip, kMaxStripWidthDip] 边界），保留左上角原点，再夹回工作
+// 区；== 0 时保持当前宽度（历史默认 720dip 起始 + 用户拖拽结果）。文本/控件布局随 WM_SIZE
+// 自动跟随，无需重复处理。
+void FloatingLyricWindow::ApplyStyleWidth() {
+  if (hwnd_ == nullptr || style_.window_width <= 0.0) {
+    return;
+  }
+  const float target_dip =
+      std::clamp(static_cast<float>(style_.window_width), MinStripWidthDip(),
+                 kMaxStripWidthDip);
+  RECT rc;
+  if (!GetWindowRect(hwnd_, &rc)) {
+    return;
+  }
+  const int target_px = static_cast<int>(ScaleForDpi(target_dip));
+  const int current_px = rc.right - rc.left;
+  if (target_px == current_px) {
+    return;
+  }
+  SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0,
+               target_px, rc.bottom - rc.top,
+               SWP_NOMOVE | SWP_NOACTIVATE);
+  ClampCurrentPositionToWindowMonitor();
+}
+
+void FloatingLyricWindow::UpdateLabels(const Labels& labels) {
+  labels_ = labels;
+  RequestRender();
+}
+
+void FloatingLyricWindow::SetPlaybackState(bool playing) {
+  playing_ = playing;
+  RequestRender();
+}
+
+float FloatingLyricWindow::MinStripWidthDip() const {
+  return hook_text_mode_ ? kHookTextMinStripWidthDip : kMinStripWidthDip;
+}
+
+void FloatingLyricWindow::SetVoiceState(bool replaying, bool recapturing) {
+  if (replaying_ == replaying && recapturing_ == recapturing) {
+    return;
+  }
+  replaying_ = replaying;
+  recapturing_ = recapturing;
+  RequestRender();
+}
+
+void FloatingLyricWindow::SetClickLookupEnabled(bool enabled) {
+  click_lookup_enabled_ = enabled;
+}
+
+void FloatingLyricWindow::SetLookupTrigger(int trigger) {
+  lookup_trigger_ = trigger;
+}
+
+// 现在这一刻，自动隐藏该不该生效。
+//
+// **穿透态一律不生效**：穿透时正文窗不吃点击，工具条是屏幕上**唯一**还能点的
+// 东西——BUG-951 / PR#460 把这条写成了不变式（「工具条是一个独立窗口，永远可点，
+// 没有状态可竞争」）。让一个 120ms 的轮询表有权把它 SW_HIDE 掉，就是把「有没有
+// 逃生口」变成了一个可竞争的状态：光标恰好不在揭示区时它就没了，而用户此刻既点
+// 不动正文、也不知道要把鼠标移回哪里；Show 再失败一次（下面那条回滚就是为它准备
+// 的）就彻底困住。非穿透态没有这个问题——正文窗自己就能点、能拖、能右键。
+bool FloatingLyricWindow::ToolbarAutoHideActive() const {
+  return toolbar_auto_hide_ && !pass_through_;
+}
+
+void FloatingLyricWindow::SetToolbarAutoHide(bool enabled) {
+  if (toolbar_auto_hide_ == enabled) {
+    return;
+  }
+  toolbar_auto_hide_ = enabled;
+  // 关掉自动隐藏 = 立刻恒显；打开 = 立刻按当前光标位置判一次，不必等下一拍。
+  toolbar_revealed_ = !ToolbarAutoHideActive() || CursorInToolbarRevealZone();
+  ApplyToolbarVisibility();
+}
+
+void FloatingLyricWindow::SetToolbarLabels(bool enabled) {
+  if (toolbar_labels_ == enabled) {
+    return;
+  }
+  toolbar_labels_ = enabled;
+  // 文字带改变工具条高度与正文的顶部预留：重排正文 + 重摆工具条。
+  text_layout_.Reset();
+  RequestRender();
+  ApplyToolbarVisibility();
+}
+
+bool FloatingLyricWindow::ToolbarLabelsActive(float body_width_px) const {
+  if (!toolbar_labels_ || !hook_text_mode_ ||
+      hook_toolbar::SlotLabel(toolbar_profile_, 0).empty()) {
+    return false;
+  }
+  const int slots = hook_toolbar::SlotCount(toolbar_profile_);
+  const float row_w = ScaleForDpi(kToolbarLabelSlotDip) * slots +
+                      ScaleForDpi(kHookTextButtonGapDip) * (slots - 1) +
+                      ScaleForDpi(kToolbarWindowMarginDip) * 2.0f;
+  return row_w <= body_width_px;
+}
+
+void FloatingLyricWindow::SetPassThroughBlocksMouse(bool enabled) {
+  if (passthrough_blocks_mouse_ == enabled) {
+    return;
+  }
+  passthrough_blocks_mouse_ = enabled;
+  // 这条只改**画**出来的 alpha（行盒 catch fill），命中由 OS 按像素判——所以重画
+  // 一帧就是生效，不需要动窗口样式。
+  RequestRender();
+}
+
+void FloatingLyricWindow::SetTopmost(bool enabled) {
+  topmost_ = enabled;
+  if (hwnd_ == nullptr) {
+    // 还没建窗：Show() 自己会按 topmost_ 插入 Z 序。
+    return;
+  }
+  // 不做「值没变就早退」：Dart 每局 show 会再调一次 SetTopmost(true)，同值也把窗口
+  // 重新插到 Z 序顶上——上一局被别的窗口爬到上面时，这一次复位就是把它拉回来。
+  SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  RequestRender();
+}
+
+void FloatingLyricWindow::SetHoverAutoLookup(bool enabled) {
+  if (hover_auto_lookup_ == enabled) {
+    return;
+  }
+  hover_auto_lookup_ = enabled;
+  // 开关一变，上一次的去重锚就没有意义了（刚关掉时更要清，否则重新按 Shift 停在
+  // 同一个字上会被当成「已经查过」）。
+  ResetHoverLookupAnchor();
+}
+
+bool FloatingLyricWindow::ScrollBy(float delta_px) {
+  // 两个前置条件写在一处，调用方（WM_MOUSEWHEEL）不必再抄一遍：
+  //  * 只有 hook 台词能滚——歌词条 / 剪贴板文本窗保持历史行为，一字不改；
+  //  * 没有溢出就没有行程，返回 false 让事件继续往下传。
+  //
+  // BUG-1859：这里**没有** pass_through_ 判据。它是 BUG-951 时代的遗物——那时穿透
+  // 态正文窗带 WS_EX_TRANSPARENT，系统不投任何鼠标消息，这条判据只是兜「置位到
+  // 应用 ex-style 之间那一瞬」。BUG-1480 之后穿透态改成逐像素 alpha 命中：OS 已经
+  // 在合成阶段把鼠标分好了——落在文字（BUG-1853 后是整个行盒）上的归我们，落在
+  // alpha-0 背景上的归游戏。一个滚轮事件既然能到这里，就说明它落在了文字上，和
+  // 「点字查词」是同一份判定；再用 pass_through_ 拦一道，等于把 OS 判给我们的事件
+  // 吞进 DefWindowProc（这窗没有父窗，事件到不了游戏），穿透态就永远滚不动。
+  if (!hook_text_mode_ || scroll_max_px_ <= 0.0f) {
+    return false;
+  }
+  return SetScrollOffset(scroll_offset_px_ + delta_px);
+}
+
+bool FloatingLyricWindow::SetScrollOffset(float offset_px) {
+  const float next = std::clamp(offset_px, 0.0f, scroll_max_px_);
+  if (next == scroll_offset_px_) {
+    return false;  // 已经顶到头 / 到底：不吞事件。
+  }
+  scroll_offset_px_ = next;
+  RequestRender();
+  return true;
+}
+
+FloatingLyricWindow::ScrollBarGeometry FloatingLyricWindow::ComputeScrollBar()
+    const {
+  // BUG-1095 (第二阶段) / BUG-1860 — 滚动条几何的唯一真相。Render 画它、
+  // ScrollBarContains 判命中、WM_MOUSEMOVE 拖 thumb 三处都问这里，所以「画在哪」
+  // 和「按哪算按到」物理上不可能不一致。
+  //
+  // 只在 hook 模式且真有溢出时存在；其余情况 visible=false，一个像素都不画、
+  // 一次命中都不算（不滚动时逐像素不变、歌词条 / 剪贴板文本窗完全不受影响）。
+  //
+  // 轨道画在文本区**右侧的留白**里：text_rect_ 只占 [pad, width - pad]，所以这条
+  // 指示条压不到任何一个字，也就不必为它缩窄换行宽度——缩窄宽度会反过来改变
+  // metrics.height，从而改变可滚行程，形成回环。轨道底端让开右下角 resize grip，
+  // 免得两个可拖拽的东西叠在同一块像素上。
+  ScrollBarGeometry g;
+  // 竖排不画滚动条：竖排的滚动轴是 x，这里的轨道 / thumb / 命中带 / 拖拽换算
+  // 全是按 y 推导的；底部可用的留白只有 pad*0.5，右下角还压着 resize grip，硬塞
+  // 一条横向滚动条要么遮字、要么和 grip 抢像素。竖排下滚轮照样滚、当前句照样
+  // 被跟随到视口中线，所以不画滚动条不丢功能；visible=false 同时保证
+  // ScrollBarContains 恒 false、BeginScrollThumbDrag 永远进不去。
+  g.visible = hook_text_mode_ && scroll_max_px_ > 0.0f && !vertical_active_;
+  if (!g.visible) {
+    return g;
+  }
+  // text_rect_ 由 Render 按 [pad, width - pad] 铺出来，反推 pad 与 width 就不必
+  // 再抄一遍 padding 的换算（ScrollBarContains 在 Render 之外被调用，没有局部
+  // 变量可用）。
+  const float pad = text_rect_.left;
+  const float width = text_rect_.left + text_rect_.width + pad;
+  g.bar_w = ScaleForDpi(kScrollBarWidthDip);
+  g.bar_x = width - pad * 0.5f - g.bar_w * 0.5f;
+  g.track_top = text_rect_.top;
+  g.track_bottom = std::max(
+      g.track_top + g.bar_w,
+      text_rect_.top + text_rect_.height - ScaleForDpi(kResizeGripDip));
+  const float track_h = g.track_bottom - g.track_top;
+  const float content_h = text_rect_.height + scroll_max_px_;
+  const float min_thumb = std::min(track_h, ScaleForDpi(kScrollBarMinThumbDip));
+  g.thumb_h = std::clamp(
+      track_h * (text_rect_.height / std::max(1.0f, content_h)), min_thumb,
+      track_h);
+  g.thumb_y =
+      g.track_top + (track_h - g.thumb_h) * (scroll_offset_px_ / scroll_max_px_);
+  const float hit_half =
+      std::max(g.bar_w, ScaleForDpi(kScrollBarHitWidthDip)) * 0.5f;
+  const float bar_center = g.bar_x + g.bar_w * 0.5f;
+  // 命中带只许长在 text_rect_ 右侧的**留白**里，一个像素都不许伸进正文：
+  // 轨道中心在 width - pad/2，命中带半宽 7dp，所以 pad < 14dp（滑杆最小 0，
+  // 默认 20）时它会盖住正文最右边 (7 - pad/2) dp —— 那一列的点击本该是「点字
+  // 查词」，却会变成起拖 thumb。夹到正文右沿，让「按滚动条」和「点字」永远
+  // 不争同一个像素。
+  g.hit_left =
+      std::max(bar_center - hit_half, text_rect_.left + text_rect_.width);
+  g.hit_right = std::min(width, bar_center + hit_half);
+  return g;
+}
+
+float FloatingLyricWindow::TextOriginX() const {
+  return vertical_active_
+             ? text_rect_.left + vertical_flow_shift_px_ + scroll_offset_px_
+             : text_rect_.left;
+}
+
+float FloatingLyricWindow::TextOriginY() const {
+  return vertical_active_ ? text_rect_.top : text_rect_.top - scroll_offset_px_;
+}
+
+bool FloatingLyricWindow::ScrollBarContains(float x, float y) const {
+  const ScrollBarGeometry g = ComputeScrollBar();
+  return g.visible && x >= g.hit_left && x <= g.hit_right && y >= g.track_top &&
+         y <= g.track_bottom;
+}
+
+bool FloatingLyricWindow::BeginScrollThumbDrag(float y) {
+  const ScrollBarGeometry g = ComputeScrollBar();
+  if (!g.visible) {
+    return false;
+  }
+  const float travel = (g.track_bottom - g.track_top) - g.thumb_h;
+  if (travel <= 0.0f) {
+    return false;  // thumb 撑满轨道：没有可拖的行程。
+  }
+  // 按在 thumb 外（轨道上）：先把 thumb 中心搬到指针下，再从这里起拖。这样
+  // 「按 thumb 拖」和「按轨道拖」是同一个手势——thumb 永远跟着指针走，不需要
+  // 「轨道点击翻页」这种第二套行为。
+  if (y < g.thumb_y || y > g.thumb_y + g.thumb_h) {
+    SetScrollOffset((y - g.track_top - g.thumb_h * 0.5f) / travel *
+                    scroll_max_px_);
+  }
+  follow_current_line_ = false;
+  scroll_thumb_dragging_ = true;
+  scroll_drag_origin_y_ = y;
+  scroll_drag_start_offset_ = scroll_offset_px_;
+  scroll_drag_px_per_px_ = scroll_max_px_ / travel;
+  SetCapture(hwnd_);
+  return true;
+}
+
+void FloatingLyricWindow::SetLocked(bool locked) {
+  if (locked_ == locked) {
+    return;
+  }
+  locked_ = locked;
+  // A lock taken while a press / drag was pending must not strand the strip in
+  // a half-dragging state; drop any in-flight gesture so the next click is
+  // interpreted fresh. BUG-1860: scroll_thumb_dragging_ is a third in-flight
+  // gesture and must be listed here too, or "SetLocked ends every gesture"
+  // is only true for two of the three.
+  if (locked_ && (pressed_ || dragging_ || scroll_thumb_dragging_)) {
+    CancelPointerGesture();
+  }
+  RequestRender();
+}
+
+void FloatingLyricWindow::SetPassThrough(bool enabled) {
+  if (pass_through_ == enabled) {
+    return;
+  }
+  pass_through_ = enabled;
+  CancelPointerGesture();
+  // A click-through body receives no mouse messages at all, so it will never
+  // see the WM_MOUSELEAVE that would normally clear the hover state. Clear it
+  // here or the body would render its hovered appearance forever.
+  hovered_ = false;
+  tracking_mouse_leave_ = false;
+  ApplyPassThroughExStyle();
+  RequestRender();
+}
+
+void FloatingLyricWindow::ApplyPassThroughExStyle() {
+  if (hwnd_ == nullptr) {
+    return;
+  }
+  // Only the galgame hook overlay has a pass-through mode. The audiobook lyric
+  // strip never reaches the branch below, so its window style is byte-for-byte
+  // what it always was.
+  // 工具条不再是「穿透专属」：hook 台词浮窗**无论穿不穿透**都用同一个独立短药丸窗
+  // （用户「统一用这个短的舒服点」）。这里的判据因此只剩「是不是 hook 台词浮窗且
+  // 可见」；有声书悬浮歌词条永远走 false 分支，行为逐字节不变。
+  const bool want_toolbar = hook_text_mode_ && visible_;
+  if (!want_toolbar) {
+    StopToolbarRevealPolling();
+    pass_through_toolbar_.Hide();
+    SetBodyExTransparent(false);
+    return;
+  }
+  BindToolbarCallbacks();
+  StartToolbarRevealPolling();
+  if (pass_through_) {
+    // 切进穿透的这一刻先把工具条亮出来：它是穿透态下**唯一的回退入口**，用户得先
+    // 看见它在哪，自动隐藏才不至于变成「关不掉的穿透」。
+    toolbar_revealed_ = true;
+  }
+  // Escape hatch FIRST. The body may only stop taking clicks once the window
+  // that can switch pass-through back off is actually on screen; if it cannot
+  // be created we refuse the toggle instead of stranding the user.
+  // 建窗收口在 ApplyToolbarVisibility()（它同时管自动隐藏），profile 由那里的
+  // Show 调用传下去 —— 两个 PR 各改了这条链的一端，合并后只保留这一个入口。
+  if (!ApplyToolbarVisibility() && pass_through_) {
+    SetBodyExTransparent(false);
+    pass_through_ = false;
+    // Tell Dart the toggle was refused. Without this its own flag stays true,
+    // and the user's next press on the button sends setPassThrough(false) into
+    // an already-false native state — a press that visibly does nothing.
+    if (on_pass_through_) {
+      on_pass_through_(false);
+    }
+    return;
+  }
+  // BUG-1480: deliberately do NOT set WS_EX_TRANSPARENT here any more.
+  //
+  // 用户要的是「穿透态下仍能点文字查词」。WS_EX_TRANSPARENT 是全窗口级的，OS 连
+  // WM_LBUTTONDOWN 都不投，字和背景一视同仁 —— 想留一个能点的字就得再造一套机制。
+  // 而这个窗口是 UpdateLayeredWindow 的逐像素 alpha 窗：**alpha-0 像素本来就会把
+  // 点击透给下面的窗口，跨进程有效，且与 WM_NCHITTEST 无关**（这正是 BUG-1046 那条
+  // 注释记录的事实）。所以把背景强制成 alpha 0（见 Render）之后，OS 自己就给出了
+  // 我们要的两分：背景像素 → 游戏，字形像素 → 我们。
+  //
+  // 与 BUG-951 的区别必须说清，别被"又回到老路"误伤：BUG-951 修掉的是
+  // HTTRANSPARENT，那玩意只在**同线程**窗口间走，永远到不了另一个进程的游戏，所以
+  // 点击是被**吞掉**的；PR#460 修掉的是**定时器翻转可交互性**的竞态。逐像素 alpha
+  // 既不是前者也不是后者：它是 OS 在合成阶段就判定"这个窗口在这个像素上不存在"。
+  SetBodyExTransparent(false);
+}
+
+void FloatingLyricWindow::SetBodyExTransparent(bool enabled) {
+  if (hwnd_ == nullptr || ex_transparent_ == enabled) {
+    return;
+  }
+  const LONG_PTR bit = static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+  LONG_PTR ex = GetWindowLongPtr(hwnd_, GWL_EXSTYLE);
+  ex = enabled ? (ex | bit) : (ex & ~bit);
+  SetWindowLongPtr(hwnd_, GWL_EXSTYLE, ex);
+  // An ex-style change is not picked up until the frame is revalidated; without
+  // SWP_FRAMECHANGED the window keeps hit-testing with the OLD style.
+  SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                   SWP_FRAMECHANGED);
+  ex_transparent_ = enabled;
+}
+
+hook_toolbar::Layout FloatingLyricWindow::ComputePassThroughToolbarLayout()
+    const {
+  hook_toolbar::Layout layout;
+  if (hwnd_ == nullptr) {
+    return layout;
+  }
+  RECT wr = {};
+  if (!GetWindowRect(hwnd_, &wr)) {
+    return layout;
+  }
+  const float btn = ScaleForDpi(kHookTextButtonSizeDip);
+  const float gap = ScaleForDpi(kHookTextButtonGapDip);
+  const float margin = ScaleForDpi(kToolbarWindowMarginDip);
+  // Same origin the in-body toolbar draws at (centred row, kControlsTopDip from
+  // the top), grown by |margin| so the pill has an edge to grab for dragging.
+  // 这里用的是 window rect 宽而不是 client 宽：本窗是无边框 WS_POPUP 分层窗，
+  // 两者相等，但语义不同——这条 offset 要落到屏幕坐标上。
+  const float body_w = static_cast<float>(wr.right - wr.left);
+  const bool labelled = ToolbarLabelsActive(body_w);
+  const int slots = hook_toolbar::SlotCount(toolbar_profile_);
+  const float slot_w = labelled ? ScaleForDpi(kToolbarLabelSlotDip) : btn;
+  const float label_h = labelled ? ScaleForDpi(kToolbarLabelHeightDip) : 0.0f;
+  const float row_w =
+      labelled ? slot_w * slots + gap * (slots - 1) : HookToolbarRowWidth();
+  const float row_x = wr.left + (labelled ? (body_w - row_w) / 2.0f
+                                          : HookToolbarRowLeft(body_w));
+  const float row_y = wr.top + ScaleForDpi(kControlsTopDip);
+  layout.rect.left = static_cast<LONG>(std::lround(row_x - margin));
+  layout.rect.top = static_cast<LONG>(std::lround(row_y - margin));
+  layout.rect.right =
+      layout.rect.left + static_cast<LONG>(std::lround(row_w + margin * 2));
+  layout.rect.bottom = layout.rect.top +
+                       static_cast<LONG>(std::lround(btn + label_h + margin * 2));
+  layout.owner_origin = POINT{wr.left, wr.top};
+  layout.button_px = btn;
+  layout.gap_px = gap;
+  layout.margin_px = margin;
+  layout.slot_px = labelled ? slot_w : 0.0f;
+  layout.label_px = label_h;
+  return layout;
+}
+
+hook_toolbar::Style FloatingLyricWindow::ToolbarStyle() const {
+  hook_toolbar::Style style;
+  style.button_text_color = style_.button_text_color;
+  style.button_bg_color = style_.button_bg_color;
+  style.active_color = style_.active_color;
+  style.bg_color = style_.bg_color;
+  style.tooltip_bg_color = style_.toolbar_tooltip_bg_color;
+  style.tooltip_text_color = style_.toolbar_tooltip_text_color;
+  if ((style_.toolbar_bg_color >> 24) != 0) {
+    style.surface_color = style_.toolbar_bg_color;
+    style.button_text_color = style_.toolbar_icon_color;
+    style.button_bg_color = style_.toolbar_hover_color;
+    style.active_bg_color = style_.toolbar_active_bg_color;
+    style.active_color = style_.toolbar_active_icon_color;
+  }
+  return style;
+}
+
+hook_toolbar::States FloatingLyricWindow::ToolbarStates() const {
+  hook_toolbar::States states;
+  states.replaying = replaying_;
+  states.recapturing = recapturing_;
+  states.playing = playing_;
+  states.pass_through = pass_through_;
+  states.locked = locked_;
+  states.topmost = topmost_;
+  return states;
+}
+
+void FloatingLyricWindow::BindToolbarCallbacks() {
+  if (toolbar_callbacks_bound_) {
+    return;
+  }
+  pass_through_toolbar_.SetActionCallback(
+      [this](const std::string& action) { DispatchControlAction(action); });
+  pass_through_toolbar_.SetDragCallback(
+      [this](int x, int y) { MoveBodyTo(x, y); });
+  pass_through_toolbar_.SetDragEndCallback([this]() {
+    SyncStripSizeFromWindow();
+    // The clamp can still nudge the body (e.g. the drag ended half off a
+    // monitor edge), so re-sync the toolbar before reporting the bounds —
+    // otherwise the pill would sit a few px away from the body it belongs to.
+    ClampCurrentPositionToWindowMonitor();
+    SyncPassThroughToolbar();
+    NotifyBoundsChanged();
+  });
+  toolbar_callbacks_bound_ = true;
+}
+
+bool FloatingLyricWindow::ApplyToolbarVisibility() {
+  if (!hook_text_mode_ || !visible_) {
+    pass_through_toolbar_.Hide();
+    return true;
+  }
+  if (ToolbarAutoHideActive() && !toolbar_revealed_) {
+    // **真隐藏**，不是降到低 alpha。这个窗口盖在游戏上，"every pixel of it is a
+    // pixel the player cannot click"（BUG-951 的原话）——留一条几乎看不见却仍然
+    // 吃点击的催化带，等于一直偷着游戏顶部这块区域，正是用户抱怨的那类"穿透不
+    // 彻底"。隐藏后靠 kToolbarRevealTimerId 那张常驻表把它请回来。
+    pass_through_toolbar_.Hide();
+    return true;
+  }
+  return pass_through_toolbar_.Show(toolbar_profile_,
+                                    ComputePassThroughToolbarLayout(),
+                                    ToolbarStyle(), ToolbarStates());
+}
+
+void FloatingLyricWindow::StartToolbarRevealPolling() {
+  if (hwnd_ == nullptr || toolbar_reveal_poll_active_) {
+    return;
+  }
+  if (SetTimer(hwnd_, kToolbarRevealTimerId, kToolbarRevealPollMs, nullptr) !=
+      0) {
+    toolbar_reveal_poll_active_ = true;
+  }
+}
+
+void FloatingLyricWindow::StopToolbarRevealPolling() {
+  if (!toolbar_reveal_poll_active_) {
+    return;
+  }
+  if (hwnd_ != nullptr) {
+    KillTimer(hwnd_, kToolbarRevealTimerId);
+  }
+  toolbar_reveal_poll_active_ = false;
+}
+
+bool FloatingLyricWindow::CursorInToolbarRevealZone() const {
+  POINT cursor;
+  if (hwnd_ == nullptr || !GetCursorPos(&cursor)) {
+    return toolbar_revealed_;
+  }
+  RECT zone = {};
+  if (!GetWindowRect(hwnd_, &zone)) {
+    return toolbar_revealed_;
+  }
+  // 揭示区 = 正文窗 ∪ 工具条矩形。工具条画在正文窗**上沿之上**
+  // （ComputePassThroughToolbarLayout 从 wr.top 起算再退一个 margin），只圈正文窗
+  // 的话，鼠标一往工具条方向移就被判成"离开"，工具条会在指针到达之前先消失。
+  const hook_toolbar::Layout layout = ComputePassThroughToolbarLayout();
+  zone.left = std::min(zone.left, layout.rect.left);
+  zone.top = std::min(zone.top, layout.rect.top);
+  zone.right = std::max(zone.right, layout.rect.right);
+  zone.bottom = std::max(zone.bottom, layout.rect.bottom);
+  const int margin =
+      static_cast<int>(std::lround(ScaleForDpi(kToolbarRevealMarginDip)));
+  InflateRect(&zone, margin, margin);
+  return PtInRect(&zone, cursor) != FALSE;
+}
+
+void FloatingLyricWindow::UpdateToolbarReveal() {
+  if (!hook_text_mode_ || hwnd_ == nullptr || !visible_) {
+    return;
+  }
+  const bool want =
+      ToolbarAutoHideActive() ? CursorInToolbarRevealZone() : true;
+  if (want == toolbar_revealed_) {
+    return;
+  }
+  toolbar_revealed_ = want;
+  if (!ApplyToolbarVisibility()) {
+    // Show 失败（建窗/定位失败）时**必须把状态退回去**：这里丢弃返回值的话，
+    // `toolbar_revealed_` 已经是 true 而窗口并不在屏幕上，下一拍
+    // `want == toolbar_revealed_` 就直接早退——工具条再也回不来，而这正是穿透
+    // 态下唯一的逃生口。回滚后下一拍会重试。
+    toolbar_revealed_ = !want;
+  }
+}
+
+void FloatingLyricWindow::SyncPassThroughToolbar() {
+  if (!pass_through_toolbar_.IsShowing()) {
+    return;
+  }
+  pass_through_toolbar_.Sync(toolbar_profile_,
+                             ComputePassThroughToolbarLayout(), ToolbarStyle(),
+                             ToolbarStates());
+}
+
+void FloatingLyricWindow::SetTopmostCeilingProvider(
+    std::function<HWND()> provider) {
+  topmost_ceiling_ = std::move(provider);
+}
+
+void FloatingLyricWindow::ReassertTopmost() {
+  if (!OwnsLiveWindow()) {
+    return;
+  }
+  // 用户按 📌 主动取消置顶是显式意图，守卫不得把它顶回去。
+  if (!topmost_) {
+    return;
+  }
+  // 查词卡也有自己的 800ms 置顶守卫（BUG-1479）。两个窗口都往置顶带最顶抢的话，
+  // 卡片会周期性地闪到浮窗底下，所以有卡片时正文窗插在**卡片正下方**：既仍在游戏
+  // 之上（卡片的守卫保证卡片在游戏之上），又不会把卡片压掉。没有卡片时才抢最顶。
+  HWND ceiling = topmost_ceiling_ ? topmost_ceiling_() : nullptr;
+  if (ceiling != nullptr && IsWindow(ceiling) && ceiling != hwnd_) {
+    SetWindowPos(hwnd_, ceiling, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  } else {
+    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+  }
+  // 正文窗刚抬到工具条窗之上，逃生口就被自己的正文盖住了（BUG-951 说的「用户再也
+  // 点不回来」）。同一个 tick 里把工具条重新顶上去——它的 Sync 在无需重绘时只做一次
+  // SetWindowPos，代价与这里的一次相同。
+  SyncPassThroughToolbar();
+}
+
+void FloatingLyricWindow::StartTopmostGuard() {
+  if (topmost_guard_active_ || hwnd_ == nullptr) {
+    return;
+  }
+  if (SetTimer(hwnd_, kTopmostGuardTimerId, kTopmostGuardIntervalMs,
+               nullptr) != 0) {
+    topmost_guard_active_ = true;
+  }
+}
+
+void FloatingLyricWindow::StopTopmostGuard() {
+  if (!topmost_guard_active_) {
+    return;
+  }
+  if (hwnd_ != nullptr) {
+    KillTimer(hwnd_, kTopmostGuardTimerId);
+  }
+  topmost_guard_active_ = false;
+}
+
+void FloatingLyricWindow::MoveBodyTo(int x, int y) {
+  if (hwnd_ == nullptr) {
+    return;
+  }
+  RECT rc;
+  if (!GetWindowRect(hwnd_, &rc)) {
+    return;
+  }
+  const int width = rc.right - rc.left;
+  const int height = rc.bottom - rc.top;
+  // Clamp against the monitor under the cursor, exactly like the body's own
+  // drag path (TODO-832), so dragging by the toolbar cannot push the overlay
+  // off-screen and can still slide it across displays.
+  POINT cursor;
+  if (GetCursorPos(&cursor)) {
+    HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfo(monitor, &mi)) {
+      const POINT clamped =
+          ClampOriginToWorkArea(x, y, width, height, mi.rcWork);
+      x = clamped.x;
+      y = clamped.y;
+    }
+  }
+  SetWindowPos(hwnd_, topmost_ ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, 0, 0,
+               SWP_NOSIZE | SWP_NOACTIVATE);
+  SyncPassThroughToolbar();
+}
+
+void FloatingLyricWindow::SetInitialBounds(int left, int top, int width,
+                                           int height) {
+  if (width <= 0 || height <= 0) {
+    has_initial_bounds_ = false;
+    return;
+  }
+  initial_bounds_ = {left, top, left + width, top + height};
+  has_initial_bounds_ = true;
+  if (hwnd_ != nullptr) {
+    SetWindowPos(hwnd_, HWND_TOPMOST, left, top, width, height,
+                 SWP_NOACTIVATE);
+    SyncStripSizeFromWindow();
+    ClampCurrentPositionToWindowMonitor();
+    RequestRender();
+  }
+}
+
+void FloatingLyricWindow::NotifyBoundsChanged() {
+  if (hwnd_ == nullptr || !on_bounds_) {
+    return;
+  }
+  RECT rect;
+  if (!GetWindowRect(hwnd_, &rect)) {
+    return;
+  }
+  on_bounds_(rect.left, rect.top, rect.right - rect.left,
+             rect.bottom - rect.top);
+}
+
+void FloatingLyricWindow::RequestRender() {
+  if (hwnd_ != nullptr && visible_) {
+    Render();
+  }
+}
+
+LRESULT CALLBACK FloatingLyricWindow::WndProc(HWND hwnd, UINT message,
+                                              WPARAM wparam,
+                                              LPARAM lparam) noexcept {
+  if (message == WM_NCCREATE) {
+    auto* create = reinterpret_cast<CREATESTRUCT*>(lparam);
+    SetWindowLongPtr(hwnd, GWLP_USERDATA,
+                     reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+    auto* self = static_cast<FloatingLyricWindow*>(create->lpCreateParams);
+    self->hwnd_ = hwnd;
+    return DefWindowProc(hwnd, message, wparam, lparam);
+  }
+  auto* self = reinterpret_cast<FloatingLyricWindow*>(
+      GetWindowLongPtr(hwnd, GWLP_USERDATA));
+  if (self != nullptr) {
+    return self->HandleMessage(hwnd, message, wparam, lparam);
+  }
+  return DefWindowProc(hwnd, message, wparam, lparam);
+}
+
+LRESULT FloatingLyricWindow::HandleMessage(HWND hwnd, UINT message,
+                                           WPARAM wparam,
+                                           LPARAM lparam) noexcept {
+  switch (message) {
+    // BUG-2889 — 划词条盖在游戏上方。WS_EX_NOACTIVATE 只挡鼠标点击；触摸 / 触控笔
+    // 按下还会发 WM_POINTERACTIVATE（DefWindowProc 回 PA_ACTIVATE），点一下条子就把
+    // 前台从游戏抢走，宿主「前台必须是游戏」的点击吞咽随之失效（BUG-2788 同一个坑）。
+    case WM_POINTERACTIVATE:
+    case WM_MOUSEACTIVATE:
+      return OverlayNoActivateReply(message);
+    case WM_NCDESTROY: {
+      // Clear ownership at the actual HWND lifetime boundary. Show() can then
+      // rebuild the body on the next automatic line or manual-open request.
+      //
+      // 身份必须取**消息自带的** |hwnd|，不是成员 hwnd_：一旦出现「旧窗口的
+      // NCDESTROY 晚于新窗口创建」的排列，成员早已指向新窗口，用它撤
+      // back-pointer 就是把活着的新窗口拆掉、还顺手把 hwnd_ 清成 null。
+      const HWND destroyed = hwnd;
+      SetWindowLongPtr(destroyed, GWLP_USERDATA, 0);
+      // BUG-2613 — 登记表里存的是 HWND 值；系统回收句柄给别的窗口之前必须撤掉，
+      // 否则将来某个无关窗口拿到同一个值就会被当成覆盖窗口。
+      fushi::UnregisterOverlayClickShield(destroyed);
+      // 成员句柄与复位表只在「死的正是我方当前这一个」时才动。走的是与
+      // Show() 死句柄分支同一张复位表；这里不能用 ForgetDeadWindow()：
+      // WM_NCDESTROY 期间窗口尚未真正消失，OwnsLiveWindow() 仍为真，会被它
+      // 的幂等守卫挡掉。
+      if (hwnd_ == destroyed) {
+        ResetWindowInteractionState();
+        hwnd_ = nullptr;
+        // 通知在复位之后：消费端收到事件时，本对象已经是「无窗口」的干净
+        // 状态，它随时可以回头调 Show() 重建。
+        if (on_destroyed_) on_destroyed_();
+      }
+      return DefWindowProc(destroyed, message, wparam, lparam);
+    }
+    case WM_MOUSEMOVE: {
+      // Mouse messages arrive immediately because the strip is not born
+      // transparent. Here we drive hover affordances, drag, and the press->drag
+      // promotion.
+      if (!hovered_) {
+        hovered_ = true;
+        RequestRender();
+      }
+      if (!tracking_mouse_leave_) {
+        TRACKMOUSEEVENT tme = {};
+        tme.cbSize = sizeof(tme);
+        tme.dwFlags = TME_LEAVE;
+        tme.hwndTrack = hwnd;
+        if (TrackMouseEvent(&tme)) {
+          tracking_mouse_leave_ = true;
+        }
+      }
+      // 鼠标进了窗口才开轮询表：静止光标上按下 Shift 也要能出词（BUG-880 在视频页
+      // 的同款坑）。离开窗口时 WM_MOUSELEAVE 停表。
+      StartHoverLookupPolling();
+      // BUG-1860：拖滚动条 thumb。行程按「轨道可走距离 ↔ 可滚行程」等比换算，
+      // 指针离窗（有 capture，坐标照样送来）也继续跟。这里 return 掉，既不进
+      // 拖窗分支，也不让 Shift-悬停查词在滚动条上乱出词。
+      if (scroll_thumb_dragging_) {
+        const float y = static_cast<float>(GET_Y_LPARAM(lparam));
+        SetScrollOffset(scroll_drag_start_offset_ +
+                        (y - scroll_drag_origin_y_) * scroll_drag_px_per_px_);
+        return 0;
+      }
+      if (dragging_) {
+        POINT cursor;
+        GetCursorPos(&cursor);
+        // Moving the body is ONE primitive: MoveBodyTo carries both the
+        // TODO-832 work-area clamp and the BUG-951 toolbar sync. Open-coding
+        // the SetWindowPos here is what left the pass-through toolbar behind
+        // for the whole drag -- a layered window's SWP_NOSIZE move raises no
+        // WM_PAINT/WM_SIZE, and this branch returns before any RequestRender,
+        // so Render() (the only other caller of SyncPassThroughToolbar) never
+        // ran until the next subtitle line teleported the pill into place.
+        MoveBodyTo(cursor.x - drag_anchor_.x, cursor.y - drag_anchor_.y);
+        return 0;
+      }
+      // A pending press becomes a drag once the cursor travels past the
+      // threshold — but only when the strip is not position-locked. This is the
+      // fix for BUG-205: the bar is now draggable from anywhere on the text,
+      // while a press that does NOT move is still treated as a word-lookup tap.
+      if (pressed_ && !locked_) {
+        POINT cursor;
+        GetCursorPos(&cursor);
+        const int dx = cursor.x - press_origin_.x;
+        const int dy = cursor.y - press_origin_.y;
+        const int threshold = static_cast<int>(ScaleForDpi(kDragThresholdDip));
+        if (dx * dx + dy * dy >= threshold * threshold) {
+          RECT rc;
+          GetWindowRect(hwnd, &rc);
+          drag_anchor_.x = cursor.x - rc.left;
+          drag_anchor_.y = cursor.y - rc.top;
+          dragging_ = true;
+        }
+      }
+      // Shift-悬停查词：按住 Shift 在台词上划过即逐字查词（与阅读器 / 视频字幕的
+      // onShiftHover 同语义）。命中新字才派发一次，见 MaybeHoverLookup。
+      MaybeHoverLookup(static_cast<float>(GET_X_LPARAM(lparam)),
+                       static_cast<float>(GET_Y_LPARAM(lparam)));
+      // 工具条槽位悬停提示（仅 hook 模式）：按钮只在 hovered_ 时可见且可点
+      // （ControlActionAt 同门），提示走同一道门；按压 / 拖拽途中不冒提示。
+      if (hook_text_mode_ && !pressed_ && !dragging_) {
+        const int slot =
+            hovered_ ? HookToolbarSlotAt(
+                           static_cast<float>(GET_X_LPARAM(lparam)),
+                           static_cast<float>(GET_Y_LPARAM(lparam)))
+                     : -1;
+        POINT cursor;
+        GetCursorPos(&cursor);
+        slot_tooltip_.Update(hwnd, toolbar_profile_, slot, cursor.x + 12,
+                             cursor.y + 22);
+      }
+      return 0;
+    }
+    case WM_TIMER: {
+      if (wparam == kTopmostGuardTimerId) {
+        ReassertTopmost();
+        return 0;
+      }
+      if (wparam == kToolbarRevealTimerId) {
+        UpdateToolbarReveal();
+        return 0;
+      }
+      if (wparam != kHoverLookupTimerId) {
+        return DefWindowProc(hwnd, message, wparam, lparam);
+      }
+      // 轮询只补一件 WM_MOUSEMOVE 补不了的事：光标不动、用户刚按下 Shift。光标位置
+      // 现问系统（不缓存），落在窗口外就直接停表——WM_MOUSELEAVE 偶尔会因为窗口 Z
+      // 序变化而不来，这是兜底。
+      POINT cursor;
+      if (!GetCursorPos(&cursor)) {
+        return 0;
+      }
+      RECT rc;
+      if (!GetWindowRect(hwnd, &rc) || !PtInRect(&rc, cursor)) {
+        StopHoverLookupPolling();
+        ResetHoverLookupAnchor();
+        return 0;
+      }
+      POINT client = cursor;
+      ScreenToClient(hwnd, &client);
+      MaybeHoverLookup(static_cast<float>(client.x),
+                       static_cast<float>(client.y));
+      return 0;
+    }
+    case WM_MOUSELEAVE: {
+      tracking_mouse_leave_ = false;
+      StopHoverLookupPolling();
+      ResetHoverLookupAnchor();
+      slot_tooltip_.Hide();
+      if (hovered_ && !dragging_ && !scroll_thumb_dragging_) {
+        hovered_ = false;
+        RequestRender();
+      }
+      return 0;
+    }
+    case WM_LBUTTONDOWN: {
+      // 按下即操作：提示的活儿到此为止，留着会盖在刚变过状态的按钮上。
+      slot_tooltip_.Hide();
+      const float x = static_cast<float>(GET_X_LPARAM(lparam));
+      const float y = static_cast<float>(GET_Y_LPARAM(lparam));
+
+      // 1. Control buttons (prev / play-pause / next / lock / close) win first.
+      const std::string action = ControlActionAt(x, y);
+      if (!action.empty()) {
+        DispatchControlAction(action);
+        return 0;
+      }
+
+      // 2. BUG-1860: the scroll bar is a control, not body. A press on it starts
+      // a thumb drag (locked or not — lock is a POSITION lock, the text must
+      // still scroll) and never becomes a move-the-window drag.
+      if (ScrollBarContains(x, y) && BeginScrollThumbDrag(y)) {
+        return 0;
+      }
+
+      // 3. Otherwise this is a pending press over the body of the strip. We do
+      // NOT decide lookup-vs-drag yet: a still press is a lookup on button-up,
+      // a moving press is promoted to a drag in WM_MOUSEMOVE.
+      POINT cursor;
+      GetCursorPos(&cursor);
+      pressed_ = true;
+      dragging_ = false;
+      press_origin_ = cursor;
+      press_client_.x = static_cast<LONG>(x);
+      press_client_.y = static_cast<LONG>(y);
+      // 触发方式不是左键时，左键按下只用来拖窗，不再"顺手"查词——这正是用户要的
+      // 「至少开启穿透的时候我不是很想单击点到单词」。
+      press_was_text_ = click_lookup_enabled_ && lookup_trigger_ == 0 &&
+                        CharIndexAt(x, y) >= 0 &&
+                        (on_lookup_ || on_context_lookup_);
+      SetCapture(hwnd);
+      return 0;
+    }
+    // BUG-1471: the system took our capture away (foreground window changed —
+    // the game grabbing focus back is a per-session event for a WS_EX_NOACTIVATE
+    // background-thread window). The button-up for this press will never arrive,
+    // so end the gesture here or `pressed_` stays true forever and hover lookup
+    // goes silent for the rest of the session while the text keeps updating.
+    case WM_CAPTURECHANGED: {
+      CancelPointerGesture();
+      return 0;
+    }
+    case WM_LBUTTONUP: {
+      const bool was_dragging = dragging_;
+      const bool was_pressed = pressed_;
+      const bool was_text = press_was_text_;
+      const POINT lookup_pt = press_client_;
+      CancelPointerGesture();
+      POINT cursor;
+      if (GetCursorPos(&cursor)) {
+        RECT rc;
+        if (GetWindowRect(hwnd, &rc) && !PtInRect(&rc, cursor) && hovered_) {
+          hovered_ = false;
+          tracking_mouse_leave_ = false;
+          RequestRender();
+        }
+      }
+      // A press that never moved into a drag over the lyric text fires the word
+      // lookup now — single-tap lookup preserved.
+      if (!was_dragging && was_pressed && was_text) {
+        DispatchLookupAt(static_cast<float>(lookup_pt.x),
+                         static_cast<float>(lookup_pt.y));
+      }
+      if (was_dragging) {
+        NotifyBoundsChanged();
+      }
+      return 0;
+    }
+    // 中键 / 侧键查词。两者都走与左键完全相同的 DispatchLookupAt，所以"查到什么、
+    // 制卡拿到哪句"不因触发键而变；差别只在"哪个键算触发"。
+    //
+    // 前提是这个像素属于本窗口：分层窗按 alpha 逐像素命中，穿透态下背景是真 alpha
+    // 0，只有文字行盒（catch fill）会把消息投进来——这恰好就是想要的语义"按侧键
+    // 查我指着的那个字"。SetPassThroughBlocksMouse(false) 时连行盒都不接，那时本
+    // 分支自然也收不到消息（文档已写明）。
+    case WM_MBUTTONUP:
+    case WM_XBUTTONUP: {
+      const bool matches = (message == WM_MBUTTONUP && lookup_trigger_ == 1) ||
+                           (message == WM_XBUTTONUP && lookup_trigger_ == 2);
+      if (!matches || !click_lookup_enabled_) {
+        return 0;
+      }
+      const float x = static_cast<float>(GET_X_LPARAM(lparam));
+      const float y = static_cast<float>(GET_Y_LPARAM(lparam));
+      if (CharIndexAt(x, y) >= 0 && (on_lookup_ || on_context_lookup_)) {
+        DispatchLookupAt(x, y);
+      }
+      return 0;
+    }
+    case WM_NCHITTEST: {
+      // Hand the bottom-right grip to the system resize loop so the user can
+      // drag the corner to grow / shrink the bar (QQ-Music style). Everywhere
+      // else stays HTCLIENT so our own mouse handlers (lookup / drag / control
+      // buttons) keep receiving WM_LBUTTON*.
+      //
+      // BUG-951: there is deliberately NO pass-through branch here any more.
+      // HTTRANSPARENT only walks same-thread windows, so it never reached the
+      // galgame (a different process) — the click was simply swallowed.
+      //
+      // BUG-1480 UPDATE — the old second half of this comment ("real
+      // pass-through is WS_EX_TRANSPARENT ... while it is set this handler is
+      // not called at all") is no longer true and was actively misleading:
+      // ApplyPassThroughExStyle() deliberately does NOT set that bit any more.
+      // Routing is done by the OS at composition time from the layered window's
+      // per-pixel alpha — the background is forced to a true alpha 0, while the
+      // text line boxes (BUG-1853) and the scroll-bar hit band (BUG-1860) carry
+      // kHookTextMinCatchAlpha. So this handler DOES run in pass-through mode,
+      // but only for the pixels the OS has already decided are ours; it must
+      // keep answering HTBOTTOMRIGHT / HTCLIENT and nothing else.
+      POINT screen = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+      POINT client = screen;
+      ScreenToClient(hwnd, &client);
+      if (ResizeGripContains(static_cast<float>(client.x),
+                             static_cast<float>(client.y))) {
+        return HTBOTTOMRIGHT;
+      }
+      return HTCLIENT;
+    }
+    case WM_MOUSEWHEEL: {
+      // BUG-1095 (第二阶段) — 滚轮翻台词。交互契约写在这里，别处不再重复：
+      //
+      //  * **接管条件**全在 ScrollBy 里（hook 模式 + 真有溢出）。不满足
+      //    就落回 DefWindowProc，歌词条 / 剪贴板文本窗的行为一字不改。
+      //  * **穿透模式**不是例外（BUG-1859）：穿透态靠逐像素 alpha 分流，滚轮
+      //    落在文字行盒上才会投到这里，落在背景上 OS 直接给游戏。到了这里就
+      //    照滚——与「穿透态点字查词」（BUG-1480）是同一份判定。
+      //  * **和工具条不打架**：那八个按钮只吃 WM_LBUTTONDOWN，从不吃滚轮。所以
+      //    滚轮的命中区可以是整个窗口，不需要「避开按钮」这种特例分支——鼠标停
+      //    在按钮上滚也照样翻文本，这正是用户预期。
+      //  * **滚到顶 / 滚到底不吞事件**（ScrollBy 返回 false），避免把窗口变成一
+      //    个吃掉滚轮的黑洞。
+      const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+      if (delta != 0) {
+        const float step = ScaleForDpi(kScrollWheelStepDip) *
+                           (-static_cast<float>(delta) / WHEEL_DELTA);
+        // 竖排时 scroll_offset_px_ 作用在 x 上：向下滚（step > 0）= 偏移增大 =
+        // 内容右移、往左看后文，与横排「向下滚看后文」同一个阅读方向。
+        if (ScrollBy(step)) {
+          // 用户手动翻看上下文：停止跟随当前句，直到下一句到来。
+          follow_current_line_ = false;
+          return 0;
+        }
+      }
+      return DefWindowProc(hwnd, message, wparam, lparam);
+    }
+    case WM_SIZE: {
+      // A system resize (corner drag) changed the window rect; recompute the
+      // logical strip size and re-render so the text + controls follow.
+      SyncStripSizeFromWindow();
+      text_format_.Reset();
+      ruby_format_.Reset();
+      text_layout_.Reset();
+      RequestRender();
+      return 0;
+    }
+    case WM_EXITSIZEMOVE: {
+      SyncStripSizeFromWindow();
+      ClampCurrentPositionToWindowMonitor();
+      NotifyBoundsChanged();
+      return 0;
+    }
+    case WM_GETMINMAXINFO: {
+      // Clamp the system resize to the same sane bounds the bar is authored
+      // for, so the user cannot drag it to an unusable size.
+      auto* mmi = reinterpret_cast<MINMAXINFO*>(lparam);
+      mmi->ptMinTrackSize.x = static_cast<LONG>(ScaleForDpi(MinStripWidthDip()));
+      mmi->ptMinTrackSize.y = static_cast<LONG>(ScaleForDpi(kMinStripHeightDip));
+      mmi->ptMaxTrackSize.x = static_cast<LONG>(ScaleForDpi(kMaxStripWidthDip));
+      mmi->ptMaxTrackSize.y = static_cast<LONG>(ScaleForDpi(kMaxStripHeightDip));
+      return 0;
+    }
+    case WM_DPICHANGED: {
+      dpi_ = HIWORD(wparam);
+      DiscardDeviceResources();
+      EnsureDeviceResources();
+      // TODO-832: a DPI change (e.g. dragged to a different-scale monitor, or
+      // the user changed scaling) can leave the strip partly off the new work
+      // area. The cursor isn't necessarily over the window here, so clamp
+      // against the window's own monitor work area, not the cursor's.
+      ClampCurrentPositionToWindowMonitor();
+      RequestRender();
+      return 0;
+    }
+    case WM_DISPLAYCHANGE: {
+      // TODO-832: resolution / monitor hot-plug can shrink or remove the work
+      // area the strip was sitting in; pull it back so ≥ kMinVisibleMarginDip
+      // stays grabbable. Use the window's monitor (cursor may be elsewhere).
+      ClampCurrentPositionToWindowMonitor();
+      RequestRender();
+      return 0;
+    }
+    default:
+      return DefWindowProc(hwnd, message, wparam, lparam);
+  }
+}
+
+void FloatingLyricWindow::Render() {
+  if (hwnd_ == nullptr || !EnsureDeviceResources()) {
+    return;
+  }
+
+  RECT rc;
+  GetClientRect(hwnd_, &rc);
+  const int width = rc.right - rc.left;
+  const int height = rc.bottom - rc.top;
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+
+  // Render into a 32-bpp top-down DIB, then push it to the layered window for
+  // true per-pixel alpha (translucent rounded strip over the desktop).
+  HDC screen_dc = GetDC(nullptr);
+  HDC mem_dc = CreateCompatibleDC(screen_dc);
+  BITMAPINFO bmi = {};
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth = width;
+  bmi.bmiHeader.biHeight = -height;  // top-down
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+  void* bits = nullptr;
+  HBITMAP dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  HBITMAP old_bmp = static_cast<HBITMAP>(SelectObject(mem_dc, dib));
+
+  RECT bind_rect = {0, 0, width, height};
+  if (FAILED(render_target_->BindDC(mem_dc, &bind_rect))) {
+    SelectObject(mem_dc, old_bmp);
+    DeleteObject(dib);
+    DeleteDC(mem_dc);
+    ReleaseDC(nullptr, screen_dc);
+    return;
+  }
+
+  render_target_->BeginDraw();
+  render_target_->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+  // TODO-708 P2: 圆角半径可调。0 是合法取值（直角），所以这里**没有**哨兵分支——
+  // 历史默认由 Style::corner_radius 的默认值承担（见头文件）。夹区间是防畸形负载：
+  // 上界与偏好侧 galHookTextCornerRadiusMax 同值。
+  static_assert(kCornerRadiusDip == 14.0f,
+                "Style::corner_radius 的默认值必须与之同源");
+  const float corner_dip =
+      static_cast<float>(std::clamp(style_.corner_radius, 0.0, 40.0));
+  const float corner = ScaleForDpi(corner_dip);
+  D2D1_ROUNDED_RECT bg_rect = D2D1::RoundedRect(
+      D2D1::RectF(0, 0, static_cast<float>(width), static_cast<float>(height)),
+      corner, corner);
+
+  // BUG-1046: keep the interactive hook-text body hit-testable when the user
+  // hides the background — floor the fill alpha (see kHookTextMinCatchAlpha).
+  uint32_t body_bg = style_.bg_color;
+  if (hook_text_mode_ && !pass_through_ &&
+      (body_bg >> 24) < kHookTextMinCatchAlpha) {
+    body_bg = (kHookTextMinCatchAlpha << 24) | (body_bg & 0x00FFFFFF);
+  }
+  // BUG-1480: pass-through now relies on PER-PIXEL hit testing (see
+  // ApplyPassThroughExStyle) instead of WS_EX_TRANSPARENT, so the background
+  // MUST be truly alpha 0 — otherwise a user-chosen visible background makes
+  // the whole rect opaque, the OS routes every click to us, and the game gets
+  // nothing. This is the exact failure the old per-pixel behaviour had; forcing
+  // the fill removes the "only works if you happened to set opacity 0" caveat
+  // rather than documenting it.
+  if (hook_text_mode_ && pass_through_) {
+    body_bg &= 0x00FFFFFF;
+  }
+  Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+  render_target_->CreateSolidColorBrush(ColorFromArgb(body_bg),
+                                        brush.GetAddressOf());
+  render_target_->FillRoundedRectangle(bg_rect, brush.Get());
+
+  // Text format / layout. The audiobook lyric strip keeps its historical
+  // behaviour: its authored font size assumes the default bar height and the
+  // live font scales with strip_height_dip_, so dragging the resize grip larger
+  // enlarges the lyric text too. Hook mode does NOT (BUG-1095): its font size is
+  // an independent user preference, so dragging the overlay taller buys visible
+  // LINES instead of re-inflating the same two lines.
+  const float height_scale =
+      hook_text_mode_ ? 1.0f : strip_height_dip_ / kBaseStripHeightForFontDip;
+  const float scaled_font = static_cast<float>(style_.font_size) *
+                            std::max(0.5f, height_scale);
+  // 注音字号与行盒加高量（物理 px）。ruby_spans_ 为空时下面所有注音分支都不执行，
+  // 排版与绘制逐像素回到引入注音之前。
+  const float ruby_font_px =
+      static_cast<float>(ScaleForDpi(scaled_font * kRubyFontScale));
+  const float ruby_gap_px = ruby_font_px * kRubyLineGapScale;
+  // has_ruby 在下面建好 text_format_（确定是否竖排）之后才定。
+
+  // 桌面歌词字重：hook 模式半粗（描边字太细会被描边吃掉笔画）；歌词条 / 剪贴板
+  // 窗保持 NORMAL，逐像素不变。
+  const DWRITE_FONT_WEIGHT text_weight =
+      hook_text_mode_ && style_.bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD
+                                     : DWRITE_FONT_WEIGHT_NORMAL;
+  auto create_text_format = [&](float font_size,
+                                IDWriteTextFormat** format) -> HRESULT {
+    const wchar_t* family = resolved_font_family_.empty()
+                                ? DefaultFontFamily()
+                                : resolved_font_family_.c_str();
+    HRESULT hr = dwrite_factory_->CreateTextFormat(
+        family, custom_font_collection_.Get(), text_weight,
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, font_size, L"",
+        format);
+    // 最后一道兜底：不带自定义 collection、钉死系统必装的 Yu Gothic UI。这里的
+    // 两个 L"Yu Gothic UI" 是**重试目标**，不是「本表面的默认字族」，所以绝不能
+    // 换成 DefaultFontFamily()——一换，hook 模式下 resolved 就等于重试目标，
+    // 判据恒假、重试整条消失，DirectWrite 在 Yu Gothic 上失手时连兜底都没有。
+    // 判据本身只回答一件事：这次重试是否与刚失败的那次不同。
+    if (FAILED(hr) &&
+        (custom_font_collection_ != nullptr ||
+         resolved_font_family_ != L"Yu Gothic UI")) {
+      hr = dwrite_factory_->CreateTextFormat(
+          L"Yu Gothic UI", nullptr, text_weight, DWRITE_FONT_STYLE_NORMAL,
+          DWRITE_FONT_STRETCH_NORMAL, font_size, L"", format);
+    }
+    return hr;
+  };
+  if (text_format_ == nullptr) {
+    create_text_format(static_cast<float>(ScaleForDpi(scaled_font)),
+                       text_format_.GetAddressOf());
+    if (text_format_ != nullptr) {
+      text_format_->SetTextAlignment(
+          hook_text_mode_ && style_.text_alignment == 1
+              ? DWRITE_TEXT_ALIGNMENT_LEADING
+              : DWRITE_TEXT_ALIGNMENT_CENTER);
+      // BUG-1890: honour the vertical-alignment preference at creation time
+      // too. In hook mode this initial value is overwritten every frame by
+      // the layout-level call below, but the audiobook lyric strip
+      // (hook_text_mode_ == false) only ever uses this one — it must stay
+      // centred, so the preference is scoped to hook mode here as well.
+      text_format_->SetParagraphAlignment(
+          hook_text_mode_ && style_.vertical_alignment == 1
+              ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+              : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+      text_format_->SetWordWrapping(
+          hook_text_mode_ ? DWRITE_WORD_WRAPPING_WRAP
+                          : DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    // 竖排（仅 hook 模式）：字从上往下（reading TOP_TO_BOTTOM）、行从右往左
+    // （flow RIGHT_TO_LEFT）。DirectWrite 在 TOP_TO_BOTTOM 阅读方向下自动对 CJK
+    // 走竖排字形（OpenType vert / vrt2：「」、。ー 等换成竖排字形），拉丁字母按默认
+    // glyph orientation 横躺，不需要我们挂任何字体特性。
+    //
+    // 对齐语义随轴旋转、由 DirectWrite 自己映射，上面两行 Set*Alignment 不用改：
+    //  * TextAlignment 作用在阅读方向（纵向）：CENTER = 列内纵向居中，LEADING =
+    //    顶端——即用户「居中 / 前端」偏好在竖排下的自然含义；
+    //  * ParagraphAlignment 作用在行进方向（横向）：每帧在下面的排版分支里按
+    //    「放得下整块水平居中、溢出则 NEAR（第一行贴右）」重设。
+    //
+    // 任一步失败都回退横排（把两个方向恢复成默认值），vertical_active_ 保持
+    // false；建 layout 时若因方向冲突失败，下面还有第二道回退。
+    vertical_active_ = false;
+    if (text_format_ != nullptr && hook_text_mode_ && style_.vertical_text) {
+      if (SUCCEEDED(text_format_->SetReadingDirection(
+              DWRITE_READING_DIRECTION_TOP_TO_BOTTOM)) &&
+          SUCCEEDED(text_format_->SetFlowDirection(
+              DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT))) {
+        vertical_active_ = true;
+      } else {
+        text_format_->SetReadingDirection(DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+        text_format_->SetFlowDirection(DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM);
+      }
+    }
+    text_layout_.Reset();
+  }
+  // 竖排下不画注音（有声书路径本来就不传 rubySpans）：注音几何（行盒顶部那条
+  // 加高留白、DrawText 横排小字）全是按横排推导的，竖排要的是「列右侧的竖排
+  // 小字」，硬套只会把读音画到相邻列上。has_ruby 一并为 false，所以下面的行距
+  // 加高也不会为注音多留一条横向空隙，竖排列距只受 line_height 偏好控制。
+  // （非 const：建 layout 时竖排若回退横排，下面会按横排重算一次。）
+  bool has_ruby = !ruby_spans_.empty() && !vertical_active_;
+
+  // 振假名的小号 format：居中 + 不换行。注音比基准字窄时居中压在基准上方；比
+  // 基准宽时向两侧对称溢出（DrawText 不带 CLIP 选项不会自己裁，外层已经用
+  // PushAxisAlignedClip 把一切文字绘制框在 text_rect_ 里，绝不会画到控件带上）。
+  auto ensure_ruby_format = [&]() {
+    if (!has_ruby || ruby_format_ != nullptr) return;
+    create_text_format(ruby_font_px, ruby_format_.GetAddressOf());
+    if (ruby_format_ != nullptr) {
+      ruby_format_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+      ruby_format_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+      ruby_format_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+  };
+  ensure_ruby_format();
+
+  const float text_padding_dip =
+      hook_text_mode_
+          ? std::clamp(static_cast<float>(style_.text_padding), 0.0f, 120.0f)
+          : kHorizontalPaddingDip;
+  const float pad = ScaleForDpi(text_padding_dip);
+  // 工具条带文字时多一条文字带，正文顶部预留跟着加高（台词不被标签压住）。
+  const float controls_h =
+      ScaleForDpi(hook_text_mode_ ? kHookTextButtonSizeDip : kButtonSizeDip) +
+      ScaleForDpi(kControlsTopDip) +
+      (ToolbarLabelsActive(static_cast<float>(width)) ? ScaleForDpi(kToolbarLabelHeightDip) : 0.0f);
+  // Both modes reserve controls_h at the top: the lyric strip for its transport
+  // row, the hook text window for its thin Luna-style hover toolbar
+  // (the text sits below the strip so the toolbar never overlaps it).
+  text_rect_.left = pad;
+  text_rect_.top = controls_h;
+  text_rect_.width = std::max(1.0f, width - pad * 2);
+  text_rect_.height = std::max(1.0f, height - controls_h - pad * 0.5f);
+
+  // BUG-1095 (第二阶段) — 可滚行程每帧从零重算：文本 / 字号 / 窗高任何一项变了都
+  // 在下面的排版分支里重新量出来。没有文本 = 没有行程（分支根本不执行）；非 hook
+  // 模式也永远停在 0，歌词条 / 剪贴板窗因此完全不受滚动这套东西影响。
+  scroll_max_px_ = 0.0f;
+  vertical_flow_shift_px_ = 0.0f;
+
+  if (text_format_ != nullptr && !text_.empty()) {
+    if (text_layout_ == nullptr) {
+      HRESULT layout_hr = dwrite_factory_->CreateTextLayout(
+          text_.c_str(), static_cast<UINT32>(text_.size()), text_format_.Get(),
+          text_rect_.width, text_rect_.height, text_layout_.GetAddressOf());
+      // 竖排的第二道回退：读/行方向组合在部分系统上要到建 layout 时才校验
+      // （DWRITE_E_FLOWDIRECTIONCONFLICTS 等）。失败就把 format 恢复横排再建一次，
+      // 竖排失败绝不让整条字幕消失。横排路径不进这个分支。
+      if (FAILED(layout_hr) && vertical_active_) {
+        text_layout_.Reset();
+        text_format_->SetReadingDirection(DWRITE_READING_DIRECTION_LEFT_TO_RIGHT);
+        text_format_->SetFlowDirection(DWRITE_FLOW_DIRECTION_TOP_TO_BOTTOM);
+        vertical_active_ = false;
+        has_ruby = !ruby_spans_.empty();
+        ensure_ruby_format();
+        dwrite_factory_->CreateTextLayout(
+            text_.c_str(), static_cast<UINT32>(text_.size()),
+            text_format_.Get(), text_rect_.width, text_rect_.height,
+            text_layout_.GetAddressOf());
+      }
+      if (hook_text_mode_ && text_layout_ != nullptr &&
+          std::abs(style_.letter_spacing) > 0.001) {
+        Microsoft::WRL::ComPtr<IDWriteTextLayout1> layout1;
+        if (SUCCEEDED(text_layout_.As(&layout1))) {
+          const float spacing = ScaleForDpi(static_cast<float>(
+              std::clamp(style_.letter_spacing, -5.0, 20.0)));
+          const DWRITE_TEXT_RANGE all = {
+              0, static_cast<UINT32>(text_.size())};
+          layout1->SetCharacterSpacing(0.0f, spacing, 0.0f, all);
+        }
+      }
+      // 有注音就把每行的行盒整体加高、基线整体下压 ruby_gap_px：多出来的空间
+      // 正好落在每行字的**正上方**，注音画进去既不遮基准字，也不会压到上一行。
+      // 只加高、不改宽，所以自动折行的断点与没有注音时完全一致。
+      if (text_layout_ != nullptr &&
+          (has_ruby ||
+           (hook_text_mode_ && std::abs(style_.line_height - 1.0) > 0.001))) {
+        // 先问行数再按数分配：缓冲区不足时 DirectWrite 只回填 actualLineCount，
+        // 并不写入 metrics，拿一个未初始化的行高去设行距会直接把排版搞乱。
+        UINT32 line_count = 0;
+        text_layout_->GetLineMetrics(nullptr, 0, &line_count);
+        if (line_count > 0) {
+          std::vector<DWRITE_LINE_METRICS> lines(line_count);
+          if (SUCCEEDED(text_layout_->GetLineMetrics(lines.data(), line_count,
+                                                     &line_count)) &&
+              line_count > 0) {
+            const float line_height = hook_text_mode_
+                                          ? static_cast<float>(std::clamp(
+                                                style_.line_height, 0.8, 2.0))
+                                          : 1.0f;
+            const float extra = lines[0].height * (line_height - 1.0f);
+            text_layout_->SetLineSpacing(
+                DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                lines[0].height + extra + (has_ruby ? ruby_gap_px : 0.0f),
+                std::max(0.0f, lines[0].baseline + extra * 0.5f +
+                                   (has_ruby ? ruby_gap_px : 0.0f)));
+          }
+        }
+      }
+    }
+    if (text_layout_ != nullptr) {
+      // BUG-1095: with scrolling added (phase 2) the strip no longer loses the
+      // tail for good, but WHICH end is off-screen first still matters. With the paragraph
+      // vertically centred, an over-long caption loses its head AND its tail
+      // symmetrically — the user cannot even start reading. Top-align the hook
+      // caption the moment it no longer fits, so reading order is preserved and
+      // only the tail is lost; a caption that fits stays centred (unchanged
+      // pixels). Scoped to hook mode: the audiobook lyric strip wants its
+      // current line near the middle, so its centring is left alone.
+      if (hook_text_mode_ && vertical_active_) {
+        // 竖排：同一套「溢出即贴开头 + 溢出量即行程」模型旋转 90°。
+        //  * 行进方向是从右往左，ParagraphAlignment 管的是行块的**横向**位置：
+        //    放得下整块水平居中；溢出则 NEAR（RTL flow 下 = 第一行贴右沿），保证
+        //    阅读顺序上的开头可见、被裁的是句尾。vertical_alignment 偏好在竖排下
+        //    不参与——竖排的「顶端 / 居中」由 text_alignment（阅读方向）承担。
+        //  * 行程是横向溢出量；滚动 = 绘制原点右移 scroll_offset_px_（见
+        //    TextOriginX），裁剪框不动，左边被裁掉的后文从左侧走进来。
+        DWRITE_TEXT_METRICS metrics = {};
+        if (SUCCEEDED(text_layout_->GetMetrics(&metrics))) {
+          const bool overflow = metrics.width > text_rect_.width;
+          text_layout_->SetParagraphAlignment(
+              overflow ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+                       : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+          scroll_max_px_ = std::max(0.0f, metrics.width - text_rect_.width);
+          if (scroll_max_px_ > 0.0f) {
+            // 对齐改了，metrics.left 随之改变：重新量一次，再把排版块右沿对齐到
+            // 视口右沿（NEAR + RTL 本来就该贴右，这一项通常为 0；显式算出来是为了
+            // 不把滚动模型押在 DirectWrite 溢出时的摆放细节上）。
+            DWRITE_TEXT_METRICS aligned = {};
+            if (SUCCEEDED(text_layout_->GetMetrics(&aligned))) {
+              vertical_flow_shift_px_ =
+                  text_rect_.width - (aligned.left + aligned.width);
+            }
+          }
+          // 跟随当前句：当前句行盒（竖排下是若干列）的水平中线对准视口中线。
+          if (follow_current_line_ && scroll_max_px_ > 0.0f &&
+              current_line_start_ >= 0 && current_line_length_ > 0) {
+            const int len = static_cast<int>(text_.size());
+            const int cur_start = std::clamp(current_line_start_, 0, len);
+            const int cur_end = std::clamp(
+                current_line_start_ + current_line_length_, cur_start, len);
+            UINT32 cur_hits = 0;
+            text_layout_->HitTestTextRange(
+                static_cast<UINT32>(cur_start),
+                static_cast<UINT32>(cur_end - cur_start), 0, 0, nullptr, 0,
+                &cur_hits);
+            if (cur_hits > 0) {
+              std::vector<DWRITE_HIT_TEST_METRICS> cur_metrics(cur_hits);
+              if (SUCCEEDED(text_layout_->HitTestTextRange(
+                      static_cast<UINT32>(cur_start),
+                      static_cast<UINT32>(cur_end - cur_start), 0, 0,
+                      cur_metrics.data(), cur_hits, &cur_hits)) &&
+                  cur_hits > 0) {
+                float cur_left = FLT_MAX;
+                float cur_right = -FLT_MAX;
+                for (const auto& m : cur_metrics) {
+                  cur_left = std::min(cur_left, m.left);
+                  cur_right = std::max(cur_right, m.left + m.width);
+                }
+                if (cur_right > cur_left) {
+                  // 视口里的 x = shift + offset + layout_x；令行盒中线落在
+                  // text_rect_.width / 2 解出 offset。
+                  scroll_offset_px_ = text_rect_.width * 0.5f -
+                                      vertical_flow_shift_px_ -
+                                      (cur_left + cur_right) * 0.5f;
+                }
+              }
+            }
+          }
+        }
+      } else if (hook_text_mode_) {
+        DWRITE_TEXT_METRICS metrics = {};
+        if (SUCCEEDED(text_layout_->GetMetrics(&metrics))) {
+          // BUG-1890：用户选「顶部对齐」时恒 NEAR；没选则维持 BUG-1095 的原判据
+          // （溢出才顶对齐、放得下仍居中）。两种设置在**溢出**场景下行为完全一致，
+          // 而下面的滚动模型（scroll_max_px_ / text_origin_y）本来就是按 NEAR
+          // 顶对齐推导出来的，恒 NEAR 只会让它更自洽，不需要额外改。
+          text_layout_->SetParagraphAlignment(
+              (style_.vertical_alignment == 1 ||
+               metrics.height > text_rect_.height)
+                  ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR
+                  : DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+          // BUG-1095 (第二阶段) — 溢出量就是可滚动行程。
+          //
+          // 顶端对齐（上面那句 NEAR）让排版从 text_rect_.top 起画，于是「滚动」
+          // 就是把绘制原点整体上移 scroll_offset_px_，而下面的裁剪框 text_clip
+          // 一动不动 —— 视口下移，被裁掉的句尾从下面走进来。这是分层窗里唯一
+          // 不需要第二个渲染目标就能做出来的滚动。
+          scroll_max_px_ = std::max(0.0f, metrics.height - text_rect_.height);
+          // 多行上下文跟随：当前句的行盒中线对准视口中线（与歌词模式同观感）。
+          // 只有溢出时才有行程可调；放得下时整块照旧居中，不需要滚。
+          if (follow_current_line_ && scroll_max_px_ > 0.0f &&
+              current_line_start_ >= 0 && current_line_length_ > 0) {
+            const int len = static_cast<int>(text_.size());
+            const int cur_start = std::clamp(current_line_start_, 0, len);
+            const int cur_end = std::clamp(
+                current_line_start_ + current_line_length_, cur_start, len);
+            UINT32 cur_hits = 0;
+            text_layout_->HitTestTextRange(
+                static_cast<UINT32>(cur_start),
+                static_cast<UINT32>(cur_end - cur_start), 0, 0, nullptr, 0,
+                &cur_hits);
+            if (cur_hits > 0) {
+              std::vector<DWRITE_HIT_TEST_METRICS> cur_metrics(cur_hits);
+              if (SUCCEEDED(text_layout_->HitTestTextRange(
+                      static_cast<UINT32>(cur_start),
+                      static_cast<UINT32>(cur_end - cur_start), 0, 0,
+                      cur_metrics.data(), cur_hits, &cur_hits)) &&
+                  cur_hits > 0) {
+                float cur_top = FLT_MAX;
+                float cur_bottom = -FLT_MAX;
+                for (const auto& m : cur_metrics) {
+                  cur_top = std::min(cur_top, m.top);
+                  cur_bottom = std::max(cur_bottom, m.top + m.height);
+                }
+                if (cur_bottom > cur_top) {
+                  scroll_offset_px_ = (cur_top + cur_bottom) * 0.5f -
+                                      text_rect_.height * 0.5f;
+                }
+              }
+            }
+          }
+        }
+      }
+      scroll_offset_px_ = std::clamp(scroll_offset_px_, 0.0f, scroll_max_px_);
+      // 没有溢出时 scroll_offset_px_ 恒为 0，text_origin_y == text_rect_.top，
+      // 与滚动引入之前逐像素一致。竖排时滚动作用在 x 上、y 恒为 text_rect_.top；
+      // 横排时 text_origin_x 恒为 text_rect_.left（见 TextOriginX / TextOriginY）。
+      const float text_origin_x = TextOriginX();
+      const float text_origin_y = TextOriginY();
+      // BUG-1070: the lyric / hook-text body is vertically centred
+      // (DWRITE_PARAGRAPH_ALIGNMENT_CENTER) inside a layout box whose top edge
+      // is text_rect_.top == controls_h, i.e. just below the hover control band
+      // [kControlsTopDip, kControlsTopDip + kButtonSizeDip]. When the wrapped
+      // text is taller than the box (many lines in a short strip), vertical
+      // centring pushes the extra lines symmetrically OUTWARD, so the top lines
+      // spill ABOVE the box into the control band. Because the buttons only
+      // occupy the horizontal centre, the spilled glyphs show through the two
+      // uncovered sides of the toolbar strip and read as "the subtitle is
+      // covering the UI". Clip every pixel of text drawing (highlight fills +
+      // the DrawTextLayout below) to text_rect_ so nothing is ever painted above
+      // y == controls_h. text_rect_ is already in physical px (its top/left use
+      // the same ScaleForDpi() as the render target's pixel-sized DIB), so no
+      // extra DIP→px conversion is needed. A short single line stays vertically
+      // centred well inside text_rect_ and is therefore never clipped.
+      const D2D1_RECT_F text_clip = D2D1::RectF(
+          text_rect_.left, text_rect_.top, text_rect_.left + text_rect_.width,
+          text_rect_.top + text_rect_.height);
+      render_target_->PushAxisAlignedClip(text_clip,
+                                          D2D1_ANTIALIAS_MODE_ALIASED);
+      // BUG-1853 — 穿透态的碰撞箱改成「文字行矩形并集」。
+      //
+      // 穿透态整窗背景是真 alpha 0（上面 body_bg &= 0x00FFFFFF），OS 逐像素判定
+      // 下「窗口存在的像素」只剩字形本身：口/国/目 的内部、笔画之间、字距行距的
+      // 镂空全是 alpha 0，点上去直接透给游戏 → 台词被推进/误触分支。这里在每一
+      // 行文字的行盒里铺一层 kHookTextMinCatchAlpha 的不可见 catch fill（与非穿
+      // 透态整窗 alpha 兜底同一技法），让行矩形内任何一点都算「点在字上」；行矩
+      // 形外仍是 alpha 0，「点背景推台词」的不变式不动。行盒来自 DirectWrite
+      // 自己的 HitTestTextRange（有注音时行盒已被 SetLineSpacing 加高，注音带自
+      // 然在内），坐标换算与下面高亮框 / CharIndexAt 同一公式，再由外层
+      // text_clip 裁掉滚出视口的行。不引入 WS_EX_TRANSPARENT / HTTRANSPARENT /
+      // 定时器（BUG-951 / PR#460 两次事故的老路）。
+      // passthrough_blocks_mouse_ = false 时连这层 catch fill 都不铺：行盒内也是
+      // 真 alpha 0，整窗对游戏彻底透明（用户「穿透不彻底等于彻底不穿透」）。
+      if (hook_text_mode_ && pass_through_ && passthrough_blocks_mouse_ &&
+          !text_.empty()) {
+        UINT32 line_hit_count = 0;
+        text_layout_->HitTestTextRange(0, static_cast<UINT32>(text_.size()), 0,
+                                       0, nullptr, 0, &line_hit_count);
+        if (line_hit_count > 0) {
+          std::vector<DWRITE_HIT_TEST_METRICS> line_metrics(line_hit_count);
+          if (SUCCEEDED(text_layout_->HitTestTextRange(
+                  0, static_cast<UINT32>(text_.size()), 0, 0,
+                  line_metrics.data(), line_hit_count, &line_hit_count))) {
+            Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> catch_brush;
+            render_target_->CreateSolidColorBrush(
+                ColorFromArgb((kHookTextMinCatchAlpha << 24) |
+                              (style_.bg_color & 0x00FFFFFF)),
+                catch_brush.GetAddressOf());
+            if (catch_brush != nullptr) {
+              // BUG-2371 —— 碰撞箱是**文字块的外接矩形**，不是逐行行盒并集。
+              //
+              // 逐行铺留下三类块**内部**的 alpha 0 空洞，点上去照样推进游戏
+              // （BUG-1853 自己在「已知缺口」里记了第一类，另两类同源）：
+              //   ① 空行（台词含连续换行）的行盒宽度为 0，FillRectangle 一个像素
+              //      都画不出 → 文字块中间横着一条整行高的漏点带；
+              //   ② 多行参差时短行两侧的**内凹**（居中对齐尤其明显）；
+              //   ③ 行与行之间若排版留了缝，缝里也是 0。
+              // 三类都是「用户明明点在字幕这一块上」却被判成背景。外接矩形一次
+              // 消掉它们，而不是给空行加一条 `if (m.width <= 0)` 特例分支。
+              //
+              // 块**外**（上下留白、居中块两侧的整片空白）仍是真 alpha 0，
+              // 「点背景推台词」的不变式一字不动。单行文本时外接矩形 == 那一行的
+              // 行盒，逐像素等于改动前。
+              float min_left = FLT_MAX;
+              float min_top = FLT_MAX;
+              float max_right = -FLT_MAX;
+              float max_bottom = -FLT_MAX;
+              for (const auto& m : line_metrics) {
+                if (vertical_active_) {
+                  // 竖排是同一判据转 90°：行（列）的「厚度」在 x 上，空列是
+                  // height == 0 而 width > 0。空列参与**横向**并集（竖排的漏点带
+                  // 是一条竖条），纵向由有字的列决定。
+                  if (m.width <= 0.0f) {
+                    continue;
+                  }
+                  min_left = std::min(min_left, text_origin_x + m.left);
+                  max_right =
+                      std::max(max_right, text_origin_x + m.left + m.width);
+                  if (m.height <= 0.0f) {
+                    continue;
+                  }
+                  min_top = std::min(min_top, text_origin_y + m.top);
+                  max_bottom =
+                      std::max(max_bottom, text_origin_y + m.top + m.height);
+                  continue;
+                }
+                if (m.height <= 0.0f) {
+                  continue;  // 退化行：没有垂直范围可并，跳过。
+                }
+                // 宽度为 0 的空行仍参与**纵向**并集（它就是那条漏点带），横向由
+                // 有字的行决定；整块都没有字时下面的空判据会挡住。
+                min_top = std::min(min_top, text_origin_y + m.top);
+                max_bottom =
+                    std::max(max_bottom, text_origin_y + m.top + m.height);
+                if (m.width <= 0.0f) {
+                  continue;
+                }
+                min_left = std::min(min_left, text_origin_x + m.left);
+                max_right =
+                    std::max(max_right, text_origin_x + m.left + m.width);
+              }
+              if (max_right > min_left && max_bottom > min_top) {
+                render_target_->FillRectangle(
+                    D2D1::RectF(min_left, min_top, max_right, max_bottom),
+                    catch_brush.Get());
+              }
+            }
+          }
+        }
+      }
+      // Highlight range background.
+      if (highlight_start_ >= 0 && highlight_length_ > 0) {
+        DWRITE_TEXT_RANGE range = {static_cast<UINT32>(highlight_start_),
+                                   static_cast<UINT32>(highlight_length_)};
+        UINT32 hit_count = 0;
+        text_layout_->HitTestTextRange(range.startPosition, range.length, 0, 0,
+                                       nullptr, 0, &hit_count);
+        if (hit_count > 0) {
+          std::vector<DWRITE_HIT_TEST_METRICS> metrics(hit_count);
+          text_layout_->HitTestTextRange(range.startPosition, range.length, 0,
+                                         0, metrics.data(), hit_count,
+                                         &hit_count);
+          Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> hl;
+          render_target_->CreateSolidColorBrush(
+              ColorFromArgb(style_.highlight_color), hl.GetAddressOf());
+          for (const auto& m : metrics) {
+            D2D1_ROUNDED_RECT hr = D2D1::RoundedRect(
+                D2D1::RectF(text_origin_x + m.left, text_origin_y + m.top,
+                            text_origin_x + m.left + m.width,
+                            text_origin_y + m.top + m.height),
+                ScaleForDpi(4), ScaleForDpi(4));
+            render_target_->FillRoundedRectangle(hr, hl.Get());
+          }
+        }
+      }
+      brush->SetColor(ColorFromArgb(style_.text_color));
+      // TODO-708 P4: 多行上下文——当前行满 text_color（或 current_line_color），
+      // 其余行降到 context_line_opacity。用 per-range SetDrawingEffect 挂画刷（D2D
+      // DrawTextLayout 会以此覆盖该 range 的前景色）。current_line_start_<0（单行 /
+      // 无标记）时不设任何效果，整块满色 = 历史观感。与 word 级 highlight 背景框正交。
+      //
+      // 效果**只在填充遍挂上**：drawing effect 会盖掉 DrawTextLayout 传入的画刷，
+      // 若在描边 / 投影遍之前就挂着，上下文行的描边会被画成降亮的字色、糊成一团。
+      // 所以先把 layout 上残留的效果整体清空（layout 跨帧复用），描边遍画完再挂。
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> dim_brush;
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> current_brush;
+      const int text_len = static_cast<int>(text_.size());
+      const bool has_current_line =
+          current_line_start_ >= 0 && current_line_length_ > 0 && text_len > 0;
+      if (text_len > 0) {
+        text_layout_->SetDrawingEffect(
+            nullptr, DWRITE_TEXT_RANGE{0, static_cast<UINT32>(text_len)});
+      }
+      if (has_current_line) {
+        const uint32_t base = style_.text_color;
+        const uint32_t base_alpha = (base >> 24) & 0xFF;
+        const float dim_factor = static_cast<float>(
+            std::clamp(style_.context_line_opacity, 0.0, 1.0));
+        const uint32_t dim_alpha =
+            static_cast<uint32_t>(base_alpha * dim_factor) & 0xFF;
+        const uint32_t dim_argb = (dim_alpha << 24) | (base & 0x00FFFFFF);
+        render_target_->CreateSolidColorBrush(ColorFromArgb(dim_argb),
+                                              dim_brush.GetAddressOf());
+        if ((style_.current_line_color >> 24) != 0) {
+          render_target_->CreateSolidColorBrush(
+              ColorFromArgb(style_.current_line_color),
+              current_brush.GetAddressOf());
+        }
+      }
+      auto apply_line_effects = [&]() {
+        if (!has_current_line || dim_brush == nullptr) return;
+        const int cur_start = std::clamp(current_line_start_, 0, text_len);
+        const int cur_end = std::clamp(
+            current_line_start_ + current_line_length_, cur_start, text_len);
+        if (cur_start > 0) {
+          text_layout_->SetDrawingEffect(
+              dim_brush.Get(),
+              DWRITE_TEXT_RANGE{0, static_cast<UINT32>(cur_start)});
+        }
+        if (cur_end < text_len) {
+          text_layout_->SetDrawingEffect(
+              dim_brush.Get(),
+              DWRITE_TEXT_RANGE{static_cast<UINT32>(cur_end),
+                                static_cast<UINT32>(text_len - cur_end)});
+        }
+        if (current_brush != nullptr && cur_end > cur_start) {
+          text_layout_->SetDrawingEffect(
+              current_brush.Get(),
+              DWRITE_TEXT_RANGE{static_cast<UINT32>(cur_start),
+                                static_cast<UINT32>(cur_end - cur_start)});
+        }
+      };
+      // 桌面歌词式描边（仅 hook 模式）：同一 text_layout_ 先按 8 向偏移画描边、
+      // 再画投影，最后回到原点画填充。所有遍都在上面的 text_clip 之内。
+      // 多行上下文的 per-range 画刷由 apply_line_effects 在填充遍前才挂，描边 /
+      // 投影遍画的是清空了效果的 layout，所以不会被换色。
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> lyric_outline;
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> lyric_shadow;
+      // BUG-1889 — 描边遍改成「图层内不透明叠印 + 整体一次合成」。
+      //
+      // 修前：8 遍描边各自带着用户设定的 alpha（默认 0xE0）直接 src-over 到目标。
+      // 字形边缘像素被覆盖的次数随方向从 1 到 8 不等，累加出来的 alpha 是非线性且
+      // 方向相关的，于是描边粗细沿轮廓忽粗忽细——曲线笔画（の / っ / あ 的弧）最
+      // 明显，看起来就是「奇怪的锯齿」。
+      //
+      // 顺带修掉一个语义 bug：叠 k 遍后的实际不透明度是 1-(1-a)^k，用户把描边设成
+      // 半透明，拿到的却几乎恒为纯色。
+      //
+      // 现在：描边色在图层内强制不透明（各遍叠加只决定**形状的并集**，不再累加
+      // alpha），PopLayer 时按用户真正设定的 alpha 整体合成一次。
+      // CreateLayer 失败时原样降级回旧路径（半透明直绘），不影响可用性。
+      Microsoft::WRL::ComPtr<ID2D1Layer> outline_layer;
+      float outline_alpha = 1.0f;
+      if (hook_text_mode_) {
+        render_target_->CreateLayer(nullptr, outline_layer.GetAddressOf());
+        const bool layered = outline_layer != nullptr;
+        outline_alpha =
+            layered
+                ? static_cast<float>((style_.outline_color >> 24) & 0xFF) /
+                      255.0f
+                : 1.0f;
+        render_target_->CreateSolidColorBrush(
+            ColorFromArgb(layered ? (style_.outline_color | 0xFF000000)
+                                  : style_.outline_color),
+            lyric_outline.GetAddressOf());
+        render_target_->CreateSolidColorBrush(
+            ColorFromArgb(kLyricShadowColor), lyric_shadow.GetAddressOf());
+      }
+      if (hook_text_mode_ && lyric_outline != nullptr &&
+          lyric_shadow != nullptr) {
+        // 投影偏移取整到物理像素（与下面描边同理，BUG-1889）：亚像素偏移会被
+        // 灰度 AA 抹成一片灰雾贴在字的右下沿。实底板上整个不画（见
+        // kLyricShadowMaxBodyAlpha）。
+        if (((body_bg >> 24) & 0xFF) < kLyricShadowMaxBodyAlpha) {
+          const float shadow_off =
+              std::max(1.0f, std::round(ScaleForDpi(kLyricShadowOffsetDip)));
+          const float shadow_dx = std::max(1.0f, std::round(shadow_off * 0.5f));
+          render_target_->DrawTextLayout(
+              D2D1::Point2F(text_origin_x + shadow_dx,
+                            text_origin_y + shadow_off),
+              text_layout_.Get(), lyric_shadow.Get(),
+              D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+        // BUG-1889 — 偏移必须取整到物理像素。ScaleForDpi 不取整：r = 1.6dip 在
+        // 150% DPI 下是 2.4px，d = r*0.7071 = 1.697px，于是每一遍字形都落在**不同
+        // 的亚像素相位**上栅格化，灰度 AA 的边缘覆盖率各不相同，叠起来就是摩尔纹
+        // 式的毛边。取整后所有描边遍与填充遍同相位，边缘干净。
+        const float r = std::round(ScaleForDpi(static_cast<float>(
+            std::clamp(style_.outline_width, 0.0, 8.0))));
+        if (r > 0.0f) {
+          const float d = std::round(r * 0.7071f);
+          // 22.5° 环的两个分量：8 向在曲线笔画上留下的扇形缺口由它们补齐。
+          const float n = std::round(r * 0.9239f);
+          const float m = std::round(r * 0.3827f);
+          const D2D1_POINT_2F ring[16] = {
+              {r, 0.0f},  {-r, 0.0f}, {0.0f, r},  {0.0f, -r},
+              {d, d},     {d, -d},    {-d, d},    {-d, -d},
+              {n, m},     {n, -m},    {-n, m},    {-n, -m},
+              {m, n},     {m, -n},    {-m, n},    {-m, -n}};
+          if (outline_layer != nullptr) {
+            render_target_->PushLayer(
+                D2D1::LayerParameters(text_clip, nullptr,
+                                      D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                      D2D1::IdentityMatrix(), outline_alpha),
+                outline_layer.Get());
+          }
+          for (const D2D1_POINT_2F& off : ring) {
+            render_target_->DrawTextLayout(
+                D2D1::Point2F(text_origin_x + off.x, text_origin_y + off.y),
+                text_layout_.Get(), lyric_outline.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_NONE);
+          }
+          if (outline_layer != nullptr) render_target_->PopLayer();
+        }
+      }
+      apply_line_effects();
+      render_target_->DrawTextLayout(
+          D2D1::Point2F(text_origin_x, text_origin_y), text_layout_.Get(),
+          brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+
+      // 振假名：画在基准字所在行盒的顶部那条留白里（行距已在建 layout 时加高）。
+      //
+      // 几何全部问 text_layout_ 要，用的是高亮背景框同一套 HitTestTextRange —— 这
+      // 意味着注音不需要任何自己的排版：折行、居中、滚动偏移怎么动，注音就怎么
+      // 跟着动。text_ 里也**不含**任何注音字符，所以 CharIndexAt 的 textPosition、
+      // Highlight 的 range、dim 的 range 三个既有契约一个都没被碰。
+      //
+      // 一段注音跨行时（基准被折行切开）只取第一个矩形：把读音压在句首那半边，
+      // 比在两行上各画半个假名可读。
+      if (has_ruby && ruby_format_ != nullptr) {
+        for (const RubySpan& span : ruby_spans_) {
+          UINT32 hit_count = 0;
+          text_layout_->HitTestTextRange(static_cast<UINT32>(span.start),
+                                         static_cast<UINT32>(span.length), 0, 0,
+                                         nullptr, 0, &hit_count);
+          if (hit_count == 0) continue;
+          std::vector<DWRITE_HIT_TEST_METRICS> boxes(hit_count);
+          if (FAILED(text_layout_->HitTestTextRange(
+                  static_cast<UINT32>(span.start),
+                  static_cast<UINT32>(span.length), 0, 0, boxes.data(),
+                  hit_count, &hit_count)) ||
+              hit_count == 0) {
+            continue;
+          }
+          const DWRITE_HIT_TEST_METRICS& box = boxes[0];
+          const D2D1_RECT_F ruby_rect = D2D1::RectF(
+              text_origin_x + box.left, text_origin_y + box.top,
+              text_origin_x + box.left + box.width,
+              text_origin_y + box.top + ruby_gap_px);
+          // 注音的桌面歌词描边：字小，半径收到 0.75 倍、不画投影。
+          if (hook_text_mode_ && lyric_outline != nullptr) {
+            // BUG-1889：与主文本同样取整到物理像素、同样在图层内不透明叠印，
+            // 否则注音描边会比正文描边更黑更实（叠印 k 遍 ≈ 纯色），两处观感不一致。
+            const float rr = std::round(ScaleForDpi(static_cast<float>(
+                std::clamp(style_.outline_width, 0.0, 8.0) * 0.75)));
+            if (rr > 0.0f) {
+              const float rd = std::round(rr * 0.7071f);
+              const D2D1_POINT_2F ruby_ring[8] = {
+                  {rr, 0.0f}, {-rr, 0.0f}, {0.0f, rr},  {0.0f, -rr},
+                  {rd, rd},   {rd, -rd},   {-rd, rd},   {-rd, -rd}};
+              if (outline_layer != nullptr) {
+                render_target_->PushLayer(
+                    D2D1::LayerParameters(text_clip, nullptr,
+                                          D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                          D2D1::IdentityMatrix(),
+                                          outline_alpha),
+                    outline_layer.Get());
+              }
+              for (const D2D1_POINT_2F& off : ruby_ring) {
+                const D2D1_RECT_F shifted = D2D1::RectF(
+                    ruby_rect.left + off.x, ruby_rect.top + off.y,
+                    ruby_rect.right + off.x, ruby_rect.bottom + off.y);
+                render_target_->DrawTextW(
+                    span.ruby.c_str(), static_cast<UINT32>(span.ruby.size()),
+                    ruby_format_.Get(), shifted, lyric_outline.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_NONE);
+              }
+              if (outline_layer != nullptr) render_target_->PopLayer();
+            }
+          }
+          render_target_->DrawTextW(
+              span.ruby.c_str(), static_cast<UINT32>(span.ruby.size()),
+              ruby_format_.Get(), ruby_rect, brush.Get(),
+              D2D1_DRAW_TEXT_OPTIONS_NONE);
+        }
+      }
+      // BUG-1070: balance the PushAxisAlignedClip that fenced the text to
+      // text_rect_ (must pop before the control band / toolbar is drawn so the
+      // buttons are unaffected).
+      render_target_->PopAxisAlignedClip();
+
+      // BUG-1095 (第二阶段) — 滚动条。没有它用户根本不知道「下面还有」，也看
+      // 不出自己滚到了哪里。几何全部来自 ComputeScrollBar()（画在 text_rect_ 右侧
+      // 留白里、不遮字、不改换行宽度、只在 hook 模式真溢出时出现），命中测试问
+      // 的是同一份几何（BUG-1860），画哪按哪。
+      const ScrollBarGeometry sb = ComputeScrollBar();
+      if (sb.visible) {
+        // 穿透态整窗背景是真 alpha 0：命中带里没画到的像素会把按下直接透给游戏，
+        // 用户按 thumb 旁边 2px 就推了台词。给命中带铺一层与 BUG-1853 行盒同款
+        // 的不可见 catch fill，让「看得见的滚动条」和「按得到的滚动条」是同一块。
+        if (pass_through_) {
+          Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> catch_brush;
+          render_target_->CreateSolidColorBrush(
+              ColorFromArgb((kHookTextMinCatchAlpha << 24) |
+                            (style_.bg_color & 0x00FFFFFF)),
+              catch_brush.GetAddressOf());
+          if (catch_brush != nullptr) {
+            render_target_->FillRectangle(
+                D2D1::RectF(sb.hit_left, sb.track_top, sb.hit_right,
+                            sb.track_bottom),
+                catch_brush.Get());
+          }
+        }
+        Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> bar;
+        render_target_->CreateSolidColorBrush(
+            ColorFromArgb(style_.button_text_color), bar.GetAddressOf());
+        if (bar != nullptr) {
+          const bool lit = hovered_ || scroll_thumb_dragging_;
+          bar->SetOpacity(lit ? 0.12f : 0.05f);
+          render_target_->FillRoundedRectangle(
+              D2D1::RoundedRect(D2D1::RectF(sb.bar_x, sb.track_top,
+                                            sb.bar_x + sb.bar_w,
+                                            sb.track_bottom),
+                                sb.bar_w / 2.0f, sb.bar_w / 2.0f),
+              bar.Get());
+          bar->SetOpacity(lit ? 0.75f : 0.35f);
+          render_target_->FillRoundedRectangle(
+              D2D1::RoundedRect(D2D1::RectF(sb.bar_x, sb.thumb_y,
+                                            sb.bar_x + sb.bar_w,
+                                            sb.thumb_y + sb.thumb_h),
+                                sb.bar_w / 2.0f, sb.bar_w / 2.0f),
+              bar.Get());
+        }
+      }
+    }
+  }
+
+  if (text_only_) {
+    // Luna-style hover toolbar for the text-only (hook) window: a thin top
+    // strip that is ALWAYS a mouse catch (so the transparent window can be
+    // grabbed to move + can reveal its controls), showing only a grip hint at
+    // rest and the shared-slot toolbar on hover. Geometry mirrors
+    // ControlActionAt(text_only_) exactly.
+    const float t_btn = ScaleForDpi(kHookTextButtonSizeDip);
+    const float t_gap = ScaleForDpi(kHookTextButtonGapDip);
+    const float t_top = ScaleForDpi(kControlsTopDip);
+    const float strip_h = t_top + t_btn;
+
+    // BUG-951: while the hook body is click-through the toolbar lives in its
+    // own always-clickable window (HookToolbarWindow). Painting the band here
+    // as well would both double it visually and advertise a grab handle that
+    // takes no mouse input any more — the body is purely visual in that mode.
+    // 统一工具栏样式（用户：「鼠标穿透开/关时这功能栏样式还不一样，统一用这个短的
+    // 舒服点」）。此前穿透**关**时在正文窗内画一条全窗宽的长条 + grip 药丸，穿透
+    // **开**时才用独立的短药丸窗，于是同一个功能栏有两副长相、两套几何、两条命中
+    // 路径。现在 hook 台词模式一律走独立短药丸窗（见 ApplyToolbarVisibility），
+    // 正文窗内这条长条整条不再绘制——少一条路径，也就少一处能走岔的地方。
+    const bool draw_body_toolbar = !hook_text_mode_;
+
+    // Full-width strip background: near-invisible at rest (still catches the
+    // mouse so the top edge is always grabbable), a visible band on hover so
+    // the whole strip stays catchable while sliding across to the buttons.
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> strip_bg;
+    render_target_->CreateSolidColorBrush(
+        ColorFromArgb(style_.bg_color | 0xFF000000), strip_bg.GetAddressOf());
+    strip_bg->SetOpacity(hovered_ ? kTextStripHoverAlpha : kTextStripRestAlpha);
+    D2D1_ROUNDED_RECT strip_rect =
+        D2D1::RoundedRect(D2D1::RectF(0, 0, static_cast<float>(width), strip_h),
+                          ScaleForDpi(6), ScaleForDpi(6));
+    if (draw_body_toolbar) {
+      render_target_->FillRoundedRectangle(strip_rect, strip_bg.Get());
+    }
+
+    // Centre grip pill — the visible move handle (brighter on hover).
+    const float grip_w = ScaleForDpi(kTextGripWidthDip);
+    const float grip_h = ScaleForDpi(kTextGripHeightDip);
+    const float grip_x = (width - grip_w) / 2.0f;
+    const float grip_y = ScaleForDpi(kTextGripTopDip);
+    Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> grip_brush;
+    render_target_->CreateSolidColorBrush(ColorFromArgb(style_.text_color),
+                                          grip_brush.GetAddressOf());
+    // Once the controls are visible the toolbar pill itself is the move
+    // affordance. Hiding the grip avoids the detached white dash floating over
+    // the centre button.
+    grip_brush->SetOpacity(hovered_ ? 0.0f : 0.28f);
+    D2D1_ROUNDED_RECT grip_rect = D2D1::RoundedRect(
+        D2D1::RectF(grip_x, grip_y, grip_x + grip_w, grip_y + grip_h),
+        grip_h / 2.0f, grip_h / 2.0f);
+    if (draw_body_toolbar) {
+      render_target_->FillRoundedRectangle(grip_rect, grip_brush.Get());
+    }
+
+    // Controls appear only on hover: a centred shared-slot core toolbar. Their
+    // hit areas in ControlActionAt() are gated on hovered_ too, so a click can
+    // never hit an invisible button.
+    if (hovered_ && draw_body_toolbar) {
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> tb_fg;
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> tb_active;
+      render_target_->CreateSolidColorBrush(
+          ColorFromArgb(style_.button_text_color), tb_fg.GetAddressOf());
+      render_target_->CreateSolidColorBrush(ColorFromArgb(style_.active_color),
+                                            tb_active.GetAddressOf());
+      const hook_toolbar::States tb_states = ToolbarStates();
+      Microsoft::WRL::ComPtr<IDWriteTextFormat> icon_format;
+      if (icon_font_collection_ != nullptr) {
+        dwrite_factory_->CreateTextFormat(
+            L"Material Symbols Rounded", icon_font_collection_.Get(),
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, t_btn * 0.68f, L"",
+            icon_format.GetAddressOf());
+        if (icon_format != nullptr) {
+          icon_format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+          icon_format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+      }
+      auto draw_tbtn = [&](float bx, int slot, bool active) {
+        D2D1_ROUNDED_RECT br =
+            D2D1::RoundedRect(D2D1::RectF(bx, t_top, bx + t_btn, t_top + t_btn),
+                              ScaleForDpi(6), ScaleForDpi(6));
+        if (active && tb_active != nullptr) {
+          tb_active->SetOpacity(0.16f);
+          render_target_->FillRoundedRectangle(br, tb_active.Get());
+          tb_active->SetOpacity(1.0f);
+        }
+        ID2D1SolidColorBrush* icon_brush =
+            active ? tb_active.Get() : tb_fg.Get();
+        if (icon_brush != nullptr) {
+          const D2D1_RECT_F icon_rect =
+              D2D1::RectF(bx, t_top, bx + t_btn, t_top + t_btn);
+          const wchar_t* glyph =
+              hook_toolbar::SlotGlyph(toolbar_profile_, slot, tb_states);
+          // 逐槽回退，不是整条二选一：打包字体是 11 个码位的极小子集，
+          // previousCue / nextCue 在里面没有字形，空串就必须落到矢量画法，
+          // 否则那两颗画出来是豆腐块。
+          if (icon_format != nullptr && glyph[0] != L'\0') {
+            // 长度一律走 GlyphLength：写死 1 会把任何代理对字形（U+1F512 等）截半，
+            // 画出一个替换方块。当前这些字形恰好都在 BMP，所以写死 1 也看不出问题
+            // ——正因如此它才会一路溜到发布，必须在源头堵死而不是靠「现在没事」。
+            render_target_->DrawTextW(glyph, GlyphLength(glyph),
+                                      icon_format.Get(), icon_rect, icon_brush);
+          } else {
+            hook_toolbar::DrawSlotIcon(render_target_.Get(), d2d_factory_.Get(),
+                                       toolbar_profile_, slot, tb_states,
+                                       icon_rect, icon_brush);
+          }
+        }
+      };
+      // 绘制是 HookToolbarSlotAt 的逆向：同一条 RowLeft 决定起点，逐槽步进
+      // (btn + gap)。命中与绘制共用起点，两者不可能各画各的。
+      // Render 的 |width| 是 client px 的 int；显式转 float 与改造前
+      // 「(width - controls_total) / 2.0f」的隐式提升逐位等价。
+      //
+      // 这里**没有** else 分支了：develop 删掉了剪贴板文本窗那条按硬编码槽下标
+      // 画按钮的路（`draw_tbtn(trans_x, 4, …)`），而那正是本 PR 明令禁止的形状，
+      // 只是搬到了调用点。合并时必须采纳那次删除，否则等于把它带回来。
+      const float left = HookToolbarRowLeft(static_cast<float>(width));
+      // No second pill behind the row: the full-width hover strip is already
+      // the toolbar surface. Only active buttons receive a local soft tint.
+      for (int slot = 0; slot < hook_toolbar::SlotCount(toolbar_profile_);
+           ++slot) {
+        draw_tbtn(left + slot * (t_btn + t_gap), slot,
+                  hook_toolbar::SlotActive(toolbar_profile_, slot, tb_states));
+      }
+    }
+
+    // Hook text is a real resizable text box.
+    if (hook_text_mode_ && !locked_) {
+      const float resize = ScaleForDpi(kResizeGripDip);
+      Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> resize_brush;
+      render_target_->CreateSolidColorBrush(
+          ColorFromArgb(style_.button_text_color),
+          resize_brush.GetAddressOf());
+      resize_brush->SetOpacity(hovered_ ? 0.7f : 0.2f);
+      const float stroke = std::max(1.0f, ScaleForDpi(1.5f));
+      for (int i = 1; i <= 3; ++i) {
+        const float off = resize * (i / 4.0f);
+        render_target_->DrawLine(
+            D2D1::Point2F(width - off, height - 2.0f),
+            D2D1::Point2F(width - 2.0f, height - off), resize_brush.Get(),
+            stroke);
+      }
+    }
+  }
+  // 旧有声书歌词条的 5 槽自绘控件行（⏮ / ⏸▶ / ⏭ / 🔒 / ✕）曾经画在这里。它是
+  // 「按钮是什么」的第二份真相，与 hook_toolbar 的槽表并存；有声书改跑 hook 富文本
+  // 模式 + kAudiobook 槽表之后，命中（ControlActionAt）已经只认槽表，绘制若还留着
+  // 就会画出一排点不动的按钮 —— 比缺按钮更难查。所以两处一起删，非 text-only 模式
+  // 现在不画任何控件（也没有任何实例再跑那个模式）。
+
+  HRESULT hr = render_target_->EndDraw();
+  if (hr == D2DERR_RECREATE_TARGET) {
+    DiscardDeviceResources();
+  }
+
+  // Push the rendered DIB to the layered window.
+  POINT src = {0, 0};
+  SIZE size = {width, height};
+  RECT wr;
+  GetWindowRect(hwnd_, &wr);
+  POINT dst = {wr.left, wr.top};
+  BLENDFUNCTION blend = {};
+  blend.BlendOp = AC_SRC_OVER;
+  blend.SourceConstantAlpha = 255;
+  blend.AlphaFormat = AC_SRC_ALPHA;
+  UpdateLayeredWindow(hwnd_, screen_dc, &dst, &size, mem_dc, &src, 0, &blend,
+                      ULW_ALPHA);
+
+  SelectObject(mem_dc, old_bmp);
+  DeleteObject(dib);
+  DeleteDC(mem_dc);
+  ReleaseDC(nullptr, screen_dc);
+
+  // BUG-951: one funnel keeps the standalone toolbar in step with the body.
+  // Every state change already ends in a render, and Sync() is a no-op when
+  // nothing it cares about moved — so per-line caption updates do not turn into
+  // toolbar repaints.
+  SyncPassThroughToolbar();
+}
+
+void FloatingLyricWindow::DispatchControlAction(const std::string& action) {
+  if (action.empty()) {
+    return;
+  }
+  if (action == "lock") {
+    // The lock button toggles the position lock locally and reports the new
+    // state to Dart; it is never a no-op (unlike the old desktop strip).
+    locked_ = !locked_;
+    if (locked_ && (pressed_ || dragging_ || scroll_thumb_dragging_)) {
+      // BUG-1471: this used to clear the flags without releasing capture, while
+      // the channel path (SetLocked) released it — same action, two behaviours.
+      CancelPointerGesture();
+    }
+    if (on_lock_) {
+      on_lock_(locked_);
+    }
+    RequestRender();
+    return;
+  }
+  if (action == "topmost") {
+    // 按钮按下 = 翻转，落地走 SetTopmost（与 Dart 的会话复位同一条路径）。
+    // Pin button (galgame hook toolbar slot 7): toggle
+    // always-on-top locally (LunaTranslator #36). Handled natively — no Dart
+    // round-trip — and every window-Z SetWindowPos reads topmost_ so the new
+    // state sticks. Re-pinning also re-asserts HWND_TOPMOST, which is the way
+    // back up when another window has since climbed over the overlay.
+    //
+    // 只作用于**正文窗**。穿透态下的独立工具条窗（HookToolbarWindow）永远保持
+    // HWND_TOPMOST：它是 BUG-951 的逃生口，被压到游戏底下就等于用户再也回不来，
+    // 所以这里刻意不把 Z 同步给它。
+    SetTopmost(!topmost_);
+    return;
+  }
+  if (on_control_) {
+    on_control_(action);
+  }
+}
+
+float FloatingLyricWindow::HookToolbarRowWidth() const {
+  const float btn = ScaleForDpi(kHookTextButtonSizeDip);
+  const float gap = ScaleForDpi(kHookTextButtonGapDip);
+  const int slots = hook_toolbar::SlotCount(toolbar_profile_);
+  return btn * slots + gap * (slots - 1);
+}
+
+float FloatingLyricWindow::HookToolbarRowLeft(float width) const {
+  return (width - HookToolbarRowWidth()) / 2.0f;
+}
+
+int FloatingLyricWindow::HookToolbarSlotAt(float x, float y) const {
+  if (hwnd_ == nullptr || !hook_text_mode_) {
+    return -1;
+  }
+  RECT rc;
+  GetClientRect(hwnd_, &rc);
+  const float width = static_cast<float>(rc.right - rc.left);
+  const float btn = ScaleForDpi(kHookTextButtonSizeDip);
+  const float gap = ScaleForDpi(kHookTextButtonGapDip);
+  const float ctrl_top = ScaleForDpi(kControlsTopDip);
+  if (y < ctrl_top || y > ctrl_top + btn) {
+    return -1;
+  }
+  const float left = HookToolbarRowLeft(width);
+  for (int slot = 0; slot < hook_toolbar::SlotCount(toolbar_profile_);
+       ++slot) {
+    const float bx = left + slot * (btn + gap);
+    if (x >= bx && x <= bx + btn) {
+      return slot;
+    }
+  }
+  return -1;
+}
+
+std::string FloatingLyricWindow::ControlActionAt(float x, float y) {
+  if (text_only_) {
+    // Text-only Luna toolbar: buttons are control hits only while hovered (they
+    // are invisible otherwise, so a click must never land on a phantom button).
+    // The grip / empty strip returns empty so a press there becomes a window
+    // drag — geometry mirrors Render().
+    // hook 台词模式下正文窗里已经不画任何按钮（见 Render 的 draw_body_toolbar），
+    // 命中必须一起撤掉：留着就是一排看不见却点得中的幽灵按钮。
+    if (hook_text_mode_ || !hovered_) {
+      return std::string();
+    }
+    const float btn = ScaleForDpi(kHookTextButtonSizeDip);
+    const float ctrl_top = ScaleForDpi(kControlsTopDip);
+    if (y < ctrl_top || y > ctrl_top + btn) {
+      return std::string();
+    }
+    // 索引 profile 槽表：独立工具条窗查的是同一张表，两个窗因此不可能对「这颗
+    // 按钮是什么」各说各的。几何走 HookToolbarSlotAt —— 悬停提示问的是同一个
+    // 入口，提示与命中永远指同一颗。
+    //
+    // 合并注记：本 PR 原来把这段包在 `if (hook_text_mode_)` 里，而上面那条
+    // `hook_text_mode_ || !hovered_` 早退让它不可达；develop 侧则是直接索引
+    // `kSlotActions`（无 profile）。正确形态是 develop 的位置 + 本 PR 的
+    // profile 化 —— 两条守卫（gal_hook_overlay_buttons /
+    // gal_overlay_passthrough_dual_window）都钉着「ControlActionAt 必须索引
+    // profile 槽表，不得另抄一份映射」。
+    const int slot = HookToolbarSlotAt(x, y);
+    return slot >= 0 ? hook_toolbar::SlotAction(toolbar_profile_, slot)
+                     : std::string();
+  }
+  // 到这里说明既不是 text-only 也不是 hook 模式。有声书悬浮字幕以前走的就是这条
+  // 路（自绘 5 槽 previousCue/playPause/nextCue/lock/close 的硬编码 switch），
+  // 现在它跑 hook 富文本模式 + kAudiobook 槽表，这条分支再也到不了。留着等于把
+  // 「按钮是什么」这件事说两遍，而两份说法迟早会各说各的 —— 所以删掉，让
+  // ControlActionAt 只有一个真相源：hook_toolbar 的槽表。
+  return std::string();
+}
+
+bool FloatingLyricWindow::ResizeGripContains(float x, float y) const {
+  if (locked_ || hwnd_ == nullptr) {
+    return false;
+  }
+  RECT rc;
+  GetClientRect(hwnd_, &rc);
+  const float width = static_cast<float>(rc.right - rc.left);
+  const float height = static_cast<float>(rc.bottom - rc.top);
+  const float grip = ScaleForDpi(kResizeGripDip);
+  return x >= width - grip && x <= width && y >= height - grip && y <= height;
+}
+
+void FloatingLyricWindow::SyncStripSizeFromWindow() {
+  if (hwnd_ == nullptr) {
+    return;
+  }
+  RECT rc;
+  GetWindowRect(hwnd_, &rc);
+  const float scale = static_cast<float>(dpi_) / 96.0f;
+  if (scale <= 0.0f) {
+    return;
+  }
+  strip_width_dip_ = static_cast<float>(rc.right - rc.left) / scale;
+  strip_height_dip_ = static_cast<float>(rc.bottom - rc.top) / scale;
+}
+
+bool FloatingLyricWindow::DispatchLookupAt(float x, float y) {
+  if (on_lookup_ == nullptr && on_context_lookup_ == nullptr) {
+    return false;
+  }
+  D2D1_RECT_F char_rect = {};
+  const int index = CharIndexAt(x, y, &char_rect);
+  if (index < 0) {
+    return false;
+  }
+  int utf8_len =
+      WideCharToMultiByte(CP_UTF8, 0, text_.c_str(),
+                          static_cast<int>(text_.size()), nullptr, 0, nullptr,
+                          nullptr);
+  std::string utf8(utf8_len, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, text_.c_str(),
+                      static_cast<int>(text_.size()), utf8.data(), utf8_len,
+                      nullptr, nullptr);
+  if (on_context_lookup_) {
+    // Client-area physical px -> screen logical px: the lookup card
+    // anchors to the tapped word, so it must be in the same unit
+    // system Dart uses for screen rects.
+    const float scale = std::max(0.01f, static_cast<float>(dpi_) / 96.0f);
+    RECT wr = {};
+    GetWindowRect(hwnd_, &wr);
+    const D2D1_RECT_F screen_rect =
+        D2D1::RectF((wr.left + char_rect.left) / scale,
+                    (wr.top + char_rect.top) / scale,
+                    (wr.left + char_rect.right) / scale,
+                    (wr.top + char_rect.bottom) / scale);
+    on_context_lookup_(context_id_, utf8, index, screen_rect);
+    return true;
+  }
+  on_lookup_(utf8, index);
+  return true;
+}
+
+void FloatingLyricWindow::ResetHoverLookupAnchor() { hover_lookup_index_ = -1; }
+
+void FloatingLyricWindow::MaybeHoverLookup(float x, float y) {
+  // 只有 gal hook 浮窗走悬停查词：歌词条 / 剪贴板文本窗保持「点字才查」，一字不改。
+  // 按下左键的那段（pending press / 拖窗 / 拉伸）里也不查——那是另一套手势，用户
+  // 正在移动窗口，不是在读词。
+  //
+  // BUG-1860 追补：拖滚动条 thumb 同样是「另一套手势」，而且它**不**经过
+  // pressed_ / dragging_。WM_MOUSEMOVE 里的 return 只挡得住内联那一条路；轮询
+  // 表（WM_TIMER）拿的是实时光标，拖 thumb 时指针横向飘回正文上就会命中
+  // CharIndexAt，于是拖到一半弹出查词卡。判据必须写在这里，两条路径才同一份答案。
+  if (!hook_text_mode_ || !click_lookup_enabled_ || pressed_ || dragging_ ||
+      scroll_thumb_dragging_) {
+    return;
+  }
+  // BUG-1480：穿透态不再整窗吃掉查词。
+  //
+  // 旧契约是「鼠标整个属于游戏」，因为正文窗带 WS_EX_TRANSPARENT、系统根本不投鼠标
+  // 消息，于是这里必须显式挡掉靠全局光标位置轮询的悬停查词。现在穿透改成逐像素
+  // 命中：**背景像素归游戏、字形像素归我们**，所以「光标正压在一个字上」这件事本身
+  // 就是合法的查词信号，不该再被挡。
+  //
+  // 但仍保留一条收窄：穿透态只认**按住 Shift** 的悬停查词，不认「自动悬停即查」。
+  // 穿透的用途是把鼠标让给游戏，纯移动就弹卡片会在玩的过程中不停打断；Shift 是
+  // 用户的显式意图声明。点击查词不受此限（点在字上本来就到不了游戏）。
+  const bool pass_through_requires_shift = pass_through_;
+  if (on_lookup_ == nullptr && on_context_lookup_ == nullptr) {
+    return;
+  }
+  // Shift 只能问**物理**键态：这个窗口是 WS_EX_NOACTIVATE 的分层窗，键盘焦点永远
+  // 在游戏那边，GetKeyState 读的是本线程消息队列的同步键态（对一个从不收键盘消息
+  // 的窗口来说永远不会更新）。GetAsyncKeyState 读的是全局实时键态，才是对的。
+  const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+  if (pass_through_requires_shift && !shift) {
+    ResetHoverLookupAnchor();
+    return;
+  }
+  if (!shift && !hover_auto_lookup_) {
+    ResetHoverLookupAnchor();
+    return;
+  }
+  const int index = CharIndexAt(x, y);
+  if (index < 0) {
+    // 移出文本区（空白 / 工具条 / 滚动条）即松锚，回来时同一个字仍会再查一次。
+    ResetHoverLookupAnchor();
+    return;
+  }
+  if (index == hover_lookup_index_) {
+    return;  // 同一个字：抖动、轮询都不重复查词。
+  }
+  hover_lookup_index_ = index;
+  if (!DispatchLookupAt(x, y)) {
+    ResetHoverLookupAnchor();
+  }
+}
+
+void FloatingLyricWindow::StartHoverLookupPolling() {
+  if (hover_poll_active_ || hwnd_ == nullptr || !hook_text_mode_) {
+    return;
+  }
+  if (SetTimer(hwnd_, kHoverLookupTimerId, kHoverLookupPollMs, nullptr) != 0) {
+    hover_poll_active_ = true;
+  }
+}
+
+void FloatingLyricWindow::StopHoverLookupPolling() {
+  if (!hover_poll_active_) {
+    return;
+  }
+  if (hwnd_ != nullptr) {
+    KillTimer(hwnd_, kHoverLookupTimerId);
+  }
+  hover_poll_active_ = false;
+}
+
+int FloatingLyricWindow::CharIndexAt(float x, float y,
+                                     D2D1_RECT_F* out_char_rect) {
+  if (text_.empty() || text_layout_ == nullptr) {
+    return -1;
+  }
+  const float local_x = x - text_rect_.left;
+  // BUG-1095 (第二阶段) — 边界判在**视口**里（用户只点得到看得见的字），坐标
+  // 换算到**布局**里（加回滚动偏移）。少了这一步，滚动之后点第一行会命中已经
+  // 被滚上去的那一行。scroll_offset_px_ 在非 hook 模式恒为 0，旧行为不变。
+  const float viewport_y = y - text_rect_.top;
+  if (local_x < 0 || local_x > text_rect_.width || viewport_y < 0 ||
+      viewport_y > text_rect_.height) {
+    return -1;
+  }
+  if (vertical_active_) {
+    // 竖排：视口边界判据同上，坐标换算走与 Render 同一个绘制原点（滚动在 x 上）。
+    // 横排路径不进这里，下面的换算一字不动。
+    const float origin_x = TextOriginX();
+    const float origin_y = TextOriginY();
+    BOOL v_trailing = FALSE;
+    BOOL v_inside = FALSE;
+    DWRITE_HIT_TEST_METRICS v_metrics = {};
+    if (FAILED(text_layout_->HitTestPoint(x - origin_x, y - origin_y,
+                                          &v_trailing, &v_inside,
+                                          &v_metrics)) ||
+        !v_inside) {
+      return -1;
+    }
+    if (out_char_rect != nullptr) {
+      out_char_rect->left = origin_x + v_metrics.left;
+      out_char_rect->top = origin_y + v_metrics.top;
+      out_char_rect->right = out_char_rect->left + v_metrics.width;
+      out_char_rect->bottom = out_char_rect->top + v_metrics.height;
+    }
+    return static_cast<int>(v_metrics.textPosition);
+  }
+  const float local_y = viewport_y + scroll_offset_px_;
+  BOOL is_trailing = FALSE;
+  BOOL is_inside = FALSE;
+  DWRITE_HIT_TEST_METRICS metrics = {};
+  if (FAILED(text_layout_->HitTestPoint(local_x, local_y, &is_trailing,
+                                        &is_inside, &metrics))) {
+    return -1;
+  }
+  if (!is_inside) {
+    return -1;
+  }
+  if (out_char_rect != nullptr) {
+    // Hit-test metrics are layout-local; lift them back into client-area px.
+    out_char_rect->left = text_rect_.left + metrics.left;
+    out_char_rect->top = text_rect_.top + metrics.top - scroll_offset_px_;
+    out_char_rect->right = out_char_rect->left + metrics.width;
+    out_char_rect->bottom = out_char_rect->top + metrics.height;
+  }
+  return static_cast<int>(metrics.textPosition);
+}

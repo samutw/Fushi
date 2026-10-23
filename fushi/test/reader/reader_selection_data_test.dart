@@ -1,0 +1,197 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/reader/reader_selection_data.dart';
+
+void main() {
+  group('ReaderSelectionData.fromJson', () {
+    test(
+      'preserves synthetic cue identity independent of normalized offset',
+      () {
+        final ReaderSelectionData data =
+            ReaderSelectionData.fromJson(<String, dynamic>{
+              'text': '次',
+              'normalizedOffset': 4,
+              'audioCuePayload': '{"type":"sid","id":"12"}',
+            });
+        expect(data.audioCuePayload, '{"type":"sid","id":"12"}');
+        expect(data.normalizedOffset, 4);
+      },
+    );
+    test('parses full JSON with all fields', () {
+      final json = <String, dynamic>{
+        'text': '猫',
+        'sentence': '吾輩は猫である。',
+        'rect': {'x': 10.0, 'y': 20.0, 'width': 100.0, 'height': 30.0},
+        'normalizedOffset': 3,
+        'normalizedLength': 1,
+        'sentenceOffset': 5,
+        'verticalWriting': true,
+        'mangaPageIndex': 2,
+        'mangaSentenceGroup': 4,
+        'sentenceNormalizedOffset': 10,
+        'sentenceNormalizedLength': 8,
+        'audioCuePayload': '{"type":"frag","id":"cue-2"}',
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+
+      expect(data.text, '猫');
+      expect(data.sentence, '吾輩は猫である。');
+      expect(data.rect, isNotNull);
+      expect(data.rect!['x'], 10.0);
+      expect(data.rect!['y'], 20.0);
+      expect(data.rect!['width'], 100.0);
+      expect(data.rect!['height'], 30.0);
+      expect(data.normalizedOffset, 3);
+      expect(data.normalizedLength, 1);
+      expect(data.sentenceOffset, 5);
+      expect(data.verticalWriting, isTrue);
+      expect(data.mangaPageIndex, 2);
+      expect(data.mangaSentenceGroup, 4);
+      expect(data.sentenceNormalizedOffset, 10);
+      expect(data.sentenceNormalizedLength, 8);
+      expect(data.audioCuePayload, '{"type":"frag","id":"cue-2"}');
+    });
+
+    test('missing optional fields default correctly', () {
+      final json = <String, dynamic>{
+        'text': 'hello',
+        'sentence': 'hello world',
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+
+      expect(data.text, 'hello');
+      expect(data.sentence, 'hello world');
+      expect(data.rect, isNull);
+      expect(data.normalizedOffset, isNull);
+      expect(data.normalizedLength, isNull);
+      expect(data.sentenceOffset, 0);
+      expect(data.verticalWriting, isFalse);
+      expect(data.mangaPageIndex, isNull);
+      expect(data.mangaSentenceGroup, isNull);
+      expect(data.sentenceNormalizedOffset, isNull);
+      expect(data.sentenceNormalizedLength, isNull);
+      expect(data.audioCuePayload, isNull);
+    });
+
+    test('empty JSON defaults text and sentence to empty strings', () {
+      final data = ReaderSelectionData.fromJson(<String, dynamic>{});
+
+      expect(data.text, '');
+      expect(data.sentence, '');
+    });
+
+    test('rect with int values converts to double', () {
+      final json = <String, dynamic>{
+        'text': 't',
+        'sentence': 's',
+        'rect': {'x': 1, 'y': 2, 'width': 3, 'height': 4},
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+
+      expect(data.rect!['x'], 1.0);
+      expect(data.rect!['y'], 2.0);
+      expect(data.rect!['width'], 3.0);
+      expect(data.rect!['height'], 4.0);
+    });
+
+    test('rect with null values defaults to zero', () {
+      final json = <String, dynamic>{
+        'text': 't',
+        'sentence': 's',
+        'rect': <String, dynamic>{},
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+
+      expect(data.rect!['x'], 0.0);
+      expect(data.rect!['y'], 0.0);
+      expect(data.rect!['width'], 0.0);
+      expect(data.rect!['height'], 0.0);
+    });
+
+    test('non-Map rect is treated as null', () {
+      final json = <String, dynamic>{
+        'text': 't',
+        'sentence': 's',
+        'rect': 'invalid',
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+      expect(data.rect, isNull);
+    });
+
+    test('numeric fields accept int values', () {
+      final json = <String, dynamic>{
+        'text': 't',
+        'sentence': 's',
+        'normalizedOffset': 5,
+        'normalizedLength': 10,
+        'sentenceOffset': 3,
+      };
+
+      final data = ReaderSelectionData.fromJson(json);
+      expect(data.normalizedOffset, 5);
+      expect(data.normalizedLength, 10);
+      expect(data.sentenceOffset, 3);
+    });
+  });
+
+  group('ReaderSelectionData constructor', () {
+    test('stores all fields', () {
+      final data = ReaderSelectionData(
+        text: '食べる',
+        sentence: '猫が魚を食べる',
+        normalizedOffset: 4,
+        normalizedLength: 3,
+        sentenceOffset: 2,
+      );
+
+      expect(data.text, '食べる');
+      expect(data.sentence, '猫が魚を食べる');
+      expect(data.normalizedOffset, 4);
+      expect(data.normalizedLength, 3);
+      expect(data.sentenceOffset, 2);
+    });
+  });
+  test('grip bounds remain separate from the lookup glyph anchor', () {
+    final ReaderSelectionData data = ReaderSelectionData.fromJson(
+      <String, dynamic>{
+        'text': '?',
+        'rect': <String, num>{'x': 80, 'y': 100, 'width': 20, 'height': 24},
+        'handlesRect': <String, num>{
+          'x': 74,
+          'y': 76,
+          'width': 32,
+          'height': 72,
+        },
+      },
+    );
+    expect(data.rect!['y'], 100);
+    expect(data.rect!['height'], 24);
+    expect(data.handlesRect, <String, double>{
+      'x': 74,
+      'y': 76,
+      'width': 32,
+      'height': 72,
+    });
+  });
+
+  test('legacy or invalid grip bounds use the glyph fallback', () {
+    for (final Object? value in <Object?>[
+      null,
+      'invalid',
+      <String, num>{'x': 1},
+      <String, num>{'x': 1, 'y': 2, 'width': 0, 'height': 32},
+      <String, num>{'x': double.nan, 'y': 2, 'width': 32, 'height': 32},
+    ]) {
+      expect(
+        ReaderSelectionData.fromJson(<String, dynamic>{
+          'handlesRect': value,
+        }).handlesRect,
+        isNull,
+      );
+    }
+  });
+}

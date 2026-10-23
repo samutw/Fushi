@@ -1,0 +1,187 @@
+import 'dart:convert';
+
+import 'package:fushi/src/media/video/video_horizontal_seek_gesture.dart';
+
+class VideoAsbplayerConfig {
+  const VideoAsbplayerConfig({
+    required this.seekSeconds,
+    required this.speedStep,
+    required this.doubleTapSeekSeconds,
+    required this.longPressSpeed,
+    required this.dragSeekSensitivity,
+    required this.tapTogglesPlayback,
+    required this.doubleTapTogglesPlayback,
+    required this.brightnessSwipeGesture,
+    required this.volumeSwipeGesture,
+  });
+
+  /// 双击「字幕跳句」哨兵值（TODO-173/BUG-231）：[doubleTapSeekSeconds] 取此值时，
+  /// 双击左右区跳上/下一句（调 `_skipCueAndPokeControls`），而非相对 seek 秒数。
+  /// 用单一离散字段（取值 `{kDoubleTapSubtitle, 0, 3, 5, 10}`）承载「关 / 秒数 /
+  /// 字幕」三态——只一个特殊值、不引入第二个布尔，避免组合态。
+  static const int kDoubleTapSubtitle = -1;
+
+  /// 双击左右快进的合法取值集合（TODO-173）：0=关（保留原双击暂停/全屏，向后兼容，
+  /// 默认）、3/5/10=相对 seek 该秒数、[kDoubleTapSubtitle]=字幕跳句。decode 用它兜底。
+  static const List<int> doubleTapSeekOptions = <int>[
+    kDoubleTapSubtitle,
+    0,
+    3,
+    5,
+    10,
+  ];
+
+  static const VideoAsbplayerConfig defaults = VideoAsbplayerConfig(
+    seekSeconds: 3,
+    speedStep: 0.1,
+    doubleTapSeekSeconds: 0,
+    longPressSpeed: 2.0,
+    dragSeekSensitivity: VideoSeekSensitivity.medium,
+    tapTogglesPlayback: true,
+    doubleTapTogglesPlayback: true,
+    brightnessSwipeGesture: true,
+    volumeSwipeGesture: true,
+  );
+
+  final int seekSeconds;
+  final double speedStep;
+  final double longPressSpeed;
+
+  /// 移动端横滑拖动 seek 的灵敏度档位（BUG-1485）。语义是「拖过整屏 = 多长视频时间」，
+  /// 与视频总时长解耦；换算模型见 [VideoHorizontalSeekGesture]。仅移动端消费（桌面
+  /// 无横滑手势）。
+  final VideoSeekSensitivity dragSeekSensitivity;
+
+  /// 双击视频左/右区的行为（TODO-173/BUG-231）。见 [doubleTapSeekOptions] /
+  /// [kDoubleTapSubtitle]。0=关（双击仍走平台默认的暂停/全屏，不分区）。
+  final int doubleTapSeekSeconds;
+
+  /// 桌面**鼠标单击**画面是否切换播放/暂停（media_kit 的 `playAndPauseOnTap`）。默认
+  /// true（保持既有行为）。关掉后单击画面只唤醒/收起控制条，不改播放态。字幕点击查词、
+  /// 进度条、控制条按钮与快捷键都不受影响（各自独立入口）。
+  ///
+  /// BUG-3310：它**只管鼠标单击**。触屏双击（移动端 / 桌面触屏）是另一个手势，归
+  /// [doubleTapTogglesPlayback]。两者曾共用本开关，而整份配置随备份 / 互联同步跨设备：
+  /// 在电脑上关掉「单击暂停」，同步到手机后手机的双击暂停被一并静默关掉（手机单击本就
+  /// 不改播放态，这个开关在手机上唯一的效果就是吃掉双击暂停）。
+  final bool tapTogglesPlayback;
+
+  /// 触屏**双击**画面（中带，或双击快退快进关闭时的任意位置）是否切换播放/暂停
+  /// （BUG-221 / BUG-3310）。默认 true。移动端与桌面触屏 / 触控笔共用；桌面鼠标双击是
+  /// 切全屏，不读本字段。
+  final bool doubleTapTogglesPlayback;
+
+  /// 移动端画面**左半区竖滑调屏幕亮度**手势开关（issue #1525）。默认 true（保持既有
+  /// 行为）。关掉后左半区竖滑不再改亮度，用户改走系统亮度条；只关这一侧，右半区音量
+  /// 手势由 [volumeSwipeGesture] 独立决定。桌面本无此手势，不消费本字段。
+  final bool brightnessSwipeGesture;
+
+  /// 移动端画面**右半区竖滑调音量**手势开关（issue #1525）。默认 true（保持既有行为）。
+  /// 关掉后右半区竖滑不再改音量，用户改用实体音量键；控制条音量滑条、键盘音量键不受影响。
+  final bool volumeSwipeGesture;
+
+  VideoAsbplayerConfig copyWith({
+    int? seekSeconds,
+    double? speedStep,
+    int? doubleTapSeekSeconds,
+    double? longPressSpeed,
+    VideoSeekSensitivity? dragSeekSensitivity,
+    bool? tapTogglesPlayback,
+    bool? doubleTapTogglesPlayback,
+    bool? brightnessSwipeGesture,
+    bool? volumeSwipeGesture,
+  }) {
+    return VideoAsbplayerConfig(
+      seekSeconds: seekSeconds ?? this.seekSeconds,
+      speedStep: speedStep ?? this.speedStep,
+      doubleTapSeekSeconds: doubleTapSeekSeconds ?? this.doubleTapSeekSeconds,
+      longPressSpeed: longPressSpeed ?? this.longPressSpeed,
+      dragSeekSensitivity: dragSeekSensitivity ?? this.dragSeekSensitivity,
+      tapTogglesPlayback: tapTogglesPlayback ?? this.tapTogglesPlayback,
+      doubleTapTogglesPlayback:
+          doubleTapTogglesPlayback ?? this.doubleTapTogglesPlayback,
+      brightnessSwipeGesture:
+          brightnessSwipeGesture ?? this.brightnessSwipeGesture,
+      volumeSwipeGesture: volumeSwipeGesture ?? this.volumeSwipeGesture,
+    );
+  }
+
+  Map<String, Object> toJson() => <String, Object>{
+        'seekSeconds': seekSeconds,
+        'speedStep': speedStep,
+        'doubleTapSeekSeconds': doubleTapSeekSeconds,
+        'longPressSpeed': longPressSpeed,
+        'dragSeekSensitivity': dragSeekSensitivity.name,
+        'tapTogglesPlayback': tapTogglesPlayback,
+        'doubleTapTogglesPlayback': doubleTapTogglesPlayback,
+        'brightnessSwipeGesture': brightnessSwipeGesture,
+        'volumeSwipeGesture': volumeSwipeGesture,
+      };
+
+  static String encode(VideoAsbplayerConfig config) =>
+      jsonEncode(config.toJson());
+
+  static VideoAsbplayerConfig decode(String json) {
+    if (json.trim().isEmpty) return defaults;
+    try {
+      final Object? raw = jsonDecode(json);
+      if (raw is! Map<String, dynamic>) return defaults;
+      return VideoAsbplayerConfig(
+        seekSeconds:
+            _readInt(raw['seekSeconds'], defaults.seekSeconds).clamp(1, 30),
+        speedStep: _readDouble(raw['speedStep'], defaults.speedStep)
+            .clamp(0.05, 0.5)
+            .toDouble(),
+        doubleTapSeekSeconds: _readDoubleTap(raw['doubleTapSeekSeconds']),
+        longPressSpeed:
+            _readDouble(raw['longPressSpeed'], defaults.longPressSpeed)
+                .clamp(1.0, 4.0)
+                .toDouble(),
+        dragSeekSensitivity: _readDragSeekSensitivity(
+          raw['dragSeekSensitivity'],
+        ),
+        // 旧档没有本键 → 回落 true，既有「点画面暂停」行为原样保留。
+        tapTogglesPlayback:
+            raw['tapTogglesPlayback'] as bool? ?? defaults.tapTogglesPlayback,
+        // BUG-3310：旧档没有本键 → 回落 true，**不**从 tapTogglesPlayback 继承。旧档里
+        // 那个 false 多半是在电脑上为鼠标单击关的、经同步带到了手机，继承它正是本 bug。
+        doubleTapTogglesPlayback: raw['doubleTapTogglesPlayback'] as bool? ??
+            defaults.doubleTapTogglesPlayback,
+        // 旧档没有这两个键 → 回落 true，既有竖滑调亮度/音量行为原样保留。
+        brightnessSwipeGesture: raw['brightnessSwipeGesture'] as bool? ??
+            defaults.brightnessSwipeGesture,
+        volumeSwipeGesture:
+            raw['volumeSwipeGesture'] as bool? ?? defaults.volumeSwipeGesture,
+      );
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  static int _readInt(Object? raw, int fallback) {
+    if (raw is num) return raw.round();
+    return fallback;
+  }
+
+  static double _readDouble(Object? raw, double fallback) {
+    if (raw is num) return raw.toDouble();
+    return fallback;
+  }
+
+  /// 双击行为：只接受 [doubleTapSeekOptions] 里的离散值，旧档/非法值兜底回默认
+  /// （0=关），避免脏持久化值进入手势分流逻辑（TODO-173）。
+  static int _readDoubleTap(Object? raw) {
+    if (raw is num) {
+      final int v = raw.round();
+      if (doubleTapSeekOptions.contains(v)) return v;
+    }
+    return defaults.doubleTapSeekSeconds;
+  }
+
+  /// 横滑 seek 档位（BUG-1485）：只接受枚举 name 字符串（存 name 而非 index，改序不串
+  /// 档）。旧档（无此键）/非法值回落默认档，不抛。
+  static VideoSeekSensitivity _readDragSeekSensitivity(Object? raw) {
+    if (raw is String) return VideoSeekSensitivity.fromName(raw);
+    return defaults.dragSeekSensitivity;
+  }
+}

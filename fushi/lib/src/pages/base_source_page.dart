@@ -1,0 +1,1856 @@
+import 'dart:async';
+import 'package:fushi/src/mining/advanced_mining/advanced_mining_capabilities.dart';
+import 'package:fushi/src/anki/source_review_navigation.dart';
+import 'package:fushi/src/anki/source_review_session.dart';
+import 'package:fushi/src/diagnostics/lookup_perf_trace.dart';
+
+import 'package:flutter/gestures.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:fushi_core/fushi_core.dart' show kStatSourceBook;
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:fushi/media.dart';
+import 'package:fushi/pages.dart';
+import 'package:fushi_anki/fushi_anki.dart'
+    show AnkiMiningPayload, AnkiOpenWordOutcome, MiningRequestOverrides;
+import 'package:fushi/src/anki/anki_view_model.dart';
+import 'package:fushi/src/anki/anki_mined_card_action_sheet.dart';
+import 'package:fushi/src/lookup/effective_lookup_size.dart';
+import 'package:fushi/src/media/favorites/favorite_lookup_context.dart';
+import 'package:fushi/src/media/video/video_exit_flush.dart';
+import 'package:fushi/src/media/audiobook/mining_sentence_draft.dart'
+    show SentenceContextSlot;
+import 'package:fushi/src/models/module_id.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_controller.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_input_bridge.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_layer.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_webview.dart';
+import 'package:fushi/src/anki/advanced_mining_deck_section.dart';
+import 'package:fushi/src/mining/advanced_mining/advanced_mining_dialog.dart';
+import 'package:fushi/src/shortcuts/mouse_binding_dispatch.dart';
+import 'package:fushi/src/shortcuts/shortcut_action.dart';
+import 'package:fushi/src/pages/implementations/stat_activity.dart';
+import 'package:fushi/src/sync/sync_auto_trigger.dart';
+import 'package:fushi/src/utils/components/fushi_deferred_loading.dart';
+import 'package:fushi/src/utils/misc/lookup_audio_playback.dart';
+import 'package:fushi/src/utils/misc/lookup_auto_read_coordinator.dart';
+import 'package:fushi/src/utils/misc/lookup_dismiss_barrier.dart';
+import 'package:fushi/src/utils/misc/swipe_dismiss_wrapper.dart';
+import 'package:fushi/utils.dart';
+
+/// Number of characters of the body text that the looked-up word actually
+/// occupies, used to drive the in-text lookup highlight (`fushiSelection
+/// .highlightSelection`).
+///
+/// BUG-206: this must be the length of the **inflected surface form as it
+/// appears in the body** (the deinflection's matched source), NOT the length of
+/// the dictionary headword. For 「うやうやしく」(6 chars in the body) the dictionary
+/// entry's [DictionaryEntry.word] is the headword 「恭しい」(3 runes); highlighting
+/// 3 chars covers only part of the word and — when the word is split across DOM
+/// text nodes on Android — renders as two misaligned bands ("multi-select").
+///
+/// [DictionarySearchResult.bestLength] already carries the matched source length
+/// (the FFI deinflection's `matched`, mirrored as Yomitan's `originalTextLength`)
+/// and [Language.getFinalHighlightLength] is the canonical way to read it
+/// (handling the space-delimited / non-space-delimited split). We only highlight
+/// when there is at least one term entry, preserving the previous "no entries →
+/// no highlight" behavior.
+int lookupHighlightCharCount({
+  required DictionarySearchResult result,
+  required String searchTerm,
+  required Language language,
+}) {
+  if (result.entries.isEmpty) return 0;
+  return language.getFinalHighlightLength(
+    result: result,
+    searchTerm: searchTerm,
+  );
+}
+
+/// 一次查词是怎么发起的。嵌套层不开新的查词诊断流水（见
+/// [BaseSourcePageState.searchDictionaryResult]）。
+enum LookupOrigin {
+  /// 明确的一次点击 / 按键 / 菜单「查词」：查的就是读者此刻那句话里的词。
+  explicit,
+
+  /// 指针扫过（Shift 悬停 / 悬停查词）：扫一行就连查十几个词。
+  hover,
+
+  /// 在弹窗释义里点词叠出的子层：查的词来自释义，不在读者的原句里。
+  nested,
+}
+
+/// A page template which assumes use of [BaseSourcePageState] by which all
+/// pages in the app that are used for when using a certain source will
+/// conveniently share base functionality.f
+abstract class BaseSourcePage extends BasePage {
+  /// Create an instance of this tab page.
+  const BaseSourcePage({
+    required this.item,
+    super.key,
+  });
+
+  /// The media item pertaining to this usage instance of the source.
+  final MediaItem? item;
+
+  @override
+  BaseSourcePageState<BaseSourcePage> createState();
+}
+
+/// A base class for providing all pages used for media in the app with a
+/// collection of shared functions and variables. In large part, this was
+/// implemented to define shortcuts for common lengthy methods across UI code.
+abstract class BaseSourcePageState<T extends BaseSourcePage>
+    extends BasePageState<T> {
+  /// 本页所属的媒体模块，决定「底部停靠」按模块细分开关听哪一个
+  /// （[AppModel.popupBottomDockedFor]）。`null` = 只听总开关。
+  ModuleId? get popupDockModule => null;
+
+  /// 本页查词弹窗实际是否底部停靠（总开关 ∧ [popupDockModule] 的细分开关）。
+  bool get popupBottomDocked => appModel.popupBottomDockedFor(popupDockModule);
+
+  @override
+  void initState() {
+    super.initState();
+
+    ExternalMediaNavigation.instance.register(
+      this,
+      _closeForSourceReturn,
+      returnToReading: SourceReviewScope.read(context)?.onReturnToReading,
+      isSourceReview: () => SourceReviewScope.read(context)?.isReview ?? false,
+      ownsRoute: (Route<dynamic> route) =>
+          mounted && identical(ModalRoute.of(context), route),
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _seedWarmPopup();
+    });
+  }
+
+  /// BUG-092: seed a single persistent, hidden popup slot on open so its
+  /// [DictionaryPopupWebView] cold-loads popup.html + JS + CSS ONCE while the
+  /// page is idle, and is then reused warm for every lookup — eliminating the
+  /// per-lookup WebView cold-load (the white flash) on the reader / video /
+  /// audiobook surfaces. The reader's pre-lookup [prunePopupStack] and the
+  /// dismiss path both preserve this slot rather than discard it.
+  ///
+  /// Low-memory mode keeps no warm slot (it disposes the popup on close), so it
+  /// is skipped there to honour the memory budget.
+  void _seedWarmPopup() {
+    if (!mounted) return;
+    // 此刻 AppModel 已初始化（源页开页在 init 之后）→ 安全设真实 lowMemory。
+    _popup.lowMemory = appModel.lowMemoryMode;
+    _popup.onLookupStarted = _recordLookupCounter;
+    _popup.seedWarmSlot(seedResult: kPopupSearchingPlaceholderResult);
+  }
+
+  @override
+  void dispose() {
+    ExternalMediaNavigation.instance.unregister(this);
+    _visibleRenderFailsafeTimer?.cancel();
+    // TODO-058：controller 现持有挂起层兜底 Timer，作为其所有者必须 dispose 取消，防泄漏。
+    _popup.dispose();
+    _isSearchingNotifier.dispose();
+    super.dispose();
+  }
+
+  /// Allows customisation of dictionary background.
+  double get dictionaryBackgroundOpacity => 0.95;
+
+  /// Allows customisation of opacity of dictionary entries.
+  double get dictionaryEntryOpacity => 1;
+
+  final DictionaryPopupController _popup = DictionaryPopupController(
+    lowMemory: false,
+    onLookupStackDepthChanged: recordLookupStackDepth,
+  );
+
+  final ValueNotifier<bool> _isSearchingNotifier = ValueNotifier<bool>(false);
+
+  Rect? _pendingSelectionRect;
+
+  int _searchGeneration = 0;
+
+  /// 推进查词代次（新查词 / 关弹窗）：代次一变，上一次查词的结果回来就丢弃。
+  int _bumpSearchGeneration() {
+    return ++_searchGeneration;
+  }
+
+  /// TODO-716：桌面对齐手机的"滑动关闭弹窗"。弹窗显示时全屏 barrier 盖住正文，
+  /// 在 barrier 上水平拖累计位移过阈即关一层（[dismissTopPopup]，与光标 B/Esc 逐层
+  /// 退回同语义；TODO-834 后这与「点 barrier 真空白清整栈」不同——滑动是明确的
+  /// 关前置弹窗手势，对齐手机顶栏 [SwipeDismissWrapper] 的逐层关），仅当
+  /// [ReaderFushiSource.enableSwipeToClose] 开启时生效。
+  ///
+  /// BUG-1757：接线（判轴 + 累积 + 阈值）全部收在 [LookupDismissBarrier] 里，页面
+  /// 只提供「过阈了要关哪一层」，不再各自持 tracker + 三个转发方法。横拖走该
+  /// widget 内不入手势竞技场的 raw Listener，判轴规则写在可单测的代码里。
+  bool get isDictionaryShown => _hasVisiblePopup(_popup.entries);
+
+  @protected
+  void onDismissBarrierHover(PointerHoverEvent event) {}
+
+  /// Pointer signals that land on the transparent area outside a visible
+  /// dictionary popup. Most sources intentionally ignore them; readers can
+  /// override this to preserve their underlying wheel navigation while the
+  /// popup itself keeps its native scrolling behavior.
+  @protected
+  void onDismissBarrierPointerSignal(PointerSignalEvent event) {}
+
+  /// 弹窗开着时「沿此轴继续滚动正文 = 关弹窗」（barrier 上的触摸/触控板拖动）。
+  /// null = 不启用（默认；只有阅读器滚动模式开了对应偏好才返回轴）。
+  @protected
+  Axis? get dismissBarrierScrollAxis => null;
+
+  /// [dismissBarrierScrollAxis] 上的拖动越过 slop 时回调（见
+  /// [LookupDismissBarrier.onScrollDismiss]）。默认直接清整栈。
+  @protected
+  void onDismissBarrierScrollDrag(int pointer, Offset delta) {
+    clearDictionaryResult();
+  }
+
+  /// 本页面的快捷键作用域。非空即启用「弹窗内输入交回宿主」的桥
+  /// （[dictionaryPopupForwardedActions] 决定交回哪些）。
+  ///
+  /// 词典弹窗是纯原生 WebView：指针落在它上面时，键盘与鼠标事件只存在于弹窗 DOM
+  /// 里，宿主的 Flutter `Focus` / `Listener` 一个都收不到。点词后弹窗恰好贴在光标
+  /// 旁，所以这是常态——不装这座桥，「关闭词典」的鼠标键永远无反应、快捷键则在与
+  /// 弹窗交互过一次之后失效（BUG-1071 复诉的两个症状）。
+  @protected
+  ShortcutScope? get dictionaryPopupInputScope => null;
+
+  /// 弹窗可见时仍要生效的动作。token 表由注册表**当前**绑定实时导出，故用户改键
+  /// 立即对弹窗持焦的路径生效（旧桥把键名硬编码在 JS 里，改键后不跟随）。
+  @protected
+  Set<ShortcutAction> get dictionaryPopupForwardedActions =>
+      const <ShortcutAction>{};
+
+  /// 当前要下发给弹窗的输入表。作用域缺席时为空表——空表**仍会**注入，用来清掉
+  /// 热槽 WebView 上残留的旧表。
+  @protected
+  DictionaryPopupInputSpec get dictionaryPopupInputSpec =>
+      dictionaryPopupInputScope == null
+          ? const DictionaryPopupInputSpec()
+          : dictionaryPopupInputSpecFor(
+              registry: appModel.shortcutRegistry,
+              actions: dictionaryPopupForwardedActions,
+            );
+
+  /// 弹窗回传 token 的落地点。默认行为：解析出的动作只要属于
+  /// [dictionaryPopupForwardedActions] 就关掉整条弹窗栈——「关闭词典」是这条桥的
+  /// 唯一通用语义。漫画页覆写它，把左右键接回自己的翻页链。
+  ///
+  /// 返回**本次是否真的执行了**动作。BUG-2031：鼠标那条路要靠这个回答决定要不要向
+  /// `MouseBindingDispatch` 认领这次按下（见 [onDismissBarrierNonPrimaryButton]）。
+  /// 键盘 token 的调用方忽略返回值即可（`bool Function(String)` 可直接当
+  /// `void Function(String)` 用，既有回调点零改动）。
+  @protected
+  bool onDictionaryPopupInputToken(String token) {
+    final ShortcutScope? scope = dictionaryPopupInputScope;
+    if (scope == null) return false;
+    final ShortcutAction? action = resolveDictionaryPopupInputToken(
+      registry: appModel.shortcutRegistry,
+      token: token,
+      scope: scope,
+    );
+    if (action == null) return false;
+    if (!dictionaryPopupForwardedActions.contains(action)) return false;
+    clearDictionaryResult();
+    return true;
+  }
+
+  /// 指针落在**弹窗矩形之外**、按下鼠标非主键。
+  ///
+  /// 为什么这条必须住在 barrier 上：弹窗可见期间根 Overlay 的
+  /// [LookupDismissBarrier] 是 `Positioned.fill`，叶子 `ColoredBox` 的命中行为是
+  /// **opaque**（颜色透明 ≠ 命中透明），于是页面根那层 [Listener] 一个指针事件都
+  /// 收不到（守卫 `test/shortcuts/video_pointer_channel_reachability_test.dart`）。
+  /// 指针落在弹窗**矩形之内**的那半边由弹窗表面自己的桥承担；**矩形之外**这半边此前
+  /// 只有视频页接了，其余表面的症状是「侧键压在浮窗上能关、移开一点就关不掉」。
+  ///
+  /// 默认实现与弹窗表面那条路**逐字同源**：同一个 [dictionaryPopupInputSpec]、同一个
+  /// [dictionaryPopupPointerToken] 折 token、同一个 [onDictionaryPopupInputToken]
+  /// 落地，故两个表面不可能各判各的。
+  /// BUG-2031：本入口必须参与 [MouseBindingDispatch] 的认领协议。barrier 住在根
+  /// Overlay 里，而 `wrapWithGlobalNavigation` 的鼠标兜底 [Listener] 是**它的祖先**，
+  /// 祖先不会被后代的 opaque 命中排除（实测派发序列 `[barrier, root]`）。不认领的
+  /// 后果是同一次按下被两层各派发一次：绑「返回上一级」的侧键 = 关词典 **+** 退出
+  /// 整本书，而键盘 Esc 只关词典——键鼠语义分叉。认领后 app 根让路，两者一致。
+  @protected
+  void onDismissBarrierNonPrimaryButton(PointerDownEvent event) {
+    // 「解析到但没执行」不认领：那等价于键盘侧「明明 ignored 却返回 handled」，会把
+    // 同一按钮上 universal / global 的合法绑定白白挡掉。
+    dispatchClaimedMouseAction(event, () {
+      final String? token = dictionaryPopupPointerToken(
+        buttons: event.buttons,
+        spec: dictionaryPopupInputSpec,
+      );
+      if (token == null) return false;
+      return onDictionaryPopupInputToken(token);
+    });
+  }
+
+  /// TODO-1027：点全屏 dismiss barrier（弹窗矩形外的真空白处）的钩子。默认行为
+  /// 是一次性清整栈（[clearDictionaryResult] → 会话收尾，保留隐藏热槽 BUG-092）—
+  /// 视频/有声书/首页等横排表面维持「点空白关栈」旧语义不变。
+  ///
+  /// 阅读器覆写此钩子（见 reader_fushi_page.dart）：barrier 叠在阅读器 WebView 之上，
+  /// 点弹窗外的新词正文若只关栈，tap 到不了底下的 WebView，必须再点一次才查新词
+  /// （查词被关窗逻辑堵塞）。覆写后用 WebView 的 RenderBox 把 [globalPos] 逆映成
+  /// CSS 坐标转发给选词：命中词→无缝换新查词弹窗（复用热槽），命中真空白→才关栈。
+  @protected
+  void onDismissBarrierTap(Offset globalPos) => clearDictionaryResult();
+
+  Widget? buildPopupAudioControls() => null;
+
+  /// Handles leaving a source page. All sources should
+  /// use this and wrap their [build] function with a [PopScope].
+  Future<bool> onWillPop() async {
+    final bool isSourceReview =
+        SourceReviewScope.read(context)?.isReview ?? false;
+    final mediaSource = appModel.currentMediaSource;
+    final item = widget.item;
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    await onSourcePagePop();
+
+    if (mediaSource != null) {
+      await appModel.closeMedia(
+        ref: ref,
+        mediaSource: mediaSource,
+        item: item,
+      );
+    }
+
+    if (!isSourceReview && item != null && messenger != null) {
+      triggerAutoSyncAfterClose(
+        db: appModel.database,
+        mediaIdentifier: item.mediaIdentifier,
+        messenger: messenger,
+        onReport: appModel.presentSyncPrompts,
+      );
+    }
+    return true;
+  }
+
+  bool _sourceExitClaimed = false;
+
+  /// 退出单飞门：页内退出（PopScope 回调 / 退出按钮）与外部导航收页
+  /// （[_closeForSourceReturn]，经 [ExternalMediaNavigation.closeActive]）共用。
+  /// 返回 false = 已经有一条退出在跑，调用方不得再跑第二遍——否则
+  /// [onSourcePagePop]（落盘、停表）、closeMedia、自动同步都会并发执行两次。
+  /// 只上不下：退出一旦发起就无条件出栈（[exitAfterPersist]），本页随之销毁。
+  /// 自带单飞门的子类（阅读器的 `_popInProgress`）覆写成同一把锁。
+  @protected
+  bool claimSourceExit() {
+    if (_sourceExitClaimed) return false;
+    _sourceExitClaimed = true;
+    return true;
+  }
+
+  Future<bool> _closeForSourceReturn() async {
+    if (!mounted) return true;
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    if (route == null || !route.isCurrent) return false;
+    // 页面自己的退出已在跑（用户同时按了返回）：它会无条件出栈，等它结束即可。
+    if (!claimSourceExit()) {
+      await route.completed;
+      return true;
+    }
+    final NavigatorState navigator = Navigator.of(context);
+    // BUG-2119 口径（与页内返回同一原语）：同步发起落库后立即出栈，不 await
+    // onWillPop。drift 写请求已排进队列，外部导航随后对同一行的读排在它之后；
+    // 而 await 一条没有上界的写会把 ExternalMediaNavigation 的共享队列永久卡死。
+    exitAfterPersist(
+      persist: onWillPop,
+      exit: navigator.pop,
+      onPersistError: (Object error, StackTrace stack) => ErrorLogService
+          .instance
+          .log('BaseSourcePage.externalClose', error, stack),
+    );
+    await route.completed;
+    return true;
+  }
+
+  /// Action to perform within the source page upon closing the media.
+  Future<void> onSourcePagePop() async {}
+
+  DictionaryPopupEntry? _deferredPopupItem;
+  int _deferredGeneration = 0;
+  DictionaryPopupEntry? _visibleRenderPendingItem;
+  int _visibleRenderPendingGeneration = 0;
+  Timer? _visibleRenderFailsafeTimer;
+
+  /// BUG-717 ②：最近一次 [showDeferredPopup] 真正显示的条目。阅读器把「显示弹窗」与
+  /// 「正文高亮 eval」解耦后，高亮 eval 回调经 [reanchorTopPopup] 只重锚这个条目（配合
+  /// [activeLookupGeneration] 代次校验），避免旧 eval 回调错位到新查词的弹窗。
+  DictionaryPopupEntry? _lastDeferredShown;
+
+  Future<int> searchDictionaryResult({
+    required String searchTerm,
+    required Rect selectionRect,
+    int? overrideMaximumTerms,
+    bool deferDisplay = false,
+    LookupOrigin origin = LookupOrigin.explicit,
+  }) async {
+    overrideMaximumTerms ??= appModel.maximumTerms;
+
+    final gen = _bumpSearchGeneration();
+    _pendingSelectionRect = selectionRect;
+    _deferredPopupItem = null;
+
+    // 诊断：阅读器 / 有声书家族此前不开查词流水，`searchDictionary` 与弹窗各段在
+    // 诊断日志里没有归属（「空闲后首查慢」无从拆段）。与 mixin 宿主同一把尺：
+    // begin → search → warm → fill → shown → push → rendered。嵌套层不开新流水
+    // （父层仍在屏上，游标被覆盖只会让父层余段串台）。
+    final LookupPerfTrace? trace = origin == LookupOrigin.nested
+        ? null
+        : LookupPerfTrace.begin(
+            term: searchTerm,
+            host: 'reader',
+            lowMemory: _popup.lowMemory,
+          );
+    try {
+      if (!deferDisplay) {
+        _isSearchingNotifier.value = true;
+      }
+
+      final dictionaryResult = await appModel.searchDictionary(
+        searchTerm: searchTerm,
+        searchWithWildcards: false,
+        overrideMaximumTerms: overrideMaximumTerms,
+      );
+      trace?.mark(
+        'search',
+        detail: 'entries=${dictionaryResult.entries.length} '
+            'kanji=${dictionaryResult.kanjiResults.length}',
+      );
+
+      if (_searchGeneration != gen) {
+        trace?.finish('superseded');
+        return 0;
+      }
+
+      appModel.addToDictionaryHistory(result: dictionaryResult);
+
+      // 复用条件与旧 _reusableHiddenTopPopup 等价：栈恰为 [单个隐藏热槽] 时原地复用，
+      // 否则（嵌套等）追加新层。reuse=false 时 beginTop 直接 append。
+      final bool reuse = _popup.entries.length == 1 &&
+          _popup.entries.first.isWarmSlot &&
+          !_popup.entries.first.visible;
+      final DictionaryPopupEntry item = _popup.beginTop(
+        term: searchTerm,
+        rect: selectionRect,
+        reuseWarmSlot: reuse,
+        replaceStack: false,
+        visible: false,
+      );
+      // TODO-962：阅读器/有声书弹窗此前硬编码 allLoaded:true，关掉了「加载更多」分页
+      // （[_buildPopupLayer] 的 onScrolledToBottom 恒 null），使弹窗永远停在第一页。
+      // maximumTerms 按 glossary 注释**行**计预算（language.dart），一个高频词头的注释
+      // 行就能吃满整个上限 → 只剩 1 个词头（首页/视频弹窗均正常，唯一差异就在此标志 +
+      // load-more 接线）。按真实截断计算：结果数 < 本次查询上限 ⇒ 已全部加载，否则可能
+      // 被截断，开放下滑加载（[loadMoreForLayer]，与 mixin/home 同构）。
+      _popup.fillResult(
+        item,
+        result: dictionaryResult,
+        allLoaded: !dictionaryResult.truncated,
+      );
+      trace?.mark('fill', detail: 'warm-reuse=$reuse defer=$deferDisplay');
+      // TODO-058 / BUG-480：嵌套冷层继续挂起到 popupRendered；复用热槽也不能裸奔
+      // 直显内容区。macOS 上隐藏/屏外热槽的 JS 注入可能没跑到当前结果，直 show 会露出
+      // 白色空 WebView。需要 WebView 渲染的结果先显示带盖板的壳，并在可见后一帧强制
+      // 重推当前结果，收到 popupRendered 后再撤盖板。空结果走 Flutter 占位，不靠 WebView。
+      final bool needsWebViewRender = _itemNeedsWebViewRender(item);
+      final bool revealImmediately = reuse || dictionaryResult.entries.isEmpty;
+      if (deferDisplay) {
+        _deferredPopupItem = item;
+        _deferredGeneration = gen;
+      } else if (revealImmediately && needsWebViewRender) {
+        _showPopupWaitingForRender(item, gen);
+      } else if (revealImmediately) {
+        _popup.show(item);
+      } else {
+        _popup.markPendingReveal(item);
+      }
+
+      final int highlightCount = lookupHighlightCharCount(
+        result: dictionaryResult,
+        searchTerm: searchTerm,
+        language: JapaneseLanguage.instance,
+      );
+
+      final bool arEnabled = ReaderFushiSource.instance.autoReadOnLookup;
+      if (arEnabled && dictionaryResult.entries.isNotEmpty) {
+        final entry = dictionaryResult.entries.first;
+        final expression = entry.word;
+        final reading = entry.reading;
+        if (expression.isNotEmpty) {
+          _autoReadWord(expression, reading);
+        }
+      }
+
+      return highlightCount;
+    } finally {
+      if (_searchGeneration == gen &&
+          (!deferDisplay || _deferredPopupItem == null) &&
+          _visibleRenderPendingItem == null) {
+        _isSearchingNotifier.value = false;
+        _pendingSelectionRect = null;
+      }
+    }
+  }
+
+  /// TODO-962：阅读器/有声书弹窗第 [index] 层「加载更多」——续查下一批词头并增量追加。
+  ///
+  /// 与 [DictionaryPageMixin.loadMoreForEntry] / [HomeDictionaryPageState] 的
+  /// `_loadMore` 同构：以「当前已显示词条数 + [AppModel.maximumTerms]」为新上限重查
+  /// 同一个 [searchTerm]，再 [DictionaryPopupController.fillResult] 更新该层
+  /// （`notifyListeners` 经 [buildDictionary] 的 [AnimatedBuilder] 自动重建，无需
+  /// setState）。webview 的 `_pushResults` 据 searchTerm 不变 + entries 增多自动判定
+  /// `isLoadMore` → 走 `window.updatePopupIncremental()` 增量渲染，保滚动位/热槽。
+  /// [allLoaded] 仍按真实截断（结果数 < 新上限）计算，到底即关闭后续 load-more。
+  Future<void> loadMoreForLayer(int index) async {
+    final List<DictionaryPopupEntry> entries = _popup.entries;
+    if (index < 0 || index >= entries.length) return;
+    final DictionaryPopupEntry entry = entries[index];
+    final DictionarySearchResult? current = entry.result;
+    if (entry.allLoaded || entry.isSearching || current == null) return;
+
+    // BUG-1478：按**词头**递增，不是按 glossary 行数（entries.length）——
+    // 后者是另一个单位，一个词头带十几条注释时上限会一次暴涨十几倍。
+    final int newMax = current.headwordCount + appModel.maximumTerms;
+    final String term = entry.searchTerm;
+    entry.isSearching = true;
+    try {
+      final DictionarySearchResult result = await appModel.searchDictionary(
+        searchTerm: term,
+        searchWithWildcards: false,
+        overrideMaximumTerms: newMax,
+      );
+      // 续查期间该层可能被裁掉/换词（嵌套查词、关栈）；用身份核对确保只更新原层。
+      // 原地跳转 / 后退 / 前进会在**同一个 entry** 上换词，所以还要核对词没变，
+      // 否则旧词的续查结果会灌进新页。
+      if (!mounted ||
+          !_popup.entries.contains(entry) ||
+          entry.searchTerm != term) {
+        return;
+      }
+      _popup.fillResult(
+        entry,
+        result: result,
+        allLoaded: !result.truncated,
+      );
+    } finally {
+      // fillResult 成功路径已把 isSearching 清 false；失败/提前 return 在此兜底复位。
+      if (_popup.entries.contains(entry) && entry.isSearching) {
+        entry.isSearching = false;
+      }
+    }
+  }
+
+  /// 弹窗内原地跳转（词头 / 交叉引用链接 / 汉字点击）：先裁掉 [index] 之上的子层，
+  /// 查 [query]，**有结果才**把 [item] 当前页压进后退栈、在同一个 WebView 里换成新词
+  /// （Hoshi iOS：`if (count > 0) redirect(count)`，空结果什么都不发生，弹窗不动）。
+  /// 弹窗位置 / 尺寸都不变：selectionRect 保留，外壳高度由新内容的 onContentMetrics
+  /// 再伸缩。
+  ///
+  /// 身份门：查询往返期间本层可能被关掉（`entries.contains`）或已被另一次跳转 /
+  /// 顶层换词换掉内容（`searchTerm` 变了）——迟到的结果一律丢弃，不灌进别的词。
+  /// 查询期间置 [DictionaryPopupEntry.isSearching] 挡住同层 load-more 并发写入。
+  Future<void> navigatePopupInPlace({
+    required int index,
+    required DictionaryPopupEntry item,
+    required String query,
+  }) async {
+    final String trimmed = query.trim();
+    if (trimmed.isEmpty || item.isSearching) return;
+    prunePopupStack(index + 1);
+    // 离开当前页前记下它的滚动位（回来时恢复）；查询开始后再读会读到新内容。
+    final double scrollTop =
+        await item.webViewKey.currentState?.currentScrollTop() ?? 0;
+    if (!mounted || !_popup.entries.contains(item)) return;
+    final String termAtStart = item.searchTerm;
+    item.isSearching = true;
+    try {
+      final DictionarySearchResult result = await appModel.searchDictionary(
+        searchTerm: trimmed,
+        searchWithWildcards: false,
+        overrideMaximumTerms: appModel.maximumTerms,
+      );
+      if (!mounted ||
+          !_popup.entries.contains(item) ||
+          item.searchTerm != termAtStart) {
+        return;
+      }
+      if (result.entries.isEmpty && result.kanjiResults.isEmpty) return;
+      appModel.addToDictionaryHistory(result: result);
+      _popup.navigateInPlace(
+        item,
+        term: trimmed,
+        result: result,
+        allLoaded: !result.truncated,
+        scrollTop: scrollTop,
+      );
+      if (ReaderFushiSource.instance.autoReadOnLookup &&
+          result.entries.isNotEmpty) {
+        final DictionaryEntry entry = result.entries.first;
+        if (entry.word.isNotEmpty) {
+          _autoReadWord(entry.word, entry.reading);
+        }
+      }
+    } finally {
+      // navigateInPlace 成功路径已清 isSearching；失败 / 提前 return 在此兜底复位。
+      if (_popup.entries.contains(item) && item.isSearching) {
+        item.isSearching = false;
+      }
+    }
+  }
+
+  /// 顶栏 ← / →：在 [item] 的原地跳转历史里后退 / 前进一页。先记当前页滚动位（再往
+  /// 回走时恢复），controller 换页后 `notifyListeners` 经 [buildDictionary] 的
+  /// AnimatedBuilder 重建，WebView 按 result 身份重推、渲染完恢复该页滚动位。
+  Future<void> _navigatePopupHistory(
+    DictionaryPopupEntry item, {
+    required bool forward,
+  }) async {
+    if (item.isSearching) return;
+    final double scrollTop =
+        await item.webViewKey.currentState?.currentScrollTop() ?? 0;
+    if (!mounted || !_popup.entries.contains(item)) return;
+    if (forward) {
+      _popup.goForward(item, scrollTop: scrollTop);
+    } else {
+      _popup.goBack(item, scrollTop: scrollTop);
+    }
+  }
+
+  void showDeferredPopup({Rect? selectionRect}) {
+    final item = _deferredPopupItem;
+    final gen = _deferredGeneration;
+    _deferredPopupItem = null;
+    if (item != null) {
+      _lastDeferredShown = item;
+      if (selectionRect != null) {
+        item.selectionRect = selectionRect;
+      }
+      // item 已在栈内（beginTop 时加入，隐藏）。需要 WebView 渲染的结果先带盖板
+      // 翻可见，等当前结果 popupRendered 后再撤盖板，避免 macOS 隐藏热槽漏注入后露白。
+      LookupPerfTrace.current?.mark('shown');
+      if (_itemNeedsWebViewRender(item)) {
+        _showPopupWaitingForRender(item, gen);
+      } else {
+        _popup.show(item);
+        // 空结果走 Flutter 占位、不经 WebView，没有 rendered / reveal 两段。
+        LookupPerfTrace.current?.finish('empty');
+      }
+    }
+    if (_searchGeneration == gen && _visibleRenderPendingItem == null) {
+      _isSearchingNotifier.value = false;
+      _pendingSelectionRect = null;
+    }
+  }
+
+  /// BUG-717 ②：当前查词代次快照。阅读器把显示与高亮 eval 解耦后，捕获它传给
+  /// [reanchorTopPopup]，异步回来时若已有更新查词（[_searchGeneration] 已 bump）就丢弃
+  /// 迟到的重锚。见 reader_fushi `_highlightAndShowPopup`。
+  int get activeLookupGeneration => _searchGeneration;
+
+  /// BUG-717 ②：把最近显示的顶层弹窗重锚到高亮 eval 精修后的词 bbox [rect]。仅当
+  /// [generation] 仍是当前查词代次（其间没有更新查词、没清栈）时才动，且委托
+  /// [DictionaryPopupController.reanchorEntry] 再校验该条目仍显示 / rect 有变。
+  void reanchorTopPopup(Rect rect, int generation) {
+    if (generation != _searchGeneration) return;
+    final DictionaryPopupEntry? item = _lastDeferredShown;
+    if (item == null) return;
+    _popup.reanchorEntry(item, rect);
+  }
+
+  bool _itemNeedsWebViewRender(DictionaryPopupEntry item) {
+    final result = item.result;
+    if (result == null) return false;
+    // A completed empty lookup is rendered by Flutter's no-results placeholder.
+    // Waiting for the reused warm WebView here exposes an empty shell on macOS.
+    return result.entries.isNotEmpty || result.kanjiResults.isNotEmpty;
+  }
+
+  void _showPopupWaitingForRender(
+    DictionaryPopupEntry item,
+    int generation,
+  ) {
+    _visibleRenderFailsafeTimer?.cancel();
+    _visibleRenderPendingItem = item;
+    _visibleRenderPendingGeneration = generation;
+    _isSearchingNotifier.value = true;
+    _popup.show(item);
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          _visibleRenderPendingItem != item ||
+          _visibleRenderPendingGeneration != generation ||
+          !_popup.entries.contains(item) ||
+          !item.visible) {
+        return;
+      }
+      // refreshCurrentResult 已去重（同一结果不再全量重推）：返回 false 表示当前
+      // 结果**已经渲染完成**、popupRendered 不会再来（阅读器 deferDisplay 路径下
+      // 渲染信号可能早于盖板架起）——立即走同一条 rendered 路径撤盖板，不空等
+      // 1.8s failsafe。state 为 null（WebView 未挂载）时维持等待，交给 failsafe。
+      final bool renderPending =
+          item.webViewKey.currentState?.refreshCurrentResult() ?? true;
+      if (!renderPending) {
+        _onPopupLayerRendered(_popup.entries.indexOf(item), item);
+      }
+    });
+
+    _visibleRenderFailsafeTimer = Timer(
+      DictionaryPopupController.kRevealFailsafeTimeout,
+      () {
+        if (!mounted ||
+            _visibleRenderPendingItem != item ||
+            _visibleRenderPendingGeneration != generation) {
+          return;
+        }
+        _clearVisibleRenderPending();
+      },
+    );
+  }
+
+  void _clearVisibleRenderPending({DictionaryPopupEntry? item}) {
+    if (item != null && _visibleRenderPendingItem != item) return;
+    _visibleRenderFailsafeTimer?.cancel();
+    _visibleRenderFailsafeTimer = null;
+    _visibleRenderPendingItem = null;
+    _visibleRenderPendingGeneration = 0;
+    _isSearchingNotifier.value = false;
+    _pendingSelectionRect = null;
+  }
+
+  /// Resolve audio exactly like Hoshi: enabled sources only, no TTS fallback.
+  Future<void> _autoReadWord(String expression, String reading) async {
+    await LookupAutoReadCoordinator.instance.runAutomatic(
+      expression: expression,
+      reading: reading,
+      play: () => _playAutoReadWord(expression, reading),
+    );
+  }
+
+  Future<bool> _playAutoReadWord(String expression, String reading) {
+    // Prefer the popup's own <audio> (unified fast path); fall back to the Dart
+    // player when the popup WebView is not ready. Capture the state once so the
+    // callback does not re-evaluate the getter mid-play.
+    final DictionaryPopupWebViewState? popup = topPopupState;
+    return autoReadWordUnified(
+      appModel,
+      expression,
+      reading,
+      playInWebView: popup?.playWordAudioUrl,
+    );
+  }
+
+  void clearDictionaryResult() => _dismissPopupAt(0);
+
+  // 弹窗盒子尺寸随「界面大小」一起放大：阅读器/词典页整树被 FushiAppUiScaleNeutralizer
+  // 中和回原生密度（净缩放=1），弹窗盒子若不乘 appUiScale，界面 200% 时它仍是原生小尺寸
+  // （内容放大走 WebView 内 CSS zoom，见 DictionaryPopupWebView）。
+  //
+  // Phase B（尺寸拖拽）：拖动把手期间用预览态 [_popupResizePreview]（基准逻辑像素）临时
+  // 覆盖偏好真值，让盒子实时跟手放大/缩小；松手 [_onPopupResizeEnd] 才落偏好并清预览。
+  double get popupMaxWidth =>
+      (_popupResizePreview?.width ?? appModel.popupMaxWidth) *
+      appModel.appUiScale;
+  double get popupMaxHeight =>
+      (_popupResizePreview?.height ?? appModel.popupMaxHeight) *
+      appModel.appUiScale;
+  double get popupPadding => 6;
+  double get popupBottomReserve => 0;
+  double get popupTopReserve => 0;
+
+  /// 竖排表面（reader vertical-rl）查词时让弹窗放当前列左/右侧而非上/下。
+  /// 默认 false（视频/有声书横排字幕、首页等非竖排表面不变）。
+  bool get popupVerticalWriting => false;
+  late final Listenable _popupListenable =
+      Listenable.merge([_popup, _isSearchingNotifier]);
+
+  /// Phase B 尺寸拖拽的预览态（基准逻辑像素，未缩放）。非空 = 正在拖把手，[popupMaxWidth]
+  /// / [popupMaxHeight] 用它临时覆盖偏好实时预览；null = 未拖，用已落库真值。松手清空。
+  LookupSize? _popupResizePreview;
+
+  /// Phase B 拖拽尺寸的**冻结原点**（2026-07-15）：拖右下把手时把弹窗左上角钉在拖拽起点，
+  /// 只往右下生长（否则贴词定位在词靠右时会把左缘往左推=「从右下拖却从左上动」）。持续到
+  /// 换词（选区变）或关窗；[_popupResizeAnchorSelection] 记它属于哪张卡（哪个选区）。
+  Offset? _popupResizeAnchorTopLeft;
+  Rect? _popupResizeAnchorSelection;
+
+  /// 顶层卡片本帧贴词算出的 rect / 选区缓存，供 [_onPopupResizeStart] 取当前左上角冻结。
+  Rect? _topPopupAnchoredRect;
+  Rect? _topPopupSelectionRect;
+
+  // BUG-2416: nested selections must use the popup Stack coordinate space.
+  final GlobalKey _popupCoordinateSpaceKey = GlobalKey();
+
+  /// 拖把手起手：把当前偏好基准尺寸存入预览态（后续增量累积其上），并冻结顶层卡当前左上角。
+  void _onPopupResizeStart() {
+    setState(() {
+      _popupResizePreview =
+          LookupSize(appModel.popupMaxWidth, appModel.popupMaxHeight);
+      _popupResizeAnchorTopLeft = _topPopupAnchoredRect?.topLeft;
+      _popupResizeAnchorSelection = _topPopupSelectionRect;
+    });
+  }
+
+  /// 拖把手进行：把盒坐标系增量位移 [deltaPx] 经 [resolveDraggedLookupSize] 折算回基准
+  /// （除 appUiScale）并 clamp，实时驱动重建。
+  void _onPopupResizeUpdate(Offset deltaPx) {
+    final LookupSize base = _popupResizePreview ??
+        LookupSize(appModel.popupMaxWidth, appModel.popupMaxHeight);
+    setState(() {
+      _popupResizePreview = resolveDraggedLookupSize(
+        currentBaseWidth: base.width,
+        currentBaseHeight: base.height,
+        deltaWidthPx: deltaPx.dx,
+        deltaHeightPx: deltaPx.dy,
+        uiScale: appModel.appUiScale,
+      );
+    });
+  }
+
+  /// 松手：把预览尺寸一次性落偏好（`setPopupMaxWidth/Height` 单一真值，与设置滑杆同源），
+  /// 清空预览态回到「读真值」。
+  void _onPopupResizeEnd() {
+    final LookupSize? committed = _popupResizePreview;
+    setState(() => _popupResizePreview = null);
+    if (committed != null) {
+      appModel.setPopupMaxWidth(committed.width);
+      appModel.setPopupMaxHeight(committed.height);
+    }
+  }
+
+  /// 拖拽被竞技场中途取消：丢弃预览态回到「读真值」，不落偏好；一并撤销冻结原点（回贴词）。
+  void _onPopupResizeCancel() {
+    if (_popupResizePreview == null) return;
+    setState(() {
+      _popupResizePreview = null;
+      _popupResizeAnchorTopLeft = null;
+      _popupResizeAnchorSelection = null;
+    });
+  }
+
+  Widget buildDictionary() {
+    // 覆盖主题（阅读器纸色亮暗）下重挂一层玻璃作用域：库组件的默认玻璃变体
+    // 跟随弹窗主题的亮暗，而不是 app 根上的那份。结构恒定（MD3 也挂）。
+    return Theme(
+      data: appModel.overrideDictionaryTheme ?? theme,
+      child: FushiGlassScope(child: AnimatedBuilder(
+        animation: _popupListenable,
+        builder: (context, _) {
+          final stack = _popup.entries;
+          final searching = _isSearchingNotifier.value;
+          if (stack.isEmpty && !searching) return const SizedBox.shrink();
+          final hasVisiblePopup = _hasVisiblePopup(stack);
+          final visibleTopIndex = _lastVisiblePopupIndex(stack);
+
+          final showLoadingPlaceholder =
+              searching && !hasVisiblePopup && _pendingSelectionRect != null;
+
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final screen = Size(constraints.maxWidth, constraints.maxHeight);
+              return Stack(
+                key: _popupCoordinateSpaceKey,
+                // BUG-135: 隐藏热槽停到屏幕右外侧（_buildPopupLayer），Clip.none 让它
+                // 在屏外照常预热、又不裁掉（默认 hardEdge 会裁，原生 WebView 失温）。
+                clipBehavior: Clip.none,
+                children: [
+                  if (hasVisiblePopup || searching)
+                    Positioned.fill(
+                      // TODO-834（反转 TODO-720 / BUG-403）：点**所有弹窗矩形外**的
+                      // 真空白 = 一次性清整栈（会话级路径 [clearDictionaryResult]
+                      // → [_dismissPopupAt(0)] 触发会话收尾 [onAllPopupsDismissed]，
+                      // 保留隐藏热槽 BUG-092）。barrier 只在弹窗矩形之外命中（弹窗本
+                      // 体的 onTapOutside 单独处理「点某层本体空白」只关其后代）。光标
+                      // B/Esc 的逐层退回（[dismissTopPopup]）不受本改动影响。
+                      // TODO-1027：tap 带全局坐标转发给 [onDismissBarrierTap]
+                      // （阅读器覆写为「命中词→换新查词」，默认表面仍清整栈）。
+                      child: LookupDismissBarrier(
+                        onTapDismiss: onDismissBarrierTap,
+                        // TODO-716：水平拖过阈关一层（逐层，与光标 B/Esc 同语义）。
+                        onSwipeDismiss: dismissTopPopup,
+                        swipeEnabled:
+                            ReaderFushiSource.instance.enableSwipeToClose,
+                        // BUG-2770：触摸半边未设置时所有平台默认开。
+                        touchSwipeEnabled:
+                            ReaderFushiSource.instance.enableTouchSwipeToClose,
+                        sensitivity:
+                            ReaderFushiSource.instance.dismissSwipeSensitivity,
+                        onPointerHover: onDismissBarrierHover,
+                        onPointerSignal: onDismissBarrierPointerSignal,
+                        // 弹窗可见时唯一还能接到指针的地方（barrier 命中行为
+                        // opaque，页面根 Listener 收不到）——见该钩子的文档。
+                        onNonPrimaryButtonDown:
+                            onDismissBarrierNonPrimaryButton,
+                        scrollDismissAxis: dismissBarrierScrollAxis,
+                        onScrollDismiss: onDismissBarrierScrollDrag,
+                      ),
+                    ),
+                  if (showLoadingPlaceholder) _buildLoadingPlaceholder(screen),
+                  for (int i = 0; i < stack.length; i++)
+                    _buildPopupLayer(
+                      stack,
+                      i,
+                      screen,
+                      isTop: i == visibleTopIndex,
+                    ),
+                  // BUG-2039 ③：停驻的嵌套 realm 屏外挂着，下一次嵌套直接接管热
+                  // WebView。本页没混入 DictionaryPageMixin，所以直接调共享原语，
+                  // 不再把循环体内联抄一遍。
+                  ...parkedRealmPopupLayers(
+                    parkedRealms: _popup.parkedRealms,
+                    screen: screen,
+                    isDark: (appModel.overrideDictionaryTheme ?? theme)
+                            .brightness ==
+                        Brightness.dark,
+                    overrideFillColor: appModel.overrideDictionaryColor,
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      )),
+    );
+  }
+
+  Widget _buildLoadingPlaceholder(Size screen) {
+    // 加载占位只在「顶层」搜索期出现（嵌套搜索时父弹窗仍 visible，hasVisiblePopup
+    // 为真，不显示占位），故按 index 0 取竖排避让。
+    final pos = _calculatePopupPosition(
+      _pendingSelectionRect!,
+      screen,
+      verticalWriting: _layerVerticalWriting(0),
+    );
+    final effectiveCs = (appModel.overrideDictionaryTheme ?? theme).colorScheme;
+    final fillColor = appModel.overrideDictionaryColor ?? effectiveCs.surface;
+
+    return Positioned(
+      // 占位层也要有稳定 key（与弹窗层的 ObjectKey(item) 配套）：barrier 插拔时
+      // Stack 里 keyed 子项按 key 匹配，占位/弹窗层不会被按位置错配成对方。
+      key: const ValueKey<String>('base-source-popup-loading-placeholder'),
+      left: pos.left,
+      top: pos.top,
+      width: pos.width,
+      height: pos.height,
+      // 查询中：卡壳先铺上，加载指示器（MD3 Expressive 变形 / Apple 菊花 / 墨水屏
+      // 沙漏）150ms 后才露出——快查询只看到卡壳一闪而过、不闪转圈；绝不画「未找到」。
+      child: FushiPopupSurface(
+        color: fillColor,
+        child: FushiDeferredLoading(active: true, color: effectiveCs.primary),
+      ),
+    );
+  }
+
+  Widget _buildPopupLayer(
+    List<DictionaryPopupEntry> stack,
+    int index,
+    Size screen, {
+    required bool isTop,
+  }) {
+    final item = stack[index];
+    // 真实空结果收成「未找到」空态的高度，否则按内容测量（见 layoutAutoFitHeight）。
+    final double emptyHeight = kLookupPopupEmptyHeight * appModel.appUiScale;
+    final double? fitHeight = item.layoutAutoFitHeight(emptyHeight: emptyHeight);
+    final pos = _calculatePopupPosition(
+      item.selectionRect,
+      screen,
+      verticalWriting: _layerVerticalWriting(index),
+      autoFitHeight: fitHeight,
+    );
+    // 自适应高度只收外壳，WebView 仍按最大高度布局、超出部分裁掉
+    // （[DictionaryPopupLayer.webViewOverflowHeight]，与 mixin 家族同一手法）：内容增减
+    // 不改原生表面尺寸，避免 Windows 上旧尺寸帧被拉伸。
+    final double fullPopupHeight = fitHeight == null ||
+            popupBottomDocked ||
+            _popupResizePreview != null
+        ? pos.height
+        : _calculatePopupPosition(
+            item.selectionRect,
+            screen,
+            verticalWriting: _layerVerticalWriting(index),
+          ).height;
+    final double webViewOverflowHeight =
+        fullPopupHeight > pos.height ? fullPopupHeight - pos.height : 0.0;
+    // Phase B 拖拽尺寸：缓存顶层卡当前 rect/选区，供 [_onPopupResizeStart] 冻结其左上角。
+    if (isTop) {
+      _topPopupSelectionRect = item.selectionRect;
+      _topPopupAnchoredRect = pos;
+    }
+    final isDark = (appModel.overrideDictionaryTheme ?? theme).brightness ==
+        Brightness.dark;
+    // 「制卡」模块（[ModuleId.cardCreation]）总闸：本处是阅读器 / 漫画 / 视频 /
+    // texthooker 四个媒体页共用的**唯一** Anki 装配点，关掉即四个表面同时失去制卡。
+    // 快照只取一次——[AppModel.moduleVisibility] 每读一次都重新合成一个 Set，
+    // 而下面要问好几次。
+    //
+    // 收藏（onFavoriteEntry / onFavoriteCheck）**不在此列**：收藏句子/词写的是本地
+    // FavoriteWords 表，与 Anki 无关，属阅读能力而非制卡能力。
+    final bool cardCreationEnabled = appModel.moduleVisibility.isEnabled(
+      ModuleId.cardCreation,
+    );
+    // 「+句」草稿（多句合一制卡 / 调整上下文）只为制卡服务，跟着制卡一起关。
+    final bool sentenceDraftEnabled =
+        supportsSentenceDraft && cardCreationEnabled;
+
+    // BUG-135 parking + Visibility 几何收口在 [parkedPopupLayer]。
+    return parkedPopupLayer(
+      // 与 mixin 侧 BUG-941 同根因：dismiss barrier / 搜索占位层出现或消失时，本层
+      // 在 Stack children 中前/后移一位。若顶层 Positioned 无 key，Flutter 按位置
+      // 把相邻层的元素错配更新、再拆掉旧位置的平台 WebView——热槽被冷重载
+      // （popup.html + JS 整包重来），甚至 Windows 上只剩空白外壳。以 entry 身份
+      // 钉住整层，让元素真正搬位而不是拆建原生表面。
+      key: ObjectKey(item),
+      pos: pos,
+      // 被更上层查词卡盖住的部分裁掉：上层的模糊才采到正文而不是本层面板
+      // （[PopupOccluderClip]，玻璃叠玻璃）。
+      occluders: <Rect>[
+        for (int j = index + 1; j < stack.length; j++)
+          if (stack[j].visible)
+            _calculatePopupPosition(
+              stack[j].selectionRect,
+              screen,
+              verticalWriting: _layerVerticalWriting(j),
+              autoFitHeight: stack[j].layoutAutoFitHeight(
+                emptyHeight: emptyHeight,
+              ),
+            ),
+      ],
+      // BUG-797 / BUG-1040：任何「必须盖住弹窗」的 Flutter 对话框（选择句子上下文 /
+      // 已制卡动作 / 打开卡片选择）期间把弹窗停靠屏外，否则原生平台视图
+      // （WebView2 / Android platform view）盖住 showAppDialog 弹的对话框（层级不对）。
+      visible: item.visible && _popupHidingDialogDepth == 0,
+      screen: screen,
+      child: DictionaryPopupLayer(
+        result: item.result,
+        restoreScrollTop: item.restoreScrollTop,
+        webViewKey: item.webViewKey,
+        keepWebViewWarm: item.isWarmSlot,
+        // TODO-869：本层有后代弹窗时注入 __hasChildPopup，点卡片本体留白才能关子窗。
+        hasChildPopup: index < stack.length - 1,
+        isDark: isDark,
+        overrideFillColor: appModel.overrideDictionaryColor,
+        // dock 面板铺满屏幕左右缘时把圆角摊平，否则边缘露出背景（BUG-2439）。
+        bottomDocked: popupBottomDocked,
+        onDismiss: () => _dismissPopupAt(index),
+        // TODO-407②：平台/偏好级"滑动关闭"开关（Windows/Linux 默认 false）。
+        enableSwipeToClose: ReaderFushiSource.instance.enableSwipeToClose,
+        // BUG-2770：触摸 / 触控笔滑关未设置时所有平台默认开（鼠标仍按上一行）。
+        enableTouchSwipeToClose:
+            ReaderFushiSource.instance.enableTouchSwipeToClose,
+        // TODO-407①：顶层仍渲染"X 关闭"并走既有关闭汇聚点 [_dismissPopupAt(0)]
+        // （不破坏 BUG-072 续播 / 清句 / 清栈）。
+        onClose: () => _dismissPopupAt(index),
+        // TODO-485：嵌套层即便禁用滑动关闭，也有显式返回父层入口。
+        onBack: null,
+        // Phase B：app 内弹窗右下角尺寸拖拽把手（全 5 平台）。拖动 = 可视化改「最大宽高」
+        // 偏好（与设置滑杆同一真值）。任意层都能拖（都编辑共享真值），预览态在宿主级。
+        showResizeGrip: true,
+        onResizeStart: _onPopupResizeStart,
+        onResizeUpdate: _onPopupResizeUpdate,
+        onResizeEnd: _onPopupResizeEnd,
+        onResizeCancel: _onPopupResizeCancel,
+        // TODO-834：点**某层弹窗本体的空白区**（非内容区）只关该层衍生的后代层，
+        // 保留本层 + 祖先（不关母代）。点顶层（无后代）= no-op 栈不变。
+        onTapOutside: () => dismissDescendantsOf(index),
+        onRendered: () => _onPopupLayerRendered(index, item),
+        webViewOverflowHeight: webViewOverflowHeight,
+        // 阅读器弹窗此前从不收缩：永远按「最大宽高」偏好铺满（默认约 1000×700），
+        // 一个词条 / 空结果也是一大块面板。按 WebView 上报的内容高度收外壳（mixin
+        // 家族 [buildNestedPopupLayer] 同一算法）。
+        onContentMetrics: (double contentHeight, double viewportHeight) {
+          if (!mounted ||
+              !_popup.entries.contains(item) ||
+              popupBottomDocked ||
+              _popupResizePreview != null) {
+            return;
+          }
+          final double nextHeight = resolveAutoFitPopupHeight(
+            currentPopupHeight: fullPopupHeight,
+            contentHeight: contentHeight,
+            viewportHeight: viewportHeight,
+            minHeight: kLookupPopupMinHeight * appModel.appUiScale,
+            maxHeight: popupMaxHeight,
+          );
+          if ((nextHeight - (item.autoFitHeight ?? pos.height)).abs() < 1) {
+            return;
+          }
+          setState(() => item.autoFitHeight = nextHeight);
+        },
+        // TODO-058 fail-safe：弹窗 WebView 加载失败也走同一翻可见入口（加载失败
+        // 也显示，不卡死「点查词什么都不出」）。
+        onRenderError: () => _onPopupLayerRendered(index, item),
+        inputSpec: dictionaryPopupInputSpec,
+        // BUG-2627：与 [DictionaryPageMixin] 同一道门——对话框期间（选择句子上下文 /
+        // 已制卡动作 / 打开卡片）弹窗停靠屏外但仍挂载，它的 DOM 还可能拿着系统键盘
+        // 焦点，一个被绑的键就能把对话框背后的整条浮层栈关掉。与 `visible:` 的
+        // `_popupHidingDialogDepth == 0` 共用判据。
+        onHostInputToken: dictionaryPopupInputScope == null
+            ? null
+            : (String token) {
+                if (_popupHidingDialogDepth != 0) return;
+                onDictionaryPopupInputToken(token);
+              },
+        headerWidget: index == 0 ? buildPopupAudioControls() : null,
+        topBarScale: dictionaryPopupTopBarScale(
+          appUiScale: appModel.appUiScale,
+          dictionaryFontSize: appModel.dictionaryFontSize,
+        ),
+        overlayWidget: isTop ? buildDictionaryLoading() : null,
+        onTextSelected: (text, localRect) async {
+          final childRect = localRect == Rect.zero
+              ? item.selectionRect
+              : popupWordScreenRect(
+                  webViewKey: item.webViewKey,
+                  localRect: localRect,
+                  fallback: item.selectionRect,
+                  coordinateSpaceKey: _popupCoordinateSpaceKey,
+                );
+          prunePopupStack(index + 1);
+          final count = await searchDictionaryResult(
+            searchTerm: text,
+            selectionRect: childRect,
+            origin: LookupOrigin.nested,
+          );
+          if (count > 0) {
+            final int generation = activeLookupGeneration;
+            final Rect? wordRect =
+                await item.webViewKey.currentState?.highlightSelection(count);
+            // BUG-2054：同一次高亮顺带取回整词 bbox，把刚 push 的子层从「点击的首
+            // 字符」重锚到整词矩形（跨行选区时首字符矩形只覆盖第一行，子弹窗会盖住
+            // 选区的第二行）。eval 往返期间可能已有更新的查词占住同一下标，故叠
+            // BUG-717② 的代次门 + expectedTerm 词形门两道身份校验。阅读器车道监听
+            // controller，reanchorEntry 的 notifyListeners 已触发重定位，无需 setState。
+            if (mounted && generation == activeLookupGeneration) {
+              reanchorNestedPopupToWord(
+                controller: _popup,
+                parentWebViewKey: item.webViewKey,
+                parentIndex: index,
+                expectedTerm: text,
+                wordLocalRect: wordRect,
+                fallback: childRect,
+                coordinateSpaceKey: _popupCoordinateSpaceKey,
+              );
+            }
+          }
+        },
+        // 词头 / 交叉引用链接 / 汉字（onLinkClick 通道）：**原地跳转**而不是叠一层
+        // 子弹窗——对齐 Hoshi Reader iOS（`lookupRedirect` → `redirect(count)`：
+        // 同一个 WebView 换内容，← → 在历史页间来回）。释义正文点词（onTextSelected）
+        // 仍叠子层，也与 Hoshi 一致（那边 `textSelected` 走 `popups.append`）。
+        onLinkClick: (query, localRect) =>
+            navigatePopupInPlace(index: index, item: item, query: query),
+        historyNav: item.hasNavigationHistory
+            ? DictionaryPopupHistoryNav(
+                canGoBack: item.canGoBack,
+                canGoForward: item.canGoForward,
+                onBack: () => _navigatePopupHistory(item, forward: false),
+                onForward: () => _navigatePopupHistory(item, forward: true),
+              )
+            : null,
+        // TODO-962：弹窗滚到底时若该层结果可能被截断（!allLoaded）就续查下一批词头
+        // （与 dictionary_page_mixin / home_dictionary_page 同构），webview 的
+        // _pushResults 据 searchTerm 不变 + entries 增多自动判 isLoadMore → 走
+        // window.updatePopupIncremental() 增量追加，不重渲染整页、保滚动位/热槽。
+        onScrolledToBottom: item.allLoaded
+            ? null
+            : () => loadMoreForLayer(index),
+        // 制卡模块关闭：制卡链路整条断开（不写卡、不问 Anki），点了给一句可见提示
+        // 说明为什么没反应——[DictionaryPopupLayer.onMineEntry] 是必填参数，
+        // popup.js 也无条件渲染这颗 + 按钮，所以此处只能落到「可点 + 反馈」这一档。
+        onMineEntry: cardCreationEnabled
+            ? closePopupAfterAcceptedMine(
+                onMineFromPopup,
+                enabled: () => ReaderFushiSource.instance.closePopupAfterMining,
+                closeAll: () {
+                  if (mounted) clearDictionaryResult();
+                },
+              )
+            : _mineBlockedByModuleGate,
+        onUpdateEntry: cardCreationEnabled ? onUpdateFromPopup : null,
+        // 用户建议 #fiwDIpFep7：顶栏就地切配置 / 牌组，随制卡模块开关。
+        showMiningTargetSwitch: cardCreationEnabled,
+        // TODO-948②：阅读器/有声书弹窗收藏按钮接线（视频走 mixin，不经此处）。
+        onFavoriteEntry: onFavoriteFromPopup,
+        onFavoriteCheck: onFavoriteCheckFromPopup,
+        // 制卡关掉时恒答「不重复」：既画不出撒谎的 ✓，也不会为一个用不了的按钮
+        // 每次查词都去问一遍 Anki（模块关掉 = 该模块的后台流量也一起停）。
+        onDuplicateCheck: cardCreationEnabled
+            ? (expression, reading) async {
+                final repo = ref.read(ankiRepositoryProvider);
+                return repo.isDuplicate(expression, reading);
+              }
+            : (String expression, String reading) async => false,
+        // TODO-614：覆写范围=「全部」时按内容反查可覆写的已存在 note id，让阅读器/
+        // 有声书/视频弹窗里更早制的卡也能点绿 ✓↩ 覆写（默认 latest / AnkiDroid 回 null）。
+        onOverwriteTargetNoteId: cardCreationEnabled
+            ? (expression, reading) async {
+                final repo = ref.read(ankiRepositoryProvider);
+                return repo.findOverwriteTargetNoteId(expression, reading);
+              }
+            : null,
+        // TODO-1007/1008：点 ✓（卡已存在）弹操作选择（覆写/新增重复卡/查看·在 Anki
+        // 中打开），命中多张让用户选哪张。reader 覆写 onMineFromPopup/onUpdateFromPopup
+        // 做真实制卡/覆盖（基类无操作）。
+        onMinedCardAction: cardCreationEnabled
+            ? onMinedCardActionFromPopup
+            : null,
+        // TODO-1360：已制卡的词旁「在 Anki 中打开卡片」按钮 → 反查命中卡直接跳转打开。
+        onOpenInAnki: cardCreationEnabled ? onOpenInAnkiFromPopup : null,
+        // TODO-270 F/G「查词窗口多句合一制卡」(乙方案)：仅支持草稿的表面（reader 覆写
+        // [supportsSentenceDraft]=true）传入回调；其余表面传 null，弹窗不渲染「+句」。
+        onAppendSentence: sentenceDraftEnabled ? onAppendSentenceToDraft : null,
+        onSetSentenceContext: sentenceDraftEnabled
+            ? onSetSentenceContextToDraft
+            : null,
+        onClearSentenceDraft: sentenceDraftEnabled
+            ? onClearSentenceDraftToDraft
+            : null,
+        // 「高级制卡」：点某词条的「高级制卡」→ 弹 app 原生顶层对话框（BUG-763/766：
+        // 不画在弹窗 WebView 内）；确认制卡回该层 WebView（item.webViewKey）精确点中该
+        // 词条的「+」并带上覆盖项。只跟制卡模块走——卡组分区所有表面都有，句子 / 音频 /
+        // 图片分区由页面的 [buildAdvancedMiningSections] 决定有无。
+        onOpenAdvancedMining: cardCreationEnabled
+            ? (int entryIndex, String matched, String expression) =>
+                _openAdvancedMiningDialog(
+                  webViewKey: item.webViewKey,
+                  entryIndex: entryIndex,
+                  matched: matched,
+                  expression: expression,
+                )
+            : null,
+      ),
+    );
+  }
+
+  /// BUG-797 / BUG-1040：有多少个「必须盖住查词弹窗」的 Flutter 对话框正开着。
+  ///
+  /// 查词弹窗是**原生平台视图**（桌面 WebView2 / Android platform view），总画在 Flutter
+  /// overlay 之上——`showAppDialog` 弹的对话框在 Flutter overlay 层，会被原生弹窗**盖住**
+  /// （用户报「层级不对」，对话框被词典弹窗遮住）。这些对话框期间据此把弹窗
+  /// [parkedPopupLayer] 的 `visible` 强制翻假 → 弹窗停靠到屏外（[parkedPopupLayer] 的
+  /// BUG-135 停靠语义，webview 仍存活、确认制卡回点照常），让对话框独占屏幕；关闭后复原。
+  ///
+  /// BUG-1040 从 bool 改成**计数**：已制卡动作对话框里还能再叠一层 note viewer 对话框，
+  /// 用 bool 会被内层 `finally` 提前复位、外层对话框当场被弹窗盖回去。计数支持嵌套。
+  int _popupHidingDialogDepth = 0;
+
+  /// BUG-1040：在 [body] 执行期间把查词弹窗停靠屏外的统一入口（收口 setState 增减，
+  /// 杜绝各调用点各写一份 try/finally 漏复位）。[body] 抛错时照常复位。
+  // 类型参数用 R（本 State 类自身已有类型参数 T，避免遮蔽）。
+  Future<R> runWithLookupPopupHidden<R>(Future<R> Function() body) async {
+    if (mounted) setState(() => _popupHidingDialogDepth++);
+    try {
+      return await body();
+    } finally {
+      if (mounted) {
+        setState(() => _popupHidingDialogDepth =
+            _popupHidingDialogDepth > 0 ? _popupHidingDialogDepth - 1 : 0);
+      }
+    }
+  }
+
+  /// 「高级制卡」：弹窗点某词条的「高级制卡」→ 弹 **app 原生顶层对话框**
+  /// （[showAdvancedMiningDialog]，BUG-763/766：不画在查词弹窗 WebView 内）。
+  ///
+  /// * 卡组分区从 Anki 设置统一组装（[loadAdvancedMiningDeckSection]）；
+  /// * 句子 / 音频 / 图片分区由页面覆写 [buildAdvancedMiningSections] 提供；
+  /// * 「确认」回 [webViewKey] 那层弹窗精确点中第 [entryIndex] 个词条的「+」
+  ///   （[DictionaryPopupWebViewState.mineEntryByIndex]，复用全部制卡 / 查重 / 覆写
+  ///   逻辑），并把用户的选择作为 [MiningRequestOverrides] 并进这一次的制卡 fields。
+  ///
+  /// BUG-797：对话框打开期间把弹窗 WebView 停靠屏外（[runWithLookupPopupHidden]），
+  /// 否则原生平台视图盖住对话框。分区的组装（读 Anki 设置、取预览）也在停靠期间做：
+  /// 它们都很快，而先弹窗再停靠会让弹窗在对话框上闪一下。
+  Future<void> _openAdvancedMiningDialog({
+    required GlobalKey<DictionaryPopupWebViewState> webViewKey,
+    required int entryIndex,
+    required String matched,
+    required String expression,
+  }) async {
+    if (!mounted) return;
+    await runWithLookupPopupHidden<void>(() async {
+      final AdvancedMiningDeckSection deck =
+          await loadAdvancedMiningDeckSection(ref);
+      final AdvancedMiningSections sections =
+          await buildAdvancedMiningSections(matched: matched);
+      if (!mounted) {
+        await sections.onClosed?.call();
+        return;
+      }
+      await showAdvancedMiningDialog(
+        context: context,
+        capabilities: AdvancedMiningCapabilities(
+          matched: matched,
+          expression: expression.isEmpty ? null : expression,
+          deck: deck,
+          sections: sections,
+          // BUG-2627：回传「有没有真的点到制卡按钮」，对话框据此提示，不再静默关窗。
+          onConfirm: (MiningRequestOverrides overrides) async =>
+              await webViewKey.currentState?.mineEntryByIndex(
+                    entryIndex,
+                    // BUG-2634 第二轮：阅读器的 onMineFromPopup 经制卡串行队列
+                    // 入队（TODO-644 / BUG-357），草稿要等前一次制卡整段跑完才被
+                    // 读走——提前关窗会让弹窗关栈把草稿清掉，排到的任务用空草稿
+                    // 合成。这条车道退回「等落地」，只是不会再因为宿主慢而误报。
+                    releaseWhenPayloadConsumed: false,
+                    overrides: overrides,
+                  ) ??
+                  false,
+        ),
+      );
+    });
+  }
+
+  /// TODO-058：某弹窗层 WebView 渲染完成（`popupRendered`）。先把挂起的冷层翻为
+  /// 可见（[markPendingReveal] 标记的层等到此刻才显示，杜绝白屏一瞬），再交给
+  /// [onDictionaryPopupRendered]（阅读器据此把字符光标交给刚显示的顶层弹窗）。
+  /// 顺序要紧：先 reveal 再回调，使回调里读到的 [topVisiblePopupIndex] 已是新层。
+  void _onPopupLayerRendered(int index, DictionaryPopupEntry item) {
+    if (!mounted) return;
+    _popup.revealRendered(item);
+    // 阅读器路径先带盖板翻可见（[showDeferredPopup]），revealRendered 不再收尾；
+    // 渲染完成即这次查词的终点，在这里收（已收尾时幂等）。
+    LookupPerfTrace.current?.finish('revealed');
+    _clearVisibleRenderPending(item: item);
+    onDictionaryPopupRendered(index);
+  }
+
+  void _dismissPopupAt(int index) {
+    _bumpSearchGeneration();
+    _pendingSelectionRect = null;
+    _isSearchingNotifier.value = false;
+    _deferredPopupItem = null;
+    _clearVisibleRenderPending();
+    if (index > 0) {
+      final parent = _popup.entries[index - 1];
+      parent.webViewKey.currentState?.clearSelection();
+    }
+    if (index == 0) {
+      _popup.lowMemory = appModel.lowMemoryMode;
+      // 关栈前清掉热槽 WebView 选区（仅保留热槽的分支需要）。
+      if (_popup.entries.isNotEmpty && _popup.entries.first.isWarmSlot) {
+        _popup.entries.first.webViewKey.currentState?.clearSelection();
+      }
+      _popup.dismissAt(0);
+      appModel.currentMediaSource?.clearCurrentSentence();
+      appModel.currentMediaSource?.clearExtraData();
+      onAllPopupsDismissed();
+    } else {
+      _popup.dismissAt(index);
+      onDictionaryStackChanged();
+    }
+  }
+
+  /// Called when all dictionary popups are dismissed (stack becomes empty).
+  /// Override in subclasses to hook post-dismiss logic.
+  void onAllPopupsDismissed() {}
+
+  /// TODO-270 F/G「查词窗口多句合一制卡」(乙方案)：本表面是否支持「+句」累积草稿。
+  /// 默认 false（纯查词/视频 E 未接入），reader 覆写为 true。决定弹窗是否渲染「+句」
+  /// 按钮（经 [onAppendSentence] → `window.sentenceDraftEnabled`）。
+  @protected
+  bool get supportsSentenceDraft => false;
+
+  /// 这个表面能不能试听「将写进卡片的那段句子音频」（BUG-2196 ②）。
+  /// 默认 false；阅读器/有声书覆写为 true。
+  @protected
+  bool get supportsSentenceAudioPreview => false;
+
+  /// 「高级制卡」对话框里本页面提供的句子 / 音频 / 图片分区（契约见
+  /// [AdvancedMiningCapabilities]）。默认什么都不提供——对话框只有卡组分区。
+  /// 阅读器 / 有声书 / 漫画覆写。[matched] 是查到的词在句中的表现形。
+  @protected
+  Future<AdvancedMiningSections> buildAdvancedMiningSections({
+    required String matched,
+  }) async =>
+      AdvancedMiningSections.none;
+
+  /// TODO-270 F/G：弹窗「+句」追加当前正查句到本表面会话级制卡草稿，返回累积句数
+  /// （含本句）。默认 no-op 返回 0（[supportsSentenceDraft] 为 false 时不会被调用）。
+  /// reader 覆写：把当前句 + 句子音频区间推进草稿。
+  @protected
+  Future<int> onAppendSentenceToDraft() async => 0;
+
+  /// TODO-393「上 N 句 / 下 N 句」上下文选择：把当前句之前 [prevCount] 句、之后
+  /// [nextCount] 句作上下文**整体设置**进本表面会话级制卡草稿（不掺历史累积），返回
+  /// 上下文句总数（上 N + 下 N）。默认 no-op 返回 0（[supportsSentenceDraft] 为 false
+  /// 时不会被调用）。reader/视频覆写：reader 走 DOM 句子上下文，视频走 cue 列表前后取。
+  @protected
+  Future<int> onSetSentenceContextToDraft(int prevCount, int nextCount) async =>
+      0;
+
+  /// TODO-382「+句」可撤销：清空本表面会话级制卡草稿，返回清空后的句数（恒 0）。
+  /// 默认 no-op（[supportsSentenceDraft] 为 false 时不会被调用）。reader/视频覆写。
+  @protected
+  Future<int> onClearSentenceDraftToDraft() async => 0;
+
+  /// Niratan「制卡前调整·选择句子上下文」：把当前会话级草稿的真实上下文句
+  /// （上 N / 下 N，已按阅读顺序）+ 当前正查句 + 词在当前句里的偏移打包成 JSON-safe
+  /// Map（[buildSentenceContextPreview] 的结构）回给弹窗渲染三栏预览。默认返回空 Map
+  /// （[supportsSentenceDraft] 为 false 时不会被调用）。reader/视频覆写：各自提供当前
+  /// 正查句与词偏移来源。
+  @protected
+  Future<Map<String, Object?>> onSentenceContextPreviewFromDraft() async =>
+      const <String, Object?>{};
+
+  /// 「制卡前调整·选择句子上下文」里**手改某一句文本**：把 [slot]（上文/当前/下文）
+  /// 第 [index] 句的文本改成 [text]，写回本表面会话级制卡草稿。
+  ///
+  /// 只改**会写进卡片的那段文本**，不动该句的音频区间与身份——改错别字 / 补主语 /
+  /// 去掉说话人名之后，仍是同一句、同一段音频，试听与压制结果不变。
+  /// 默认 no-op（[supportsSentenceDraft] 为 false 时不会被调用）。reader/视频覆写。
+  @protected
+  Future<void> onEditSentenceContextText(
+    SentenceContextSlot slot,
+    int index,
+    String text,
+  ) async {}
+
+  /// 「制卡前调整·选择句子上下文」里把 [slot]（上文/下文）第 [index] 句从卡片里
+  /// 移除（[removed] = true）或恢复。被移除的句子不进卡片文本与音频区间，但仍占着
+  /// 上下文的位置（加减句数不会把它挤丢）。
+  /// 默认 no-op（[supportsSentenceDraft] 为 false 时不会被调用）。reader 覆写。
+  @protected
+  Future<void> onRemoveSentenceContext(
+    SentenceContextSlot slot,
+    int index,
+    bool removed,
+  ) async {}
+
+  /// BUG-2196 ②：试听**这次制卡真正会写进卡片的那段音频**。
+  ///
+  /// 为什么值得单独一个钩子而不是「播当前句的 cue」：写进卡的区间是
+  /// `MiningSentenceDraft.composeAudioRange(当前句区间)` 的结果——它把用户在这个
+  /// 对话框里加减出来的上下文句一起合并了，并且带上首尾留白与 A/V 偏移。播 cue
+  /// 只能证明「这句有音频」，证明不了「裁出来的那段念全了」，而用户报的恰恰是
+  /// 后者（断句歪了 → 区间歪了 → 压出来的音频没念到目标词）。
+  ///
+  /// 返回 false = 这句没有可试听的音频（没挂有声书、跨音频文件、区间解不出来）。
+  /// 默认 false：不支持的表面（视频页等）对话框里就不显示试听按钮。
+  @protected
+  Future<bool> onPreviewSentenceAudio() async => false;
+
+  /// 停止 [onPreviewSentenceAudio] 起的试听，并让主播放恢复原状。
+  @protected
+  Future<void> onStopSentenceAudioPreview() async {}
+
+  /// Called when a non-last popup layer is dismissed (the stack shrinks but a
+  /// parent popup remains). Override (reader) to keep the char cursor following
+  /// the new top popup — covers both B/Esc and swipe dismissal of a deeper layer.
+  void onDictionaryStackChanged() {}
+
+  /// Called after the popup at [index] finishes rendering. Override (reader) to
+  /// hand the char-level cursor to the freshly shown top popup.
+  void onDictionaryPopupRendered(int index) {}
+
+  /// The currently top-most VISIBLE popup's WebView state — the surface the
+  /// char-level cursor drives when it lives in the dictionary. Null when no
+  /// popup is visible.
+  @protected
+  DictionaryPopupWebViewState? get topPopupState =>
+      _lastVisiblePopup(_popup.entries)?.webViewKey.currentState;
+
+  /// Index of the top-most visible popup in the stack, or -1.
+  @protected
+  int get topVisiblePopupIndex => _lastVisiblePopupIndex(_popup.entries);
+
+  /// Dismiss only the top-most visible popup (one layer), leaving any parent
+  /// popup in place — used by the cursor's B/Esc "back one layer".
+  @protected
+  void dismissTopPopup() {
+    final int index = _lastVisiblePopupIndex(_popup.entries);
+    if (index >= 0) _dismissPopupAt(index);
+  }
+
+  /// TODO-834：关闭第 [index] 层**衍生的所有后代层**（index 更大的全部层），保留本层
+  /// + 祖先。线性扁平栈里 index 即 depth，无分叉，故「后代」= `index+1..end`，用
+  /// [DictionaryPopupController.truncateTo] 精确裁掉。点最顶层（无后代）= no-op 栈不变
+  /// （本层成新顶层，选区高亮保留，不走清整栈路径）。裁完调一次
+  /// [onDictionaryStackChanged] 让光标跟随回到新顶层（与 B/Esc 逐层退回同钩子）。
+  @protected
+  void dismissDescendantsOf(int index) {
+    if (index < 0 || index >= _popup.entries.length - 1) return; // 无后代=no-op
+    _popup.truncateTo(index + 1);
+    onDictionaryStackChanged();
+  }
+
+  /// 竖排避让（放当前列左/右侧而非上/下）只对**顶层弹窗**成立：顶层选区来自
+  /// 书面文字，可能是竖排列。嵌套层（index>0）的选区来自上一层弹窗内部，而弹
+  /// 窗内容（assets/popup/*）恒为横排，必须按横排上下避让——不能继承外层书的
+  /// 竖排设定。
+  bool _layerVerticalWriting(int index) => index == 0 && popupVerticalWriting;
+
+  Rect _calculatePopupPosition(
+    Rect sel,
+    Size screen, {
+    bool verticalWriting = false,
+    double? autoFitHeight,
+  }) {
+    // TODO-108：查词弹窗位置计算的单一收口点（reader/有声书/独立查词页家族共用），
+    // 底部固定模式忽略选区放屏幕底部全宽面板。video 家族在 dictionary_page_mixin
+    // 用同一个 [resolvePopupRect] 收口（不碰 video_fushi_page）。reserve/padding/
+    // verticalWriting 走本类 getter（子类可 override，如 reader 预留底栏）。
+    final Rect anchored = resolvePopupRect(
+      selectionRect: sel,
+      screen: screen,
+      bottomDocked: popupBottomDocked,
+      maxWidth: popupMaxWidth,
+      // 查词弹窗按内容收缩（与 mixin 家族 [_calcMixinPopupPosition] 同口径）：
+      // [autoFitHeight] 来自 WebView 上报的内容高度，只收不放（夹在偏好最大高度内）；
+      // 拖尺寸把手期间以预览态为准，不收缩。
+      maxHeight: _popupResizePreview != null || autoFitHeight == null
+          ? popupMaxHeight
+          : autoFitHeight.clamp(0.0, popupMaxHeight).toDouble(),
+      padding: popupPadding,
+      bottomReserve: popupBottomReserve,
+      topReserve: popupTopReserve,
+      verticalWriting: verticalWriting,
+    );
+    // Phase B 拖拽尺寸（2026-07-15）：被拖的那张卡（选区匹配）冻结左上角，从右下生长，
+    // 消除「词靠右缘时贴词定位把左缘左移」的 bug。底部固定 dock 模式忽略选区、不冻结。
+    if (!popupBottomDocked &&
+        _popupResizeAnchorTopLeft != null &&
+        _popupResizeAnchorSelection == sel) {
+      return anchorPopupTopLeft(
+        anchored: anchored,
+        topLeft: _popupResizeAnchorTopLeft!,
+        screen: screen,
+        inset: popupPadding,
+      );
+    }
+    return anchored;
+  }
+
+  bool get dictionaryPopupShown => _hasVisiblePopup(_popup.entries);
+
+  /// Test-only snapshot of the popup stack (BUG-092): lets widget tests assert
+  /// the warm-slot seed/prune/reuse lifecycle without rendering the real
+  /// [DictionaryPopupWebView], which cannot instantiate the platform WebView in
+  /// the unit-test harness.
+  @visibleForTesting
+  List<
+      ({
+        bool isWarmSlot,
+        bool visible,
+        bool revealOnRender,
+        // TODO-962：暴露 allLoaded + entryCount，让 widget 测试断言「弹窗结果被截断时
+        // 不再硬编码 allLoaded:true、load-more 后词头数增加」。按名访问，不破坏既有解构。
+        bool allLoaded,
+        int entryCount,
+        GlobalKey<DictionaryPopupWebViewState> webViewKey
+      })> get debugPopupStack => _popup.entries
+      .map((e) => (
+            isWarmSlot: e.isWarmSlot,
+            visible: e.visible,
+            revealOnRender: e.revealOnRender,
+            allLoaded: e.allLoaded,
+            entryCount: e.result?.entries.length ?? 0,
+            webViewKey: e.webViewKey,
+          ))
+      .toList();
+
+  /// 测试钩子：当前弹窗栈的条目本身。
+  @visibleForTesting
+  List<DictionaryPopupEntry> get debugPopupEntries =>
+      List<DictionaryPopupEntry>.unmodifiable(_popup.entries);
+
+  /// TODO-058 test hook: simulate the WebView at [index] firing `popupRendered`
+  /// (the fake test WebView never fires real lifecycle callbacks). Reveals a
+  /// pending cold layer exactly like the production [DictionaryPopupLayer.onRendered]
+  /// path, so widget tests can assert "nested popup hidden until render".
+  @visibleForTesting
+  void debugFirePopupRendered(int index) {
+    if (index < 0 || index >= _popup.entries.length) return;
+    _onPopupLayerRendered(index, _popup.entries[index]);
+  }
+
+  /// TODO-058 fail-safe test hook: simulate the WebView at [index] firing the
+  /// load-error callback (`onReceivedError` -> [DictionaryPopupLayer.onRenderError]).
+  /// Reveals a pending cold layer exactly like the production error wiring, so
+  /// widget tests can assert "load failure still shows the popup, not stuck hidden".
+  @visibleForTesting
+  void debugFirePopupRenderError(int index) {
+    if (index < 0 || index >= _popup.entries.length) return;
+    // Same reveal entry the onRenderError closure uses in _buildPopupLayer.
+    _onPopupLayerRendered(index, _popup.entries[index]);
+  }
+
+  void onDictionaryDismiss() {
+    clearDictionaryResult();
+  }
+
+  Widget buildDictionaryLoading() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _isSearchingNotifier,
+      builder: (context, value, child) {
+        // 顶层查词在途（含「已显示、等热槽 WebView 报 popupRendered」）：延迟加载层
+        // ——150ms 后才露出指示器、露出后至少停 300ms，撤场后是不拦指针的空盒。
+        return FushiDeferredLoading(
+          active: value,
+          color: theme.colorScheme.primary,
+        );
+      },
+    );
+  }
+
+  Future<MinePopupResult> onMineFromPopup(Map<String, String> fields) async {
+    return const MinePopupResult();
+  }
+
+  /// 「制卡」模块关闭时顶替 [onMineFromPopup] 挂进弹窗的 no-op：**不写任何卡、
+  /// 不碰 Anki**，只弹一句说明为什么没反应。
+  ///
+  /// 为什么不是「按钮不渲染」：popup.js 的制卡 + 按钮是无条件构造的（见
+  /// `assets/popup/popup.js` 的 `createEntryHeader`），而
+  /// [DictionaryPopupLayer.onMineEntry] 又是必填参数——宿主侧没有任何能让那颗按钮
+  /// 消失的开关。在弹窗接上「回调为空就不渲染」的契约之前，这里按仓规「保留可点
+  /// 位置就必须给可见反馈」办，绝不做静默失败。
+  Future<MinePopupResult> _mineBlockedByModuleGate(
+    Map<String, String> fields,
+  ) async {
+    FushiToast.show(msg: t.module_disabled_hint, severity: ToastSeverity.info);
+    return const MinePopupResult();
+  }
+
+  /// TODO-270 D：覆盖「最新制的那张卡」（reader 覆写做真实更新；基类无操作）。
+  Future<MinePopupResult> onUpdateFromPopup(
+    int noteId,
+    Map<String, String> fields,
+  ) async {
+    return const MinePopupResult();
+  }
+
+  /// TODO-1007/1008：点 ✓（卡已存在）的编排入口（reader/有声书车道，与
+  /// [DictionaryPageMixin.onMinedCardAction] 对称）。据当前词条 [fields] 的
+  /// expression/reading 反查 Anki 全部命中卡，弹操作选择让用户选（覆写哪张 /
+  /// 新增重复卡 / 查看·在 Anki 中打开），复用可被 reader 覆写的 [onMineFromPopup] /
+  /// [onUpdateFromPopup] 执行。
+  Future<MinePopupResult> onMinedCardActionFromPopup(
+      Map<String, String> fields) async {
+    if (SourceReviewScope.read(context) != null) {
+      return onMineFromPopup(fields);
+    }
+    final repo = ref.read(ankiRepositoryProvider);
+    final expression = fields['expression'] ?? '';
+    final reading = fields['reading'] ?? '';
+    // 「新增」分支的原始结果：进了待发队列时要原样交回弹窗（queued 画 ✓、不回查
+    // Anki），下面那个二元组装不下这个状态。
+    MinePopupResult? minedNew;
+    final r = await runAnkiMinedCardAction(
+      context: context,
+      repo: repo,
+      expression: expression,
+      reading: reading,
+      // BUG-2605：走到 mineNew 的三条路（点「新增为重复卡」/ AnkiMobile「再加一张」/
+      // 反查为空后重制）用户都已被告知「这张卡已有」并选择继续，请求必须带上
+      // allowDuplicate，否则两后端的 addNote 仍按全局 allowDupes（默认关）判重拒掉。
+      mineNew: () async {
+        final res = await onMineFromPopup(
+          AnkiMiningPayload.withAllowDuplicate(fields),
+        );
+        minedNew = res;
+        return (ankiConnect: res.ankiConnect, noteId: res.noteId);
+      },
+      overwrite: (noteId) async {
+        final res = await onUpdateFromPopup(noteId, fields);
+        return (ankiConnect: res.ankiConnect, noteId: res.noteId);
+      },
+      // BUG-1040：对话框期间停靠查词弹窗，否则原生平台视图盖住它（用户报「看不见」）。
+      runHidden: runWithLookupPopupHidden,
+    );
+    if (minedNew?.queued ?? false) return minedNew!;
+    return MinePopupResult(ankiConnect: r.ankiConnect, noteId: r.noteId);
+  }
+
+  /// TODO-1360 / BUG-2051：已制卡的词旁 ↗「在 Anki 中打开卡片」按钮的 reader/有声书
+  /// 车道入口（与 [DictionaryPageMixin.onOpenInAnki] 对称）。判据与画 ✓ 的查重同源，
+  /// 见 [BaseAnkiRepository.openWordInAnki]；不制卡、不覆写，也不再弹选择框。
+  Future<AnkiOpenWordOutcome> onOpenInAnkiFromPopup(
+    String expression,
+    String reading,
+  ) async {
+    final repo = ref.read(ankiRepositoryProvider);
+    return repo.openWordInAnki(expression, reading);
+  }
+
+  /// 收藏/制卡计入统计时的来源标识。阅读器（EPUB）/有声书都归书籍统计
+  /// （[kStatSourceBook]）；视频走 [DictionaryPageMixin] 自己覆写，不经本基类。
+  @protected
+  String get dictionarySourceType => kStatSourceBook;
+
+  /// TODO-1204：本次查词归属的书身份（[bookKey] + [title]），供 per-book 查词计数。
+  /// 阅读器（EPUB/有声书）覆写返回当前书（[title] 与阅读统计 tile 的 title 聚合键
+  /// 对齐）；无书来源保持 null → 查词只进统计页「查词」汇总，不落 per-book tile。
+  @protected
+  ({String? bookKey, String? title})? get lookupBookIdentity => null;
+
+  /// 收藏词时的上下文（原句 + 定位锚点，口径见 [FavoriteLookupContext]）。阅读器 /
+  /// 有声书覆写返回查词所在句；默认取当前媒体源的当前句（无锚点），首页查词等没有
+  /// 句子的场景为 null。此前弹窗 ☆ 只落词形，收藏夹里的词没有释义也没有上下文。
+  @protected
+  FavoriteLookupContext? get favoriteLookupContext {
+    final String sentence =
+        appModel.currentMediaSource?.currentSentence.text.trim() ?? '';
+    if (sentence.isEmpty) return null;
+    return FavoriteLookupContext(sentence: sentence);
+  }
+
+  /// TODO-1204：[DictionaryPopupController.onLookupStarted] 注入点——每次查词
+  /// （顶层 / 嵌套 / 重复查各一次）累加 [FushiDatabase.addLookupCount]。best-effort，
+  /// 失败吞掉并记日志（与 [addMiningCount] 记账同容错口径）。
+  void _recordLookupCounter() {
+    if (SourceReviewScope.read(context)?.isReview ?? false) return;
+    // best-effort：连同同步阶段（[AppModel.database] late 字段 getter 在 DB 未初始化
+    // 时会抛 LateInitializationError）一起吞掉——查词计数是旁路埋点，任何异常都不得
+    // 打断弹窗查词流程（否则 [DictionaryPopupController.beginTop] 会随查词一起崩）。
+    try {
+      final ({String? bookKey, String? title})? identity = lookupBookIdentity;
+      unawaited(appModel.database
+          .addLookupCount(
+        bookKey: identity?.bookKey,
+        title: identity?.title ?? '',
+        sourceType: dictionarySourceType,
+        dateKey: statTodayKey(),
+      )
+          .catchError((Object e, StackTrace st) {
+        debugPrint('[fushi-stats] addLookupCount failed: $e\n$st');
+      }));
+    } catch (e, st) {
+      debugPrint('[fushi-stats] addLookupCount failed (sync): $e\n$st');
+    }
+  }
+
+  /// TODO-948②：弹窗右部「收藏」按钮回调（阅读器 EPUB 走本基类的 [_buildPopupLayer]，
+  /// 不经 [DictionaryPageMixin]，曾因这里漏接线导致点击无反应）。切换收藏当前词条：
+  /// 已收藏则取消（返回 false），否则按 [dictionarySourceType] 落 DB（返回 true）。
+  /// 与 [DictionaryPageMixin.onFavoriteEntry] 行为一致，真写穿 FavoriteWords 表。
+  Future<bool> onFavoriteFromPopup(Map<String, String> fields) async {
+    final String expression = fields['expression'] ?? '';
+    final String reading = fields['reading'] ?? '';
+    if (expression.isEmpty) return false;
+    final db = appModel.database;
+    final bool already = await db.isFavoriteWord(
+      expression: expression,
+      reading: reading,
+      sourceType: dictionarySourceType,
+    );
+    if (already) {
+      await db.removeFavoriteWord(
+        expression: expression,
+        reading: reading,
+        sourceType: dictionarySourceType,
+      );
+      // TODO-956 A：桌面 flutter_inappwebview_windows fork 的 callHandler 返回值
+      // marshalling 与移动端不同，弹窗里 ☆→★ 变色依赖 JS 往返的返回值（popup.js
+      // favoriteEntry），桌面可能收不到 → 星标不变色 → 用户判定「点了没用」（DB 其实
+      // 已写）。DB 写成功后**与 callHandler 返回值解耦**直接弹 toast，保证两宿主都有
+      // 确定反馈，不依赖也不改动返回值通道。
+      FushiToast.show(
+        msg: t.word_favorite_removed,
+        severity: ToastSeverity.success,
+      );
+      return false;
+    }
+    // TODO-1252：把当前书身份（阅读器 / 有声书覆写 lookupBookIdentity）随收藏落库，
+    // 供统计页 per-book tile 聚合「收藏 N」；无书来源为 null / '' → 只进汇总。
+    final ({String? bookKey, String? title})? favIdentity = lookupBookIdentity;
+    final FavoriteLookupContext? favContext = favoriteLookupContext;
+    await db.addFavoriteWord(
+      expression: expression,
+      reading: reading,
+      glossary: fields['glossary'] ?? '',
+      sourceType: dictionarySourceType,
+      dateKey: statTodayKey(),
+      bookKey: favIdentity?.bookKey,
+      title: favIdentity?.title ?? '',
+      sentence: favContext?.sentence ?? '',
+      sectionIndex: favContext?.sectionIndex,
+      normCharOffset: favContext?.normCharOffset,
+      normCharLength: favContext?.normCharLength,
+    );
+    FushiToast.show(
+      msg: t.word_favorite_added,
+      severity: ToastSeverity.success,
+    );
+    return true;
+  }
+
+  /// TODO-948②：查询某词条当前是否已收藏（供弹窗按钮初始 ☆/★ 状态）。
+  Future<bool> onFavoriteCheckFromPopup(
+      String expression, String reading) async {
+    if (expression.isEmpty) return false;
+    return appModel.database.isFavoriteWord(
+      expression: expression,
+      reading: reading,
+      sourceType: dictionarySourceType,
+    );
+  }
+
+  /// Placeholder when there are no search results.
+  Widget buildNoSearchResultsPlaceholderMessage() {
+    return Center(
+      child: FushiPlaceholderMessage(
+        icon: Icons.search_off,
+        message: t.no_search_results,
+      ),
+    );
+  }
+
+  DictionarySearchResult? get currentResult =>
+      _lastVisiblePopup(_popup.entries)?.result;
+
+  /// 顶层（从正文点出来的那一层）查词结果。收藏句时用它的首个词头记下「为哪个词
+  /// 收藏的这句」；嵌套层是在释义里再查的词，不代表原文里的那个词。
+  DictionarySearchResult? get rootLookupResult =>
+      _popup.entries.isEmpty ? null : _popup.entries.first.result;
+
+  @protected
+  void prunePopupStack(int keepCount) {
+    if (keepCount > 0) {
+      final pending = _visibleRenderPendingItem;
+      if (pending != null) {
+        final index = _popup.entries.indexOf(pending);
+        if (index < 0 || index >= keepCount) {
+          _clearVisibleRenderPending(item: pending);
+        }
+      }
+      _popup.truncateTo(keepCount);
+      return;
+    }
+    // keepCount <= 0: a fresh top-level lookup is starting. Preserve the
+    // persistent warm slot (index 0) so its already-loaded WebView survives and
+    // the upcoming lookup reuses it warm (BUG-092) — only drop nested children
+    // and hide the slot. Low-memory mode keeps no warm slot, so it clears.
+    if (_popup.entries.isEmpty) return;
+    _popup.lowMemory = appModel.lowMemoryMode;
+    if (_popup.entries.first.isWarmSlot && !appModel.lowMemoryMode) {
+      _popup.entries.first.webViewKey.currentState?.clearSelection();
+    }
+    _clearVisibleRenderPending();
+    _popup.pruneToWarmSlot();
+  }
+
+  bool _hasVisiblePopup(List<DictionaryPopupEntry> stack) {
+    return stack.any((item) => item.visible);
+  }
+
+  int _lastVisiblePopupIndex(List<DictionaryPopupEntry> stack) {
+    for (int i = stack.length - 1; i >= 0; i--) {
+      if (stack[i].visible) return i;
+    }
+    return -1;
+  }
+
+  DictionaryPopupEntry? _lastVisiblePopup(List<DictionaryPopupEntry> stack) {
+    final index = _lastVisiblePopupIndex(stack);
+    if (index < 0) return null;
+    return stack[index];
+  }
+}

@@ -1,0 +1,5105 @@
+#include "flutter_window.h"
+
+#include <dwmapi.h>
+#include <flutter_windows.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <wincodec.h>
+#include <windows.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <charconv>
+#include <cstdio>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <variant>
+#include <vector>
+
+#include <flutter/method_result_functions.h>
+
+#include "external_video_handoff.h"
+#include "flutter/generated_plugin_registrant.h"
+#include "audio_loopback_capture.h"
+#include "clipboard_image_reader.h"
+#include "voice_hook_reader.h"
+#include "foreground_selection.h"
+#include "game_client_extent.h"
+#include "game_stream_input.h"
+#include "global_mouse_trigger.h"
+#include "ime_space_dispatch.h"
+#include "low_level_mouse_hook.h"
+#include "system_font_list.h"
+#include "system_transparency_channel.h"
+#include "utils.h"
+#include "window_capture.h"
+#include "window_recorder.h"
+#include "../../../native/galgame_hook/include/voice_hook_ipc.h"
+
+#pragma comment(lib, "windowscodecs.lib")
+
+namespace {
+
+std::wstring Utf8ToWideString(const std::string& value) {
+  if (value.empty()) {
+    return std::wstring();
+  }
+  int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                 static_cast<int>(value.size()), nullptr, 0);
+  if (size <= 0) {
+    return std::wstring();
+  }
+  std::wstring result(size, L'\0');
+  MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                      static_cast<int>(value.size()), result.data(), size);
+  return result;
+}
+
+std::string HResultMessage(HRESULT hr) {
+  char buffer[128];
+  snprintf(buffer, sizeof(buffer), "HRESULT 0x%08X", static_cast<unsigned>(hr));
+  return std::string(buffer);
+}
+
+std::optional<std::string> CopyImageFileToClipboard(HWND hwnd,
+                                                    const std::wstring& path) {
+  if (hwnd == nullptr) {
+    return std::string("Window handle is unavailable");
+  }
+  if (path.empty()) {
+    return std::string("Image path is empty");
+  }
+
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+    return std::string("WIC factory creation failed: ") + HResultMessage(hr);
+  }
+
+  ComPtr<IWICBitmapDecoder> decoder;
+  hr = factory->CreateDecoderFromFilename(
+      path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad,
+      &decoder);
+  if (FAILED(hr)) {
+    return std::string("Image decode failed: ") + HResultMessage(hr);
+  }
+
+  ComPtr<IWICBitmapFrameDecode> frame;
+  hr = decoder->GetFrame(0, &frame);
+  if (FAILED(hr)) {
+    return std::string("Image frame read failed: ") + HResultMessage(hr);
+  }
+
+  ComPtr<IWICFormatConverter> converter;
+  hr = factory->CreateFormatConverter(&converter);
+  if (FAILED(hr)) {
+    return std::string("Image converter creation failed: ") +
+           HResultMessage(hr);
+  }
+  hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                             WICBitmapDitherTypeNone, nullptr, 0.0,
+                             WICBitmapPaletteTypeCustom);
+  if (FAILED(hr)) {
+    return std::string("Image conversion failed: ") + HResultMessage(hr);
+  }
+
+  UINT width = 0;
+  UINT height = 0;
+  hr = converter->GetSize(&width, &height);
+  if (FAILED(hr) || width == 0 || height == 0) {
+    return std::string("Image size is invalid");
+  }
+
+  const size_t stride = static_cast<size_t>(width) * 4;
+  const size_t pixel_bytes = stride * static_cast<size_t>(height);
+  if (pixel_bytes == 0 ||
+      pixel_bytes > static_cast<size_t>(std::numeric_limits<DWORD>::max())) {
+    return std::string("Image is too large for the clipboard");
+  }
+
+  std::vector<BYTE> pixels(pixel_bytes);
+  hr = converter->CopyPixels(nullptr, static_cast<UINT>(stride),
+                             static_cast<UINT>(pixel_bytes), pixels.data());
+  if (FAILED(hr)) {
+    return std::string("Image pixel copy failed: ") + HResultMessage(hr);
+  }
+
+  const size_t dib_bytes = sizeof(BITMAPINFOHEADER) + pixel_bytes;
+  HGLOBAL dib = GlobalAlloc(GMEM_MOVEABLE, dib_bytes);
+  if (dib == nullptr) {
+    return std::string("Clipboard memory allocation failed");
+  }
+
+  void* locked = GlobalLock(dib);
+  if (locked == nullptr) {
+    GlobalFree(dib);
+    return std::string("Clipboard memory lock failed");
+  }
+
+  auto* header = static_cast<BITMAPINFOHEADER*>(locked);
+  ZeroMemory(header, sizeof(BITMAPINFOHEADER));
+  header->biSize = sizeof(BITMAPINFOHEADER);
+  header->biWidth = static_cast<LONG>(width);
+  header->biHeight = static_cast<LONG>(height);
+  header->biPlanes = 1;
+  header->biBitCount = 32;
+  header->biCompression = BI_RGB;
+  header->biSizeImage = static_cast<DWORD>(pixel_bytes);
+
+  BYTE* dest = static_cast<BYTE*>(locked) + sizeof(BITMAPINFOHEADER);
+  for (UINT row = 0; row < height; ++row) {
+    const BYTE* source_row =
+        pixels.data() + (static_cast<size_t>(height - 1 - row) * stride);
+    memcpy(dest + (static_cast<size_t>(row) * stride), source_row, stride);
+  }
+  GlobalUnlock(dib);
+
+  if (!OpenClipboard(hwnd)) {
+    GlobalFree(dib);
+    return std::string("OpenClipboard failed");
+  }
+  if (!EmptyClipboard()) {
+    CloseClipboard();
+    GlobalFree(dib);
+    return std::string("EmptyClipboard failed");
+  }
+  if (SetClipboardData(CF_DIB, dib) == nullptr) {
+    CloseClipboard();
+    GlobalFree(dib);
+    return std::string("SetClipboardData(CF_DIB) failed");
+  }
+  CloseClipboard();
+  return std::nullopt;
+}
+
+// Decodes |path| via WIC, scales to |size|x|size| 32bpp BGRA, and builds a
+// color+mask HICON. Returns nullptr on any failure. Caller owns the result and
+// must DestroyIcon it. Mirrors the WIC pipeline used by CopyImageFileToClipboard.
+HICON CreateIconFromImageFile(const std::wstring& path, int size) {
+  if (path.empty() || size <= 0) {
+    return nullptr;
+  }
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IWICImagingFactory> factory;
+  HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  ComPtr<IWICBitmapDecoder> decoder;
+  hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                          WICDecodeMetadataCacheOnLoad, &decoder);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  ComPtr<IWICBitmapFrameDecode> frame;
+  hr = decoder->GetFrame(0, &frame);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  ComPtr<IWICBitmapScaler> scaler;
+  hr = factory->CreateBitmapScaler(&scaler);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  hr = scaler->Initialize(frame.Get(), size, size,
+                          WICBitmapInterpolationModeFant);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  ComPtr<IWICFormatConverter> converter;
+  hr = factory->CreateFormatConverter(&converter);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  hr = converter->Initialize(scaler.Get(), GUID_WICPixelFormat32bppBGRA,
+                             WICBitmapDitherTypeNone, nullptr, 0.0,
+                             WICBitmapPaletteTypeCustom);
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  const UINT stride = static_cast<UINT>(size) * 4;
+  std::vector<BYTE> pixels(static_cast<size_t>(stride) * size);
+  hr = converter->CopyPixels(nullptr, stride,
+                             static_cast<UINT>(pixels.size()), pixels.data());
+  if (FAILED(hr)) {
+    return nullptr;
+  }
+  BITMAPINFO bmi;
+  ZeroMemory(&bmi, sizeof(bmi));
+  bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bmi.bmiHeader.biWidth = size;
+  bmi.bmiHeader.biHeight = -size;  // top-down
+  bmi.bmiHeader.biPlanes = 1;
+  bmi.bmiHeader.biBitCount = 32;
+  bmi.bmiHeader.biCompression = BI_RGB;
+  void* dib_pixels = nullptr;
+  HBITMAP color = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &dib_pixels,
+                                   nullptr, 0);
+  if (color == nullptr || dib_pixels == nullptr) {
+    if (color != nullptr) {
+      DeleteObject(color);
+    }
+    return nullptr;
+  }
+  memcpy(dib_pixels, pixels.data(), pixels.size());
+  // 32bpp BGRA color bitmap 带 alpha 通道时，CreateIconIndirect 直接用 color 的
+  // alpha 做混合、忽略 AND mask 的内容，故 mask 仅需存在（1bpp 占位）即可，内容
+  // 无关。若日后把 color 改回 24bpp，必须改用真正的 AND mask，否则透明区域花屏。
+  HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+  if (mask == nullptr) {
+    DeleteObject(color);
+    return nullptr;
+  }
+  ICONINFO icon_info;
+  ZeroMemory(&icon_info, sizeof(icon_info));
+  icon_info.fIcon = TRUE;
+  icon_info.hbmColor = color;
+  icon_info.hbmMask = mask;
+  HICON icon = CreateIconIndirect(&icon_info);
+  DeleteObject(color);
+  DeleteObject(mask);
+  return icon;
+}
+
+// Resolves an existing file to the kernel's final DOS path so equivalent path
+// spellings (8.3 names, junctions, symlinks, \\?\ prefixes) compare by identity.
+// Returns empty when the file cannot be opened/resolved.
+std::wstring FinalPathForComparison(const std::wstring& path) {
+  if (path.empty()) {
+    return std::wstring();
+  }
+  HANDLE file = CreateFileW(path.c_str(), 0,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    return std::wstring();
+  }
+  const DWORD required = GetFinalPathNameByHandleW(
+      file, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (required == 0) {
+    CloseHandle(file);
+    return std::wstring();
+  }
+  std::wstring resolved(required, L'\0');
+  const DWORD written = GetFinalPathNameByHandleW(
+      file, resolved.data(), required,
+      FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  CloseHandle(file);
+  if (written == 0 || written >= required) {
+    return std::wstring();
+  }
+  resolved.resize(written);
+  return resolved;
+}
+
+// Outcome of pointing one .lnk at an icon.
+enum class ShortcutIconResult {
+  kSkipped,    // No such .lnk, target mismatch, or a COM step failed.
+  kUnchanged,  // IconLocation already is |icon_path|,0: nothing written.
+  kRewritten,  // IconLocation rewritten and saved.
+};
+
+// Points a single existing .lnk at |icon_path| (index 0), preserving its
+// target/args/workdir, then notifies the shell to re-read it. A missing .lnk
+// (user deleted it, or a portable unzip install with no shortcuts) is a soft
+// skip, not an error. When the .lnk already carries exactly this icon nothing
+// is saved or notified: cold start replays this sync on every launch, and an
+// unconditional Save + shell notify made Explorer re-read icons each time.
+ShortcutIconResult SetShortcutIconLocation(
+    const std::wstring& lnk_path,
+    const std::wstring& icon_path,
+    bool require_current_executable = false) {
+  if (lnk_path.empty() || icon_path.empty()) {
+    return ShortcutIconResult::kSkipped;
+  }
+  if (GetFileAttributesW(lnk_path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    return ShortcutIconResult::kSkipped;  // No such .lnk: soft skip.
+  }
+  using Microsoft::WRL::ComPtr;
+  ComPtr<IShellLinkW> shell_link;
+  HRESULT hr =
+      CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                       IID_PPV_ARGS(&shell_link));
+  if (FAILED(hr)) {
+    return ShortcutIconResult::kSkipped;
+  }
+  ComPtr<IPersistFile> persist_file;
+  hr = shell_link.As(&persist_file);
+  if (FAILED(hr)) {
+    return ShortcutIconResult::kSkipped;
+  }
+  // Load the existing .lnk so target/args/workdir survive; we only touch icon.
+  hr = persist_file->Load(lnk_path.c_str(), STGM_READWRITE);
+  if (FAILED(hr)) {
+    return ShortcutIconResult::kSkipped;
+  }
+  if (require_current_executable) {
+    std::vector<wchar_t> target(32768, L'\0');
+    WIN32_FIND_DATAW target_data = {};
+    hr = shell_link->GetPath(target.data(), static_cast<int>(target.size()),
+                             &target_data, SLGP_UNCPRIORITY);
+    if (FAILED(hr) || target.front() == L'\0') {
+      return ShortcutIconResult::kSkipped;
+    }
+    std::vector<wchar_t> executable(32768, L'\0');
+    const DWORD executable_size = GetModuleFileNameW(
+        nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+    if (executable_size == 0 ||
+        executable_size >= static_cast<DWORD>(executable.size())) {
+      return ShortcutIconResult::kSkipped;
+    }
+    const std::wstring target_final = FinalPathForComparison(target.data());
+    const std::wstring executable_final =
+        FinalPathForComparison(executable.data());
+    if (target_final.empty() || executable_final.empty() ||
+        CompareStringOrdinal(target_final.c_str(), -1,
+                             executable_final.c_str(), -1, TRUE) !=
+            CSTR_EQUAL) {
+      return ShortcutIconResult::kSkipped;
+    }
+  }
+  std::vector<wchar_t> current_icon(32768, L'\0');
+  int current_index = 0;
+  hr = shell_link->GetIconLocation(current_icon.data(),
+                                   static_cast<int>(current_icon.size()),
+                                   &current_index);
+  if (SUCCEEDED(hr) && current_index == 0 &&
+      CompareStringOrdinal(current_icon.data(), -1, icon_path.c_str(), -1,
+                           TRUE) == CSTR_EQUAL) {
+    return ShortcutIconResult::kUnchanged;
+  }
+  hr = shell_link->SetIconLocation(icon_path.c_str(), 0);
+  if (FAILED(hr)) {
+    return ShortcutIconResult::kSkipped;
+  }
+  hr = persist_file->Save(lnk_path.c_str(), TRUE);
+  if (FAILED(hr)) {
+    return ShortcutIconResult::kSkipped;
+  }
+  // Ask the shell to re-read this .lnk's icon.
+  SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, lnk_path.c_str(), nullptr);
+  return ShortcutIconResult::kRewritten;
+}
+
+// Joins a known-folder path with |relative| (a path tail relative to the
+// folder root, e.g. the desktop .lnk filename or the Start menu group
+// subfolder + .lnk). Returns empty on failure.
+std::wstring FushiShortcutInFolder(REFKNOWNFOLDERID folder_id,
+                                    const wchar_t* relative) {
+  PWSTR folder = nullptr;
+  HRESULT hr = SHGetKnownFolderPath(folder_id, 0, nullptr, &folder);
+  if (FAILED(hr) || folder == nullptr) {
+    if (folder != nullptr) {
+      CoTaskMemFree(folder);
+    }
+    return std::wstring();
+  }
+  std::wstring path(folder);
+  CoTaskMemFree(folder);
+  if (!path.empty() && path.back() != L'\\') {
+    path.push_back(L'\\');
+  }
+  path += relative;
+  return path;
+}
+
+// TODO-901: points the desktop + Start menu Fushi shortcuts at |icon_path|
+// (a freshly generated multi-size .ico). Installer (fushi.iss) drops the .lnk
+// at {userdesktop}\Fushi (Desktop\Fushi.lnk) and {group}\Fushi, where
+// {group} = {autoprograms}\{DefaultGroupName=Fushi} -> Programs\Fushi\Fushi.lnk
+// (DisableProgramGroupPage only hides the wizard page; the Fushi subfolder
+// still exists). The user's pinned taskbar shortcut is also updated, but only
+// when its target is this running executable so a stale/unrelated Fushi.lnk is
+// never rewritten. Returns true if at least one shortcut now carries the icon
+// (rewritten, or already pointing at it).
+bool ApplyShortcutIcon(const std::wstring& icon_path) {
+  if (icon_path.empty()) {
+    return false;
+  }
+  bool any = false;
+  bool rewritten = false;
+  const auto record = [&any, &rewritten](ShortcutIconResult result) {
+    any |= result != ShortcutIconResult::kSkipped;
+    rewritten |= result == ShortcutIconResult::kRewritten;
+  };
+  const std::wstring desktop_lnk =
+      FushiShortcutInFolder(FOLDERID_Desktop, L"Fushi.lnk");
+  if (!desktop_lnk.empty()) {
+    record(SetShortcutIconLocation(desktop_lnk, icon_path));
+  }
+  // Start menu lives under the Fushi program group subfolder, not Programs root.
+  const std::wstring programs_lnk =
+      FushiShortcutInFolder(FOLDERID_Programs, L"Fushi\\Fushi.lnk");
+  if (!programs_lnk.empty()) {
+    record(SetShortcutIconLocation(programs_lnk, icon_path));
+  }
+  const std::wstring taskbar_lnk = FushiShortcutInFolder(
+      FOLDERID_UserPinned, L"TaskBar\\Fushi.lnk");
+  if (!taskbar_lnk.empty()) {
+    record(SetShortcutIconLocation(taskbar_lnk, icon_path, true));
+  }
+  // One global associations-changed notify so already-open Explorer views pick
+  // the new icon up sooner (best-effort; shell icon cache is not guaranteed to
+  // refresh instantly). Only when something was actually rewritten: it is a
+  // system-wide broadcast that makes Explorer rebuild icons, and the cold-start
+  // replay almost always finds every .lnk already current.
+  if (rewritten) {
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+  }
+  return any;
+}
+
+}  // namespace
+
+FlutterWindow::FlutterWindow(const flutter::DartProject& project)
+    : project_(project) {}
+
+FlutterWindow::~FlutterWindow() {
+  fushi::VoiceHookReader::Instance().SetLookupGeometryStatusSink(nullptr);
+}
+
+bool FlutterWindow::OnCreate() {
+  if (!Win32Window::OnCreate()) {
+    return false;
+  }
+
+  RECT frame = GetClientArea();
+
+  // The size here must match the window dimensions to avoid unnecessary surface
+  // creation / destruction in the startup path.
+  flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
+      frame.right - frame.left, frame.bottom - frame.top, project_);
+  // Ensure that basic setup of the controller was successful.
+  if (!flutter_controller_->engine() || !flutter_controller_->view()) {
+    return false;
+  }
+  RegisterPlugins(flutter_controller_->engine());
+
+  // Title-bar theming channel: Dart pushes surface/onSurface colors so the
+  // native caption follows the in-app theme (see window_caption_channel.dart).
+  caption_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "app.fushi/window",
+          &flutter::StandardMethodCodec::GetInstance());
+  caption_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() == "setCaptionColors") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args != nullptr) {
+            const auto caption_it =
+                args->find(flutter::EncodableValue("caption"));
+            const auto text_it = args->find(flutter::EncodableValue("text"));
+            // Dart sends ARGB ints; opaque colors (alpha 0xFF) exceed int32
+            // range and arrive as int64. TryGetLongValue() accepts either
+            // int32 or int64 without throwing (unlike std::get<int>).
+            const int64_t caption_argb =
+                caption_it != args->end()
+                    ? caption_it->second.TryGetLongValue().value_or(0)
+                    : 0;
+            const int64_t text_argb =
+                text_it != args->end()
+                    ? text_it->second.TryGetLongValue().value_or(0)
+                    : 0;
+            ApplyCaptionColors(static_cast<uint32_t>(caption_argb),
+                               static_cast<uint32_t>(text_argb));
+          }
+          result->Success();
+        } else if (call.method_name() == "setSystemBackdrop") {
+          const auto* backdrop_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          auto read_flag = [backdrop_args](const char* key) -> bool {
+            if (backdrop_args == nullptr) {
+              return false;
+            }
+            const auto it = backdrop_args->find(flutter::EncodableValue(key));
+            if (it == backdrop_args->end()) {
+              return false;
+            }
+            const bool* value = std::get_if<bool>(&it->second);
+            return value != nullptr && *value;
+          };
+          result->Success(flutter::EncodableValue(
+              ApplySystemBackdrop(read_flag("mica"), read_flag("dark"))));
+        } else if (call.method_name() == "beginStartupWindowPreparation") {
+          // Visible integration-test windows retain normal resize delivery.
+          BeginStartupWindowPreparation();
+          result->Success();
+        } else if (call.method_name() == "endStartupWindowPreparation") {
+          EndStartupWindowPreparation();
+          result->Success();
+        } else if (call.method_name() == "setCaptionMaxButtonRect") {
+          // Physical-pixel rect of the Flutter maximize button in the Flutter
+          // view (= child client coordinates); all zero = disabled.
+          const auto* rect_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          auto read_int = [rect_args](const char* key) -> LONG {
+            if (rect_args == nullptr) {
+              return 0;
+            }
+            const auto it = rect_args->find(flutter::EncodableValue(key));
+            if (it == rect_args->end()) {
+              return 0;
+            }
+            return static_cast<LONG>(it->second.TryGetLongValue().value_or(0));
+          };
+          const RECT rect{read_int("left"), read_int("top"), read_int("right"),
+                          read_int("bottom")};
+          caption_snap_button_.SetRect(rect);
+          result->Success();
+        } else if (call.method_name() == "clearTaskbarFlash") {
+          // TODO-615: actively stop any taskbar "flash / request attention"
+          // state on the main window. SetForegroundWindow (window_manager's
+          // show()/focus()/setAlwaysOnTop() degrade into it under the foreground
+          // lock) flashes our taskbar button until the user clicks it. Dart's
+          // foreground guard can still miss-judge during focus jitter, so the
+          // foreground path asks us to clear unconditionally. FLASHW_STOP on a
+          // window that is not flashing is a no-op, so this is idempotent.
+          HWND hwnd = GetHandle();
+          if (hwnd != nullptr) {
+            FLASHWINFO flash_info;
+            flash_info.cbSize = sizeof(FLASHWINFO);
+            flash_info.hwnd = hwnd;
+            flash_info.dwFlags = FLASHW_STOP;
+            flash_info.uCount = 0;
+            flash_info.dwTimeout = 0;
+            FlashWindowEx(&flash_info);
+          }
+          result->Success();
+        } else if (call.method_name() == "setFullscreen") {
+          // BUG-1933: runner-owned flash-free fullscreen (Win32Window::
+          // SetFullscreen). Dart routes F11 and the video player's native
+          // fullscreen here on Windows instead of window_manager / media_kit,
+          // whose style-stripping implementations reveal the redirection
+          // surface for a frame (white in a light theme).
+          const auto* fs_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          bool enter = false;
+          if (fs_args != nullptr) {
+            const auto fs_it =
+                fs_args->find(flutter::EncodableValue("fullscreen"));
+            if (fs_it != fs_args->end()) {
+              const bool* value = std::get_if<bool>(&fs_it->second);
+              if (value != nullptr) {
+                enter = *value;
+              }
+            }
+          }
+          const bool was_fullscreen = IsFullscreen();
+          if (!enter) {
+            // BUG-2964: give the frame its normal DWM rendering back while it
+            // still hangs off-screen, before the geometry restores it.
+            fushi::MainSurfaceState leaving = main_surface_state();
+            leaving.fullscreen = false;
+            ApplyMainSurfaceComposition(leaving);
+          }
+          SetFullscreen(enter);
+          ApplyMainSurfaceComposition();
+          // A fullscreen/maximized transition can preserve the client size,
+          // so WM_SIZE alone does not guarantee a fresh Flutter presentation.
+          // Request it AFTER geometry restoration and snapshot release, while
+          // the controller is alive. Do not redraw failed or no-op transitions.
+          if (flutter_controller_ && was_fullscreen != IsFullscreen()) {
+            flutter_controller_->ForceRedraw();
+          }
+          result->Success();
+        } else if (call.method_name() == "isFullscreen") {
+          result->Success(flutter::EncodableValue(IsFullscreen()));
+        } else if (call.method_name() == "reportRasterizedFrameSize") {
+          // BUG-2462: Dart's rasterised-frame size report, the authoritative
+          // "the engine now presents at this size" signal for the child
+          // resize gate (child_resize_gate.h). Sent only when the rasterised
+          // size changes, so this is not a per-frame cost.
+          const auto* size_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          int32_t width = 0;
+          int32_t height = 0;
+          if (size_args != nullptr) {
+            const auto w_it = size_args->find(flutter::EncodableValue("width"));
+            const auto h_it =
+                size_args->find(flutter::EncodableValue("height"));
+            if (w_it != size_args->end()) {
+              if (const int32_t* v = std::get_if<int32_t>(&w_it->second)) {
+                width = *v;
+              }
+            }
+            if (h_it != size_args->end()) {
+              if (const int32_t* v = std::get_if<int32_t>(&h_it->second)) {
+                height = *v;
+              }
+            }
+          }
+          OnChildFrameRasterized(width, height);
+          result->Success();
+        } else if (call.method_name() == "setWindowIcon") {
+          // Runtime window/taskbar icon (preset or user-picked image). Decodes
+          // the file to big+small HICONs and WM_SETICONs them. Cannot change the
+          // exe's embedded file icon — Dart re-applies the preference on startup.
+          const auto* icon_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          std::wstring icon_path;
+          if (icon_args != nullptr) {
+            const auto path_it =
+                icon_args->find(flutter::EncodableValue("path"));
+            if (path_it != icon_args->end()) {
+              const auto* s = std::get_if<std::string>(&path_it->second);
+              if (s != nullptr) {
+                icon_path = Utf8ToWideString(*s);
+              }
+            }
+          }
+          if (icon_path.empty()) {
+            result->Error("bad_args", "Missing icon path");
+          } else {
+            const bool ok = ApplyWindowIcon(icon_path);
+            result->Success(flutter::EncodableValue(ok));
+          }
+        } else if (call.method_name() == "setShortcutIcon") {
+          // TODO-901: rewrite the desktop + Start menu Fushi .lnk IconLocation
+          // to the freshly generated multi-size .ico Dart wrote to disk. Note
+          // the arg key is 'iconPath' (distinct from setWindowIcon's 'path').
+          const auto* shortcut_args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          std::wstring ico_path;
+          if (shortcut_args != nullptr) {
+            const auto path_it =
+                shortcut_args->find(flutter::EncodableValue("iconPath"));
+            if (path_it != shortcut_args->end()) {
+              const auto* s = std::get_if<std::string>(&path_it->second);
+              if (s != nullptr) {
+                ico_path = Utf8ToWideString(*s);
+              }
+            }
+          }
+          if (ico_path.empty()) {
+            result->Error("bad_args", "Missing iconPath");
+          } else {
+            const bool ok = ApplyShortcutIcon(ico_path);
+            result->Success(flutter::EncodableValue(ok));
+          }
+        } else {
+          result->NotImplemented();
+        }
+      });
+
+  clipboard_image_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/clipboard_image",
+          &flutter::StandardMethodCodec::GetInstance());
+  clipboard_image_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() == "readImage") {
+          // 反馈提交页「粘贴截图」：剪贴板里的位图（编成 PNG）或复制的文件路径。
+          fushi_clipboard::ClipboardImage image;
+          const std::optional<std::string> error =
+              fushi_clipboard::ReadClipboardImage(GetHandle(), &image);
+          if (error.has_value()) {
+            result->Error("read_failed", error.value());
+            return;
+          }
+          if (image.empty()) {
+            result->Success();
+            return;
+          }
+          flutter::EncodableMap map;
+          if (!image.bytes.empty()) {
+            map[flutter::EncodableValue("bytes")] =
+                flutter::EncodableValue(std::move(image.bytes));
+          }
+          if (!image.paths.empty()) {
+            flutter::EncodableList paths;
+            for (std::string& path : image.paths) {
+              paths.emplace_back(std::move(path));
+            }
+            map[flutter::EncodableValue("paths")] =
+                flutter::EncodableValue(std::move(paths));
+          }
+          result->Success(flutter::EncodableValue(std::move(map)));
+          return;
+        }
+        if (call.method_name() != "copyImageFile") {
+          result->NotImplemented();
+          return;
+        }
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        if (args == nullptr) {
+          result->Error("bad_args", "Expected a map with an image path");
+          return;
+        }
+        const auto path_it = args->find(flutter::EncodableValue("path"));
+        if (path_it == args->end()) {
+          result->Error("bad_args", "Missing image path");
+          return;
+        }
+        const auto* path = std::get_if<std::string>(&path_it->second);
+        if (path == nullptr) {
+          result->Error("bad_args", "Image path must be a string");
+          return;
+        }
+        const std::wstring wide_path = Utf8ToWideString(*path);
+        const std::optional<std::string> error =
+            CopyImageFileToClipboard(GetHandle(), wide_path);
+        if (error.has_value()) {
+          result->Error("copy_failed", error.value());
+          return;
+        }
+        result->Success();
+      });
+
+  // TODO-904 P0 回归：外部视频路径转交 channel。首实例无需主动调用任何方法，仅作为
+  // MessageHandler 收到 WM_COPYDATA 后把路径 InvokeMethod 给 Dart 的出口。
+  external_video_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi/external_video",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // TODO-1092: 系统强调色/主题色实时变更通知 channel。runner 侧收到 Windows 的
+  // WM_DWMCOLORIZATIONCOLORCHANGED / WM_SETTINGCHANGE("ImmersiveColorSet") /
+  // WM_THEMECHANGED 后，经此 channel 把 onSystemColorChanged 推给 Dart，触发
+  // ThemeNotifier.refreshSystemPalette()——动态取色不再依赖 app 生命周期 resumed。
+  // 首实例无需主动调用任何方法，仅作为 MessageHandler 的出口。
+  system_theme_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "app.fushi/system_theme",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  windows_ime_space_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi/windows_ime_space",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  RegisterImeGuardChannel();
+  RegisterLookupImeChannel();
+  RegisterFloatingLyricChannel();
+  RegisterFloatingBallChannel();
+  RegisterGalHookTextChannel();
+  RegisterGlobalLookupChannel();
+  RegisterForegroundSelectionChannel();
+  RegisterWindowCaptureChannel();
+  RegisterSystemOcrChannel();
+  RegisterHdrVideoHostChannel();
+  RegisterAudioLoopbackChannel();
+  RegisterVoiceHookChannel();
+  RegisterMagpieChannel();
+  RegisterGameStreamInputChannel();
+  RegisterSystemFontListChannel(flutter_controller_->engine()->messenger());
+  RegisterSystemTransparencyChannel(flutter_controller_->engine()->messenger());
+
+  SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  caption_snap_button_.Attach(
+      GetHandle(), flutter_controller_->view()->GetNativeWindow(),
+      [this](const char* event) {
+        if (caption_channel_) {
+          caption_channel_->InvokeMethod(
+              "onCaptionMaxButton",
+              std::make_unique<flutter::EncodableValue>(std::string(event)));
+        }
+      });
+  return true;
+}
+
+namespace {
+
+// ARGB int arriving from Dart may exceed int32 (opaque colors); accept either.
+uint32_t ArgbFromValue(const flutter::EncodableMap* args, const char* key,
+                        uint32_t fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  return static_cast<uint32_t>(it->second.TryGetLongValue().value_or(fallback));
+}
+
+double DoubleFromValue(const flutter::EncodableMap* args, const char* key,
+                       double fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  if (const auto* d = std::get_if<double>(&it->second)) {
+    return *d;
+  }
+  if (const auto* i = std::get_if<int32_t>(&it->second)) {
+    return static_cast<double>(*i);
+  }
+  if (const auto* l = std::get_if<int64_t>(&it->second)) {
+    return static_cast<double>(*l);
+  }
+  return fallback;
+}
+
+int IntFromValue(const flutter::EncodableMap* args, const char* key,
+                 int fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  return static_cast<int>(it->second.TryGetLongValue().value_or(fallback));
+}
+
+int64_t Int64FromValue(const flutter::EncodableMap* args, const char* key,
+                       int64_t fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  return it->second.TryGetLongValue().value_or(fallback);
+}
+
+bool BoolFromValue(const flutter::EncodableMap* args, const char* key,
+                   bool fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  if (const auto* b = std::get_if<bool>(&it->second)) {
+    return *b;
+  }
+  return fallback;
+}
+
+std::wstring WideFromValue(const flutter::EncodableMap* args, const char* key,
+                           const std::wstring& fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  const auto* s = std::get_if<std::string>(&it->second);
+  if (s == nullptr) {
+    return fallback;
+  }
+  if (s->empty()) {
+    return std::wstring();
+  }
+  int size = MultiByteToWideChar(CP_UTF8, 0, s->data(),
+                                 static_cast<int>(s->size()), nullptr, 0);
+  std::wstring result(size, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s->data(), static_cast<int>(s->size()),
+                      result.data(), size);
+  return result;
+}
+
+// List<String> 载荷 -> UTF-16。缺键 / 类型不符返回空 vector（老 payload 不带
+// 提示表时就当没有提示，工具条照常可用）。非字符串元素按空串占位，绝不移位
+// ——下标即槽位，一旦压缩就会让第 5 颗按钮顶着第 4 颗的说明。
+std::vector<std::wstring> WideListFromValue(const flutter::EncodableMap* args,
+                                            const char* key) {
+  std::vector<std::wstring> result;
+  if (args == nullptr) {
+    return result;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return result;
+  }
+  const auto* list = std::get_if<flutter::EncodableList>(&it->second);
+  if (list == nullptr) {
+    return result;
+  }
+  result.reserve(list->size());
+  for (const flutter::EncodableValue& item : *list) {
+    const auto* s = std::get_if<std::string>(&item);
+    if (s == nullptr || s->empty()) {
+      result.emplace_back();
+      continue;
+    }
+    const int size = MultiByteToWideChar(CP_UTF8, 0, s->data(),
+                                         static_cast<int>(s->size()), nullptr,
+                                         0);
+    std::wstring wide(size, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s->data(), static_cast<int>(s->size()),
+                        wide.data(), size);
+    result.push_back(std::move(wide));
+  }
+  return result;
+}
+
+std::string StringFromValue(const flutter::EncodableMap* args, const char* key,
+                            const std::string& fallback) {
+  if (args == nullptr) {
+    return fallback;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return fallback;
+  }
+  const auto* s = std::get_if<std::string>(&it->second);
+  return s != nullptr ? *s : fallback;
+}
+
+void BindRouteContext(GlobalLookupWindow* window,
+                      const flutter::EncodableMap* args,
+                      const std::string& fallback_source) {
+  if (window == nullptr) {
+    return;
+  }
+  std::string source = StringFromValue(args, "source", fallback_source);
+  if (source != "desktop" && source != "galCard") {
+    source = fallback_source;
+  }
+  window->SetRouteContext(std::move(source),
+                          Int64FromValue(args, "routeEpoch", 0),
+                          Int64FromValue(args, "lookupEpoch", 0));
+}
+
+std::unique_ptr<flutter::EncodableValue> RoutedPayloadEnvelope(
+    const std::string& payload,
+    const GlobalLookupWindow::RouteContext& route) {
+  return std::make_unique<flutter::EncodableValue>(flutter::EncodableMap{
+      {flutter::EncodableValue("payload"), flutter::EncodableValue(payload)},
+      {flutter::EncodableValue("source"),
+       flutter::EncodableValue(route.source)},
+      {flutter::EncodableValue("routeEpoch"),
+       flutter::EncodableValue(route.route_epoch)},
+      {flutter::EncodableValue("lookupEpoch"),
+       flutter::EncodableValue(route.lookup_epoch)},
+  });
+}
+
+std::unique_ptr<flutter::EncodableValue> RoutedHiddenEnvelope(
+    const GlobalLookupWindow::RouteContext& route) {
+  return std::make_unique<flutter::EncodableValue>(flutter::EncodableMap{
+      {flutter::EncodableValue("source"),
+       flutter::EncodableValue(route.source)},
+      {flutter::EncodableValue("routeEpoch"),
+       flutter::EncodableValue(route.route_epoch)},
+      {flutter::EncodableValue("lookupEpoch"),
+       flutter::EncodableValue(route.lookup_epoch)},
+  });
+}
+
+// 解包可选的注音区间列表（`[{start, length, ruby}, ...]`）。
+//
+// 字段缺失、类型不对、区间非法都只是「这条没有注音」，绝不让整条 updateText 失败：
+// 旧 Dart 端不会带这个字段，浮窗必须照常显示文本（never-break userspace）。
+// start / length 的越界校验放在 FloatingLyricWindow::UpdateText 里做，因为只有那里
+// 才知道最终文本长度。
+std::vector<FloatingLyricWindow::RubySpan> RubySpansFromValue(
+    const flutter::EncodableMap* args, const char* key) {
+  std::vector<FloatingLyricWindow::RubySpan> spans;
+  if (args == nullptr) {
+    return spans;
+  }
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) {
+    return spans;
+  }
+  const auto* list = std::get_if<flutter::EncodableList>(&it->second);
+  if (list == nullptr) {
+    return spans;
+  }
+  for (const auto& item : *list) {
+    const auto* map = std::get_if<flutter::EncodableMap>(&item);
+    if (map == nullptr) {
+      continue;
+    }
+    FloatingLyricWindow::RubySpan span;
+    span.start = IntFromValue(map, "start", -1);
+    span.length = IntFromValue(map, "length", 0);
+    span.ruby = WideFromValue(map, "ruby", L"");
+    if (span.start < 0 || span.length <= 0 || span.ruby.empty()) {
+      continue;
+    }
+    spans.push_back(std::move(span));
+  }
+  return spans;
+}
+
+FloatingLyricWindow::Style StyleFromArgs(const flutter::EncodableMap* args) {
+  FloatingLyricWindow::Style style;
+  style.font_size = DoubleFromValue(args, "fontSize", style.font_size);
+  style.font_family = WideFromValue(args, "fontFamily", style.font_family);
+  style.font_path = WideFromValue(args, "fontPath", style.font_path);
+  style.letter_spacing =
+      DoubleFromValue(args, "letterSpacing", style.letter_spacing);
+  style.line_height = DoubleFromValue(args, "lineHeight", style.line_height);
+  style.bold = BoolFromValue(args, "bold", style.bold);
+  style.text_alignment =
+      IntFromValue(args, "textAlignment", style.text_alignment);
+  style.vertical_alignment =
+      IntFromValue(args, "verticalAlignment", style.vertical_alignment);
+  style.text_color = ArgbFromValue(args, "textColor", style.text_color);
+  style.bg_color = ArgbFromValue(args, "bgColor", style.bg_color);
+  style.outline_color =
+      ArgbFromValue(args, "outlineColor", style.outline_color);
+  style.outline_width =
+      DoubleFromValue(args, "outlineWidth", style.outline_width);
+  style.text_padding =
+      DoubleFromValue(args, "textPadding", style.text_padding);
+  style.button_text_color =
+      ArgbFromValue(args, "buttonTextColor", style.button_text_color);
+  style.button_bg_color =
+      ArgbFromValue(args, "buttonBgColor", style.button_bg_color);
+  style.highlight_color =
+      ArgbFromValue(args, "highlightColor", style.highlight_color);
+  style.active_color = ArgbFromValue(args, "activeColor", style.active_color);
+  style.toolbar_bg_color =
+      ArgbFromValue(args, "toolbarBgColor", style.toolbar_bg_color);
+  style.toolbar_icon_color =
+      ArgbFromValue(args, "toolbarIconColor", style.toolbar_icon_color);
+  style.toolbar_hover_color =
+      ArgbFromValue(args, "toolbarHoverColor", style.toolbar_hover_color);
+  style.toolbar_active_bg_color =
+      ArgbFromValue(args, "toolbarActiveBgColor", style.toolbar_active_bg_color);
+  style.toolbar_active_icon_color = ArgbFromValue(
+      args, "toolbarActiveIconColor", style.toolbar_active_icon_color);
+  style.toolbar_tooltip_bg_color = ArgbFromValue(
+      args, "toolbarTooltipBgColor", style.toolbar_tooltip_bg_color);
+  style.toolbar_tooltip_text_color = ArgbFromValue(
+      args, "toolbarTooltipTextColor", style.toolbar_tooltip_text_color);
+  // TODO-708 P2: 圆角半径 / 窗宽（逻辑 dp）。旧 payload 缺字段回退结构体默认 0=平台默认。
+  style.corner_radius = DoubleFromValue(args, "cornerRadius", style.corner_radius);
+  style.window_width = DoubleFromValue(args, "windowWidth", style.window_width);
+  style.window_height =
+      DoubleFromValue(args, "windowHeight", style.window_height);
+  style.current_line_color =
+      ArgbFromValue(args, "currentLineColor", style.current_line_color);
+  style.context_line_opacity = DoubleFromValue(
+      args, "contextLineOpacity", style.context_line_opacity);
+  // 竖排偏好：旧 payload 缺字段 = false（横排，逐像素不变）。
+  style.vertical_text = BoolFromValue(args, "verticalText", style.vertical_text);
+  return style;
+}
+
+const flutter::EncodableMap* MapFromValue(const flutter::EncodableMap* args,
+                                          const char* key) {
+  if (args == nullptr) return nullptr;
+  const auto it = args->find(flutter::EncodableValue(key));
+  if (it == args->end()) return nullptr;
+  return std::get_if<flutter::EncodableMap>(&it->second);
+}
+
+bool AttachedEpochFromArgs(const flutter::EncodableMap* args,
+                           AttachedTextSurfaceWindow::Epoch* epoch) {
+  if (epoch == nullptr) return false;
+  const int64_t session = Int64FromValue(args, "sessionEpoch", 0);
+  const int64_t surface = Int64FromValue(args, "surfaceEpoch", 0);
+  if (session <= 0 || surface <= 0) return false;
+  epoch->session = static_cast<uint64_t>(session);
+  epoch->surface = static_cast<uint64_t>(surface);
+  return true;
+}
+
+HWND AttachedHwndFromArgs(const flutter::EncodableMap* args) {
+  if (args == nullptr) return nullptr;
+  const auto it = args->find(flutter::EncodableValue("targetHwnd"));
+  if (it == args->end()) return nullptr;
+  if (const auto numeric = it->second.TryGetLongValue(); numeric.has_value()) {
+    return reinterpret_cast<HWND>(static_cast<uintptr_t>(numeric.value()));
+  }
+  const auto* text = std::get_if<std::string>(&it->second);
+  if (text == nullptr || text->empty()) return nullptr;
+  const bool hexadecimal = text->size() > 2 && (*text)[0] == '0' &&
+                           ((*text)[1] == 'x' || (*text)[1] == 'X');
+  const char* begin = text->data() + (hexadecimal ? 2 : 0);
+  const char* end = text->data() + text->size();
+  uint64_t value = 0;
+  const auto parsed = std::from_chars(begin, end, value,
+                                      hexadecimal ? 16 : 10);
+  if (begin == end || parsed.ec != std::errc() || parsed.ptr != end ||
+      value > std::numeric_limits<uintptr_t>::max()) {
+    return nullptr;
+  }
+  return reinterpret_cast<HWND>(static_cast<uintptr_t>(value));
+}
+
+std::optional<AttachedTextSurfaceWindow::NormalizedRect>
+AttachedRectFromArgs(const flutter::EncodableMap* args) {
+  const flutter::EncodableMap* rect = MapFromValue(args, "bodyRect");
+  if (rect == nullptr) return std::nullopt;
+  AttachedTextSurfaceWindow::NormalizedRect result;
+  result.left = DoubleFromValue(rect, "left", -1.0);
+  result.top = DoubleFromValue(rect, "top", -1.0);
+  result.width = DoubleFromValue(rect, "width", -1.0);
+  result.height = DoubleFromValue(rect, "height", -1.0);
+  return result;
+}
+
+AttachedTextSurfaceWindow::ReferenceClient AttachedReferenceFromArgs(
+    const flutter::EncodableMap* args) {
+  AttachedTextSurfaceWindow::ReferenceClient reference;
+  const flutter::EncodableMap* map = MapFromValue(args, "referenceClient");
+  if (map == nullptr) return reference;
+  reference.width_px = IntFromValue(map, "widthPx", 0);
+  reference.height_px = IntFromValue(map, "heightPx", 0);
+  reference.dpi = static_cast<int>(
+      std::llround(DoubleFromValue(map, "dpi", 96.0)));
+  return reference;
+}
+
+bool ExactFiniteDoubleFromValue(const flutter::EncodableMap* map,
+                                const char* key, double* output) {
+  if (map == nullptr || output == nullptr) return false;
+  const auto it = map->find(flutter::EncodableValue(key));
+  if (it == map->end()) return false;
+  if (const auto* value = std::get_if<double>(&it->second)) {
+    if (!std::isfinite(*value)) return false;
+    *output = *value;
+    return true;
+  }
+  if (const auto* value = std::get_if<int32_t>(&it->second)) {
+    *output = static_cast<double>(*value);
+    return true;
+  }
+  if (const auto* value = std::get_if<int64_t>(&it->second)) {
+    *output = static_cast<double>(*value);
+    return true;
+  }
+  return false;
+}
+
+bool ExactIntFromValue(const flutter::EncodableMap* map, const char* key,
+                       int* output) {
+  if (map == nullptr || output == nullptr) return false;
+  const auto it = map->find(flutter::EncodableValue(key));
+  if (it == map->end()) return false;
+  if (const auto* value = std::get_if<int32_t>(&it->second)) {
+    *output = *value;
+    return true;
+  }
+  if (const auto* value = std::get_if<int64_t>(&it->second)) {
+    if (*value < std::numeric_limits<int>::min() ||
+        *value > std::numeric_limits<int>::max()) {
+      return false;
+    }
+    *output = static_cast<int>(*value);
+    return true;
+  }
+  if (const auto* value = std::get_if<double>(&it->second)) {
+    if (!std::isfinite(*value) || std::floor(*value) != *value ||
+        *value < static_cast<double>(std::numeric_limits<int>::min()) ||
+        *value > static_cast<double>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+    *output = static_cast<int>(*value);
+    return true;
+  }
+  return false;
+}
+
+bool HasExactCellGridKeys(const flutter::EncodableMap* map) {
+  static constexpr const char* kLegacyKeys[] = {
+      "advancePerClientHeight", "lineAdvancePerClientHeight",
+      "cellHeightPerClientHeight", "columns", "continuationIndent",
+      "quotedContinuationIndent"};
+  constexpr size_t kLegacyKeyCount =
+      sizeof(kLegacyKeys) / sizeof(kLegacyKeys[0]);
+  if (map == nullptr || map->size() < kLegacyKeyCount ||
+      map->size() > kLegacyKeyCount + 4)
+    return false;
+  for (const char* key : kLegacyKeys) {
+    if (map->find(flutter::EncodableValue(key)) == map->end()) return false;
+  }
+  const auto hanging = map->find(flutter::EncodableValue("hangingPunctuation"));
+  if (hanging != map->end() && std::get_if<bool>(&hanging->second) == nullptr)
+    return false;
+  const auto trim_wrap_whitespace =
+      map->find(flutter::EncodableValue("trimWrapWhitespace"));
+  if (trim_wrap_whitespace != map->end() &&
+      std::get_if<bool>(&trim_wrap_whitespace->second) == nullptr)
+    return false;
+  const auto explicit_line_breaks =
+      map->find(flutter::EncodableValue("explicitLineBreaks"));
+  if (explicit_line_breaks != map->end() &&
+      std::get_if<bool>(&explicit_line_breaks->second) == nullptr)
+    return false;
+  const auto line_width = map->find(flutter::EncodableValue("lineWidthInCells"));
+  if (line_width != map->end() &&
+      std::get_if<double>(&line_width->second) == nullptr &&
+      std::get_if<int32_t>(&line_width->second) == nullptr &&
+      std::get_if<int64_t>(&line_width->second) == nullptr) {
+    return false;
+  }
+  if (map->size() != kLegacyKeyCount +
+                           (hanging != map->end() ? 1u : 0u) +
+                           (trim_wrap_whitespace != map->end() ? 1u : 0u) +
+                           (explicit_line_breaks != map->end() ? 1u : 0u) +
+                           (line_width != map->end() ? 1u : 0u)) {
+    return false;
+  }
+  return true;
+}
+
+bool HasExactCharacterAdvanceKeys(const flutter::EncodableMap* map) {
+  static constexpr const char* kKeys[] = {"codePoint", "advanceRatio"};
+  constexpr size_t kKeyCount = sizeof(kKeys) / sizeof(kKeys[0]);
+  if (map == nullptr || map->size() != kKeyCount) return false;
+  for (const char* key : kKeys) {
+    if (map->find(flutter::EncodableValue(key)) == map->end()) return false;
+  }
+  return true;
+}
+
+bool ExactCharacterAdvanceCodePointFromValue(const flutter::EncodableMap* map,
+                                            const char* key,
+                                            uint32_t* output) {
+  if (map == nullptr || output == nullptr) return false;
+  const auto it = map->find(flutter::EncodableValue(key));
+  if (it == map->end()) return false;
+  int64_t code_point = 0;
+  if (const auto* value32 = std::get_if<int32_t>(&it->second)) {
+    code_point = *value32;
+  } else if (const auto* value64 = std::get_if<int64_t>(&it->second)) {
+    code_point = *value64;
+  } else {
+    return false;
+  }
+  if (code_point < 0 || code_point > 0x10FFFF) return false;
+  *output = static_cast<uint32_t>(code_point);
+  return true;
+}
+
+bool CharacterAdvanceFromValue(
+    const flutter::EncodableValue& value,
+    fushi::attached_text_layout::CharacterAdvance* output) {
+  if (output == nullptr) return false;
+  const auto* map = std::get_if<flutter::EncodableMap>(&value);
+  if (!HasExactCharacterAdvanceKeys(map)) return false;
+  fushi::attached_text_layout::CharacterAdvance advance;
+  if (!ExactCharacterAdvanceCodePointFromValue(map, "codePoint",
+                                               &advance.code_point) ||
+      !ExactFiniteDoubleFromValue(map, "advanceRatio",
+                                  &advance.advance_ratio) ||
+      !fushi::attached_text_layout::IsCharacterAdvanceValid(advance)) {
+    return false;
+  }
+  *output = advance;
+  return true;
+}
+
+bool HasExactPunctuationVisualBoundKeys(const flutter::EncodableMap* map) {
+  static constexpr const char* kKeys[] = {"codePoint", "left", "top",
+                                          "right", "bottom"};
+  constexpr size_t kKeyCount = sizeof(kKeys) / sizeof(kKeys[0]);
+  if (map == nullptr || map->size() != kKeyCount) return false;
+  for (const char* key : kKeys) {
+    if (map->find(flutter::EncodableValue(key)) == map->end()) return false;
+  }
+  return true;
+}
+
+bool PunctuationVisualBoundFromValue(
+    const flutter::EncodableValue& value,
+    fushi::attached_text_layout::PunctuationVisualBounds* output) {
+  if (output == nullptr) return false;
+  const auto* map = std::get_if<flutter::EncodableMap>(&value);
+  if (!HasExactPunctuationVisualBoundKeys(map)) return false;
+  int code_point = 0;
+  fushi::attached_text_layout::PunctuationVisualBounds bounds;
+  if (!ExactIntFromValue(map, "codePoint", &code_point) || code_point < 0) {
+    return false;
+  }
+  bounds.code_point = static_cast<uint32_t>(code_point);
+  if (!ExactFiniteDoubleFromValue(map, "left", &bounds.left) ||
+      !ExactFiniteDoubleFromValue(map, "top", &bounds.top) ||
+      !ExactFiniteDoubleFromValue(map, "right", &bounds.right) ||
+      !ExactFiniteDoubleFromValue(map, "bottom", &bounds.bottom) ||
+      !fushi::attached_text_layout::IsPunctuationVisualBoundsValid(bounds)) {
+    return false;
+  }
+  *output = bounds;
+  return true;
+}
+
+AttachedTextSurfaceWindow::Layout AttachedLayoutFromArgs(
+    const flutter::EncodableMap* args) {
+  AttachedTextSurfaceWindow::Layout layout;
+  const flutter::EncodableMap* map = MapFromValue(args, "layout");
+  if (map == nullptr) map = args;
+  if (map == nullptr) return layout;
+  layout.font_family = WideFromValue(map, "fontFamily", layout.font_family);
+  layout.font_size_per_client_height = DoubleFromValue(
+      map, "fontSizePerClientHeight", layout.font_size_per_client_height);
+  layout.letter_spacing_per_client_height =
+      DoubleFromValue(map, "letterSpacingPerClientHeight",
+                      layout.letter_spacing_per_client_height);
+  layout.line_height =
+      DoubleFromValue(map, "lineHeight", layout.line_height);
+  layout.text_align =
+      StringFromValue(map, "textAlign", layout.text_align);
+  layout.vertical_align =
+      StringFromValue(map, "verticalAlign", layout.vertical_align);
+  layout.padding_per_client_height =
+      DoubleFromValue(map, "paddingPerClientHeight",
+                      layout.padding_per_client_height);
+  const auto cell_grid_it = map->find(flutter::EncodableValue("cellGrid"));
+  if (cell_grid_it != map->end()) {
+    // Presence changes the layout contract. Any malformed grid deliberately
+    // remains invalid so the surface validation gate cannot silently fall
+    // back to legacy DirectWrite geometry.
+    fushi::attached_text_layout::CellGrid grid;
+    const auto* grid_map =
+        std::get_if<flutter::EncodableMap>(&cell_grid_it->second);
+    if (HasExactCellGridKeys(grid_map)) {
+      (void)ExactFiniteDoubleFromValue(grid_map, "advancePerClientHeight",
+                                       &grid.advance_per_client_height);
+      (void)ExactFiniteDoubleFromValue(
+          grid_map, "lineAdvancePerClientHeight",
+          &grid.line_advance_per_client_height);
+      (void)ExactFiniteDoubleFromValue(grid_map, "cellHeightPerClientHeight",
+                                       &grid.cell_height_per_client_height);
+      (void)ExactIntFromValue(grid_map, "columns", &grid.columns);
+      (void)ExactFiniteDoubleFromValue(grid_map, "continuationIndent",
+                                       &grid.continuation_indent);
+      (void)ExactFiniteDoubleFromValue(
+          grid_map, "quotedContinuationIndent",
+          &grid.quoted_continuation_indent);
+      const auto line_width =
+          grid_map->find(flutter::EncodableValue("lineWidthInCells"));
+      if (line_width != grid_map->end() &&
+          !ExactFiniteDoubleFromValue(grid_map, "lineWidthInCells",
+                                      &grid.line_width_in_cells)) {
+        // A present but malformed optional value must not be treated as
+        // omitted; IsCellGridValid will reject this sentinel.
+        grid.line_width_in_cells = 0.0;
+      }
+      const auto hanging =
+          grid_map->find(flutter::EncodableValue("hangingPunctuation"));
+      if (hanging != grid_map->end()) {
+        grid.hanging_punctuation = std::get<bool>(hanging->second);
+      }
+      const auto trim_wrap_whitespace =
+          grid_map->find(flutter::EncodableValue("trimWrapWhitespace"));
+      if (trim_wrap_whitespace != grid_map->end()) {
+        grid.trim_wrap_whitespace =
+            std::get<bool>(trim_wrap_whitespace->second);
+      }
+      const auto explicit_line_breaks =
+          grid_map->find(flutter::EncodableValue("explicitLineBreaks"));
+      if (explicit_line_breaks != grid_map->end()) {
+        grid.explicit_line_breaks =
+            std::get<bool>(explicit_line_breaks->second);
+      }
+    }
+    layout.cell_grid = grid;
+  }
+  const auto quoted_text_only =
+      map->find(flutter::EncodableValue("quotedTextOnly"));
+  if (quoted_text_only != map->end()) {
+    const bool* enabled = std::get_if<bool>(&quoted_text_only->second);
+    if (enabled != nullptr)
+      layout.quoted_text_only = *enabled;
+    else
+      layout.cell_grid = fushi::attached_text_layout::CellGrid{};
+  }
+  const auto character_advances_it =
+      map->find(flutter::EncodableValue("characterAdvances"));
+  if (character_advances_it != map->end()) {
+    const auto* list =
+        std::get_if<flutter::EncodableList>(&character_advances_it->second);
+    if (list == nullptr || list->empty() || list->size() > 64) {
+      layout.character_advances_valid = false;
+    } else {
+      for (const flutter::EncodableValue& value : *list) {
+        fushi::attached_text_layout::CharacterAdvance advance;
+        if (!CharacterAdvanceFromValue(value, &advance) ||
+            std::any_of(
+                layout.character_advances.begin(),
+                layout.character_advances.end(),
+                [&advance](const auto& existing) {
+                  return existing.code_point == advance.code_point;
+                })) {
+          layout.character_advances_valid = false;
+          layout.character_advances.clear();
+          break;
+        }
+        layout.character_advances.push_back(advance);
+      }
+      if (layout.character_advances_valid) {
+        std::sort(layout.character_advances.begin(),
+                  layout.character_advances.end(),
+                  [](const auto& left, const auto& right) {
+                    return left.code_point < right.code_point;
+                  });
+      }
+    }
+  }
+  const auto visual_it =
+      map->find(flutter::EncodableValue("punctuationVisualBounds"));
+  if (visual_it != map->end()) {
+    const auto* list = std::get_if<flutter::EncodableList>(&visual_it->second);
+    if (list == nullptr || list->empty() || list->size() > 32) {
+      layout.punctuation_visual_bounds_valid = false;
+    } else {
+      for (const flutter::EncodableValue& value : *list) {
+        fushi::attached_text_layout::PunctuationVisualBounds bounds;
+        if (!PunctuationVisualBoundFromValue(value, &bounds) ||
+            std::any_of(
+                layout.punctuation_visual_bounds.begin(),
+                layout.punctuation_visual_bounds.end(),
+                [&bounds](const auto& existing) {
+                  return existing.code_point == bounds.code_point;
+                })) {
+          layout.punctuation_visual_bounds_valid = false;
+          layout.punctuation_visual_bounds.clear();
+          break;
+        }
+        layout.punctuation_visual_bounds.push_back(bounds);
+      }
+    }
+  }
+  return layout;
+}
+
+flutter::EncodableMap AttachedPreviewLayoutFromArgs(
+    const flutter::EncodableMap* args) {
+  const auto failure = [](const char* reason) {
+    return flutter::EncodableMap{
+        {flutter::EncodableValue("accepted"), flutter::EncodableValue(false)},
+        {flutter::EncodableValue("reason"), flutter::EncodableValue(reason)},
+        {flutter::EncodableValue("boxes"),
+         flutter::EncodableValue(flutter::EncodableList{})},
+    };
+  };
+  const auto rect = AttachedRectFromArgs(args);
+  if (!rect.has_value()) return failure("invalid_body_rect");
+  const flutter::EncodableMap* reference_map =
+      MapFromValue(args, "referenceClient");
+  const double width = DoubleFromValue(reference_map, "widthPx", 0.0);
+  const double height = DoubleFromValue(reference_map, "heightPx", 0.0);
+  const double dpi = DoubleFromValue(reference_map, "dpi", 0.0);
+  // Validate before narrowing: malformed int64/NaN fields must not wrap into
+  // a plausible client size and allocate an unbounded DirectWrite layout.
+  if (!std::isfinite(width) || !std::isfinite(height) || !std::isfinite(dpi) ||
+      width < 1 || width > 16384 || width != std::floor(width) ||
+      height < 1 || height > 16384 || height != std::floor(height) ||
+      dpi < 1 || dpi > 960) {
+    return failure("invalid_reference_client");
+  }
+  const flutter::EncodableMap* layout_map = MapFromValue(args, "layout");
+  if (layout_map == nullptr) return failure("invalid_layout");
+  const std::string source_utf8 = StringFromValue(args, "sourceText", "");
+  if (source_utf8.size() > 4u * 32768u)
+    return failure("source_text_too_large");
+  const std::wstring source = Utf8ToWideString(source_utf8);
+  if (!source_utf8.empty() && source.empty())
+    return failure("invalid_source_text");
+  const std::string font = StringFromValue(layout_map, "fontFamily", "");
+  if (font.size() > 4u * 256u ||
+      (!font.empty() && Utf8ToWideString(font).empty())) {
+    return failure("invalid_layout");
+  }
+  const AttachedTextSurfaceWindow::ReferenceClient reference{
+      static_cast<int>(width), static_cast<int>(height),
+      static_cast<int>(std::llround(dpi))};
+  const fushi::attached_text_layout::Result preview =
+      fushi::attached_text_layout::Preview(
+          source, reference, rect.value(), AttachedLayoutFromArgs(args));
+  flutter::EncodableList boxes;
+  boxes.reserve(preview.boxes.size());
+  for (const auto& box : preview.boxes) {
+    boxes.emplace_back(flutter::EncodableMap{
+        {flutter::EncodableValue("charIndex"),
+         flutter::EncodableValue(static_cast<int64_t>(box.text_position))},
+        {flutter::EncodableValue("charLength"),
+         flutter::EncodableValue(static_cast<int64_t>(box.text_length))},
+        {flutter::EncodableValue("left"),
+         flutter::EncodableValue(static_cast<int32_t>(box.hit_rect.left))},
+        {flutter::EncodableValue("top"),
+         flutter::EncodableValue(static_cast<int32_t>(box.hit_rect.top))},
+        {flutter::EncodableValue("right"),
+         flutter::EncodableValue(static_cast<int32_t>(box.hit_rect.right))},
+        {flutter::EncodableValue("bottom"),
+         flutter::EncodableValue(static_cast<int32_t>(box.hit_rect.bottom))},
+        {flutter::EncodableValue("visualLeft"),
+         flutter::EncodableValue(static_cast<int32_t>(box.visual_rect.left))},
+        {flutter::EncodableValue("visualTop"),
+         flutter::EncodableValue(static_cast<int32_t>(box.visual_rect.top))},
+        {flutter::EncodableValue("visualRight"),
+         flutter::EncodableValue(static_cast<int32_t>(box.visual_rect.right))},
+        {flutter::EncodableValue("visualBottom"),
+         flutter::EncodableValue(static_cast<int32_t>(box.visual_rect.bottom))},
+    });
+  }
+  return flutter::EncodableMap{
+      {flutter::EncodableValue("accepted"),
+       flutter::EncodableValue(preview.ok())},
+      {flutter::EncodableValue("reason"),
+       flutter::EncodableValue(preview.reason)},
+      {flutter::EncodableValue("boxes"),
+       flutter::EncodableValue(std::move(boxes))},
+  };
+}
+
+AttachedTextSurfaceWindow::CalibrationProbes AttachedProbesFromArgs(
+    const flutter::EncodableMap* args) {
+  AttachedTextSurfaceWindow::CalibrationProbes probes;
+  if (args == nullptr) return probes;
+  const auto apply = [&](const char* index_key, const char* confirmed_key,
+                         uint32_t bit, int64_t* destination) {
+    const auto index_it = args->find(flutter::EncodableValue(index_key));
+    const auto confirmed_it =
+        args->find(flutter::EncodableValue(confirmed_key));
+    if (index_it == args->end() && confirmed_it == args->end()) return;
+    probes.provided_mask |= bit;
+    *destination = Int64FromValue(args, index_key, -1);
+    if (BoolFromValue(args, confirmed_key, false)) {
+      probes.confirmed_mask |= bit;
+    }
+  };
+  apply("probeStartIndex", "probeStartConfirmed", 1u, &probes.start_index);
+  apply("probeMiddleIndex", "probeMiddleConfirmed", 2u,
+        &probes.middle_index);
+  apply("probeEndIndex", "probeEndConfirmed", 4u, &probes.end_index);
+  return probes;
+}
+
+std::string Utf8FromWide(const std::wstring& value) {
+  if (value.empty()) return std::string();
+  const int size = WideCharToMultiByte(
+      CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+      static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr);
+  if (size <= 0) return std::string();
+  std::string result(static_cast<size_t>(size), '\0');
+  WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                      static_cast<int>(value.size()), result.data(), size,
+                      nullptr, nullptr);
+  return result;
+}
+
+flutter::EncodableMap AttachedRectMap(
+    const AttachedTextSurfaceWindow::NormalizedRect& rect) {
+  flutter::EncodableMap result{
+      {flutter::EncodableValue("left"), flutter::EncodableValue(rect.left)},
+      {flutter::EncodableValue("top"), flutter::EncodableValue(rect.top)},
+      {flutter::EncodableValue("width"), flutter::EncodableValue(rect.width)},
+      {flutter::EncodableValue("height"),
+       flutter::EncodableValue(rect.height)},
+  };
+  return result;
+}
+
+flutter::EncodableMap AttachedReferenceMap(
+    const AttachedTextSurfaceWindow::ReferenceClient& reference) {
+  return flutter::EncodableMap{
+      {flutter::EncodableValue("widthPx"),
+       flutter::EncodableValue(reference.width_px)},
+      {flutter::EncodableValue("heightPx"),
+       flutter::EncodableValue(reference.height_px)},
+      {flutter::EncodableValue("dpi"),
+       flutter::EncodableValue(static_cast<double>(reference.dpi))},
+  };
+}
+
+flutter::EncodableMap AttachedLayoutMap(
+    const AttachedTextSurfaceWindow::Layout& layout) {
+  flutter::EncodableMap result{
+      {flutter::EncodableValue("fontFamily"),
+       flutter::EncodableValue(Utf8FromWide(layout.font_family))},
+      {flutter::EncodableValue("fontSizePerClientHeight"),
+       flutter::EncodableValue(layout.font_size_per_client_height)},
+      {flutter::EncodableValue("letterSpacingPerClientHeight"),
+       flutter::EncodableValue(layout.letter_spacing_per_client_height)},
+      {flutter::EncodableValue("lineHeight"),
+       flutter::EncodableValue(layout.line_height)},
+      {flutter::EncodableValue("textAlign"),
+       flutter::EncodableValue(layout.text_align)},
+      {flutter::EncodableValue("verticalAlign"),
+       flutter::EncodableValue(layout.vertical_align)},
+      {flutter::EncodableValue("paddingPerClientHeight"),
+       flutter::EncodableValue(layout.padding_per_client_height)},
+  };
+  if (layout.quoted_text_only) {
+    result[flutter::EncodableValue("quotedTextOnly")] =
+        flutter::EncodableValue(true);
+  }
+  if (layout.cell_grid.has_value()) {
+    const fushi::attached_text_layout::CellGrid& grid = *layout.cell_grid;
+    flutter::EncodableMap serialized_grid{
+        {flutter::EncodableValue("advancePerClientHeight"),
+         flutter::EncodableValue(grid.advance_per_client_height)},
+        {flutter::EncodableValue("lineAdvancePerClientHeight"),
+         flutter::EncodableValue(grid.line_advance_per_client_height)},
+        {flutter::EncodableValue("cellHeightPerClientHeight"),
+         flutter::EncodableValue(grid.cell_height_per_client_height)},
+        {flutter::EncodableValue("columns"),
+         flutter::EncodableValue(grid.columns)},
+        {flutter::EncodableValue("continuationIndent"),
+         flutter::EncodableValue(grid.continuation_indent)},
+        {flutter::EncodableValue("quotedContinuationIndent"),
+         flutter::EncodableValue(grid.quoted_continuation_indent)},
+    };
+    if (std::isfinite(grid.line_width_in_cells)) {
+      serialized_grid[flutter::EncodableValue("lineWidthInCells")] =
+          flutter::EncodableValue(grid.line_width_in_cells);
+    }
+    if (grid.hanging_punctuation) {
+      serialized_grid[flutter::EncodableValue("hangingPunctuation")] =
+          flutter::EncodableValue(true);
+    }
+    if (grid.trim_wrap_whitespace) {
+      serialized_grid[flutter::EncodableValue("trimWrapWhitespace")] =
+          flutter::EncodableValue(true);
+    }
+    if (grid.explicit_line_breaks) {
+      serialized_grid[flutter::EncodableValue("explicitLineBreaks")] =
+          flutter::EncodableValue(true);
+    }
+    result[flutter::EncodableValue("cellGrid")] =
+        flutter::EncodableValue(std::move(serialized_grid));
+  }
+  if (!layout.character_advances.empty()) {
+    std::vector<fushi::attached_text_layout::CharacterAdvance> advances =
+        layout.character_advances;
+    std::sort(advances.begin(), advances.end(),
+              [](const auto& left, const auto& right) {
+                return left.code_point < right.code_point;
+              });
+    flutter::EncodableList serialized_advances;
+    serialized_advances.reserve(advances.size());
+    for (const auto& advance : advances) {
+      serialized_advances.emplace_back(flutter::EncodableMap{
+          {flutter::EncodableValue("codePoint"),
+           flutter::EncodableValue(static_cast<int64_t>(advance.code_point))},
+          {flutter::EncodableValue("advanceRatio"),
+           flutter::EncodableValue(advance.advance_ratio)},
+      });
+    }
+    result[flutter::EncodableValue("characterAdvances")] =
+        flutter::EncodableValue(std::move(serialized_advances));
+  }
+  if (!layout.punctuation_visual_bounds.empty()) {
+    flutter::EncodableList serialized_bounds;
+    serialized_bounds.reserve(layout.punctuation_visual_bounds.size());
+    for (const auto& bound : layout.punctuation_visual_bounds) {
+      serialized_bounds.emplace_back(flutter::EncodableMap{
+          {flutter::EncodableValue("codePoint"),
+           flutter::EncodableValue(static_cast<int64_t>(bound.code_point))},
+          {flutter::EncodableValue("left"),
+           flutter::EncodableValue(bound.left)},
+          {flutter::EncodableValue("top"),
+           flutter::EncodableValue(bound.top)},
+          {flutter::EncodableValue("right"),
+           flutter::EncodableValue(bound.right)},
+          {flutter::EncodableValue("bottom"),
+           flutter::EncodableValue(bound.bottom)},
+      });
+    }
+    result[flutter::EncodableValue("punctuationVisualBounds")] =
+        flutter::EncodableValue(std::move(serialized_bounds));
+  }
+  return result;
+}
+
+flutter::EncodableMap AttachedSnapshotMap(
+    const AttachedTextSurfaceWindow::Snapshot& snapshot) {
+  flutter::EncodableMap shield{
+      {flutter::EncodableValue("available"),
+       flutter::EncodableValue(snapshot.shield.available)},
+      {flutter::EncodableValue("requestSeq"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.request_seq))},
+      {flutter::EncodableValue("appliedSeq"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.applied_seq))},
+      {flutter::EncodableValue("requiredMask"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.required_mask))},
+      {flutter::EncodableValue("readyMask"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.ready_mask))},
+      {flutter::EncodableValue("observedMask"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.observed_mask))},
+      {flutter::EncodableValue("faultMask"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.fault_mask))},
+      {flutter::EncodableValue("statusFlags"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.status_flags))},
+      {flutter::EncodableValue("ownerKind"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.owner_kind))},
+      {flutter::EncodableValue("targetHwnd"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.target_hwnd))},
+      {flutter::EncodableValue("transactionId"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.transaction_id))},
+      {flutter::EncodableValue("activeButtons"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.shield.active_buttons))},
+      {flutter::EncodableValue("allowRisk"),
+       flutter::EncodableValue(snapshot.shield.allow_risk)},
+  };
+  flutter::EncodableMap result{
+      {flutter::EncodableValue("sessionEpoch"),
+       flutter::EncodableValue(static_cast<int64_t>(snapshot.epoch.session))},
+      {flutter::EncodableValue("surfaceEpoch"),
+       flutter::EncodableValue(static_cast<int64_t>(snapshot.epoch.surface))},
+      {flutter::EncodableValue("targetPid"),
+       flutter::EncodableValue(static_cast<int32_t>(snapshot.target.pid))},
+      {flutter::EncodableValue("targetHwnd"),
+       flutter::EncodableValue(static_cast<int64_t>(
+           reinterpret_cast<uintptr_t>(snapshot.target.hwnd)))},
+      {flutter::EncodableValue("exePath"),
+       flutter::EncodableValue(snapshot.target.exe_path)},
+      {flutter::EncodableValue("exeSha256"),
+       flutter::EncodableValue(snapshot.target.exe_sha256)},
+      {flutter::EncodableValue("state"),
+       flutter::EncodableValue(snapshot.state)},
+      {flutter::EncodableValue("status"),
+       flutter::EncodableValue(snapshot.status)},
+      {flutter::EncodableValue("reason"),
+       flutter::EncodableValue(snapshot.reason)},
+      {flutter::EncodableValue("surfaceVisible"),
+       flutter::EncodableValue(snapshot.surface_visible)},
+      {flutter::EncodableValue("riskAccepted"),
+       flutter::EncodableValue(snapshot.risk_accepted)},
+      {flutter::EncodableValue("textGeneration"),
+       flutter::EncodableValue(snapshot.text_generation)},
+      {flutter::EncodableValue("calibrationProbeMask"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.calibration_probe_mask))},
+      {flutter::EncodableValue("providerKind"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.provider.provider_kind))},
+      {flutter::EncodableValue("providerId"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.provider.provider_id))},
+      {flutter::EncodableValue("providerStatus"),
+       flutter::EncodableValue(
+           static_cast<int64_t>(snapshot.provider.provider_status))},
+      {flutter::EncodableValue("bodyRect"),
+       flutter::EncodableValue(AttachedRectMap(snapshot.body_rect))},
+      {flutter::EncodableValue("referenceClient"),
+       flutter::EncodableValue(
+           AttachedReferenceMap(snapshot.target.reference_client))},
+      {flutter::EncodableValue("layout"),
+       flutter::EncodableValue(AttachedLayoutMap(snapshot.layout))},
+      {flutter::EncodableValue("shield"),
+       flutter::EncodableValue(std::move(shield))},
+  };
+  if (snapshot.probe_start_observed_index >= 0) {
+    result[flutter::EncodableValue("probeStartObservedIndex")] =
+        flutter::EncodableValue(snapshot.probe_start_observed_index);
+  }
+  if (snapshot.probe_middle_observed_index >= 0) {
+    result[flutter::EncodableValue("probeMiddleObservedIndex")] =
+        flutter::EncodableValue(snapshot.probe_middle_observed_index);
+  }
+  if (snapshot.probe_end_observed_index >= 0) {
+    result[flutter::EncodableValue("probeEndObservedIndex")] =
+        flutter::EncodableValue(snapshot.probe_end_observed_index);
+  }
+  return result;
+}
+
+// TODO-1030 M0 — private window message posting a completed foreground-selection
+// UIA capture (run on a worker thread) back to the UI thread, where the pending
+// Flutter MethodResult is completed. The LPARAM is a heap-owned
+// ForegroundSelectionPending* transferred to MessageHandler (which deletes it).
+constexpr UINT WM_FGSEL_CAPTURE_DONE = WM_APP + 3;
+
+// Ownership hand-off across the worker->UI thread boundary: the UIA result plus
+// the still-pending Flutter reply. Deleted by MessageHandler after replying.
+struct ForegroundSelectionPending {
+  ForegroundSelectionResult capture;
+  std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result;
+  int64_t elapsed_ms = 0;
+};
+
+constexpr UINT_PTR kWindowCaptureReplyTimerId = 0x46574350;
+constexpr UINT kWindowCaptureReplyTickMs = 16;
+
+flutter::EncodableMap WindowCaptureReplyMap(
+    const fushi::WindowCaptureResult& capture) {
+  flutter::EncodableMap reply;
+  if (capture.ok && !capture.png.empty()) {
+    reply[flutter::EncodableValue("pngBytes")] =
+        flutter::EncodableValue(capture.png);
+  } else {
+    reply[flutter::EncodableValue("error")] =
+        flutter::EncodableValue(capture.error.empty()
+                                    ? std::string("capture failed")
+                                    : capture.error);
+  }
+  // BUG-1096 — 成功路径上的可观测事实（WGC 光标抑制是否真的生效 / 捕获目标是否
+  // 被从 Magpie 缩放窗重定向）。空则不带字段，Dart 侧只在非空时记一条日志。
+  if (!capture.diagnostics.empty()) {
+    reply[flutter::EncodableValue("diagnostics")] =
+        flutter::EncodableValue(capture.diagnostics);
+  }
+  if (!capture.capture_reason.empty()) {
+    reply[flutter::EncodableValue("captureReason")] =
+        flutter::EncodableValue(capture.capture_reason);
+  }
+  if (capture.has_metadata) {
+    const auto& metadata = capture.metadata;
+    reply[flutter::EncodableValue("metadata")] =
+        flutter::EncodableValue(flutter::EncodableMap{
+            {flutter::EncodableValue("capturedHwnd"),
+             flutter::EncodableValue(metadata.captured_hwnd)},
+            {flutter::EncodableValue("capturedPid"),
+             flutter::EncodableValue(
+                 static_cast<int64_t>(metadata.captured_pid))},
+            {flutter::EncodableValue("clientLeftPx"),
+             flutter::EncodableValue(metadata.client_left_px)},
+            {flutter::EncodableValue("clientTopPx"),
+             flutter::EncodableValue(metadata.client_top_px)},
+            {flutter::EncodableValue("clientWidthPx"),
+             flutter::EncodableValue(metadata.client_width_px)},
+            {flutter::EncodableValue("clientHeightPx"),
+             flutter::EncodableValue(metadata.client_height_px)},
+            {flutter::EncodableValue("imageWidthPx"),
+             flutter::EncodableValue(metadata.image_width_px)},
+            {flutter::EncodableValue("imageHeightPx"),
+             flutter::EncodableValue(metadata.image_height_px)},
+            {flutter::EncodableValue("contentWidthPx"),
+             flutter::EncodableValue(metadata.content_width_px)},
+            {flutter::EncodableValue("contentHeightPx"),
+             flutter::EncodableValue(metadata.content_height_px)},
+            {flutter::EncodableValue("textureWidthPx"),
+             flutter::EncodableValue(metadata.texture_width_px)},
+            {flutter::EncodableValue("textureHeightPx"),
+             flutter::EncodableValue(metadata.texture_height_px)},
+            {flutter::EncodableValue("sourceHwnd"),
+             flutter::EncodableValue(metadata.source_hwnd)},
+            {flutter::EncodableValue("sourcePid"),
+             flutter::EncodableValue(static_cast<int64_t>(metadata.source_pid))},
+            {flutter::EncodableValue("presentationHwnd"),
+             flutter::EncodableValue(metadata.presentation_hwnd)},
+            {flutter::EncodableValue("presentationPid"),
+             flutter::EncodableValue(static_cast<int64_t>(metadata.presentation_pid))},
+            {flutter::EncodableValue("usedPresentationCapture"),
+             flutter::EncodableValue(metadata.used_presentation_capture)},
+            {flutter::EncodableValue("presentationViewportComplete"),
+             flutter::EncodableValue(metadata.presentation_viewport_complete)},
+            {flutter::EncodableValue("sourceClientLeftPx"),
+             flutter::EncodableValue(metadata.source_client_left_px)},
+            {flutter::EncodableValue("sourceClientTopPx"),
+             flutter::EncodableValue(metadata.source_client_top_px)},
+            {flutter::EncodableValue("sourceClientWidthPx"),
+             flutter::EncodableValue(metadata.source_client_width_px)},
+            {flutter::EncodableValue("sourceClientHeightPx"),
+             flutter::EncodableValue(metadata.source_client_height_px)},
+            {flutter::EncodableValue("sourceClientDpi"),
+             flutter::EncodableValue(metadata.source_client_dpi)},
+            {flutter::EncodableValue("sourceViewportLeftPx"),
+             flutter::EncodableValue(metadata.source_viewport_left_px)},
+            {flutter::EncodableValue("sourceViewportTopPx"),
+             flutter::EncodableValue(metadata.source_viewport_top_px)},
+            {flutter::EncodableValue("sourceViewportWidthPx"),
+             flutter::EncodableValue(metadata.source_viewport_width_px)},
+            {flutter::EncodableValue("sourceViewportHeightPx"),
+             flutter::EncodableValue(metadata.source_viewport_height_px)},
+            {flutter::EncodableValue("destinationViewportWidthPx"),
+             flutter::EncodableValue(metadata.destination_viewport_width_px)},
+            {flutter::EncodableValue("destinationViewportHeightPx"),
+             flutter::EncodableValue(metadata.destination_viewport_height_px)},
+            {flutter::EncodableValue("dpi"),
+             flutter::EncodableValue(metadata.dpi)},
+            {flutter::EncodableValue("clientAreaComplete"),
+             flutter::EncodableValue(metadata.client_area_complete)},
+            {flutter::EncodableValue("capturedAtTickMs"),
+             flutter::EncodableValue(static_cast<int64_t>(
+                 metadata.captured_at_tick_ms))},
+        });
+  }
+  return reply;
+}
+
+// BUG-2613 — 覆盖窗口左键护盾要保护的游戏窗口：当前 galgame 会话进程里正在玩的
+// 那个客户区窗（与 direct galCard 用同一条 FindProcessClientWindow）。没有会话 = 0，
+// 登记就退化成空操作。跑在窗口线程（登记点），不在钩子回调里。
+HWND ResolveOverlayClickShieldGame() {
+  const uint32_t pid = fushi::VoiceHookReader::Instance().CurrentPid();
+  return pid == 0 ? nullptr
+                  : fushi::game_client_extent::FindProcessClientWindow(pid);
+}
+
+// Dart 的数值可能是 double / int32 / int64（`<double>[...]` 编码成 double，整数
+// 列表编码成 int）：三种都收。
+std::optional<double> NumberFromValue(const flutter::EncodableValue& value) {
+  if (const auto* d = std::get_if<double>(&value)) return *d;
+  if (const auto* i = std::get_if<int32_t>(&value)) {
+    return static_cast<double>(*i);
+  }
+  if (const auto* l = std::get_if<int64_t>(&value)) {
+    return static_cast<double>(*l);
+  }
+  return std::nullopt;
+}
+
+// `[left, top, right, bottom]` → RectD；形状不对返回 nullopt。
+std::optional<fushi::screen_ocr::RectD> RectFromValue(
+    const flutter::EncodableValue& value) {
+  const auto* list = std::get_if<flutter::EncodableList>(&value);
+  if (list == nullptr || list->size() != 4) {
+    return std::nullopt;
+  }
+  double v[4] = {};
+  for (size_t i = 0; i < 4; ++i) {
+    const std::optional<double> n = NumberFromValue((*list)[i]);
+    if (!n || !std::isfinite(*n)) return std::nullopt;
+    v[i] = *n;
+  }
+  return fushi::screen_ocr::RectD{v[0], v[1], v[2], v[3]};
+}
+
+const flutter::EncodableValue* FindArg(const flutter::EncodableMap* args,
+                                       const char* key) {
+  if (args == nullptr) return nullptr;
+  const auto it = args->find(flutter::EncodableValue(key));
+  return it == args->end() ? nullptr : &it->second;
+}
+
+}  // namespace
+
+void FlutterWindow::RegisterFloatingLyricChannel() {
+  floating_lyric_window_ = std::make_unique<FloatingLyricWindow>();
+  // 有声书悬浮字幕跑与 galgame hook 台词浮窗同一套富文本形态：换行、滚动条、
+  // 拖角改尺寸、鼠标穿透、一键透明、Shift-悬停查词、点字后卡片锚定到那个字。
+  // 旧的自绘 5 槽歌词条形态已删 —— 它是同一件事的第二份实现，且只有它还在用无坐标
+  // 的旧 LookupCallback（卡片只能跟着鼠标飘）。
+  floating_lyric_window_->SetHookTextMode(true);
+  // BUG-2365 —— 正文窗的置顶守卫必须让位给查词卡：卡片自己也每 800ms 重申置顶
+  // （BUG-1479），两个窗口都抢置顶带最顶就会互相顶掉、卡片周期性闪到浮窗底下。
+  // 有可见卡片时正文窗插在卡片正下方，仍在全屏游戏之上。
+  floating_lyric_window_->SetTopmostCeilingProvider([this]() -> HWND {
+    return global_lookup_window_ != nullptr
+               ? global_lookup_window_->TopmostCeilingHandle()
+               : nullptr;
+  });
+  // 但按钮语义不同：这里是上一句 / 播放暂停 / 下一句，不是试听 / 重捕 / 工作台。
+  floating_lyric_window_->SetToolbarProfile(
+      hook_toolbar::Profile::kAudiobook);
+
+  floating_lyric_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/floating_lyric",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // Native taps -> Dart events (handled by FloatingLyricChannel.setEventHandlers
+  // in the reader page). The window's WndProc runs on this (platform) thread, so
+  // InvokeMethod is safe to call directly from the callbacks.
+  floating_lyric_window_->SetControlCallback(
+      [this](const std::string& action) {
+        floating_lyric_channel_->InvokeMethod(
+            action, std::make_unique<flutter::EncodableValue>());
+      });
+  // 带词矩形的查词回调（与 gal 台词浮窗同一条）：wordLeft/Top/Width/Height 是被点
+  // 那个字的屏幕逻辑 px 矩形，查词卡据此锚定到词而不是鼠标位置。老字段 text/index
+  // 原样保留，Dart 侧读不到词矩形时回落到光标锚定，逐像素与改造前一致。
+  floating_lyric_window_->SetContextLookupCallback(
+      [this](const std::string& line_id, const std::string& text,
+             int char_index, const D2D1_RECT_F& word_rect) {
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("lineId"),
+             flutter::EncodableValue(line_id)},
+            {flutter::EncodableValue("text"), flutter::EncodableValue(text)},
+            {flutter::EncodableValue("index"),
+             flutter::EncodableValue(char_index)},
+            {flutter::EncodableValue("wordLeft"),
+             flutter::EncodableValue(static_cast<double>(word_rect.left))},
+            {flutter::EncodableValue("wordTop"),
+             flutter::EncodableValue(static_cast<double>(word_rect.top))},
+            {flutter::EncodableValue("wordWidth"),
+             flutter::EncodableValue(
+                 static_cast<double>(word_rect.right - word_rect.left))},
+            {flutter::EncodableValue("wordHeight"),
+             flutter::EncodableValue(
+                 static_cast<double>(word_rect.bottom - word_rect.top))},
+        };
+        floating_lyric_channel_->InvokeMethod(
+            "lookupText",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+  // 穿透被 native 否决时必须让 Dart 知道（工具条窗建不出来 = 不许把正文点穿，
+  // 否则用户被浮窗挡住且再也点不回来）。
+  floating_lyric_window_->SetPassThroughCallback([this](bool enabled) {
+    flutter::EncodableMap map{
+        {flutter::EncodableValue("passThrough"),
+         flutter::EncodableValue(enabled)},
+    };
+    floating_lyric_channel_->InvokeMethod(
+        "passThroughChanged",
+        std::make_unique<flutter::EncodableValue>(std::move(map)));
+  });
+  floating_lyric_window_->SetBoundsCallback(
+      [this](int left, int top, int width, int height) {
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("left"), flutter::EncodableValue(left)},
+            {flutter::EncodableValue("top"), flutter::EncodableValue(top)},
+            {flutter::EncodableValue("width"), flutter::EncodableValue(width)},
+            {flutter::EncodableValue("height"),
+             flutter::EncodableValue(height)},
+        };
+        floating_lyric_channel_->InvokeMethod(
+            "windowRectChanged",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+  // The user toggling the lock button on the strip reports the new state back
+  // so the Dart side can persist it / refresh any in-app mirror.
+  floating_lyric_window_->SetLockCallback([this](bool locked) {
+    flutter::EncodableMap map{
+        {flutter::EncodableValue("locked"), flutter::EncodableValue(locked)},
+    };
+    floating_lyric_channel_->InvokeMethod(
+        "lockChanged", std::make_unique<flutter::EncodableValue>(std::move(map)));
+  });
+
+  floating_lyric_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        const std::string& method = call.method_name();
+
+        if (method == "canDrawOverlays") {
+          // The desktop strip is a runner-owned window — no OS overlay
+          // permission exists, so it is always permitted.
+          result->Success(flutter::EncodableValue(true));
+        } else if (method == "show") {
+          // 工具条槽位悬停提示（与 kAudiobookSlotActions 同下标）。native 不持有
+          // i18n，文案按 locale 由 Dart 下发；表按 profile 分开存，不会和 gal
+          // 台词浮窗的提示互相覆盖。
+          hook_toolbar::SetSlotTooltips(
+              hook_toolbar::Profile::kAudiobook,
+              WideListFromValue(args, "slotTooltips"));
+          floating_lyric_window_->UpdateStyle(StyleFromArgs(args));
+          floating_lyric_window_->SetClickLookupEnabled(
+              BoolFromValue(args, "clickLookupEnabled", true));
+          floating_lyric_window_->SetHoverAutoLookup(
+              BoolFromValue(args, "hoverAutoLookup", false));
+          // 置顶 / 穿透按会话复位：上一次关掉置顶后，这一次不该藏在别的窗口后面
+          // 让用户以为它没出来；穿透同理（开着穿透复原 = 用户点不到浮窗）。
+          floating_lyric_window_->SetTopmost(
+              BoolFromValue(args, "topmost", true));
+          if (args != nullptr &&
+              args->find(flutter::EncodableValue("locked")) != args->end()) {
+            floating_lyric_window_->SetLocked(
+                BoolFromValue(args, "locked", false));
+          }
+          floating_lyric_window_->SetPassThrough(
+              BoolFromValue(args, "passThrough", false));
+          floating_lyric_window_->SetInitialBounds(
+              IntFromValue(args, "left", 0), IntFromValue(args, "top", 0),
+              IntFromValue(args, "width", 0),
+              IntFromValue(args, "height", 0));
+          const bool shown = floating_lyric_window_->Show(GetHandle());
+          result->Success(flutter::EncodableValue(shown));
+        } else if (method == "hide") {
+          floating_lyric_window_->Hide();
+          result->Success();
+        } else if (method == "isShowing") {
+          result->Success(
+              flutter::EncodableValue(floating_lyric_window_->IsShowing()));
+        } else if (method == "updateText") {
+          // TODO-708 P4: 多行上下文块内当前行区间。缺字段回退 -1/0 = 无行标记
+          // （N=0 单行/旧 payload），整块满色（never-break userspace）。
+          floating_lyric_window_->UpdateText(
+              WideFromValue(args, "text", L""),
+              IntFromValue(args, "currentLineStart", -1),
+              IntFromValue(args, "currentLineLength", 0),
+              StringFromValue(args, "lineId", ""),
+              RubySpansFromValue(args, "rubySpans"));
+          result->Success();
+        } else if (method == "highlight") {
+          floating_lyric_window_->Highlight(IntFromValue(args, "start", -1),
+                                            IntFromValue(args, "length", 0));
+          result->Success();
+        } else if (method == "updateStyle") {
+          floating_lyric_window_->UpdateStyle(StyleFromArgs(args));
+          result->Success();
+        } else if (method == "updateLabels") {
+          FloatingLyricWindow::Labels labels;
+          labels.previous = WideFromValue(args, "previous", labels.previous);
+          labels.play_pause =
+              WideFromValue(args, "playPause", labels.play_pause);
+          labels.next = WideFromValue(args, "next", labels.next);
+          labels.lock = WideFromValue(args, "lock", labels.lock);
+          labels.unlock = WideFromValue(args, "unlock", labels.unlock);
+          labels.close = WideFromValue(args, "close", labels.close);
+          floating_lyric_window_->UpdateLabels(labels);
+          result->Success();
+        } else if (method == "setPlaybackState") {
+          floating_lyric_window_->SetPlaybackState(
+              BoolFromValue(args, "playing", false));
+          result->Success();
+        } else if (method == "setClickLookupEnabled") {
+          floating_lyric_window_->SetClickLookupEnabled(
+              BoolFromValue(args, "enabled", true));
+          result->Success();
+        } else if (method == "setLocked") {
+          // Position lock: drag disabled, lookup + playback controls still work
+          // (mirrors the Android FloatingLyricService lock). The strip reports
+          // any user-driven toggle back over "lockChanged".
+          floating_lyric_window_->SetLocked(
+              BoolFromValue(args, "locked", false));
+          result->Success();
+        } else if (method == "setPassThrough") {
+          floating_lyric_window_->SetPassThrough(
+              BoolFromValue(args, "enabled", false));
+          result->Success();
+        } else if (method == "setHoverAutoLookup") {
+          // 「悬停即查词」live 下发：设置页一改，正开着的浮窗立刻跟上。
+          floating_lyric_window_->SetHoverAutoLookup(
+              BoolFromValue(args, "enabled", false));
+          result->Success();
+        } else {
+          result->NotImplemented();
+        }
+      });
+}
+
+void FlutterWindow::RegisterFloatingBallChannel() {
+  // 只注册一次：重复 make_unique 会把旧窗口连同它的回调一起析构掉，Dart 手里的球
+  // 就凭空消失了。
+  if (floating_ball_channel_) {
+    return;
+  }
+  floating_ball_window_ = std::make_unique<FloatingBallWindow>();
+  floating_ball_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/floating_ball",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // 原生 → Dart。窗口过程跑在本（平台）线程，回调里直接 InvokeMethod 是安全的。
+  floating_ball_window_->SetActionCallback(
+      [this](const std::string& id, const RECT& anchor) {
+        // anchor = 球在屏幕上的矩形：物理像素、左上原点（与 global_lookup 同约定）。
+        flutter::EncodableList rect{
+            flutter::EncodableValue(static_cast<int32_t>(anchor.left)),
+            flutter::EncodableValue(static_cast<int32_t>(anchor.top)),
+            flutter::EncodableValue(static_cast<int32_t>(anchor.right)),
+            flutter::EncodableValue(static_cast<int32_t>(anchor.bottom)),
+        };
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("id"), flutter::EncodableValue(id)},
+            {flutter::EncodableValue("anchor"),
+             flutter::EncodableValue(std::move(rect))},
+        };
+        floating_ball_channel_->InvokeMethod(
+            "systemBallAction",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+  floating_ball_window_->SetClosedCallback([this]() {
+    floating_ball_channel_->InvokeMethod(
+        "systemBallClosedByUser", std::make_unique<flutter::EncodableValue>());
+  });
+  floating_ball_window_->SetPositionCallback(
+      [this](bool dock_left, double fraction) {
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("dock"),
+             flutter::EncodableValue(dock_left ? "left" : "right")},
+            {flutter::EncodableValue("fraction"),
+             flutter::EncodableValue(fraction)},
+        };
+        floating_ball_channel_->InvokeMethod(
+            "systemBallPositionChanged",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+
+  // 截屏识字冻结层的回调同样跑在平台线程。
+  screen_ocr_overlay_ = std::make_unique<ScreenOcrOverlay>();
+  screen_ocr_overlay_->SetTapCallback([this](int x, int y) {
+    // 截图像素 = 相对显示器左上的物理像素。层不自动关，Dart 决定。
+    flutter::EncodableMap map{
+        {flutter::EncodableValue("x"),
+         flutter::EncodableValue(static_cast<double>(x))},
+        {flutter::EncodableValue("y"),
+         flutter::EncodableValue(static_cast<double>(y))},
+    };
+    floating_ball_channel_->InvokeMethod(
+        "screenOcrTap",
+        std::make_unique<flutter::EncodableValue>(std::move(map)));
+  });
+  screen_ocr_overlay_->SetDismissCallback([this]() {
+    // 层已由 overlay 自己关掉：恢复球后再告诉 Dart。
+    if (floating_ball_window_) {
+      floating_ball_window_->RestoreAfterCapture();
+    }
+    floating_ball_channel_->InvokeMethod(
+        "screenOcrDismissed", std::make_unique<flutter::EncodableValue>());
+  });
+
+  floating_ball_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        const std::string& method = call.method_name();
+        if (method == "startSystemBall") {
+          FloatingBallWindow::Config config;
+          config.animate = BoolFromValue(args, "animate", true);
+          config.show_labels = BoolFromValue(args, "showLabels", true);
+          auto find = [args](const char* key) -> const flutter::EncodableValue* {
+            if (args == nullptr) return nullptr;
+            const auto it = args->find(flutter::EncodableValue(key));
+            return it == args->end() ? nullptr : &it->second;
+          };
+          if (const auto* v = find("actions")) {
+            if (const auto* list = std::get_if<flutter::EncodableList>(v)) {
+              for (const auto& item : *list) {
+                if (const auto* s = std::get_if<std::string>(&item)) {
+                  config.actions.push_back(*s);
+                }
+              }
+            }
+          }
+          if (const auto* v = find("labels")) {
+            if (const auto* map = std::get_if<flutter::EncodableMap>(v)) {
+              for (const auto& [key, value] : *map) {
+                const auto* k = std::get_if<std::string>(&key);
+                const auto* s = std::get_if<std::string>(&value);
+                if (k != nullptr && s != nullptr) {
+                  config.labels[*k] = Utf8ToWideString(*s);
+                }
+              }
+            }
+          }
+          if (const auto* v = find("iconImages")) {
+            if (const auto* map = std::get_if<flutter::EncodableMap>(v)) {
+              for (const auto& [key, value] : *map) {
+                const auto* k = std::get_if<std::string>(&key);
+                const auto* bytes = std::get_if<std::vector<uint8_t>>(&value);
+                if (k != nullptr && bytes != nullptr) {
+                  config.icon_images[*k] = *bytes;
+                }
+              }
+            }
+          }
+          if (const auto* v = find("ballImage")) {
+            if (const auto* bytes = std::get_if<std::vector<uint8_t>>(v)) {
+              config.ball_image = *bytes;
+            }
+          }
+          if (const auto* v = find("colors")) {
+            if (const auto* colors = std::get_if<flutter::EncodableMap>(v)) {
+              // 不透明 ARGB 超出 int32，按 int64 到达；两种都收。
+              config.surface = ArgbFromValue(colors, "surface", config.surface);
+              config.on_surface =
+                  ArgbFromValue(colors, "onSurface", config.on_surface);
+              config.primary = ArgbFromValue(colors, "primary", config.primary);
+              config.ball_container = ArgbFromValue(colors, "ballContainer",
+                                                    config.ball_container);
+              config.button_container = ArgbFromValue(
+                  colors, "buttonContainer", config.button_container);
+              config.on_button_container = ArgbFromValue(
+                  colors, "onButtonContainer", config.on_button_container);
+              config.outline =
+                  ArgbFromValue(colors, "outline", config.outline);
+              config.ball_open =
+                  ArgbFromValue(colors, "ballOpen", config.primary);
+              config.on_ball_open =
+                  ArgbFromValue(colors, "onBallOpen", config.on_ball_open);
+            }
+          }
+          const bool dock_left = StringFromValue(args, "dock", "right") == "left";
+          const double fraction = DoubleFromValue(args, "fraction", 1.0 / 3.0);
+          // 回真实结果：建窗 / D2D 失败时 Dart 不记签名，下次同步再试。
+          const bool started =
+              floating_ball_window_->Start(config, dock_left, fraction, GetHandle());
+          result->Success(flutter::EncodableValue(started));
+        } else if (method == "stopSystemBall") {
+          // 冻结层跟着球走：球没了，定格的画面也不该留着（不回调）。
+          screen_ocr_overlay_->Close();
+          floating_ball_window_->Stop();
+          result->Success();
+        } else if (method == "startScreenOcrCapture") {
+          result->Success(StartScreenOcrCapture(args));
+        } else if (method == "updateScreenOcrOverlay") {
+          std::vector<fushi::screen_ocr::RectD> lines;
+          if (const auto* v = FindArg(args, "lines")) {
+            if (const auto* list = std::get_if<flutter::EncodableList>(v)) {
+              for (const auto& item : *list) {
+                if (const auto rect = RectFromValue(item)) {
+                  lines.push_back(*rect);
+                }
+              }
+            }
+          }
+          std::optional<std::wstring> message;
+          if (const auto* v = FindArg(args, "message")) {
+            if (const auto* text = std::get_if<std::string>(v)) {
+              message = Utf8ToWideString(*text);
+            }
+          }
+          screen_ocr_overlay_->Update(std::move(lines), std::move(message));
+          result->Success();
+        } else if (method == "stopScreenOcr") {
+          StopScreenOcr();
+          result->Success();
+        } else if (method == "isSystemBallRunning") {
+          result->Success(
+              flutter::EncodableValue(floating_ball_window_->IsRunning()));
+        } else if (method == "setAppForeground") {
+          // true = Fushi 在前台且应用内球开着：应用外球让位（藏起来），
+          // false = 露面。Dart 已把「应用内球是否开着」折进这个值。
+          bool hidden = false;
+          if (const auto* map = std::get_if<flutter::EncodableMap>(
+                  call.arguments())) {
+            auto it = map->find(flutter::EncodableValue("foreground"));
+            if (it != map->end()) {
+              if (const auto* value = std::get_if<bool>(&it->second)) {
+                hidden = *value;
+              }
+            }
+          }
+          floating_ball_window_->SetHiddenForApp(hidden);
+          result->Success();
+        } else if (method == "takeSystemBallClosedByUser") {
+          // 关闭即时推给 Dart（进程就是 app），没有待取的持久标记。
+          result->Success(flutter::EncodableValue(false));
+        } else {
+          result->NotImplemented();
+        }
+      });
+}
+
+flutter::EncodableValue FlutterWindow::StartScreenOcrCapture(
+    const flutter::EncodableMap* args) {
+  auto failure = [](const char* error) {
+    return flutter::EncodableValue(flutter::EncodableMap{
+        {flutter::EncodableValue("error"), flutter::EncodableValue(error)},
+    });
+  };
+  if (!screen_ocr_overlay_ || !floating_ball_window_) {
+    return failure("capture_failed");
+  }
+  std::optional<fushi::screen_ocr::RectD> anchor;
+  if (const auto* v = FindArg(args, "anchor")) {
+    anchor = RectFromValue(*v);
+  }
+  ScreenOcrOverlay::Style style;
+  if (const auto* v = FindArg(args, "labels")) {
+    if (const auto* labels = std::get_if<flutter::EncodableMap>(v)) {
+      style.recognizing = Utf8ToWideString(
+          StringFromValue(labels, "recognizing", std::string()));
+      style.hint =
+          Utf8ToWideString(StringFromValue(labels, "hint", std::string()));
+      style.close =
+          Utf8ToWideString(StringFromValue(labels, "close", std::string()));
+    }
+  }
+  if (const auto* v = FindArg(args, "colors")) {
+    if (const auto* colors = std::get_if<flutter::EncodableMap>(v)) {
+      style.primary = ArgbFromValue(colors, "primary", style.primary);
+      style.surface = ArgbFromValue(colors, "surface", style.surface);
+      style.on_surface = ArgbFromValue(colors, "onSurface", style.on_surface);
+    }
+  }
+
+  // 截哪块：anchor（球）中心所在显示器；没有 anchor 取光标所在。
+  POINT cursor = {};
+  GetCursorPos(&cursor);
+  const fushi::screen_ocr::ProbePoint probe =
+      fushi::screen_ocr::MonitorProbePoint(anchor, {cursor.x, cursor.y});
+  const HMONITOR monitor =
+      MonitorFromPoint(POINT{probe.x, probe.y}, MONITOR_DEFAULTTONEAREST);
+
+  // HDR 显示器：藏窗口**之前**建好 duplication——它只交付建好之后合成过的帧，
+  // 下面藏球 / 关旧层那次合成就是要取的那帧（hdr_desktop_capture.h）。
+  ScreenOcrOverlay::Capture capture;
+  fushi::HdrMonitorDuplication hdr;
+  {
+    std::string note;
+    switch (hdr.Open(monitor, &note)) {
+      case fushi::HdrMonitorDuplication::OpenResult::kOpened:
+        // 成功取帧后由 Capture 的参数摘要覆盖；失败时 CaptureMonitor 写回落原因。
+        break;
+      case fushi::HdrMonitorDuplication::OpenResult::kGdiByPolicy:
+        capture.diagnostic = "gdi path: " + note;
+        break;
+      case fushi::HdrMonitorDuplication::OpenResult::kFailed:
+        capture.diagnostic = "dxgi path failed, fell back to gdi: " + note;
+        break;
+      case fushi::HdrMonitorDuplication::OpenResult::kNotHdr:
+        if (!note.empty()) capture.diagnostic = "hdr probe skipped: " + note;
+        break;
+    }
+  }
+
+  // 上一层还开着（重复点）：先关掉，不回调；它与球都不能入镜。
+  screen_ocr_overlay_->Close();
+  floating_ball_window_->HideForCapture();
+  // 等 DWM 把「球已隐藏」合成上屏再截：第一次 DwmFlush 可能正赶上隐藏之前就已
+  // 提交的那一帧，第二次保证至少有一整帧是在隐藏之后合成的。
+  DwmFlush();
+  DwmFlush();
+
+  if (!ScreenOcrOverlay::CaptureMonitor(
+          monitor, hdr.is_open() ? &hdr : nullptr, &capture)) {
+    floating_ball_window_->RestoreAfterCapture();
+    flutter::EncodableValue reply = failure("capture_failed");
+    if (!capture.diagnostic.empty()) {
+      std::get<flutter::EncodableMap>(reply)[flutter::EncodableValue(
+          "diagnostic")] = flutter::EncodableValue(capture.diagnostic);
+    }
+    return reply;
+  }
+  const RECT screen = capture.screen;
+  const int width = capture.width;
+  const int height = capture.height;
+  std::string diagnostic = capture.diagnostic;
+  // 先盖冻结层（画面立刻「定格」并显示「识别中」），再编 PNG。
+  if (!screen_ocr_overlay_->Show(std::move(capture), style)) {
+    floating_ball_window_->RestoreAfterCapture();
+    return failure("capture_failed");
+  }
+  std::string encode_error;
+  std::vector<uint8_t> png = fushi::EncodeBgraToPng(
+      screen_ocr_overlay_->capture().bgra.data(), static_cast<UINT>(width),
+      static_cast<UINT>(height), static_cast<UINT>(width) * 4, &encode_error);
+  if (png.empty()) {
+    StopScreenOcr();
+    return failure("capture_failed");
+  }
+  flutter::EncodableList screen_rect{
+      flutter::EncodableValue(static_cast<int32_t>(screen.left)),
+      flutter::EncodableValue(static_cast<int32_t>(screen.top)),
+      flutter::EncodableValue(static_cast<int32_t>(screen.right)),
+      flutter::EncodableValue(static_cast<int32_t>(screen.bottom)),
+  };
+  flutter::EncodableMap reply{
+      {flutter::EncodableValue("png"), flutter::EncodableValue(std::move(png))},
+      {flutter::EncodableValue("screen"),
+       flutter::EncodableValue(std::move(screen_rect))},
+  };
+  // HDR 显示器的取帧路径 / 回落原因：Dart 记进诊断日志（不影响结果）。
+  if (!diagnostic.empty()) {
+    reply[flutter::EncodableValue("diagnostic")] =
+        flutter::EncodableValue(std::move(diagnostic));
+  }
+  return flutter::EncodableValue(std::move(reply));
+}
+
+void FlutterWindow::StopScreenOcr() {
+  if (screen_ocr_overlay_) {
+    screen_ocr_overlay_->Close();
+  }
+  if (floating_ball_window_) {
+    floating_ball_window_->RestoreAfterCapture();
+  }
+}
+
+// app.fushi.reader/system_ocr：通道、工作线程与回话队列整块在
+// system_ocr_channel_host.cpp（本文件是 galgame 查词路由宿主，不碰识别实现）。
+void FlutterWindow::RegisterSystemOcrChannel() {
+  system_ocr_host_ = std::make_unique<fushi::SystemOcrChannelHost>(
+      flutter_controller_->engine()->messenger(), GetHandle());
+}
+
+void FlutterWindow::RegisterImeGuardChannel() {
+  // BUG-1450: Dart owns focus knowledge, the runner owns the HWND. Dart calls
+  // setImeEnabled(false) while nothing editable holds focus so a CJK IME stops
+  // consuming shortcut keys, and setImeEnabled(true) the moment a text field
+  // takes focus so Chinese/Japanese input keeps working everywhere.
+  ime_association_guard_ = ImeAssociationGuard(
+      [](HWND hwnd, bool enable, void*) {
+        return ApplyImeAssociation(hwnd, enable);
+      },
+      nullptr);
+
+  windows_ime_guard_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi/windows_ime_guard",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  windows_ime_guard_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() != "setImeEnabled") {
+          result->NotImplemented();
+          return;
+        }
+        const auto* enable = std::get_if<bool>(call.arguments());
+        if (enable == nullptr) {
+          result->Error("bad_args", "setImeEnabled expects a bool");
+          return;
+        }
+        // The IME context is per-HWND and applies to whichever window holds
+        // focus. Win32Window::SetChildContent does SetFocus(child), so the
+        // Flutter view — not the top-level frame — is the window the IME talks
+        // to. Fall back to the frame only if the view is gone (teardown).
+        HWND target = flutter_controller_ && flutter_controller_->view()
+                          ? flutter_controller_->view()->GetNativeWindow()
+                          : nullptr;
+        if (target == nullptr) {
+          target = GetHandle();
+        }
+        const ImeAssociationUpdate update =
+            ime_association_guard_.SetEnabled(target, *enable);
+        if (update == ImeAssociationUpdate::kFailed) {
+          // Let Dart clear its optimistic cache so the same desired state can
+          // be retried. Reporting Success here would strand a recreated view
+          // with the wrong association until some unrelated focus transition.
+          result->Error("ime_association_failed",
+                        "ImmAssociateContextEx failed for the Flutter view");
+          return;
+        }
+        result->Success();
+      });
+}
+
+void FlutterWindow::RegisterLookupImeChannel() {
+  // 查词输入框的输入法语言。Dart 在查词页面 mount 时说「期望日语」，页面走掉时
+  // 说 null；我们在**已安装**的键盘布局里找对应语言切过去，并记住用户原来那个。
+  // 还原是硬要求：Win8 起输入法是 per-user，不还原就会漏到用户的其它应用里。
+  ime_language_switcher_ = ImeLanguageSwitcher(
+      [](HWND hwnd, HKL hkl, void*) { return RequestInputLanguage(hwnd, hkl); },
+      nullptr);
+
+  lookup_ime_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/lookup_ime",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  lookup_ime_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        // 键盘焦点在 Flutter view 子窗口上（Win32Window::SetChildContent 做的
+        // SetFocus），输入语言请求要发给它；拆窗期间回退到顶层框架窗口。
+        HWND target = flutter_controller_ && flutter_controller_->view()
+                          ? flutter_controller_->view()->GetNativeWindow()
+                          : nullptr;
+        if (target == nullptr) {
+          target = GetHandle();
+        }
+        const DWORD thread_id = GetWindowThreadProcessId(target, nullptr);
+
+        if (call.method_name() == "setLanguage") {
+          std::wstring tag;
+          if (const auto* value = std::get_if<std::string>(call.arguments())) {
+            tag = Utf8ToWideString(*value);
+          }
+          desired_lookup_ime_tag_ = tag;
+          const ImeLanguageUpdate update = ime_language_switcher_.Activate(
+              target, tag, GetKeyboardLayout(thread_id),
+              InstalledKeyboardLayouts());
+          switch (update) {
+            case ImeLanguageUpdate::kFailed:
+              // 让 Dart 清掉乐观缓存，下次还能重试（否则它会以为已经设过了）。
+              result->Error("lookup_ime_failed",
+                            "WM_INPUTLANGCHANGEREQUEST was rejected");
+              return;
+            case ImeLanguageUpdate::kUnavailable:
+              // 用户选的语言系统里没装输入法。这不是错误，是「做不了」——绝不替他
+              // 装一个布局上去。
+              result->Success(flutter::EncodableValue("unavailable"));
+              return;
+            case ImeLanguageUpdate::kUnchanged:
+              result->Success(flutter::EncodableValue("unchanged"));
+              return;
+            case ImeLanguageUpdate::kApplied:
+              result->Success(flutter::EncodableValue("applied"));
+              return;
+          }
+          result->Success();
+          return;
+        }
+
+        if (call.method_name() == "probe") {
+          // 形状与 macOS 侧一致（语言标签而不是 LANGID），集成测试才能共用一份。
+          const auto locale_name = [](HKL layout) -> std::string {
+            const LANGID langid =
+                static_cast<LANGID>(reinterpret_cast<UINT_PTR>(layout) & 0xffff);
+            wchar_t buffer[LOCALE_NAME_MAX_LENGTH] = {};
+            const int written =
+                LCIDToLocaleName(MAKELCID(langid, SORT_DEFAULT), buffer,
+                                 LOCALE_NAME_MAX_LENGTH, 0);
+            return written > 0 ? Utf8FromUtf16(buffer) : std::string();
+          };
+          flutter::EncodableList enabled;
+          for (const HKL layout : InstalledKeyboardLayouts()) {
+            const std::string name = locale_name(layout);
+            if (!name.empty()) {
+              enabled.push_back(flutter::EncodableValue(name));
+            }
+          }
+          flutter::EncodableList current;
+          const std::string current_name =
+              locale_name(GetKeyboardLayout(thread_id));
+          if (!current_name.empty()) {
+            current.push_back(flutter::EncodableValue(current_name));
+          }
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("installed"), flutter::EncodableValue(true)},
+              {flutter::EncodableValue("active"),
+               flutter::EncodableValue(ime_language_switcher_.active())},
+              {flutter::EncodableValue("currentLanguages"),
+               flutter::EncodableValue(current)},
+              {flutter::EncodableValue("enabledLanguages"),
+               flutter::EncodableValue(enabled)},
+          }));
+          return;
+        }
+
+        result->NotImplemented();
+      });
+}
+
+void FlutterWindow::RegisterGalHookTextChannel() {
+  // BUG-2613 — 在任何覆盖窗口可能上屏之前装好游戏窗口解析器（正文窗 / 工具条 /
+  // 查词卡的登记都问它）。
+  fushi::SetOverlayClickShieldGameResolver(&ResolveOverlayClickShieldGame);
+  gal_hook_text_window_ = std::make_unique<FloatingLyricWindow>();
+  gal_hook_text_window_->SetHookTextMode(true);
+  // BUG-2365 —— 正文窗的置顶守卫必须让位给查词卡：卡片自己也每 800ms 重申置顶
+  // （BUG-1479），两个窗口都抢置顶带最顶就会互相顶掉、卡片周期性闪到浮窗底下。
+  // 有可见卡片时正文窗插在卡片正下方，仍在全屏游戏之上。
+  gal_hook_text_window_->SetTopmostCeilingProvider([this]() -> HWND {
+    return global_lookup_window_ != nullptr
+               ? global_lookup_window_->TopmostCeilingHandle()
+               : nullptr;
+  });
+  attached_text_surface_window_ =
+      std::make_unique<AttachedTextSurfaceWindow>();
+
+  gal_hook_text_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/gal_hook_text",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  attached_text_surface_window_->SetStateCallback(
+      [this](const AttachedTextSurfaceWindow::Snapshot& snapshot) {
+        if (!gal_hook_text_channel_) return;
+        gal_hook_text_channel_->InvokeMethod(
+            "attachedSurfaceStateChanged",
+            std::make_unique<flutter::EncodableValue>(
+                AttachedSnapshotMap(snapshot)));
+      });
+  attached_text_surface_window_->SetCalibrationCommittedCallback(
+      [this](const AttachedTextSurfaceWindow::Snapshot& snapshot) {
+        if (!gal_hook_text_channel_) return;
+        gal_hook_text_channel_->InvokeMethod(
+            "attachedCalibrationCommitted",
+            std::make_unique<flutter::EncodableValue>(
+                AttachedSnapshotMap(snapshot)));
+      });
+  attached_text_surface_window_->SetCalibrationCancelledCallback(
+      [this](const AttachedTextSurfaceWindow::Snapshot& snapshot) {
+        if (!gal_hook_text_channel_) return;
+        gal_hook_text_channel_->InvokeMethod(
+            "attachedCalibrationCancelled",
+            std::make_unique<flutter::EncodableValue>(
+                AttachedSnapshotMap(snapshot)));
+      });
+  attached_text_surface_window_->SetLookupCallback(
+      [this](const AttachedTextSurfaceWindow::LookupEvent& event) {
+        if (!gal_hook_text_channel_) return;
+        const double logical_scale = 96.0 / std::max(96, event.dpi);
+        const double left = event.screen_rect_px.left * logical_scale;
+        const double top = event.screen_rect_px.top * logical_scale;
+        const double width =
+            (event.screen_rect_px.right - event.screen_rect_px.left) *
+            logical_scale;
+        const double height =
+            (event.screen_rect_px.bottom - event.screen_rect_px.top) *
+            logical_scale;
+        const std::string line_id =
+            std::string("attached/") +
+            std::to_string(event.epoch.session) + "/" +
+            std::to_string(event.text_generation);
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("surface"),
+             flutter::EncodableValue("attached")},
+            {flutter::EncodableValue("sessionEpoch"),
+             flutter::EncodableValue(
+                 static_cast<int64_t>(event.epoch.session))},
+            {flutter::EncodableValue("surfaceEpoch"),
+             flutter::EncodableValue(
+                 static_cast<int64_t>(event.epoch.surface))},
+            {flutter::EncodableValue("targetPid"),
+             flutter::EncodableValue(static_cast<int32_t>(event.target_pid))},
+            {flutter::EncodableValue("targetHwnd"),
+             flutter::EncodableValue(static_cast<int64_t>(
+                 reinterpret_cast<uintptr_t>(event.target_hwnd)))},
+            {flutter::EncodableValue("lineId"),
+             flutter::EncodableValue(line_id)},
+            {flutter::EncodableValue("text"),
+             flutter::EncodableValue(event.source_text)},
+            {flutter::EncodableValue("sourceText"),
+             flutter::EncodableValue(event.source_text)},
+            {flutter::EncodableValue("index"),
+             flutter::EncodableValue(
+                 static_cast<int32_t>(event.char_index))},
+            {flutter::EncodableValue("charIndex"),
+             flutter::EncodableValue(
+                 static_cast<int32_t>(event.char_index))},
+            {flutter::EncodableValue("sourceLength"),
+             flutter::EncodableValue(
+                 static_cast<int32_t>(event.source_length))},
+            // Shift+悬浮（attached_text_surface_window.cpp 的 hover timer）与
+            // 点击共用这一条 lookupText 事件；Dart 据此只做诊断区分，查词链相同。
+            {flutter::EncodableValue("hover"),
+             flutter::EncodableValue(event.hover)},
+            {flutter::EncodableValue("textGeneration"),
+             flutter::EncodableValue(event.text_generation)},
+            {flutter::EncodableValue("wordLeft"),
+             flutter::EncodableValue(left)},
+            {flutter::EncodableValue("wordTop"),
+             flutter::EncodableValue(top)},
+            {flutter::EncodableValue("wordWidth"),
+             flutter::EncodableValue(width)},
+            {flutter::EncodableValue("wordHeight"),
+             flutter::EncodableValue(height)},
+            {flutter::EncodableValue("anchorX"),
+             flutter::EncodableValue(left)},
+            {flutter::EncodableValue("anchorY"),
+             flutter::EncodableValue(top)},
+            {flutter::EncodableValue("anchorW"),
+             flutter::EncodableValue(width)},
+            {flutter::EncodableValue("anchorH"),
+             flutter::EncodableValue(height)},
+            // Keep the raw screen-physical geometry alongside the legacy
+            // target-DPI-normalized rectangle. Dart must not multiply this
+            // domain by the main Flutter window's DPR.
+            {flutter::EncodableValue("physicalWordRect"),
+             flutter::EncodableMap{
+                 {flutter::EncodableValue("left"),
+                  flutter::EncodableValue(event.screen_rect_px.left)},
+                 {flutter::EncodableValue("top"),
+                  flutter::EncodableValue(event.screen_rect_px.top)},
+                 {flutter::EncodableValue("width"),
+                  flutter::EncodableValue(event.screen_rect_px.right -
+                                         event.screen_rect_px.left)},
+                 {flutter::EncodableValue("height"),
+                  flutter::EncodableValue(event.screen_rect_px.bottom -
+                                         event.screen_rect_px.top)},
+             }},
+            {flutter::EncodableValue("destinationViewportScreen"),
+             flutter::EncodableMap{
+                 {flutter::EncodableValue("left"),
+                  flutter::EncodableValue(
+                      event.destination_viewport_screen_px.left)},
+                 {flutter::EncodableValue("top"),
+                  flutter::EncodableValue(
+                      event.destination_viewport_screen_px.top)},
+                 {flutter::EncodableValue("width"),
+                  flutter::EncodableValue(
+                      event.destination_viewport_screen_px.right -
+                      event.destination_viewport_screen_px.left)},
+                 {flutter::EncodableValue("height"),
+                  flutter::EncodableValue(
+                      event.destination_viewport_screen_px.bottom -
+                      event.destination_viewport_screen_px.top)},
+             }},
+        };
+        gal_hook_text_channel_->InvokeMethod(
+            "lookupText",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+  attached_text_surface_window_->SetShieldStatusCallback([]() {
+    const fushi::VoiceHookLookupShieldStatus status =
+        fushi::VoiceHookReader::Instance().LookupShieldStatus();
+    AttachedTextSurfaceWindow::ShieldStatus attached;
+    attached.available = status.ok();
+    attached.request_seq = status.request_seq;
+    attached.applied_seq = status.applied_seq;
+    attached.required_mask = status.required_mask;
+    attached.ready_mask = status.ready_mask;
+    attached.observed_mask = status.observed_mask;
+    attached.fault_mask = status.fault_mask;
+    attached.status_flags = status.status_flags;
+    attached.owner_kind = status.owner_kind;
+    attached.target_hwnd = status.target_hwnd;
+    attached.transaction_id = status.transaction_id;
+    attached.active_buttons = status.active_buttons;
+    attached.allow_risk = status.allow_risk;
+    return attached;
+  });
+  attached_text_surface_window_->SetShieldProbeCallback(
+      [](HWND target, uint64_t transaction_id, bool allow_risk) {
+        return fushi::VoiceHookReader::Instance()
+            .PublishLookupShieldTransaction(
+                fushi_voice_hook::kLookupShieldOwnerNativeGlyph, target,
+                transaction_id, 0, allow_risk);
+      });
+  attached_text_surface_window_->SetGeometryProviderStatusCallback([]() {
+    const fushi::VoiceHookLookupGeometryStatus status =
+        fushi::VoiceHookReader::Instance().LookupGeometryStatus();
+    AttachedTextSurfaceWindow::GeometryProviderStatus attached;
+    attached.available = status.ok();
+    attached.snapshot_conflicted =
+        status.error == fushi::VoiceHookLookupError::kGeometrySnapshotConflicted;
+    attached.provider_kind = status.provider_kind;
+    attached.provider_id = status.provider_id;
+    attached.provider_status = status.provider_status;
+    attached.lookup_diag = status.lookup_diag;
+    attached.generation = status.generation;
+    attached.text_generation = status.text_generation;
+    return attached;
+  });
+  fushi::VoiceHookReader::Instance().SetLookupGeometryStatusSink(
+      [this](const fushi::VoiceHookLookupGeometryStatus&) {
+        if (attached_text_surface_window_ != nullptr)
+          attached_text_surface_window_->OnGeometryProviderStatusChanged();
+      });
+
+  gal_hook_text_window_->SetContextLookupCallback(
+      [this](const std::string& line_id, const std::string& text,
+             int char_index, const D2D1_RECT_F& word_rect) {
+        // wordLeft/Top/Width/Height：被点字的屏幕逻辑 px 矩形，供查词卡锚定到
+        // 那个词（而不是鼠标位置）。
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("lineId"),
+             flutter::EncodableValue(line_id)},
+            {flutter::EncodableValue("text"), flutter::EncodableValue(text)},
+            {flutter::EncodableValue("index"),
+             flutter::EncodableValue(char_index)},
+            {flutter::EncodableValue("wordLeft"),
+             flutter::EncodableValue(static_cast<double>(word_rect.left))},
+            {flutter::EncodableValue("wordTop"),
+             flutter::EncodableValue(static_cast<double>(word_rect.top))},
+            {flutter::EncodableValue("wordWidth"),
+             flutter::EncodableValue(
+                 static_cast<double>(word_rect.right - word_rect.left))},
+            {flutter::EncodableValue("wordHeight"),
+             flutter::EncodableValue(
+                 static_cast<double>(word_rect.bottom - word_rect.top))},
+        };
+        gal_hook_text_channel_->InvokeMethod(
+            "lookupText",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+  gal_hook_text_window_->SetControlCallback(
+      [this](const std::string& action) {
+        gal_hook_text_channel_->InvokeMethod(
+            action, std::make_unique<flutter::EncodableValue>());
+      });
+  gal_hook_text_window_->SetLockCallback([this](bool locked) {
+    flutter::EncodableMap map{
+        {flutter::EncodableValue("locked"), flutter::EncodableValue(locked)},
+    };
+    gal_hook_text_channel_->InvokeMethod(
+        "lockChanged",
+        std::make_unique<flutter::EncodableValue>(std::move(map)));
+  });
+  gal_hook_text_window_->SetPassThroughCallback([this](bool enabled) {
+    flutter::EncodableMap map{
+        {flutter::EncodableValue("passThrough"),
+         flutter::EncodableValue(enabled)},
+    };
+    gal_hook_text_channel_->InvokeMethod(
+        "passThroughChanged",
+        std::make_unique<flutter::EncodableValue>(std::move(map)));
+  });
+  // HWND 没了就立刻告诉 Dart。Dart 的 `_visible` 是派生镜像，靠这条事件被动
+  // 复位；没有它，消费端只能每行台词打一次 isShowing() 往返来轮询同一件事。
+  gal_hook_text_window_->SetDestroyedCallback([this]() {
+    if (!gal_hook_text_channel_) return;
+    gal_hook_text_channel_->InvokeMethod(
+        "overlayDestroyed", std::make_unique<flutter::EncodableValue>());
+  });
+  gal_hook_text_window_->SetBoundsCallback(
+      [this](int left, int top, int width, int height) {
+        flutter::EncodableMap map{
+            {flutter::EncodableValue("left"), flutter::EncodableValue(left)},
+            {flutter::EncodableValue("top"), flutter::EncodableValue(top)},
+            {flutter::EncodableValue("width"), flutter::EncodableValue(width)},
+            {flutter::EncodableValue("height"),
+             flutter::EncodableValue(height)},
+        };
+        gal_hook_text_channel_->InvokeMethod(
+            "windowRectChanged",
+            std::make_unique<flutter::EncodableValue>(std::move(map)));
+      });
+
+  // ── v14 游戏内查词：把共享内存查词通道接到这条既有通道上 ──────────────────
+  // 通道复用 gal_hook_text 而不是新开一条：查词命中与台词浮窗是同一个 galgame 会话的
+  // 两个面，Dart 侧的 GalHookTextOverlayController 已经守着这条通道。
+  fushi::VoiceHookReader::Instance().AttachLookupChannel(
+      flutter_controller_->engine()->messenger());
+  // 交互主路把懒建的第三个 GlobalLookupWindow composition surface 直接贴到游戏
+  // 客户区；不可覆盖（含独占全屏/归属未知）时必须返回 false，让 CapturePreview
+  // 生成共享位图并交给已获准的 KiriKiri 游戏内 Layer。SetWindowPos 成功或
+  // IsWindowVisible=true 都不能证明一个桌面 HWND 真能盖住 exclusive scan-out。
+  fushi::VoiceHookReader::Instance().SetLookupDirectPresenter(
+      [this](int32_t anchor_x, int32_t anchor_y, uint32_t card_width,
+             uint32_t card_height, uint32_t view_width, uint32_t view_height,
+             int32_t glyph_x, int32_t glyph_y, uint32_t glyph_w,
+             uint32_t glyph_h, uint32_t* out_client_width,
+             uint32_t* out_client_height, int32_t* out_root_client_x,
+             int32_t* out_root_client_y) {
+        const uint32_t pid = fushi::VoiceHookReader::Instance().CurrentPid();
+        if (attached_text_surface_window_ == nullptr ||
+            !attached_text_surface_window_->DesktopOverlayAvailableForTarget(
+                pid)) {
+          return false;
+        }
+        GlobalLookupWindow* card = EnsureGalLookupCardWindow();
+        if (card == nullptr) return false;
+        return card->RevealOverProcessClient(
+            pid, anchor_x, anchor_y, card_width, card_height, view_width,
+            view_height, glyph_x, glyph_y, glyph_w, glyph_h,
+            out_client_width, out_client_height, out_root_client_x,
+            out_root_client_y);
+      });
+  fushi::VoiceHookReader::Instance().SetLookupCaptureRequest(
+      [this](uint32_t max_width, uint32_t max_height,
+             fushi::VoiceHookReader::LookupCaptureCallback done) {
+        GlobalLookupWindow* card = EnsureGalLookupCardWindow();
+        if (card == nullptr) {
+          done(false, false, {}, 0, 0, 0);
+          return;
+        }
+        card->CaptureBgraAsync(max_width, max_height, std::move(done));
+      });
+  fushi::VoiceHookReader::Instance().SetLookupInputSink(
+      [this](uint32_t kind, int32_t x, int32_t y, int32_t wheel,
+             uint32_t keys) {
+        GlobalLookupWindow* card = EnsureGalLookupCardWindow();
+        if (card == nullptr) return false;
+        return card->InjectLookupInput(kind, x, y, wheel, keys);
+      });
+
+  gal_hook_text_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        const std::string& method = call.method_name();
+        if (method == "attachedPreviewLayout") {
+          // Stateless calibration rendering works with saved samples even
+          // when the game/session is closed. It never adopts a live surface.
+          result->Success(
+              flutter::EncodableValue(AttachedPreviewLayoutFromArgs(args)));
+          return;
+        }
+        // 查词方法先走一遍：同名通道只有一个 handler 槽位，所以 reader 侧不能自己
+        // 注册（会顶掉本处理器），只能挂在分发链最前面。不认的方法它返回 false。
+        if (fushi::VoiceHookReader::Instance().TryHandleLookupMethodCall(
+                call, result)) {
+          return;
+        }
+        const bool attached_method =
+            method == "attachedInspectTarget" ||
+            method == "attachedCalibrationStart" ||
+            method == "attachedCalibrationUpdate" ||
+            method == "attachedCalibrationCommit" ||
+            method == "attachedCalibrationCancel" ||
+            method == "attachedConfigure" ||
+            method == "attachedUpdateText" ||
+            method == "attachedUpdateStyle" ||
+            method == "attachedSuspendForCapture" ||
+            method == "attachedRestoreAfterCapture" ||
+            method == "attachedDetach";
+        if (attached_method) {
+          AttachedTextSurfaceWindow::Epoch epoch;
+          const uint32_t target_pid = static_cast<uint32_t>(
+              std::max(0, IntFromValue(args, "targetPid", 0)));
+          const HWND target_hwnd = AttachedHwndFromArgs(args);
+          if (!AttachedEpochFromArgs(args, &epoch) || target_pid == 0) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue("invalid_target")},
+                {flutter::EncodableValue("reason"),
+                 flutter::EncodableValue(
+                     "sessionEpoch, surfaceEpoch and targetPid are required")},
+            }));
+            return;
+          }
+
+          std::string error;
+          AttachedTextSurfaceWindow::RequestResult request =
+              AttachedTextSurfaceWindow::RequestResult::kRejected;
+          if (method == "attachedInspectTarget") {
+            const std::string launch_exe_path =
+                StringFromValue(args, "launchExePath", std::string());
+            const std::wstring launch_exe_path_wide =
+                Utf8ToWideString(launch_exe_path);
+            if (!launch_exe_path.empty() && launch_exe_path_wide.empty()) {
+              error = "launch_exe_path_invalid_utf8";
+            } else {
+              request = attached_text_surface_window_->InspectTarget(
+                  epoch, target_pid, target_hwnd, launch_exe_path_wide,
+                  &error);
+            }
+          } else if (method == "attachedCalibrationStart") {
+            const std::optional<AttachedTextSurfaceWindow::NormalizedRect> rect =
+                AttachedRectFromArgs(args);
+            request = attached_text_surface_window_->StartCalibration(
+                epoch, target_pid, target_hwnd,
+                rect.has_value() ? &rect.value() : nullptr,
+                AttachedReferenceFromArgs(args), AttachedLayoutFromArgs(args),
+                BoolFromValue(args, "riskAccepted", false),
+                StringFromValue(args, "inputMode", "unsafeLeftClick"),
+                &error);
+          } else if (method == "attachedCalibrationUpdate") {
+            const std::optional<AttachedTextSurfaceWindow::NormalizedRect> rect =
+                AttachedRectFromArgs(args);
+            if (!rect.has_value()) {
+              error = "invalid_body_rect";
+            } else {
+              request = attached_text_surface_window_->UpdateCalibration(
+                  epoch, target_pid, target_hwnd, rect.value(),
+                  AttachedProbesFromArgs(args), &error);
+            }
+          } else if (method == "attachedCalibrationCommit") {
+            const std::optional<AttachedTextSurfaceWindow::NormalizedRect> rect =
+                AttachedRectFromArgs(args);
+            if (!rect.has_value()) {
+              error = "invalid_body_rect";
+            } else {
+              request = attached_text_surface_window_->UpdateCalibration(
+                  epoch, target_pid, target_hwnd, rect.value(),
+                  AttachedProbesFromArgs(args), &error);
+              if (request ==
+                  AttachedTextSurfaceWindow::RequestResult::kApplied) {
+                request = attached_text_surface_window_->CommitCalibration(
+                    epoch, target_pid, target_hwnd,
+                    AttachedProbesFromArgs(args), &error);
+              }
+            }
+          } else if (method == "attachedCalibrationCancel") {
+            request = attached_text_surface_window_->CancelCalibration(
+                epoch, target_pid, target_hwnd,
+                StringFromValue(args, "reason", "cancelled"), &error);
+          } else if (method == "attachedConfigure") {
+            const std::optional<AttachedTextSurfaceWindow::NormalizedRect> rect =
+                AttachedRectFromArgs(args);
+            if (!rect.has_value()) {
+              error = "invalid_body_rect";
+            } else {
+              request = attached_text_surface_window_->Configure(
+                   epoch, target_pid, target_hwnd, rect.value(),
+                   AttachedReferenceFromArgs(args), AttachedLayoutFromArgs(args),
+                   BoolFromValue(args, "riskAccepted", false),
+                   StringFromValue(args, "inputMode", ""),
+                   StringFromValue(args, "mode", "attachedOnly"), &error);
+            }
+          } else if (method == "attachedUpdateText") {
+            request = attached_text_surface_window_->UpdateText(
+                epoch, target_pid, target_hwnd,
+                WideFromValue(args, "sourceText",
+                              WideFromValue(args, "text", L"")),
+                Int64FromValue(args, "textGeneration", 0),
+                StringFromValue(args, "writingMode", "horizontal"), &error);
+          } else if (method == "attachedUpdateStyle") {
+            request = attached_text_surface_window_->UpdateStyle(
+                epoch, target_pid, target_hwnd, AttachedLayoutFromArgs(args),
+                &error);
+          } else if (method == "attachedSuspendForCapture") {
+            request = attached_text_surface_window_->SuspendForCapture(
+                epoch, target_pid, target_hwnd,
+                Int64FromValue(args, "textGeneration", 0),
+                static_cast<uint64_t>(
+                    std::max<int64_t>(0, Int64FromValue(
+                                             args, "captureGeneration", 0))),
+                &error);
+          } else if (method == "attachedRestoreAfterCapture") {
+            request = attached_text_surface_window_->RestoreAfterCapture(
+                epoch, target_pid, target_hwnd,
+                Int64FromValue(args, "textGeneration", 0),
+                static_cast<uint64_t>(
+                    std::max<int64_t>(0, Int64FromValue(
+                                             args, "captureGeneration", 0))),
+                &error);
+          } else if (method == "attachedDetach") {
+            request = attached_text_surface_window_->Detach(
+                epoch, target_pid, target_hwnd, &error);
+          }
+
+          flutter::EncodableMap reply = AttachedSnapshotMap(
+              attached_text_surface_window_->GetSnapshot());
+          reply[flutter::EncodableValue("accepted")] = flutter::EncodableValue(
+              request == AttachedTextSurfaceWindow::RequestResult::kApplied);
+          reply[flutter::EncodableValue("stale")] = flutter::EncodableValue(
+              request == AttachedTextSurfaceWindow::RequestResult::kStale);
+          if (request != AttachedTextSurfaceWindow::RequestResult::kApplied) {
+            reply[flutter::EncodableValue("error")] = flutter::EncodableValue(
+                error.empty()
+                    ? (request ==
+                               AttachedTextSurfaceWindow::RequestResult::kStale
+                           ? "stale_epoch"
+                           : "attached_surface_rejected")
+                    : error);
+          }
+          result->Success(flutter::EncodableValue(std::move(reply)));
+        } else if (method == "canDrawOverlays") {
+          result->Success(flutter::EncodableValue(true));
+        } else if (method == "show") {
+          // 工具条 9 槽悬停提示文案（与 hook_toolbar::kSlotActions 同下标）。
+          // 按 locale 由 Dart 在 show 载荷里下发：native 不持有 i18n，正文内
+          // 工具条与穿透工具条窗读的是这同一张表。缺键 = 无提示，老 payload
+          // 不受影响。
+          hook_toolbar::SetSlotTooltips(
+              hook_toolbar::Profile::kGalHook,
+              WideListFromValue(args, "slotTooltips"));
+          // 图标下方短标签（同下标）。缺键 = 空表 = 不画文字。
+          hook_toolbar::SetSlotLabels(hook_toolbar::Profile::kGalHook,
+                                      WideListFromValue(args, "slotLabels"));
+          gal_hook_text_window_->UpdateStyle(StyleFromArgs(args));
+          gal_hook_text_window_->SetClickLookupEnabled(
+              BoolFromValue(args, "clickLookupEnabled", true));
+          gal_hook_text_window_->SetHoverAutoLookup(
+              BoolFromValue(args, "hoverAutoLookup", false));
+          // 查词触发方式 / 工具条自动隐藏 / 穿透时是否拦截鼠标：三项都是**偏好**
+          // 而不是会话状态，随 show 下发一次，改设置时再走各自的 live setter。
+          gal_hook_text_window_->SetLookupTrigger(
+              IntFromValue(args, "lookupTrigger", 0));
+          gal_hook_text_window_->SetToolbarAutoHide(
+              BoolFromValue(args, "toolbarAutoHide", true));
+          gal_hook_text_window_->SetToolbarLabels(
+              BoolFromValue(args, "toolbarLabels", false));
+          gal_hook_text_window_->SetPassThroughBlocksMouse(
+              BoolFromValue(args, "passThroughBlocksMouse", true));
+          // 置顶按会话复位（与 locked / passThrough / following 同规矩）：上一局
+          // 关掉置顶后，这一局的浮窗不该藏在全屏游戏后面让用户以为它没出来。
+          gal_hook_text_window_->SetTopmost(
+              BoolFromValue(args, "topmost", true));
+          gal_hook_text_window_->SetLocked(
+              BoolFromValue(args, "locked", false));
+          gal_hook_text_window_->SetPassThrough(
+              BoolFromValue(args, "passThrough", false));
+          gal_hook_text_window_->SetPlaybackState(
+              BoolFromValue(args, "following", true));
+          // 同一 window 对象跨会话复用：重新 show 时语音控件必须回到静止态，
+          // 否则上一会话遗留的「录音中」高亮会挂在新会话的浮窗上。
+          gal_hook_text_window_->SetVoiceState(false, false);
+          gal_hook_text_window_->SetInitialBounds(
+              IntFromValue(args, "left", 0), IntFromValue(args, "top", 0),
+              IntFromValue(args, "width", 0),
+              IntFromValue(args, "height", 0));
+          result->Success(
+              flutter::EncodableValue(gal_hook_text_window_->Show(GetHandle())));
+        } else if (method == "hide") {
+          gal_hook_text_window_->Hide();
+          result->Success();
+        } else if (method == "isShowing") {
+          result->Success(
+              flutter::EncodableValue(gal_hook_text_window_->IsShowing()));
+        } else if (method == "updateText") {
+          gal_hook_text_window_->UpdateText(
+              WideFromValue(args, "text", L""), -1, 0,
+              StringFromValue(args, "lineId", ""),
+              RubySpansFromValue(args, "rubySpans"));
+          result->Success();
+        } else if (method == "updateStyle") {
+          gal_hook_text_window_->UpdateStyle(StyleFromArgs(args));
+          result->Success();
+        } else if (method == "setClickLookupEnabled") {
+          gal_hook_text_window_->SetClickLookupEnabled(
+              BoolFromValue(args, "enabled", true));
+          result->Success();
+        } else if (method == "setHoverAutoLookup") {
+          // 「悬停即查词」live 下发：设置页一改，正在开着的浮窗立刻跟上，不必等下
+          // 一局游戏（与字号 applyFontSizeFromPreferences 同款纪律）。
+          gal_hook_text_window_->SetHoverAutoLookup(
+              BoolFromValue(args, "enabled", false));
+          result->Success();
+        } else if (method == "setLookupTrigger") {
+          gal_hook_text_window_->SetLookupTrigger(
+              IntFromValue(args, "trigger", 0));
+          result->Success();
+        } else if (method == "setToolbarAutoHide") {
+          gal_hook_text_window_->SetToolbarAutoHide(
+              BoolFromValue(args, "enabled", true));
+          result->Success();
+        } else if (method == "setToolbarLabels") {
+          gal_hook_text_window_->SetToolbarLabels(
+              BoolFromValue(args, "enabled", false));
+          result->Success();
+        } else if (method == "setPassThroughBlocksMouse") {
+          gal_hook_text_window_->SetPassThroughBlocksMouse(
+              BoolFromValue(args, "enabled", true));
+          result->Success();
+        } else if (method == "setLocked") {
+          gal_hook_text_window_->SetLocked(
+              BoolFromValue(args, "locked", false));
+          result->Success();
+        } else if (method == "setPassThrough") {
+          gal_hook_text_window_->SetPassThrough(
+              BoolFromValue(args, "enabled", false));
+          result->Success();
+        } else if (method == "setFollowing") {
+          gal_hook_text_window_->SetPlaybackState(
+              BoolFromValue(args, "following", true));
+          result->Success();
+        } else if (method == "setVoiceState") {
+          gal_hook_text_window_->SetVoiceState(
+              BoolFromValue(args, "replaying", false),
+              BoolFromValue(args, "recapturing", false));
+          result->Success();
+        } else {
+          result->NotImplemented();
+        }
+      });
+}
+
+// v14 游戏内查词的像素源。懒建：只有用户真开启这个功能才付 WebView2 的启动代价，
+// 没开的用户一分钱不花。返回 nullptr 表示这次拿不到（尚未 prepare 过 popup 资源目录）。
+GlobalLookupWindow* FlutterWindow::EnsureGalLookupCardWindow() {
+  if (gal_lookup_card_window_ != nullptr) return gal_lookup_card_window_.get();
+  // 没有资源目录就起不来（WebView2 会导航到空路径，出一张白卡）。宁可这次失败并让
+  // 上层回 no_capture_source，也不要起一个注定渲染不出东西的实例——后者的症状是
+  // 「卡片出来了但是白的」，比「卡片没出来」难查得多。
+  if (popup_assets_dir_.empty()) return nullptr;
+
+  gal_lookup_card_window_ = std::make_unique<GlobalLookupWindow>();
+  // 交互式卡片全靠 composition controller 的 SendMouseInput；windowed 实例没有它。
+  gal_lookup_card_window_->SetCompositionMode(true);
+  gal_lookup_card_window_->SetPopupAssetsDir(popup_assets_dir_);
+
+  // 外字（image://）走与主浮窗同一个 Dart 处理器：卡片内容本来就是同一份 popup.html，
+  // 没有理由让它有第二套资源解析语义。
+  gal_lookup_card_window_->SetMediaResolver(
+      [this](const std::string& url,
+             std::function<void(std::vector<uint8_t>)> respond) {
+        auto args = std::make_unique<flutter::EncodableValue>(
+            flutter::EncodableMap{
+                {flutter::EncodableValue("url"), flutter::EncodableValue(url)}});
+        auto result = std::make_unique<
+            flutter::MethodResultFunctions<flutter::EncodableValue>>(
+            [respond](const flutter::EncodableValue* ok) {
+              std::vector<uint8_t> bytes;
+              if (ok != nullptr) {
+                if (const auto* b = std::get_if<std::vector<uint8_t>>(ok)) {
+                  bytes = *b;
+                }
+              }
+              respond(std::move(bytes));
+            },
+            [respond](const std::string&, const std::string&,
+                      const flutter::EncodableValue*) { respond({}); },
+            [respond]() { respond({}); });
+        global_lookup_channel_->InvokeMethod("getMedia", std::move(args),
+                                             std::move(result));
+      });
+
+  // The embedded card reuses the complete Fushi popup, not just its pixels.
+  // Route its JS bridge through the same Dart controller so audio, mining,
+  // nested lookup, and popup dismissal retain their normal semantics while the
+  // HWND itself remains off-screen.
+  gal_lookup_card_window_->SetMessageCallback(
+      [this](const std::string& json,
+             const GlobalLookupWindow::RouteContext& route) {
+        global_lookup_channel_->InvokeMethod(
+            "jsMessage", RoutedPayloadEnvelope(json, route));
+      });
+  gal_lookup_card_window_->SetHiddenCallback(
+      [this](const GlobalLookupWindow::RouteContext& route) {
+        global_lookup_channel_->InvokeMethod(
+            "overlayHidden", RoutedHiddenEnvelope(route));
+      });
+
+  // WebView2 起不来必须能被看见。否则症状是「游戏内查词永远没反应」，而真因在 native
+  // 环境创建失败——和「hook 没装上」「host 没投帧」三者同形，真机上分不开。
+  gal_lookup_card_window_->SetErrorCallback([this](const std::string& message) {
+    global_lookup_channel_->InvokeMethod(
+        "nativeError",
+        std::make_unique<flutter::EncodableValue>(
+            std::string("gal-lookup-card: ") + message));
+  });
+
+  // 先离屏预热；真正查词时同一实例仍只走 ShowAt/ResizeOffscreen 进行布局和取帧，
+  // 从不 Reveal 到桌面。owner 传 nullptr，与另外两个实例同源解耦，不把主窗拉到前台。
+  gal_lookup_card_window_->PrewarmWebView(480, 360, nullptr);
+  return gal_lookup_card_window_.get();
+}
+
+void FlutterWindow::RegisterGlobalLookupChannel() {
+  global_lookup_window_ = std::make_unique<GlobalLookupWindow>();
+
+  global_lookup_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/global_lookup",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // image:// -> ask the main Dart engine for the bytes. Asynchronous: the reply
+  // is delivered on this (platform) thread, so the WebView2 deferral is
+  // completed inside the InvokeMethod result without blocking the message loop.
+  global_lookup_window_->SetMediaResolver(
+      [this](const std::string& url,
+             std::function<void(std::vector<uint8_t>)> respond) {
+        auto args = std::make_unique<flutter::EncodableValue>(
+            flutter::EncodableMap{{flutter::EncodableValue("url"),
+                                   flutter::EncodableValue(url)}});
+        auto result = std::make_unique<
+            flutter::MethodResultFunctions<flutter::EncodableValue>>(
+            [respond](const flutter::EncodableValue* ok) {
+              std::vector<uint8_t> bytes;
+              if (ok != nullptr) {
+                if (const auto* b =
+                        std::get_if<std::vector<uint8_t>>(ok)) {
+                  bytes = *b;
+                }
+              }
+              respond(std::move(bytes));
+            },
+            [respond](const std::string&, const std::string&,
+                      const flutter::EncodableValue*) { respond({}); },
+            [respond]() { respond({}); });
+        global_lookup_channel_->InvokeMethod("getMedia", std::move(args),
+                                             std::move(result));
+      });
+
+  // JS postMessage (dismiss / audio handlers) -> Dart.
+  global_lookup_window_->SetMessageCallback(
+      [this](const std::string& json,
+             const GlobalLookupWindow::RouteContext& route) {
+        global_lookup_channel_->InvokeMethod(
+            "jsMessage", RoutedPayloadEnvelope(json, route));
+      });
+
+  // TODO-1153 -- native overlay bring-up errors (WebView2 environment/controller
+  // create failure) -> Dart, so ErrorLogService surfaces "app-external lookup
+  // shows no popup" like the TODO-1086 hotkey-registration failure instead of
+  // swallowing it. Fires on the platform thread (WebView2 posts its completion
+  // callbacks to the creating thread's loop), so InvokeMethod is safe here.
+  global_lookup_window_->SetErrorCallback([this](const std::string& message) {
+    global_lookup_channel_->InvokeMethod(
+        "nativeError", std::make_unique<flutter::EncodableValue>(message));
+  });
+
+  // TODO-1233 -- the overlay dismissed (foreground hook / click-outside / JS
+  // dismiss) -> Dart, so a resume-on-dismiss (video subtitle lookup BUG-072) or
+  // the controller's own reveal-state reset can hang off it. Not fired for the
+  // programmatic reset Hide(false) before a fresh lookup (see the "hide" method
+  // below + GlobalLookupWindow::Hide). Fires on the platform thread.
+  global_lookup_window_->SetHiddenCallback(
+      [this](const GlobalLookupWindow::RouteContext& route) {
+        global_lookup_channel_->InvokeMethod(
+            "overlayHidden", RoutedHiddenEnvelope(route));
+      });
+
+  global_lookup_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        const std::string& method = call.method_name();
+        // 同一套查词管线要能驱动**两个**窗口：可见的桌面浮窗，以及游戏内查词专用的
+        // 离屏卡片窗（`target: "galCard"`）。
+        //
+        // 🔴 之前离屏窗只被 EnsureGalLookupCardWindow 建出来并预热，**没有任何一处
+        // 往它里面塞过内容**；而 Dart 侧查词走的是可见浮窗。结果就是：桌面弹出浮窗
+        // （用户看到的那个），投进游戏的却是那张 480x360 的空白预热页——"游戏内渲染"
+        // 从头到尾没有内容。渲染器建好却没接上，是本 PR 的核心接线缺失。
+        GlobalLookupWindow* win = global_lookup_window_.get();
+        if (StringFromValue(args, "target", "") == "galCard") {
+          win = EnsureGalLookupCardWindow();
+          if (win == nullptr) {
+            result->Error("gal_card_unavailable",
+                          "in-game lookup card window is not available");
+            return;
+          }
+        }
+        BindRouteContext(win, args,
+                         win == gal_lookup_card_window_.get() ? "galCard"
+                                                             : "desktop");
+
+        if (method == "suspendForCapture") {
+          const int64_t capture_generation =
+              Int64FromValue(args, "captureGeneration", 0);
+          result->Success(flutter::EncodableValue(
+              capture_generation > 0 &&
+              win->SuspendForCapture(capture_generation)));
+        } else if (method == "restoreAfterCapture") {
+          const int64_t capture_generation =
+              Int64FromValue(args, "captureGeneration", 0);
+          result->Success(flutter::EncodableValue(
+              capture_generation > 0 &&
+              win->RestoreAfterCapture(capture_generation)));
+        } else if (method == "prepare") {
+          const std::wstring assets_dir = WideFromValue(args, "assetsDir", L"");
+          win->SetPopupAssetsDir(assets_dir);
+          // v14：游戏内查词卡片用同一份 popup 资源，但它懒建于「用户开启游戏内查词」，
+          // 那时 Dart 不会再发一次 prepare。留存一份，别让第三个实例拿着空目录起来。
+          popup_assets_dir_ = assets_dir;
+          result->Success();
+        } else if (method == "prewarmWebView") {
+          // TODO-1079 — build the overlay window + WebView2 off-screen at
+          // startup so the first hotkey lookup hits a WARM surface (no cold
+          // create-chain race that left the popup blank / self-closed).
+          // nullptr owner：与 showAt 同源解耦（无 owner，不拉主窗前台）。prewarm
+          // 与 showAt 的 owner 必须一致，否则 ForgetDeadWindow 重建时 owner 漂移。
+          win->PrewarmWebView(
+              IntFromValue(args, "width", 420),
+              IntFromValue(args, "height", 600), nullptr);
+          result->Success();
+        } else if (method == "isWebViewReady") {
+          // TODO-1079 — the ready-driven reveal fallback confirms the WebView2
+          // finished its initial navigation before revealing (else it defers).
+          result->Success(flutter::EncodableValue(
+              win->IsWebViewReady()));
+        } else if (method == "showAt") {
+          int x = IntFromValue(args, "x", 0);
+          int y = IntFromValue(args, "y", 0);
+          POINT cursor = {x, y};
+          if (BoolFromValue(args, "atCursor", false)) {
+            // GetCursorPos returns physical screen pixels, matching
+            // CreateWindowEx — no logical/physical DPI mismatch.
+            POINT pt;
+            if (GetCursorPos(&pt)) {
+              cursor = pt;
+              x = pt.x + 8;
+              y = pt.y + 8;
+            }
+          }
+          // nullptr owner（不传主窗 HWND）：owned 窗显示/Z 序变更会连带把
+          // owner 主窗拉到前台（真机第 4 轮对面板确认的机制，见 1067 注释）。
+          // 用户诉求=悬浮字幕点词等 app 外查词绝不该夺前台（覆盖窗 §5 契约）：
+          // 瞬态窗也解耦成无 owner，与面板一致。短命窗（点外/前台切换即经
+          // arm_dismiss_hooks 自关），主窗最小化时照样收纳，无孤儿窗回归。
+          const bool ok = win->ShowAt(
+              x, y, IntFromValue(args, "width", 420),
+              IntFromValue(args, "height", 600), nullptr);
+          // TODO-893 (symptom 2) — report the CURSOR MONITOR work area
+          // (physical px) so Dart's cascade layout uses the real screen, not
+          // the off-screen measurement canvas. computeFrameRect's showBelow /
+          // clamp must reason about the actual display: feeding the 2x card
+          // canvas made every child cascade up (spaceBelow tiny), shoving the
+          // parent card off the top. Dart divides workW/workH by the same dpr
+          // it uses for window geometry to get CSS px (single dpr source).
+          int work_w = 0;
+          int work_h = 0;
+          // TODO-893 v2 (symptom 3) — the WINDOW-LOCAL origin's position INSIDE
+          // the cursor monitor work area (physical px). The overlay's
+          // window-local (0,0) sits at the placed top-left (x, y) = cursor+8 on
+          // screen; subtracting rcWork.left/top gives its offset from the work
+          // area origin. Dart translates the host's window-local child anchor
+          // rect into this same work-area-absolute domain before feeding
+          // computeFrameRect (whose screenW/H are work-area dimensions), then
+          // shifts the result back to window-local for the host shell — fixing
+          // the zero-point mismatch that mis-decided showBelow near the screen
+          // bottom edge and shoved the parent card off the top.
+          int cursor_work_x = 0;
+          int cursor_work_y = 0;
+          // BUG-859 — the CURSOR MONITOR's effective scale. Dart used to divide
+          // the physical-px work/cursor values above by the MAIN window's dpr;
+          // on a mixed-scale multi-monitor setup that put the cascade layout's
+          // work-area domain in the WRONG CSS scale (the overlay WebView2
+          // rasterizes at the overlay monitor's scale), mis-placing nested
+          // cards and breaking the reserve-to-edge clamp invariant. Report the
+          // authoritative per-monitor dpr alongside the physical values so
+          // Dart converts them in the SAME scale the page measures in. 0 =
+          // monitor query failed (Dart falls back to the main-window dpr).
+          double monitor_dpr = 0.0;
+          HMONITOR monitor =
+              MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+          MONITORINFO mi = {};
+          mi.cbSize = sizeof(mi);
+          if (GetMonitorInfo(monitor, &mi)) {
+            work_w = mi.rcWork.right - mi.rcWork.left;
+            work_h = mi.rcWork.bottom - mi.rcWork.top;
+            cursor_work_x = x - mi.rcWork.left;
+            cursor_work_y = y - mi.rcWork.top;
+            monitor_dpr = FlutterDesktopGetDpiForMonitor(monitor) / 96.0;
+          }
+          // 🔴 游戏内级联的工作区覆盖。capW/H 表示**完整游戏 viewport**，
+          // 绝不是 Dart 侧按位图预算/视口比例算出的**单卡 cap**。capX/Y 则是
+          // 冻结根卡左上角在该 viewport 内的物理 px 原点；Dart 用它把 host-local
+          // 选词矩形提升到同一 viewport 坐标域。不覆盖时桌面 route 仍使用显示器
+          // 工作区；卡片自身的尺寸上限不在这里处理。
+          const int cap_w = IntFromValue(args, "capW", 0);
+          const int cap_h = IntFromValue(args, "capH", 0);
+          if (cap_w > 0 && cap_h > 0) {
+            work_w = cap_w;
+            work_h = cap_h;
+            // BUG-1835 — preserve the full viewport plus its non-zero root
+            // origin. The old 0,0 reply trapped every nested card inside the
+            // single-card-sized red rectangle.
+            cursor_work_x = IntFromValue(args, "capX", 0);
+            cursor_work_y = IntFromValue(args, "capY", 0);
+          }
+          flutter::EncodableMap reply = {
+              {flutter::EncodableValue("ok"), flutter::EncodableValue(ok)},
+              {flutter::EncodableValue("workW"),
+               flutter::EncodableValue(work_w)},
+              {flutter::EncodableValue("workH"),
+               flutter::EncodableValue(work_h)},
+              {flutter::EncodableValue("cursorWorkX"),
+               flutter::EncodableValue(cursor_work_x)},
+              {flutter::EncodableValue("cursorWorkY"),
+               flutter::EncodableValue(cursor_work_y)},
+              {flutter::EncodableValue("monitorDpr"),
+               flutter::EncodableValue(monitor_dpr)},
+          };
+          result->Success(flutter::EncodableValue(reply));
+        } else if (method == "render") {
+          win->RenderJson(StringFromValue(args, "json", ""));
+          result->Success();
+        } else if (method == "gamepadAction") {
+          // 手柄重设计 P5：Dart 侧 GamepadService 独占路由 → host gamepadAction
+          // （词条导航/制卡/发音/滚动，动作名白名单在 window 实现里钉死）。
+          win->DispatchGamepadAction(StringFromValue(args, "action", ""),
+                                     DoubleFromValue(args, "dy", 0.0));
+          result->Success();
+        } else if (method == "resize") {
+          if (win == gal_lookup_card_window_.get()) {
+            win->ResizeOffscreen(IntFromValue(args, "width", 0),
+                                 IntFromValue(args, "height", 0));
+          } else {
+            win->ResizeTo(IntFromValue(args, "width", 0),
+                          IntFromValue(args, "height", 0));
+          }
+          result->Success();
+        } else if (method == "reveal") {
+          // galCard 的通用 reveal-safety 在 native presenter 选定输出模式前只负责
+          // 让 WebView 离屏完成定尺与绘制。后续若 direct presenter 可用，
+          // RevealOverProcessClient 会把同一 composition HWND 贴到游戏客户区；
+          // 否则 CaptureBgraAsync 仍从这个离屏 surface 取帧。这里不提前把它
+          // 当成普通桌面浮窗上屏。
+          if (win == gal_lookup_card_window_.get()) {
+            win->ResizeOffscreen(IntFromValue(args, "width", 0),
+                                 IntFromValue(args, "height", 0));
+          } else {
+            win->Reveal(IntFromValue(args, "width", 0),
+                        IntFromValue(args, "height", 0));
+          }
+          result->Success();
+        } else if (method == "revealStack") {
+          // TODO-867 P3c E1 — reveal/resize to the nested-stack union bbox.
+          if (win == gal_lookup_card_window_.get()) {
+            // direct-active 时围绕冻结根卡原点原位扩缩已贴在游戏上的
+            // HWND，不把它停回 OffscreenX；尚未进入 direct mode 或 direct 不可用
+            // 时，同一方法才执行离屏 resize + layer shift/captureReady 回退。
+            win->ResizeStackForGal(
+                IntFromValue(args, "dx", 0),
+                IntFromValue(args, "dy", 0),
+                IntFromValue(args, "width", 0),
+                IntFromValue(args, "height", 0),
+                DoubleFromValue(args, "left", 0.0),
+                DoubleFromValue(args, "top", 0.0),
+                Int64FromValue(args, "geometryEpoch", 0),
+                IntFromValue(args, "rootHeight", 0));
+          } else {
+            win->RevealStack(
+                IntFromValue(args, "dx", 0), IntFromValue(args, "dy", 0),
+                IntFromValue(args, "width", 0), IntFromValue(args, "height", 0),
+                DoubleFromValue(args, "left", 0.0),
+                DoubleFromValue(args, "top", 0.0),
+                Int64FromValue(args, "geometryEpoch", 0));
+          }
+          result->Success();
+        } else if (method == "resolveBridge") {
+          // Dart's real reply for a deferred audio handler. "value" is a JSON
+          // literal string (jsonEncode'd in Dart): pass it straight through.
+          win->ResolveBridge(
+              IntFromValue(args, "id", 0),
+              StringFromValue(args, "value", "null"));
+          result->Success();
+        } else if (method == "hide") {
+          // TODO-1233 -- notify defaults true (genuine dismiss); the controller
+          // passes notify=false for the reset that precedes a fresh lookup so it
+          // does not fire overlayHidden between two lookups.
+          win->Hide(BoolFromValue(args, "notify", true));
+          result->Success();
+        } else if (method == "isShowing") {
+          result->Success(
+              flutter::EncodableValue(win->IsShowing()));
+        } else if (method == "setOutsideClickOwner") {
+          // attached 校准字形表面打开的桌面 route 弹窗：记下游戏 HWND，随后的
+          // Reveal/RevealStack 走同步吞点击 Arm，点卡外关闭不再推进游戏台词。
+          // 0 = 清空。Hide() 自清；普通桌面查词从不调用这条方法。
+          win->SetOutsideClickConsumeOwner(reinterpret_cast<HWND>(
+              static_cast<uintptr_t>(Int64FromValue(args, "hwnd", 0))));
+          result->Success();
+        } else if (method == "setGlobalMouseTrigger") {
+          // TODO-1066 — 全局鼠标侧键触发的注册/注销。**进程级**，与 win / route
+          // 无关（它要在一张卡片都没有的时候生效——那正是它的用途），所以这里
+          // 不碰上面按 target 取到的那个 win。
+          //
+          // 按钮号 0 = 注销，native 侧不留任何 Raw Input 监听（Dart 侧在用户没绑
+          // 侧键时就是推 0，沿用 BUG-1077「不查词不留全局钩子」的纪律）。
+          const bool ok = fushi::SetGlobalMouseTrigger(
+              GetHandle(), IntFromValue(args, "button", 0));
+          result->Success(flutter::EncodableValue(ok));
+        } else if (method == "setBlockCapture") {
+          // 防截屏（WDA_EXCLUDEFROMCAPTURE）：瞬态查词窗对用户可见但不进截图 /
+          // 录屏 / 屏幕共享。GlobalLookupWindow 记住该值，窗口重建后由
+          // ApplyBlockCapture 自动重加（pref lookupBlockCapture，默认关）。
+          win->SetBlockCapture(
+              BoolFromValue(args, "block", true));
+          result->Success();
+        } else {
+          result->NotImplemented();
+        }
+      });
+}
+
+// TODO-1030 M0 — Windows UIA foreground-selection context capture channel.
+// Dart (selection_capture_ffi.dart) calls `captureContext` when the global
+// lookup pref opts into context capture. The UIA call can block 50-200ms
+// cross-process, so it runs on a DETACHED worker thread; the completed result is
+// marshalled back to the UI thread via WM_FGSEL_CAPTURE_DONE, where the pending
+// Flutter reply is finished (MethodResult is not thread-safe). A failure returns
+// null so Dart falls back to the clipboard capture (never break userspace).
+void FlutterWindow::RegisterForegroundSelectionChannel() {
+  foreground_selection_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/foreground_selection",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  foreground_selection_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        if (call.method_name() != "captureContext") {
+          result->NotImplemented();
+          return;
+        }
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        const int max_expand =
+            IntFromValue(args, "maxExpand", kForegroundContextExpand);
+        const HWND hwnd = GetHandle();
+        // Move the pending reply onto the heap so the worker thread can own it
+        // until the UI thread completes it (via WM_FGSEL_CAPTURE_DONE).
+        auto* pending = new ForegroundSelectionPending();
+        pending->result = std::move(result);
+        std::thread([hwnd, max_expand, pending]() {
+          const LARGE_INTEGER t0 = [] {
+            LARGE_INTEGER v;
+            QueryPerformanceCounter(&v);
+            return v;
+          }();
+          pending->capture = CaptureForegroundSelectionContext(max_expand);
+          LARGE_INTEGER t1;
+          QueryPerformanceCounter(&t1);
+          LARGE_INTEGER freq;
+          QueryPerformanceFrequency(&freq);
+          pending->elapsed_ms = freq.QuadPart > 0
+              ? ((t1.QuadPart - t0.QuadPart) * 1000) / freq.QuadPart
+              : 0;
+          // Hand ownership to the UI thread. If PostMessage fails (window gone),
+          // reply null here and delete to avoid a leak / dangling result.
+          if (!PostMessage(hwnd, WM_FGSEL_CAPTURE_DONE, 0,
+                           reinterpret_cast<LPARAM>(pending))) {
+            pending->result->Success(flutter::EncodableValue());
+            delete pending;
+          }
+        }).detach();
+      });
+}
+
+// TODO-1162 M0 — window_capture channel (Windows-only external-window mining).
+// `listWindows` runs synchronously (EnumWindows is instant). `captureWindow`
+// runs the blocking single-frame grab on a worker thread. An owned completion
+// queue delivers pixels/error on the UI thread; workers never retain a Flutter
+// MethodResult or host HWND. Host teardown cancels pending replies before the
+// Flutter messenger is destroyed.
+void FlutterWindow::RegisterWindowCaptureChannel() {
+  window_capture_replies_ = std::make_unique<fushi::WindowCaptureReplyQueue>();
+  window_capture_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/window_capture",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  window_capture_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const std::string& method = call.method_name();
+        if (method == "listWindows") {
+          const std::vector<fushi::ExternalWindow> windows =
+              fushi::EnumerateTopLevelWindows(GetHandle());
+          flutter::EncodableList list;
+          for (const auto& w : windows) {
+            list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("hwnd"),
+                 flutter::EncodableValue(static_cast<int64_t>(
+                     reinterpret_cast<intptr_t>(w.hwnd)))},
+                {flutter::EncodableValue("title"),
+                 flutter::EncodableValue(w.title)},
+                {flutter::EncodableValue("pid"),
+                 flutter::EncodableValue(static_cast<int64_t>(w.pid))},
+            }));
+          }
+          result->Success(flutter::EncodableValue(std::move(list)));
+          return;
+        }
+        // galgame 视频卡片：持续滚动录制游戏窗口（WindowRecorder 单例，见
+        // window_recorder.cpp）。start 同步等 WGC 会话建立（毫秒级）；export 在
+        // UI 线程同步落盘区间内的 JPEG 帧（几 MB）。全部 fail-open：失败以 false /
+        // error map 回 Dart，绝不抛。
+        auto read_long = [&call](const char* key, int64_t fallback) -> int64_t {
+          const auto* map =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (map == nullptr) {
+            return fallback;
+          }
+          const auto it = map->find(flutter::EncodableValue(key));
+          if (it == map->end()) {
+            return fallback;
+          }
+          return it->second.TryGetLongValue().value_or(fallback);
+        };
+        auto read_string = [&call](const char* key) -> std::string {
+          const auto* map =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (map == nullptr) {
+            return std::string();
+          }
+          const auto it = map->find(flutter::EncodableValue(key));
+          if (it == map->end()) {
+            return std::string();
+          }
+          const auto* s = std::get_if<std::string>(&it->second);
+          return s == nullptr ? std::string() : *s;
+        };
+        if (method == "startWindowRecording") {
+          const int64_t rec_hwnd = read_long("hwnd", 0);
+          if (rec_hwnd == 0) {
+            result->Success(flutter::EncodableValue(false));
+            return;
+          }
+          const bool started = fushi::WindowRecorder::Instance().Start(
+              reinterpret_cast<HWND>(static_cast<intptr_t>(rec_hwnd)),
+              static_cast<int>(read_long("fps", 5)),
+              static_cast<int>(read_long("maxSeconds", 20)),
+              static_cast<int>(read_long("maxWidth", 640)));
+          result->Success(flutter::EncodableValue(started));
+          return;
+        }
+        if (method == "stopWindowRecording") {
+          fushi::WindowRecorder::Instance().Stop();
+          result->Success();
+          return;
+        }
+        if (method == "isWindowRecording") {
+          result->Success(flutter::EncodableValue(
+              fushi::WindowRecorder::Instance().IsRecording()));
+          return;
+        }
+        if (method == "exportWindowRecording") {
+          const fushi::WindowRecordingExport exported =
+              fushi::WindowRecorder::Instance().Export(
+                  read_long("fromTickMs", 0), read_long("toTickMs", 0),
+                  read_string("directory"));
+          flutter::EncodableList frames;
+          for (const fushi::WindowRecordingFrame& f : exported.frames) {
+            frames.push_back(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("path"),
+                 flutter::EncodableValue(f.path)},
+                {flutter::EncodableValue("tickMs"),
+                 flutter::EncodableValue(static_cast<int64_t>(f.tick_ms))},
+            }));
+          }
+          flutter::EncodableMap reply{
+              {flutter::EncodableValue("frames"),
+               flutter::EncodableValue(std::move(frames))},
+              {flutter::EncodableValue("nowTickMs"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(exported.now_tick_ms))},
+          };
+          if (!exported.error.empty()) {
+            reply[flutter::EncodableValue("error")] =
+                flutter::EncodableValue(exported.error);
+          }
+          result->Success(flutter::EncodableValue(std::move(reply)));
+          return;
+        }
+        if (method != "captureWindow") {
+          result->NotImplemented();
+          return;
+        }
+        const auto* args = std::get_if<flutter::EncodableMap>(call.arguments());
+        int64_t hwnd_val = 0;
+        if (args != nullptr) {
+          const auto it = args->find(flutter::EncodableValue("hwnd"));
+          if (it != args->end()) {
+            hwnd_val = it->second.TryGetLongValue().value_or(0);
+          }
+        }
+        if (hwnd_val == 0) {
+          result->Error("bad_args", "Missing hwnd");
+          return;
+        }
+        const HWND target =
+            reinterpret_cast<HWND>(static_cast<intptr_t>(hwnd_val));
+        // Keep replies UI-owned. The completion timer is active only while a
+        // request exists; it schedules delivery, never retries the capture.
+        if (window_capture_replies_->empty() &&
+            SetTimer(GetHandle(), kWindowCaptureReplyTimerId,
+                     kWindowCaptureReplyTickMs, nullptr) == 0) {
+          result->Error("capture_dispatch_failed",
+                        "Could not schedule capture completion");
+          return;
+        }
+        auto reply = std::shared_ptr<
+            flutter::MethodResult<flutter::EncodableValue>>(std::move(result));
+        auto completion = window_capture_replies_->Enqueue(
+            [reply](fushi::WindowCaptureResult captured) {
+              reply->Success(
+                  flutter::EncodableValue(WindowCaptureReplyMap(captured)));
+            });
+        if (completion) {
+          std::thread([target, completion]() {
+            completion->Publish(fushi::CaptureWindowPng(target));
+          }).detach();
+        }
+      });
+}
+
+// galgame 一键制卡 A 阶段 — audio_loopback channel（仅 Windows）。start 打开 WASAPI
+// loopback 采集进环形缓冲（同步握手拿格式）；grabRecent 拉最近 N 毫秒 PCM；stop 释放。
+// 采集/环形缓冲逻辑在 AudioLoopbackCapture 单例（见 audio_loopback_capture.cpp）。native
+// 内部全程 HRESULT 校验，失败以 error map fail-open（Dart 侧 LoopbackGalAudioSource 降级）。
+void FlutterWindow::RegisterAudioLoopbackChannel() {
+  audio_loopback_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/audio_loopback",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  audio_loopback_channel_->SetMethodCallHandler(
+      [](const flutter::MethodCall<flutter::EncodableValue>& call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+             result) {
+        const std::string& method = call.method_name();
+        auto format_map = [](const fushi::LoopbackFormat& f) {
+          return flutter::EncodableMap{
+              {flutter::EncodableValue("sampleRate"),
+               flutter::EncodableValue(f.sample_rate)},
+              {flutter::EncodableValue("channels"),
+               flutter::EncodableValue(f.channels)},
+              {flutter::EncodableValue("bitsPerSample"),
+               flutter::EncodableValue(f.bits_per_sample)},
+              {flutter::EncodableValue("isFloat"),
+               flutter::EncodableValue(f.is_float)},
+          };
+        };
+        if (method == "start") {
+          const fushi::LoopbackFormat f =
+              fushi::AudioLoopbackCapture::Instance().Start();
+          if (!f.ok) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(
+                     std::string("loopback start failed"))}}));
+            return;
+          }
+          result->Success(flutter::EncodableValue(format_map(f)));
+          return;
+        }
+        if (method == "stop") {
+          fushi::AudioLoopbackCapture::Instance().Stop();
+          result->Success();
+          return;
+        }
+        if (method == "grabRecent") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          int back_ms = 0;
+          if (args != nullptr) {
+            const auto it = args->find(flutter::EncodableValue("backMs"));
+            if (it != args->end()) {
+              back_ms = static_cast<int>(
+                  it->second.TryGetLongValue().value_or(0));
+            }
+          }
+          std::vector<uint8_t> pcm;
+          const fushi::LoopbackFormat f =
+              fushi::AudioLoopbackCapture::Instance().GrabRecent(back_ms, pcm);
+          if (!f.ok || pcm.empty()) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("no audio buffered"))}}));
+            return;
+          }
+          flutter::EncodableMap out = format_map(f);
+          out[flutter::EncodableValue("pcm")] =
+              flutter::EncodableValue(std::move(pcm));
+          result->Success(flutter::EncodableValue(std::move(out)));
+          return;
+        }
+        result->NotImplemented();
+      });
+}
+
+// galgame 一键制卡 C 阶段 — voice_hook channel（仅 Windows）。open{pid} 打开隔离组件建好的
+// 共享内存；status 轮询 hook 是否就绪（hooked/calibrating/格式）；grabRecent{backMs} 拉最近 N
+// 毫秒干净语音 PCM；close 解除映射。注入/挂钩代码全在独立 injector+hook DLL，本体只**读**共享
+// 内存（读不是注入、不被杀软标记）。native fail-open：无映射/未就绪返回 error map，Dart 侧
+// EngineHookGalAudioSource 据此降级回 loopback。
+void FlutterWindow::RegisterVoiceHookChannel() {
+  voice_hook_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi.reader/voice_hook",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  voice_hook_channel_->SetMethodCallHandler(
+      [](const flutter::MethodCall<flutter::EncodableValue>& call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+             result) {
+        const std::string& method = call.method_name();
+        auto status_map = [](const fushi::VoiceHookStatus& s) {
+          return flutter::EncodableMap{
+              {flutter::EncodableValue("ipcProtocolVersion"),
+               flutter::EncodableValue(s.ipc_protocol_version)},
+              {flutter::EncodableValue("lunaBridgeAbiVersion"),
+               flutter::EncodableValue(s.luna_bridge_abi_version)},
+              {flutter::EncodableValue("lunaVendoredVersion"),
+               flutter::EncodableValue(s.luna_vendored_version)},
+              {flutter::EncodableValue("sampleRate"),
+               flutter::EncodableValue(s.sample_rate)},
+              {flutter::EncodableValue("channels"),
+               flutter::EncodableValue(s.channels)},
+              {flutter::EncodableValue("bitsPerSample"),
+               flutter::EncodableValue(s.bits_per_sample)},
+              {flutter::EncodableValue("isFloat"),
+               flutter::EncodableValue(s.is_float)},
+              {flutter::EncodableValue("hooked"),
+               flutter::EncodableValue(s.hooked)},
+              {flutter::EncodableValue("calibrating"),
+               flutter::EncodableValue(s.calibrating)},
+              {flutter::EncodableValue("textHooked"),
+               flutter::EncodableValue(s.text_hooked)},
+              {flutter::EncodableValue("audioHooksReady"),
+               flutter::EncodableValue(s.audio_hooks_ready)},
+              {flutter::EncodableValue("rawVoiceReady"),
+               flutter::EncodableValue(s.raw_voice_ready)},
+              {flutter::EncodableValue("textLaneRecycles"),
+               flutter::EncodableValue(s.text_lane_recycles)},
+              {flutter::EncodableValue("textLaneOverflows"),
+               flutter::EncodableValue(s.text_lane_overflows)},
+              {flutter::EncodableValue("nativeLoopbackRequested"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.native_loopback_requested))},
+              {flutter::EncodableValue("nativeLoopbackRequestSeq"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.native_loopback_request_seq))},
+              {flutter::EncodableValue("nativeLoopbackState"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.native_loopback_state))},
+              {flutter::EncodableValue("nativeLoopbackAppliedSeq"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.native_loopback_applied_seq))},
+              {flutter::EncodableValue("xaudioDiagnostics"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.xaudio_diagnostics))},
+              {flutter::EncodableValue("xaudioDiagnostics2"),
+               flutter::EncodableValue(
+                   static_cast<int64_t>(s.xaudio_diagnostics2))},
+              {flutter::EncodableValue("ready"),
+               flutter::EncodableValue(s.ok || s.raw_voice_ready)},
+          };
+        };
+        auto read_long = [&call](const char* key) -> int64_t {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args == nullptr) {
+            return 0;
+          }
+          const auto it = args->find(flutter::EncodableValue(key));
+          if (it == args->end()) {
+            return 0;
+          }
+          return it->second.TryGetLongValue().value_or(0);
+        };
+        auto read_pid = [&call]() -> uint32_t {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args == nullptr) {
+            return 0;
+          }
+          const auto it = args->find(flutter::EncodableValue("pid"));
+          if (it == args->end()) {
+            return 0;
+          }
+          return static_cast<uint32_t>(
+              it->second.TryGetLongValue().value_or(0));
+        };
+        if (method == "open") {
+          const uint32_t pid = read_pid();
+          const fushi::VoiceHookOpenResult opened =
+              fushi::VoiceHookReader::Instance().Open(pid);
+          // open 成功但 hook 未就绪**不是错误**（调用方轮询 status）。旧判据
+          // `!s.hooked && !s.ok` 把「映射已建、DLL 还没置 hooked 位」这段启动窗口
+          // 误报成「共享内存不存在」，Dart 侧据此立刻降级回 loopback——引擎 hook 明明
+          // 装得上，只是慢了一拍。真实失败的唯一判据是 Open 自己报的 error。
+          if (!opened.ok()) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                // 机器可读 token：Dart 侧据此归类成可执行处置（要管理员 / 重开游戏 /
+                // 更新 helper），不再一律说「重启 Fushi」。
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(
+                     std::string(fushi::VoiceHookOpenErrorToken(
+                         opened.error)))},
+                // 一手事实（win32 码 / 映射名 / 双方版本对照），原样进用户可见诊断。
+                {flutter::EncodableValue("detail"),
+                 flutter::EncodableValue(opened.detail)},
+                {flutter::EncodableValue("win32"),
+                 flutter::EncodableValue(
+                     static_cast<int>(opened.win32_error))}}));
+            return;
+          }
+          result->Success(flutter::EncodableValue(status_map(opened.status)));
+          return;
+        }
+        if (method == "status") {
+          result->Success(flutter::EncodableValue(
+              status_map(fushi::VoiceHookReader::Instance().Status())));
+          return;
+        }
+        if (method == "requestNativeLoopbackPolicy") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          const std::string* policy = nullptr;
+          if (args != nullptr) {
+            const auto it =
+                args->find(flutter::EncodableValue("policy"));
+            if (it != args->end()) {
+              policy = std::get_if<std::string>(&it->second);
+            }
+          }
+          if (policy == nullptr ||
+              (*policy != "allow" && *policy != "deny")) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("invalid_policy"))}}));
+            return;
+          }
+          const uint32_t request_seq =
+              fushi::VoiceHookReader::Instance().RequestNativeLoopbackPolicy(
+                  *policy == "allow");
+          if (request_seq == 0) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("not_open"))}}));
+            return;
+          }
+          // Return a full snapshot so Dart can often satisfy an already-
+          // applied idempotent request without an extra status round-trip.
+          result->Success(flutter::EncodableValue(status_map(
+              fushi::VoiceHookReader::Instance().Status())));
+          return;
+        }
+        if (method == "grabRecent") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          int back_ms = 0;
+          if (args != nullptr) {
+            const auto it = args->find(flutter::EncodableValue("backMs"));
+            if (it != args->end()) {
+              back_ms = static_cast<int>(
+                  it->second.TryGetLongValue().value_or(0));
+            }
+          }
+          std::vector<uint8_t> pcm;
+          const fushi::VoiceHookStatus s =
+              fushi::VoiceHookReader::Instance().GrabRecent(back_ms, pcm);
+          if (!s.ok || pcm.empty()) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(
+                     std::string("no voice buffered"))}}));
+            return;
+          }
+          flutter::EncodableMap out = status_map(s);
+          out[flutter::EncodableValue("pcm")] =
+              flutter::EncodableValue(std::move(pcm));
+          result->Success(flutter::EncodableValue(std::move(out)));
+          return;
+        }
+        if (method == "pollText") {
+          // 取 (fromSeq, count] 的新台词行，喂 Dart 的 texthooker。
+          const uint64_t from_seq =
+              static_cast<uint64_t>(read_long("fromSeq"));
+          std::vector<fushi::VoiceHookText> lines;
+          fushi::VoiceHookReader::Instance().PollText(from_seq, lines);
+          const uint64_t count =
+              fushi::VoiceHookReader::Instance().TextWriteCount();
+          flutter::EncodableList list;
+          for (const auto& ln : lines) {
+            list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("seq"),
+                 flutter::EncodableValue(static_cast<int64_t>(ln.seq))},
+                {flutter::EncodableValue("ts"),
+                 flutter::EncodableValue(static_cast<int64_t>(ln.timestamp_ms))},
+                {flutter::EncodableValue("text"),
+                 flutter::EncodableValue(ln.utf8)},
+                {flutter::EncodableValue("threadId"),
+                 flutter::EncodableValue(static_cast<int64_t>(ln.thread_id))},
+                {flutter::EncodableValue("faceId"),
+                 flutter::EncodableValue(static_cast<int64_t>(ln.face_id))},
+                {flutter::EncodableValue("threadAddress"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.thread_address))},
+                {flutter::EncodableValue("threadContext"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.thread_context))},
+                {flutter::EncodableValue("threadContext2"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.thread_context2))},
+                {flutter::EncodableValue("processId"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.process_id))},
+                {flutter::EncodableValue("sourceKind"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.source_kind))},
+                {flutter::EncodableValue("eventKind"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.event_kind))},
+                {flutter::EncodableValue("eventFlags"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(ln.event_flags))},
+                {flutter::EncodableValue("hookName"),
+                 flutter::EncodableValue(ln.hook_name)},
+                {flutter::EncodableValue("hookCode"),
+                 flutter::EncodableValue(ln.hook_code)},
+            }));
+          }
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("count"),
+               flutter::EncodableValue(static_cast<int64_t>(count))},
+              {flutter::EncodableValue("lines"),
+               flutter::EncodableValue(std::move(list))},
+          }));
+          return;
+        }
+        if (method == "pollThreadPreviews") {
+          // v12：每条线程的最近一行（含未被选中的线程），供选择器展示。全量快照，无游标。
+          std::vector<fushi::VoiceHookThreadPreview> previews;
+          const uint64_t write_count =
+              fushi::VoiceHookReader::Instance().PollThreadPreviews(previews);
+          flutter::EncodableList list;
+          for (const auto& pv : previews) {
+            list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("threadId"),
+                 flutter::EncodableValue(static_cast<int64_t>(pv.thread_id))},
+                {flutter::EncodableValue("seq"),
+                 flutter::EncodableValue(static_cast<int64_t>(pv.seq))},
+                {flutter::EncodableValue("ts"),
+                 flutter::EncodableValue(static_cast<int64_t>(pv.timestamp_ms))},
+                {flutter::EncodableValue("lineCount"),
+                 flutter::EncodableValue(static_cast<int64_t>(pv.line_count))},
+                {flutter::EncodableValue("artifactCount"),
+                 flutter::EncodableValue(
+                     static_cast<int64_t>(pv.artifact_count))},
+                {flutter::EncodableValue("eventFlags"),
+                 flutter::EncodableValue(static_cast<int64_t>(pv.event_flags))},
+                {flutter::EncodableValue("text"),
+                 flutter::EncodableValue(pv.utf8)},
+            }));
+          }
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("writeCount"),
+               flutter::EncodableValue(static_cast<int64_t>(write_count))},
+              {flutter::EncodableValue("previews"),
+               flutter::EncodableValue(std::move(list))},
+          }));
+          return;
+        }
+        if (method == "selectTextThread") {
+          const uint64_t thread_id =
+              static_cast<uint64_t>(read_long("threadId"));
+          const bool ok =
+              fushi::VoiceHookReader::Instance().SelectTextThread(thread_id);
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("ok"), flutter::EncodableValue(ok)},
+          }));
+          return;
+        }
+        if (method == "grabClipNear") {
+          // 按句取语音：找时间戳与 tsMs 最近（差 <= tolMs）的语音 clip PCM。
+          // 选轨/排除参数与 grabUtterance 同契约：本方法是它的兜底，必须同样遵守。
+          const uint64_t ts = static_cast<uint64_t>(read_long("tsMs"));
+          uint64_t tol = static_cast<uint64_t>(read_long("tolMs"));
+          if (tol == 0) {
+            tol = 3000;  // 缺省 ±3s
+          }
+          const uint64_t target =
+              static_cast<uint64_t>(read_long("sourcePtr"));
+          std::vector<uint64_t> exclude;
+          const auto* cargs =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (cargs != nullptr) {
+            const auto ex_it = cargs->find(flutter::EncodableValue("exclude"));
+            if (ex_it != cargs->end()) {
+              const auto* list =
+                  std::get_if<flutter::EncodableList>(&ex_it->second);
+              if (list != nullptr) {
+                for (const auto& e : *list) {
+                  exclude.push_back(
+                      static_cast<uint64_t>(e.TryGetLongValue().value_or(0)));
+                }
+              }
+            }
+          }
+          std::vector<uint8_t> pcm;
+          const fushi::VoiceHookStatus s =
+              fushi::VoiceHookReader::Instance().GrabClipNear(ts, tol, target,
+                                                               exclude, pcm);
+          if (!s.ok || pcm.empty()) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("no clip near timestamp"))}}));
+            return;
+          }
+          flutter::EncodableMap out = status_map(s);
+          out[flutter::EncodableValue("pcm")] =
+              flutter::EncodableValue(std::move(pcm));
+          result->Success(flutter::EncodableValue(std::move(out)));
+          return;
+        }
+        if (method == "grabUtterance") {
+          // 按句取「整句」语音：拼同源整段（sourcePtr 非 0=手动选轨；缺省能量自动选，可
+          // exclude BGM 源）。返回 PCM + 格式，或 {error} 让 Dart 回退 grabClipNear。
+          const uint64_t ts = static_cast<uint64_t>(read_long("tsMs"));
+          const uint64_t target =
+              static_cast<uint64_t>(read_long("sourcePtr"));
+          // BUG-1475：可选的前向窗口上界（下一句的时间戳）。缺省 0 = 旧行为。
+          const uint64_t end_ts = static_cast<uint64_t>(read_long("endTsMs"));
+          std::vector<uint64_t> exclude;
+          const auto* uargs =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (uargs != nullptr) {
+            const auto exit_it =
+                uargs->find(flutter::EncodableValue("exclude"));
+            if (exit_it != uargs->end()) {
+              const auto* list =
+                  std::get_if<flutter::EncodableList>(&exit_it->second);
+              if (list != nullptr) {
+                for (const auto& e : *list) {
+                  exclude.push_back(
+                      static_cast<uint64_t>(e.TryGetLongValue().value_or(0)));
+                }
+              }
+            }
+          }
+          std::vector<uint8_t> pcm;
+          const fushi::VoiceHookStatus s =
+              fushi::VoiceHookReader::Instance().GrabUtterance(
+                  ts, target, exclude, pcm, end_ts);
+          if (!s.ok || pcm.empty()) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(
+                     std::string("no utterance near timestamp"))}}));
+            return;
+          }
+          flutter::EncodableMap out = status_map(s);
+          out[flutter::EncodableValue("pcm")] =
+              flutter::EncodableValue(std::move(pcm));
+          result->Success(flutter::EncodableValue(std::move(out)));
+          return;
+        }
+        if (method == "listAudioTracks") {
+          // 枚举 ts 附近活跃语音源（供 UI 音轨列表让用户手动选/排除语音源）。
+          const uint64_t ts = static_cast<uint64_t>(read_long("tsMs"));
+          std::vector<fushi::VoiceTrackInfo> tracks;
+          fushi::VoiceHookReader::Instance().ListAudioTracks(ts, tracks);
+          flutter::EncodableList list;
+          for (const auto& tk : tracks) {
+            list.push_back(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("sourcePtr"),
+                 flutter::EncodableValue(static_cast<int64_t>(tk.source_ptr))},
+                {flutter::EncodableValue("sampleRate"),
+                 flutter::EncodableValue(tk.sample_rate)},
+                {flutter::EncodableValue("channels"),
+                 flutter::EncodableValue(tk.channels)},
+                {flutter::EncodableValue("bitsPerSample"),
+                 flutter::EncodableValue(tk.bits_per_sample)},
+                {flutter::EncodableValue("isFloat"),
+                 flutter::EncodableValue(tk.is_float)},
+                {flutter::EncodableValue("avgBytes"),
+                 flutter::EncodableValue(static_cast<int64_t>(tk.avg_bytes))},
+                {flutter::EncodableValue("avgEnergy"),
+                 flutter::EncodableValue(tk.avg_energy)},
+                {flutter::EncodableValue("orderIndex"),
+                 flutter::EncodableValue(tk.order_index)},
+                {flutter::EncodableValue("clipCount"),
+                 flutter::EncodableValue(tk.clip_count)},
+                {flutter::EncodableValue("clipCountAtCue"),
+                 flutter::EncodableValue(tk.clip_count_at_cue)},
+            }));
+          }
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("tracks"),
+               flutter::EncodableValue(std::move(list))}}));
+          return;
+        }
+        if (method == "processIsWow64") {
+          // 查目标进程位数：fushi.exe 是 64 位，故 IsWow64Process==TRUE 即目标为 32 位
+          // （多数 KiriKiri 游戏），Dart 据此选 x86 注入器；FALSE 为 64 位选 x64。
+          const uint32_t pid = read_pid();
+          if (pid == 0) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("no pid"))}}));
+            return;
+          }
+          HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                 static_cast<DWORD>(pid));
+          if (h == nullptr) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("open process failed"))}}));
+            return;
+          }
+          BOOL wow64 = FALSE;
+          const BOOL ok = IsWow64Process(h, &wow64);
+          CloseHandle(h);
+          if (!ok) {
+            result->Success(flutter::EncodableValue(flutter::EncodableMap{
+                {flutter::EncodableValue("error"),
+                 flutter::EncodableValue(std::string("IsWow64Process failed"))}}));
+            return;
+          }
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("isWow64"),
+               flutter::EncodableValue(wow64 != FALSE)}}));
+          return;
+        }
+        if (method == "close") {
+          fushi::VoiceHookReader::Instance().Close();
+          result->Success();
+          return;
+        }
+        result->NotImplemented();
+      });
+}
+
+// Magpie 缩放状态监听（仅 Windows）。Magpie 用 RegisterWindowMessage 注册的广播消息
+// "MagpieScalingChanged" 通知全系统顶层窗口缩放状态变化；本 runner 只读不回，收到后
+// 经 app.fushi.reader/magpie channel 把事件推给 Dart。
+void FlutterWindow::RegisterHdrVideoHostChannel() {
+  hdr_video_host_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi/hdr_video_host",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  hdr_video_host_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const std::string& method = call.method_name();
+        if (method == "create") {
+          if (!hdr_video_host_) {
+            hdr_video_host_ = std::make_unique<fushi::HdrVideoHostWindow>(
+                GetHandle(),
+                [this](bool enabled) { SetMainVideoPassthrough(enabled); });
+          }
+          const HWND host = hdr_video_host_->Create();
+          result->Success(flutter::EncodableValue(
+              static_cast<int64_t>(reinterpret_cast<intptr_t>(host))));
+          return;
+        }
+        if (method == "setRect") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          if (args == nullptr || !hdr_video_host_) {
+            result->Error("bad_state", "host not created");
+            return;
+          }
+          auto read = [args](const char* key) -> int {
+            const auto it = args->find(flutter::EncodableValue(key));
+            if (it == args->end()) {
+              return 0;
+            }
+            return static_cast<int>(it->second.TryGetLongValue().value_or(0));
+          };
+          hdr_video_host_->SetClientRect(read("x"), read("y"), read("width"),
+                                         read("height"));
+          result->Success();
+          return;
+        }
+        if (method == "destroy") {
+          if (hdr_video_host_) {
+            hdr_video_host_->Destroy();
+          }
+          result->Success();
+          return;
+        }
+        if (method == "displayInfo") {
+          const fushi::HdrDisplayInfo info =
+              fushi::QueryHdrDisplayInfo(GetHandle());
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("valid"),
+               flutter::EncodableValue(info.valid)},
+              {flutter::EncodableValue("colorSpace"),
+               flutter::EncodableValue(info.color_space)},
+              {flutter::EncodableValue("maxLuminance"),
+               flutter::EncodableValue(
+                   static_cast<double>(info.max_luminance))},
+              {flutter::EncodableValue("bitsPerColor"),
+               flutter::EncodableValue(
+                   static_cast<int>(info.bits_per_color))},
+              {flutter::EncodableValue("sdrWhiteNits"),
+               flutter::EncodableValue(
+                   static_cast<double>(info.sdr_white_nits))},
+          }));
+          return;
+        }
+        if (method == "compositorHdrSupported") {
+          result->Success(
+              flutter::EncodableValue(ResolveViewSetHdrOutput() != nullptr));
+          return;
+        }
+        if (method == "setCompositorHdrOutput") {
+          const auto* args =
+              std::get_if<flutter::EncodableMap>(call.arguments());
+          bool enabled = false;
+          double sdr_white_nits = 80.0;
+          if (args != nullptr) {
+            auto it = args->find(flutter::EncodableValue("enabled"));
+            if (it != args->end()) {
+              if (const bool* v = std::get_if<bool>(&it->second)) {
+                enabled = *v;
+              }
+            }
+            it = args->find(flutter::EncodableValue("sdrWhiteNits"));
+            if (it != args->end()) {
+              if (const double* v = std::get_if<double>(&it->second)) {
+                sdr_white_nits = *v;
+              }
+            }
+          }
+          result->Success(flutter::EncodableValue(SetCompositorHdrOutput(
+              enabled, static_cast<float>(sdr_white_nits))));
+          return;
+        }
+        result->NotImplemented();
+      });
+}
+
+// HDR inside Flutter's own swap chain (ci/patches/flutter-engine): resolved
+// at runtime so the runner keeps working on a stock engine, which simply does
+// not export the symbol.
+FlutterWindow::ViewSetHdrOutputFn FlutterWindow::ResolveViewSetHdrOutput() {
+  static const ViewSetHdrOutputFn fn = [] {
+    HMODULE engine = ::GetModuleHandleW(L"flutter_windows.dll");
+    return engine == nullptr
+               ? nullptr
+               : reinterpret_cast<ViewSetHdrOutputFn>(
+                     ::GetProcAddress(engine, "FlutterDesktopViewSetHdrOutput"));
+  }();
+  return fn;
+}
+
+bool FlutterWindow::SetCompositorHdrOutput(bool enabled,
+                                           float sdr_white_nits) {
+  const ViewSetHdrOutputFn set_hdr_output = ResolveViewSetHdrOutput();
+  if (set_hdr_output == nullptr || !flutter_controller_) {
+    return false;
+  }
+  FlutterDesktopPluginRegistrarRef registrar =
+      flutter_controller_->engine()->GetRegistrarForPlugin(
+          "FushiCompositorHdrOutput");
+  FlutterDesktopViewRef view =
+      registrar != nullptr ? FlutterDesktopPluginRegistrarGetView(registrar)
+                           : nullptr;
+  return view != nullptr && set_hdr_output(view, enabled, sdr_white_nits);
+}
+
+void FlutterWindow::RegisterMagpieChannel() {
+  magpie_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), "app.fushi.reader/magpie",
+          &flutter::StandardMethodCodec::GetInstance());
+
+  // 广播消息号只注册一次：同一字符串在全系统映射到同一个消息号，Magpie 侧
+  // RegisterWindowMessage 同名即可对上。
+  magpie_scaling_message_ = RegisterWindowMessageW(L"MagpieScalingChanged");
+  if (magpie_scaling_message_ == 0) {
+    // 注册失败只丢监听能力（Dart 侧收不到事件、按未缩放处理），绝不能让 OnCreate
+    // 失败把整个 app 拖挂。
+    return;
+  }
+
+  // UIPI：Magpie 可能以与本进程不同的完整性级别运行，跨完整性级别的窗口消息默认被
+  // 消息过滤器丢弃。对这一条消息显式放行；失败同样忽略（同级别时本来就收得到）。
+  const HWND hwnd = GetHandle();
+  if (hwnd != nullptr) {
+    ChangeWindowMessageFilterEx(hwnd, magpie_scaling_message_, MSGFLT_ALLOW,
+                                nullptr);
+  }
+}
+
+void FlutterWindow::RegisterGameStreamInputChannel() {
+  game_stream_input_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(),
+          "app.fushi/game_stream_input",
+          &flutter::StandardMethodCodec::GetInstance());
+  game_stream_input_ = std::make_unique<fushi::GameStreamInput>();
+  game_stream_input_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        const auto* args =
+            std::get_if<flutter::EncodableMap>(call.arguments());
+        if (call.method_name() == "bind") {
+          if (args == nullptr) {
+            result->Error("bad_args", "Missing window handle");
+            return;
+          }
+          const auto it = args->find(flutter::EncodableValue("hwnd"));
+          const int64_t value =
+              it == args->end() ? 0 : it->second.TryGetLongValue().value_or(0);
+          std::string reason;
+          if (!game_stream_input_->Bind(static_cast<uintptr_t>(value),
+                                        &reason)) {
+            result->Error("bind_rejected", reason);
+            return;
+          }
+          result->Success();
+          return;
+        }
+        if (call.method_name() == "send") {
+          if (args == nullptr) {
+            result->Error("bad_args", "Missing input event");
+            return;
+          }
+          std::string reason;
+          if (!game_stream_input_->Send(*args, &reason)) {
+            // Dart reads the specific reason from PlatformException.message
+            // (window_not_foreground, unsupported_native_pointer, ...).
+            result->Error("input_rejected",
+                          reason.empty() ? "input_rejected" : reason);
+            return;
+          }
+          result->Success();
+          return;
+        }
+        if (call.method_name() == "inspect") {
+          const uintptr_t value =
+              args == nullptr
+                  ? 0
+                  : static_cast<uintptr_t>(
+                        args->find(flutter::EncodableValue("hwnd")) ==
+                                args->end()
+                            ? 0
+                            : args->at(flutter::EncodableValue("hwnd"))
+                                  .TryGetLongValue()
+                                  .value_or(0));
+          const fushi::GameStreamWindowInfo info =
+              value == 0 ? game_stream_input_->InspectBound()
+                         : game_stream_input_->Inspect(value);
+          result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("alive"),
+               flutter::EncodableValue(info.alive)},
+              {flutter::EncodableValue("minimized"),
+               flutter::EncodableValue(info.minimized)},
+              {flutter::EncodableValue("visible"),
+               flutter::EncodableValue(info.visible)},
+              {flutter::EncodableValue("foreground"),
+               flutter::EncodableValue(info.foreground)},
+              {flutter::EncodableValue("processMatches"),
+               flutter::EncodableValue(info.process_matches)},
+              {flutter::EncodableValue("width"),
+               flutter::EncodableValue(info.width)},
+              {flutter::EncodableValue("height"),
+               flutter::EncodableValue(info.height)},
+              {flutter::EncodableValue("pid"),
+               flutter::EncodableValue(static_cast<int64_t>(info.pid))},
+          }));
+          return;
+        }
+        if (call.method_name() == "release") {
+          game_stream_input_->Release();
+          result->Success();
+          return;
+        }
+        if (call.method_name() == "activate") {
+          std::string reason;
+          if (!game_stream_input_->Activate(&reason)) {
+            result->Error(reason, "Game window could not receive input");
+          } else {
+            result->Success();
+          }
+          return;
+        }
+        if (call.method_name() == "unbind") {
+          game_stream_input_->Unbind();
+          result->Success();
+          return;
+        }
+        result->NotImplemented();
+      });
+}
+
+void FlutterWindow::NotifyMagpieScalingChanged(WPARAM wparam, LPARAM lparam) {
+  // WndProc 跑在 platform 线程，InvokeMethod 可直接调用。channel 在 OnCreate 建好
+  // 前（极早期消息）可能为空；**退出期**则是引擎先被拆掉、窗口还在收广播消息，此时
+  // channel 指针虽非空但底下的 messenger 已随 flutter_controller_ 一起销毁 ——
+  // 两个都要判，否则退出期收到一条 Magpie 广播就是 use-after-free。
+  if (!flutter_controller_ || !magpie_channel_) {
+    return;
+  }
+  const bool output_lifecycle_event =
+      lparam != 0 &&
+      (wparam == 0 || wparam == 1 || wparam == 2 || wparam == 3);
+  // A zero state with a non-zero HWND only backgrounds the source window;
+  // scaling remains active until the output HWND is destroyed.
+  const bool scaling = (wparam == 0) ? (lparam != 0) : true;
+  if (attached_text_surface_window_ != nullptr &&
+      (output_lifecycle_event || (wparam == 0 && lparam == 0))) {
+    attached_text_surface_window_->OnExternalWindowLifecycle(
+        reinterpret_cast<HWND>(static_cast<intptr_t>(lparam)), scaling);
+  }
+  // Magpie 广播语义（state = wParam）：
+  //   1                  -> 缩放开始，或源窗口重新回到前台；lParam = 缩放窗口 HWND。
+  //   0 且 lParam == 0   -> 缩放窗口 WM_DESTROY，缩放**真正结束**。
+  //   0 且 lParam != 0   -> 仅源窗口切到后台，**缩放仍在跑**：必须仍算缩放中，
+  //                         否则一切走到后台就被误判成「已退出缩放」。
+  //   2 / 3              -> 窗口模式下位置/大小变化 / 用户开始拖动；不改变缩放态，
+  //                         原样透传给 Dart。
+  flutter::EncodableMap map{
+      {flutter::EncodableValue("state"),
+       flutter::EncodableValue(static_cast<int>(wparam))},
+      {flutter::EncodableValue("handle"),
+       flutter::EncodableValue(static_cast<int64_t>(lparam))},
+      {flutter::EncodableValue("scaling"), flutter::EncodableValue(scaling)},
+  };
+  magpie_channel_->InvokeMethod(
+      "onScalingChanged",
+      std::make_unique<flutter::EncodableValue>(std::move(map)));
+}
+
+void FlutterWindow::NotifySystemColorChanged() {
+  // TODO-1092: 把「系统强调色/主题色已变」事件推给 Dart。WndProc 跑在 platform
+  // 线程，InvokeMethod 可直接调用。channel 在 OnCreate 建好前（极早期消息）可能为
+  // 空，做 null 保护后静默忽略——启动完成后所有实时变更都会被投递。
+  if (system_theme_channel_) {
+    system_theme_channel_->InvokeMethod(
+        "onSystemColorChanged", std::make_unique<flutter::EncodableValue>());
+  }
+}
+
+void FlutterWindow::ApplyCaptionColors(uint32_t caption_argb,
+                                       uint32_t text_argb) {
+  HWND hwnd = GetHandle();
+  if (hwnd == nullptr) {
+    return;
+  }
+  // ARGB (0xAARRGGBB) -> Win32 COLORREF (0x00BBGGRR). Alpha is dropped;
+  // DWM caption colors are opaque.
+  auto to_colorref = [](uint32_t argb) -> COLORREF {
+    return RGB((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
+  };
+  COLORREF caption = to_colorref(caption_argb);
+  COLORREF text = to_colorref(text_argb);
+  // DWMWA_CAPTION_COLOR (35) / DWMWA_TEXT_COLOR (36): Windows 11 build 22000+.
+  // On older Windows these return a failure HRESULT that we intentionally
+  // ignore, leaving the system-drawn title bar untouched.
+  DwmSetWindowAttribute(hwnd, 35, &caption, sizeof(caption));
+  DwmSetWindowAttribute(hwnd, 36, &text, sizeof(text));
+  // BUG-1916: the caption colour Dart pushes is the theme's surface colour —
+  // the same colour the app paints its page background with. Use it for this
+  // window's own surface too, so a maximize / restore / DPI transition that
+  // momentarily shows the surface shows the app background, not the splash.
+  SetBackdropColor(caption);
+}
+
+bool FlutterWindow::ApplySystemBackdrop(bool mica, bool dark) {
+  HWND hwnd = GetHandle();
+  if (hwnd == nullptr) {
+    return false;
+  }
+  // DWMWA_USE_IMMERSIVE_DARK_MODE (20): Mica tints itself from this flag.
+  const BOOL dark_mode = dark ? TRUE : FALSE;
+  DwmSetWindowAttribute(hwnd, 20, &dark_mode, sizeof(dark_mode));
+  if (mica) {
+    // DWMWA_SYSTEMBACKDROP_TYPE (38) = DWMSBT_MAINWINDOW (2), Windows 11 22621+.
+    // 22000 only knows the undocumented DWMWA_MICA_EFFECT (1029) = TRUE.
+    const int backdrop_type = 2;
+    bool active = SUCCEEDED(DwmSetWindowAttribute(
+        hwnd, 38, &backdrop_type, sizeof(backdrop_type)));
+    if (!active) {
+      const BOOL mica_effect = TRUE;
+      active = SUCCEEDED(
+          DwmSetWindowAttribute(hwnd, 1029, &mica_effect, sizeof(mica_effect)));
+    }
+    if (!active) {
+      return false;
+    }
+    // The backdrop only shows through client pixels DWM treats as glass:
+    // the frame is extended over the whole client area (transparent Flutter
+    // pixels and the black surface fill then reveal Mica).
+    SetSystemBackdrop(true);
+    ApplyMainSurfaceComposition();
+    return true;
+  }
+  const int backdrop_none = 1;  // DWMSBT_NONE
+  DwmSetWindowAttribute(hwnd, 38, &backdrop_none, sizeof(backdrop_none));
+  const BOOL mica_off = FALSE;
+  DwmSetWindowAttribute(hwnd, 1029, &mica_off, sizeof(mica_off));
+  // Back to window_manager's hidden-title-bar shadow margins.
+  SetSystemBackdrop(false);
+  ApplyMainSurfaceComposition();
+  return false;
+}
+
+void FlutterWindow::ApplyMainSurfaceComposition(
+    const fushi::MainSurfaceState& state) {
+  HWND hwnd = GetHandle();
+  if (hwnd == nullptr) {
+    return;
+  }
+  const MARGINS margins = fushi::MainFrameMargins(state);
+  DwmExtendFrameIntoClientArea(hwnd, &margins);
+  const DWMNCRENDERINGPOLICY policy =
+      fushi::MainSurfaceNcRenderingDisabled(state) ? DWMNCRP_DISABLED
+                                                   : DWMNCRP_USEWINDOWSTYLE;
+  DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, &policy,
+                        sizeof(policy));
+}
+
+void FlutterWindow::ApplyMainSurfaceComposition() {
+  ApplyMainSurfaceComposition(main_surface_state());
+}
+
+void FlutterWindow::SetMainVideoPassthrough(bool enabled) {
+  SetVideoPassthrough(enabled);
+  ApplyMainSurfaceComposition();
+}
+
+bool FlutterWindow::ApplyWindowIcon(const std::wstring& path) {
+  HWND hwnd = GetHandle();
+  if (hwnd == nullptr) {
+    return false;
+  }
+  int big_size = GetSystemMetrics(SM_CXICON);
+  int small_size = GetSystemMetrics(SM_CXSMICON);
+  HICON new_big = CreateIconFromImageFile(path, big_size > 0 ? big_size : 32);
+  HICON new_small =
+      CreateIconFromImageFile(path, small_size > 0 ? small_size : 16);
+  if (new_big == nullptr && new_small == nullptr) {
+    return false;
+  }
+  if (new_big != nullptr) {
+    SendMessage(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(new_big));
+    if (icon_big_ != nullptr) {
+      DestroyIcon(icon_big_);
+    }
+    icon_big_ = new_big;
+  }
+  if (new_small != nullptr) {
+    SendMessage(hwnd, WM_SETICON, ICON_SMALL,
+                reinterpret_cast<LPARAM>(new_small));
+    if (icon_small_ != nullptr) {
+      DestroyIcon(icon_small_);
+    }
+    icon_small_ = new_small;
+  }
+  return true;
+}
+
+void FlutterWindow::OnDestroy() {
+  // Before the Flutter view / channels go away: unhook the child subclass and
+  // drop the Dart relay.
+  caption_snap_button_.Detach();
+  if (window_capture_channel_) {
+    window_capture_channel_->SetMethodCallHandler(nullptr);
+    window_capture_channel_.reset();
+  }
+  KillTimer(GetHandle(), kWindowCaptureReplyTimerId);
+  if (window_capture_replies_) {
+    window_capture_replies_->Close();
+    window_capture_replies_.reset();
+  }
+  if (system_ocr_host_) {
+    // 未完成的识别回 HOST_CLOSED（messenger 此刻还活着）；之后才完成的结果丢弃。
+    system_ocr_host_->Shutdown();
+    system_ocr_host_.reset();
+  }
+  // TODO-1066 — 撤销全局侧键的 Raw Input 登记。登记是绑在**本窗口 HWND** 上的
+  // （RIDEV_INPUTSINK 要求 hwndTarget），HWND 一销毁那条登记就成了悬空目标，
+  // 必须在这里主动摘掉而不是等进程退出兜底。
+  fushi::SetGlobalMouseTrigger(nullptr, fushi::kGlobalMouseTriggerNone);
+  if (game_stream_input_) {
+    game_stream_input_->Unbind();
+  }
+  // 应用外悬浮球的回调走 floating_ball_channel_：趁 messenger 还活着先拆窗
+  // （Stop 不触发回调），再撤通道。
+  // 截屏识字冻结层同理（Close 不回调），先于球拆掉。
+  if (screen_ocr_overlay_) {
+    screen_ocr_overlay_->Close();
+    screen_ocr_overlay_.reset();
+  }
+  if (floating_ball_window_) {
+    floating_ball_window_->Stop();
+    floating_ball_window_.reset();
+  }
+  if (floating_ball_channel_) {
+    floating_ball_channel_->SetMethodCallHandler(nullptr);
+    floating_ball_channel_.reset();
+  }
+  // Attached surface callbacks invoke gal_hook_text_channel_; tear the HWND and
+  // its follow timer down while the Flutter messenger is still alive.
+  attached_text_surface_window_.reset();
+  if (icon_big_ != nullptr) {
+    DestroyIcon(icon_big_);
+    icon_big_ = nullptr;
+  }
+  if (icon_small_ != nullptr) {
+    DestroyIcon(icon_small_);
+    icon_small_ = nullptr;
+  }
+  if (flutter_controller_) {
+    flutter_controller_ = nullptr;
+  }
+
+  Win32Window::OnDestroy();
+}
+
+void FlutterWindow::OnDisplayRecovered() {
+  // The display came back (monitor power-on / WM_DISPLAYCHANGE). The engine does
+  // not produce a new frame on its own, so the window can stay blank until some
+  // other event wakes it. Force one fresh frame (TODO-689). Only the first-tier
+  // ForceRedraw is done here; the second-tier resize jiggle is intentionally
+  // omitted because it can flicker — add it only if a real device still shows a
+  // black screen after this.
+  if (!flutter_controller_) {
+    return;
+  }
+  flutter_controller_->ForceRedraw();
+}
+
+LRESULT
+FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
+                              WPARAM const wparam,
+                              LPARAM const lparam) noexcept {
+  if (message == WM_TIMER && system_ocr_host_ &&
+      system_ocr_host_->HandleTimer(wparam)) {
+    return 0;
+  }
+  if (message == WM_TIMER && wparam == kWindowCaptureReplyTimerId) {
+    if (window_capture_replies_) {
+      window_capture_replies_->Drain();
+    }
+    if (!window_capture_replies_ || window_capture_replies_->empty()) {
+      KillTimer(hwnd, kWindowCaptureReplyTimerId);
+    }
+    return 0;
+  }
+  // HDR passthrough host: keep the libmpv popup glued behind the main window.
+  // Non-consuming — these messages fall through to their normal handlers.
+  if (hdr_video_host_ && hdr_video_host_->IsCreated()) {
+    switch (message) {
+      case WM_WINDOWPOSCHANGED:
+      case WM_ACTIVATE:
+      case WM_SIZE:
+      case WM_MOVE:
+      case WM_SHOWWINDOW:
+        hdr_video_host_->SyncPlacement();
+        break;
+      case WM_DESTROY:
+        hdr_video_host_->Destroy();
+        break;
+      default:
+        break;
+    }
+  }
+  // HDR toggled / monitor changed: let Dart re-evaluate the output mode.
+  // Activation counts too while the host is up: the "SDR content brightness"
+  // slider (which Dart reads to level the subtitle layer against the HDR
+  // video) changes without any window message, and it lives in the Settings
+  // app — so the earliest point the new value can matter is the main window
+  // getting activated again.
+  const bool host_activated =
+      message == WM_ACTIVATE && LOWORD(wparam) != WA_INACTIVE &&
+      hdr_video_host_ && hdr_video_host_->IsCreated();
+  if ((message == WM_DISPLAYCHANGE || host_activated) &&
+      hdr_video_host_channel_) {
+    hdr_video_host_channel_->InvokeMethod(
+        "onDisplayChanged", std::make_unique<flutter::EncodableValue>());
+  }
+  // BUG-1239: inspect VK_PROCESSKEY before Flutter handles the message. The
+  // engine deliberately reports IME-owned keys as physical=0/logical=0, so
+  // checking after HandleTopLevelWindowProc can no longer identify Space.
+  // Notify Dart without consuming the Win32 message; Flutter/IME processing
+  // continues unchanged.
+  if (windows_ime_space_channel_) {
+    const ImeSpaceModifierState modifiers{
+        GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0,
+        GetKeyState(VK_MENU) < 0,    GetKeyState(VK_LWIN) < 0,
+        GetKeyState(VK_RWIN) < 0};
+    DispatchInitialUnmodifiedImeSpaceDown(
+        message, wparam, lparam, modifiers,
+        [](void* context) {
+          auto* channel = static_cast<
+              flutter::MethodChannel<flutter::EncodableValue>*>(context);
+          channel->InvokeMethod(
+              "onImeSpaceDown",
+              std::make_unique<flutter::EncodableValue>());
+        },
+        windows_ime_space_channel_.get());
+  }
+
+  // Snap Layouts hit testing for the app-drawn maximize button (before the
+  // plugins: window_manager answers WM_NCHITTEST on its own otherwise).
+  if (std::optional<LRESULT> snap =
+          caption_snap_button_.HandleTopLevel(hwnd, message, wparam, lparam)) {
+    return *snap;
+  }
+
+  // Give Flutter, including plugins, an opportunity to handle window messages.
+  if (flutter_controller_) {
+    std::optional<LRESULT> result =
+        flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,
+                                                      lparam);
+    // BUG-1933: fullscreen deliberately sizes the window LARGER than the
+    // monitor (frame off-screen, see Win32Window::SetFullscreen). The default
+    // ptMaxTrackSize (SM_C*MAXTRACK) silently clamps that SetWindowPos and
+    // leaves a strip of desktop/taskbar exposed at the bottom. window_manager's
+    // delegate consumes WM_GETMINMAXINFO (it applies our minimum size), so the
+    // override must happen here, after the delegates ran: lift the max track
+    // size while fullscreen, keeping whatever minimums the plugins wrote.
+    if (message == WM_GETMINMAXINFO && IsFullscreen()) {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+      if (info != nullptr) {
+        // Generous fixed headroom over any real monitor: monitor + frame.
+        info->ptMaxTrackSize.x = GetSystemMetrics(SM_CXVIRTUALSCREEN) + 256;
+        info->ptMaxTrackSize.y = GetSystemMetrics(SM_CYVIRTUALSCREEN) + 256;
+      }
+      return 0;
+    }
+    if (result) {
+      return *result;
+    }
+  }
+
+  // Magpie 缩放状态广播。RegisterWindowMessage 得到的消息号是运行时值，不能写成
+  // case 标签，只能在 switch 之前判；magpie_scaling_message_ == 0 表示没注册成功，
+  // 此时不做任何匹配。收到后**不消费**（不 return），因为这是系统广播，落到下面的
+  // 默认处理，保持既有消息语义不变。
+  if (magpie_scaling_message_ != 0 && message == magpie_scaling_message_) {
+    NotifyMagpieScalingChanged(wparam, lparam);
+  }
+
+  // 查词输入法语言：窗口失去激活就立刻还原用户原来的输入法——Win8 起输入法状态是
+  // per-user，留着不还原，用户 Alt-Tab 去别的应用打字也会变成日语。重新激活时按
+  // Dart 最后表达的期望再切回来（查词页面可能还开着）。不消费消息。
+  if (message == WM_ACTIVATE) {
+    HWND ime_target = flutter_controller_ && flutter_controller_->view()
+                          ? flutter_controller_->view()->GetNativeWindow()
+                          : GetHandle();
+    if (ime_target != nullptr) {
+      if (LOWORD(wparam) == WA_INACTIVE) {
+        ime_language_switcher_.Restore(ime_target);
+      } else if (!desired_lookup_ime_tag_.empty()) {
+        ime_language_switcher_.Activate(
+            ime_target, desired_lookup_ime_tag_,
+            GetKeyboardLayout(GetWindowThreadProcessId(ime_target, nullptr)),
+            InstalledKeyboardLayouts());
+      }
+    }
+  }
+
+  switch (message) {
+    case WM_FONTCHANGE:
+      flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+    case WM_FGSEL_CAPTURE_DONE: {
+      // TODO-1030 M0 — a worker-thread UIA capture finished; complete its
+      // pending Flutter reply here on the UI thread. On success return a
+      // {contextText, selStart, selLen} map; on failure return null so Dart
+      // falls back to the clipboard capture. NEVER log capture.text (privacy);
+      // only lengths / elapsed / ok are diagnostic-safe.
+      auto* pending =
+          reinterpret_cast<ForegroundSelectionPending*>(lparam);
+      if (pending != nullptr) {
+        if (pending->capture.ok) {
+          pending->result->Success(flutter::EncodableValue(flutter::EncodableMap{
+              {flutter::EncodableValue("contextText"),
+               flutter::EncodableValue(pending->capture.text)},
+              {flutter::EncodableValue("selStart"),
+               flutter::EncodableValue(pending->capture.sel_start)},
+              {flutter::EncodableValue("selLen"),
+               flutter::EncodableValue(pending->capture.sel_len)},
+              {flutter::EncodableValue("elapsedMs"),
+               flutter::EncodableValue(
+                   static_cast<int>(pending->elapsed_ms))}}));
+        } else {
+          pending->result->Success(flutter::EncodableValue());
+        }
+        delete pending;
+      }
+      return 0;
+    }
+    case WM_COPYDATA: {
+      // TODO-904 P0 回归：第二实例转交「用 Fushi 打开视频」的路径。解出 UTF-8 路径
+      // （dwData magic 不匹配则 DecodeExternalVideoPath 返回空串，忽略非本协议消息），
+      // 经 app.fushi/external_video channel 推给 Dart 复用 _openExternalVideo。
+      // WndProc 跑在 platform 线程，InvokeMethod 可直接调用。
+      const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(lparam);
+      const std::string video_path = ::fushi::DecodeExternalVideoPath(cds);
+      if (!video_path.empty() && external_video_channel_) {
+        external_video_channel_->InvokeMethod(
+            "openExternalVideo",
+            std::make_unique<flutter::EncodableValue>(video_path));
+        return TRUE;  // 已处理本 WM_COPYDATA。
+      }
+      break;
+    }
+    // TODO-1092: 系统强调色/主题色实时变更。三条广播覆盖不同触发面：
+    //   WM_DWMCOLORIZATIONCOLORCHANGED — DWM 玻璃/强调色变（改强调色即发）；
+    //   WM_SETTINGCHANGE + lParam=="ImmersiveColorSet" — 设置里改「浅色/深色/强调色」；
+    //   WM_THEMECHANGED — 经典主题切换。
+    // 收到后通知 Dart 重新取系统色（refreshSystemPalette），随后 **不消费** 消息、
+    // 落到下面 Win32Window::MessageHandler 走默认处理，保持既有其它消息分支语义不变。
+    case WM_INPUT:
+      // TODO-1066 — 全局鼠标侧键触发（Raw Input + RIDEV_INPUTSINK，见
+      // global_mouse_trigger.h 里"为什么不用 WH_MOUSE_LL"）。只在用户真绑了侧键
+      // 时才有注册，没绑时 HandleGlobalMouseTriggerRawInput 第一行就返回 false。
+      //
+      // **必须 break 而不是 return**：WM_INPUT 要交给 DefWindowProc 做清理。
+      if (fushi::HandleGlobalMouseTriggerRawInput(lparam) &&
+          global_lookup_channel_ != nullptr) {
+        global_lookup_channel_->InvokeMethod(
+            "globalMouseTrigger", std::make_unique<flutter::EncodableValue>());
+      }
+      break;
+    case WM_DWMCOLORIZATIONCOLORCHANGED:
+    case WM_THEMECHANGED:
+      NotifySystemColorChanged();
+      break;
+    case WM_SETTINGCHANGE: {
+      const auto* area = reinterpret_cast<const wchar_t*>(lparam);
+      if (area != nullptr && wcscmp(area, L"ImmersiveColorSet") == 0) {
+        NotifySystemColorChanged();
+        // 「透明效果」开关同样以 ImmersiveColorSet 广播；内部按值去重。
+        NotifySystemTransparencySettingChanged();
+      }
+      break;
+    }
+  }
+
+  return Win32Window::MessageHandler(hwnd, message, wparam, lparam);
+}

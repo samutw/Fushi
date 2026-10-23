@@ -1,0 +1,3926 @@
+// TODO-867 P3b/P3c — app-OUTSIDE global lookup nested-stack HOST (Windows only).
+//
+// Ported from hoshi reader-popup-host.js frames model. Injected ONLY into the
+// top-level WebView2 document of the bare global-lookup window
+// (global_lookup_window.cpp AddScriptToExecuteOnDocumentCreated). NEVER loaded
+// in-app, so in-app popup rendering is byte-for-byte unchanged.
+//
+// Why iframes: popup.js is a page-level SINGLETON. To stack N lookup cards we
+// host N iframes, each loading popup.html unchanged, so each frame keeps the
+// single-frame assumptions inside its own document. The host owns the OUTER
+// shell layout + frame diff.
+//
+// NO sandbox on the iframes (same-origin contentWindow injection needs a
+// non-opaque origin). Frames load https://hibiki.popup/popup.html and the host
+// injects per-frame settings + entries via iframe.contentWindow.
+//
+// renderStack(payload) is the single Dart entry point. Modern descriptors carry
+// a small staticRevision + per-lookup entriesJs/renderJs; only an unknown
+// revision also carries staticHeadJs/staticTailJs. Legacy settingsJs remains a
+// recovery compatibility path. The host diffs the payload against its live
+// frames Map.
+//
+// P3c (this file) adds, on top of P3b:
+//   - C1: re-anchor a child iframe onLinkClick LOCAL rect to full-screen CSS px
+//         (shell.left/top + FRAME_CONTENT_TOP) + stamp source frame id, before
+//         the message reaches C++ -> Dart (child cascades off the clicked word).
+//   - C3: capture-phase pointerdown outside ALL shells dismisses the root (whole
+//         stack); an iframe tapOutside dismisses that layer children.
+//   - D2: measure each iframe same-origin content height + report the UNION
+//         bounding box (overlaySize) so C++ sizes the window to the whole stack.
+//   - E2: handleGlobalClick(x,y) lets the C++ WH_MOUSE_LL hook push a global
+//         click into the host for shell hit-testing (host owns geometry truth).
+//   - D1: a two-flag reveal gate per shell (data-content-ready +
+//         data-reveal-ready). Each shell starts invisible; it only paints once
+//         BOTH its iframe content has arrived (host MutationObserver on the
+//         same-origin contentDocument.body) AND its geometry is placed +
+//         measured. Kills the "empty frame -> content fills in" flash. The
+//         coalesced re-measure (rAF/microtask) keeps the union bbox convergence
+//         stable when several layers report content height at once.
+// Window enlargement + the mouse hooks live in C++ (global_lookup_window.cpp).
+
+(function () {
+  'use strict';
+
+  // Only run on the TOP-LEVEL host document. AddScriptToExecuteOnDocumentCreated
+  // injects this into EVERY frame (incl. child popup.html iframes); sub-frames
+  // have window.top !== window.self, so bail there.
+  if (window.top !== window.self) {
+    return;
+  }
+
+  if (window.__globalLookupHost && window.__globalLookupHost.__installed) {
+    return;
+  }
+
+  // popup.html sits next to THIS host document: Windows serves both from the
+  // WebView2 virtual host https://hibiki.popup, macOS from the fushi-popup://
+  // custom scheme (macos/Runner/GlobalLookupOverlay.swift). Resolve it RELATIVE
+  // to the host location so the same-origin contract (per-frame injection via
+  // contentWindow) holds on both; the literal stays as the fallback for the
+  // node harness, which has no window.location.
+  var POPUP_SRC = (function () {
+    try {
+      if (window.location && typeof window.location.href === 'string' &&
+          /^[a-z][a-z0-9+.-]*:/i.test(window.location.href)) {
+        return new URL('popup.html', window.location.href).href;
+      }
+    } catch (e) {
+      // No URL API / opaque location: fall through to the literal.
+    }
+    return 'https://hibiki.popup/popup.html';
+  })();
+  var LAYER_ID = 'global-lookup-host-layer';
+  var STYLE_ID = 'global-lookup-host-style';
+  var FRAME_CHROME_STYLE_ID = 'global-lookup-frame-chrome-owner-style';
+  var FRAME_CHROME_CLASS = 'global-lookup-frame-chrome-owned';
+  // BUG-1609 follow-up — the popup document is served by WebView2's persistent
+  // virtual-host cache, while this host script is loaded from the current app
+  // bundle and injected by C++ on every process launch.  Keep the canvas guard
+  // here so a rebuilt app cannot keep painting the old square document canvas
+  // merely because a stale popup.css response survived under hibiki.popup.
+  // A present-but-fully-transparent background prevents CSS body-background
+  // propagation without adding a single opaque pixel.
+  var FRAME_CANVAS_GUARD_BACKGROUND =
+      'linear-gradient(rgba(0, 0, 0, 0), rgba(0, 0, 0, 0))';
+
+  // D1 — reveal gate. A shell paints only when BOTH flags are 'true'. The
+  // attribute selector below is the single source of truth for visibility; JS
+  // only flips the two data-* attributes, never the inline visibility, so the
+  // gate stays declarative + testable.
+  var ATTR_CONTENT_READY = 'data-content-ready';
+  var ATTR_REVEAL_READY = 'data-reveal-ready';
+  // Host-side safety: if an iframe never reports content (render failure), force
+  // content-ready after this budget so the card is not stuck invisible. Mirrors
+  // the Dart 450ms reveal safety (controller.dart) one layer down.
+  var CONTENT_READY_SAFETY_MS = 450;
+  // Reveal-ready recovery budget. Expiry requests a fresh geometry measurement;
+  // it deliberately never forces a nested card through an uncommitted HWND/HRGN
+  // boundary, because that recreates the clipped intermediate frame.
+  var REVEAL_READY_SAFETY_MS = 450;
+  // Sub-pixel slack for the origin-coverage compare (device-pixel-ratio
+  // rounding at the C++ window boundary) so an on-edge shell counts as covered.
+  var COVER_EPS = 0.5;
+
+  // C1 — vertical offset (CSS px) from a frame shell top-left to the popup
+  // CONTENT top. In Fushi the iframe FILLS its shell and the star/audio header
+  // lives INSIDE popup.html body, so popup.js getBoundingClientRect is already
+  // relative to the shell top-left -> offset 0 (hoshi reader-popup-host.js uses a
+  // conditional actionBar(37)+sasayaki(37)=74 band ABOVE the iframe; Fushi has
+  // neither). Named + explicit so the coordinate contract is testable.
+  var FRAME_CONTENT_TOP = 0;
+
+  var frames = new Map();
+  // BUG-1833 ancestor replacement — a logical stack can replace a whole suffix
+  // in one render (R,A,B -> R,C). Keep that retiring suffix painted until every
+  // frame in the incoming suffix has both rendered and joined the matching
+  // native geometry transaction; otherwise removeMissing exposes a root-only
+  // compositor frame while the replacement is still reveal-gated.
+  var pendingSuffixSwap = null;
+  // BUG-1833 — logical child ids stay monotonic (late messages fail closed), but
+  // the expensive popup.html browsing context is physical and reusable. Keep one
+  // hidden child realm warm: enough for the first nested lookup, then replenish
+  // one look-ahead slot while the user reads the current card. The bound is
+  // deliberate — a dictionary frame owns popup.js, observers and decoded fonts.
+  var STANDBY_POOL_SIZE = 1;
+  var STANDBY_ID_PREFIX = '__global-lookup-standby-';
+  var standbyRecords = [];
+  var standbySeq = 0;
+  var standbyStaticRevision = null;
+  var standbyRefillScheduled = false;
+  var standbyRefillGeneration = 0;
+  var STANDBY_REFILL_WATCHDOG_MS = 50;
+  // BUG-1833 — large immutable popup settings (notably an inlined custom font)
+  // belong to the host lifetime, not to a single lookup. The host converts each
+  // data:font/...;base64 source into ONE same-origin Blob URL per revision, then
+  // drops the base64 descriptor. Every iframe still receives exactly the same
+  // @font-face family/style/weight/format CSS, but evals only a short blob: URL
+  // instead of reparsing ~13 MB of base64. Keeping the rewritten source here also
+  // lets an iframe reload rebuild its realm without asking Dart to resend it.
+  var staticSettingsByRevision = new Map();
+  // Request coalescing is route-scoped. A request posted for route A can be
+  // rejected after beginLookup binds route B; keying only by revision would
+  // then suppress B's retry forever and leave the new shell content-gated.
+  var staticSettingsRequests = new Set();
+  var frameSources = new WeakMap();
+  // TODO-1188 — bridge round-trip routing. popup.js runs inside a CHILD iframe,
+  // so its window.flutter_inappwebview.callHandler Promise lives in THAT iframe's
+  // popup_bridge_adapter realm (each iframe adapter mints its own _seq from 1, so
+  // the frame-LOCAL bridge ids collide across frames). Native
+  // (global_lookup_window.cpp) only ever ExecuteScripts the TOP-LEVEL document,
+  // whose window.__fushiBridgeResolve is a DIFFERENT adapter realm — so a native
+  // reply used to never reach the source iframe and every AWAITED callHandler
+  // (audio ♪ / favorite ☆) hung forever. Fix: the host rewrites each outbound
+  // frame-local __bridgeId to a HOST-GLOBAL id (transformFrameMessage) and records
+  // the route here; the top-level __fushiBridgeResolve (installBridgeRouter) then
+  // forwards the native reply back to EXACTLY the source frame's adapter with its
+  // own local id — no cross-frame id collision, no broadcast to the wrong card.
+  var bridgeSeq = 0;
+  var bridgeRoutes = new Map();
+  var lastBBoxKey = '';
+  // BUG-749 — last posted shell-rects payload (window-relative CSS px CSV).
+  // De-duped independently of lastBBoxKey: a nested child that lands INSIDE the
+  // reserved-floor bbox leaves the bbox key unchanged (overlaySize suppressed)
+  // but MUST still refresh the native hit/paint region, or clicks on the new
+  // card would fall through the stale region hole.
+  var lastShellRectsKey = '';
+  // BUG-1833 follow-up — bbox and shellRects form one native geometry
+  // transaction. A nested shell must not paint merely because popup.js finished:
+  // the HWND may still have the previous right/bottom extent (or the old HRGN
+  // may still contain a transparent gap). Keep epochs monotonic for the whole
+  // host lifetime so a delayed commit from lookup A can never acknowledge B.
+  var nextGeometryEpoch = 0;
+  var announcedGeometryEpoch = 0;
+  var committedGeometryEpoch = 0;
+  var announcedGeometryKey = '';
+  var announcedGeometryBounds = null;
+  var committedGeometryBounds = null;
+  // TODO-1079 (C) / TODO-1095 — the root frame id of the currently-rendered
+  // stack. TODO-1095 makes the root frame id STABLE across hotkey lookups (the
+  // root iframe is REUSED, not rebuilt per lookup — see beginLookup), so the
+  // authoritative "new lookup" bbox-dedup reset + content-gate re-arm now arrive
+  // via beginLookup(). This changed-root-id path stays as belt-and-braces for any
+  // caller that still rotates the root id (nested-only rebuilds, tests).
+  var lastRootId = null;
+
+  // TODO-1189 — the layer translation applied by measureAndReport so the union
+  // bbox top-left maps to the window origin. The layer element is shifted by
+  // (-minLeft, -minTop); a shell's REAL position relative to the window is
+  // therefore (shell.style.left - layerOffsetLeft, shell.style.top -
+  // layerOffsetTop). Hit-testing (frameIdAtPoint) compares C++-forwarded clicks
+  // in WINDOW coordinates, so it MUST subtract these offsets — otherwise nested
+  // sub-popups pushed up/left off the cursor (screen-edge second lookup, minLeft/
+  // minTop < 0) hit-test against un-shifted shell coords and a click ON the card
+  // is misread as an empty gap, dismissing the whole stack. Kept as host-scope
+  // fields (minLeft/minTop are locals inside measureAndReport). Default 0 = no
+  // shift (single popup / down-right cascade), matching the un-shifted layer.
+  var layerOffsetLeft = 0;
+  var layerOffsetTop = 0;
+
+  // TODO-1345 (BUG-583 深层根因续) — reserved cascade origin FLOOR (window-local
+  // CSS px, always <= 0). Dart computes it per lookup from the REAL screen edges
+  // (headroom toward the screen interior, bounded so the window stays on-screen)
+  // and pushes it on the renderStack payload (applyOriginFloor). measureAndReport
+  // pulls the union bbox MIN-corner (origin) OUT to at least this floor, so the
+  // window is revealed already covering the region an up/left cascade child will
+  // occupy. The child then lands INSIDE the committed origin and never moves it —
+  // no SetWindowPos + commitLayerShift round-trip across the DWM/WebView2 boundary
+  // when the child appears, so the pinned PARENT card has ZERO displacement (the
+  // residual BUG-583 rounds 1-4 could only mask by coinciding the origin move with
+  // the child's appearance frame). 0 = no reservation (down-right cascade, or the
+  // cursor sits against an edge) -> the origin is byte-identical to the pre-fix
+  // behaviour, so the common cascade + first reveal are unchanged.
+  var originFloorLeft = 0;
+  var originFloorTop = 0;
+  // The gal direct surface deliberately does not reserve a near-viewport-sized
+  // origin floor on its first root card. Once an up/left child really expands
+  // the HWND, however, Dart keeps that outward origin for the rest of the live
+  // lookup so closing the child cannot move the parent. Mirror that ratchet in
+  // the host geometry truth: shellRects and bbox must stay relative to the SAME
+  // held origin, otherwise the native clip/mask is translated away from the
+  // WebView layer after N -> 1.
+  var galOriginRatchetLeft = Infinity;
+  var galOriginRatchetTop = Infinity;
+
+  // BUG-1857 — 拖 root 卡右下角 grip 期间的「live-fit」状态。
+  //
+  // 拖拽走 native 模态 size 循环：窗口（viewport）每帧随光标长大，但 root 卡的
+  // 宽高是 Dart 钉死的 descriptor.frame 固定 px（applyShellStyle），host 又没有任何
+  // resize 监听 → 拖拽全程卡片一个像素不动、只有透明空白在长，松手后 Dart 收到
+  // WM_EXITSIZEMOVE 的 windowMoved 重排才一步跳到位。这里让 root 卡在拖拽期间跟着
+  // viewport 走：root 尺寸 = grip 按下时的 root 尺寸 + viewport 增量。与 Dart 松手
+  // 后的折算同一口径（resolveOverlayResizeFromDelta：当前尺寸 + 物理增量÷设备像素比，
+  // 且 CSS 增量 == 物理增量÷设备像素比），所以松手时 Dart 的权威重排只是把同一尺寸再写一遍
+  // （高度封顶到内容那一步除外）。不写 Dart、不重渲染词条、不发 overlaySize，
+  // 拖拽期间不会有第二个 SetWindowPos 和模态循环打架。
+  // 嵌套子卡锚在父卡词上，不动。
+  var liveResize = null;
+  var LIVE_RESIZE_MIN_PX = 80;
+
+  // Route identity for the lookup currently being rendered. Desktop callers
+  // predating the routed galgame card contract omit this value and therefore
+  // retain the legacy desktop/0/0 identity.
+  var activeRoute = {
+    source: 'desktop',
+    routeEpoch: 0,
+    lookupEpoch: 0,
+  };
+
+  function normalizeRoute(route, routeEpoch, lookupEpoch) {
+    var source = 'desktop';
+    var rawRouteEpoch = routeEpoch;
+    var rawLookupEpoch = lookupEpoch;
+    if (route && typeof route === 'object') {
+      source = route.source === 'galCard' ? 'galCard' : 'desktop';
+      rawRouteEpoch = route.routeEpoch;
+      rawLookupEpoch = route.lookupEpoch;
+    } else if (route === 'galCard') {
+      source = 'galCard';
+    }
+    return {
+      source: source,
+      routeEpoch: (typeof rawRouteEpoch === 'number' && isFinite(rawRouteEpoch))
+          ? Math.trunc(rawRouteEpoch)
+          : 0,
+      lookupEpoch: (typeof rawLookupEpoch === 'number' && isFinite(rawLookupEpoch))
+          ? Math.trunc(rawLookupEpoch)
+          : 0,
+    };
+  }
+
+  function cloneRoute(route) {
+    return normalizeRoute(route);
+  }
+
+  function routeKey(route) {
+    var value = normalizeRoute(route);
+    return value.source + ':' + value.routeEpoch + ':' + value.lookupEpoch;
+  }
+
+  function sameRoute(a, b) {
+    return routeKey(a) === routeKey(b);
+  }
+
+  function stampRoute(message, route) {
+    var value = normalizeRoute(route);
+    message.__source = value.source;
+    message.__routeEpoch = value.routeEpoch;
+    message.__lookupEpoch = value.lookupEpoch;
+    return message;
+  }
+
+  // Post a message to C++ (and on to Dart) via the TOP-LEVEL chrome.webview
+  // bridge. Mirrors the adapter envelope { handler, args } so _onJsMessage routes
+  // it identically to popup.js-originated messages. Read-only host messages need
+  // no __bridgeId.
+  function postToHost(handler, args, routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    try {
+      if (window.chrome && window.chrome.webview &&
+          typeof window.chrome.webview.postMessage === 'function') {
+        window.chrome.webview.postMessage(stampRoute({
+          handler: handler,
+          args: args || [],
+        }, route));
+      }
+    } catch (e) {
+      // No bridge (node harness) -> swallow; tests stub postToHost.
+    }
+  }
+
+  // setTimeout / cancel that degrade when the host (node harness) has no timer
+  // API: returns null and the caller treats the deferred work as "do it now"
+  // is NOT applied here — instead the caller relies on the synchronous content
+  // check / direct measure. Returns an opaque handle or null.
+  function setTimerSafe(fn, ms) {
+    if (typeof window.setTimeout === 'function') {
+      try {
+        return window.setTimeout(fn, ms);
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  function clearTimerSafe(handle) {
+    if (handle != null && typeof window.clearTimeout === 'function') {
+      try {
+        window.clearTimeout(handle);
+      } catch (e) {
+        // no-op
+      }
+    }
+  }
+
+  // D2 convergence — coalesce re-measure requests. Several layers can report
+  // content-ready in the same tick (multi-layer stack filling at once); without
+  // coalescing each would call measureAndReport and thrash the union-bbox
+  // postMessage. Batch them into ONE measure per frame via requestAnimationFrame
+  // (falling back to a microtask, then to a synchronous call when neither timer
+  // API exists, e.g. the node harness). measureAndReport itself de-dupes on the
+  // bbox key, so the worst case is a single redundant measure, never a loop.
+  var measureSchedules = new Map();
+  var galDirtySchedules = new Map();
+  var galCaptureReadySchedules = new Map();
+  // Chromium may suspend requestAnimationFrame for the permanently off-screen
+  // galCard WebView even while timers and input dispatch keep running. Prefer
+  // two compositor frames, but race them with a bounded fallback. Route and
+  // round identity below make the two completion sources exactly-once.
+  var GAL_DIRTY_RAF_FALLBACK_MS = 120;
+  // captureReady has the same off-screen WebView2 scheduling constraint as a
+  // dirty-frame acknowledgement.  The timer is a bounded liveness fallback,
+  // not a second completion source: route/epoch/token checks below make a late
+  // compositor frame a no-op after the timer wins.
+  var GAL_CAPTURE_READY_RAF_FALLBACK_MS = 120;
+  function scheduleMeasure(routeSnapshot, allowCachedMeasurements) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    var key = routeKey(route);
+    if (measureSchedules.has(key)) {
+      // Any ordinary/content-driven request upgrades a pending truncate-only
+      // cached pass to a real layout read. Never let the optimisation mask an
+      // actual DOM growth notification.
+      if (allowCachedMeasurements !== true) {
+        measureSchedules.get(key).allowCached = false;
+      }
+      return;
+    }
+    var raf = (typeof window.requestAnimationFrame === 'function')
+        ? window.requestAnimationFrame
+        : null;
+    var runner = function () {
+      var pending = measureSchedules.get(key);
+      measureSchedules.delete(key);
+      measureAndReport(route, pending && pending.allowCached === true);
+    };
+    if (raf) {
+      measureSchedules.set(key, {
+        allowCached: allowCachedMeasurements === true,
+      });
+      try {
+        raf(runner);
+        return;
+      } catch (e) {
+        measureSchedules.delete(key);
+      }
+    }
+    if (typeof window.queueMicrotask === 'function') {
+      measureSchedules.set(key, {
+        allowCached: allowCachedMeasurements === true,
+      });
+      try {
+        window.queueMicrotask(runner);
+        return;
+      } catch (e) {
+        measureSchedules.delete(key);
+      }
+    }
+    // No deferral primitive (node harness): measure synchronously. De-dup on the
+    // bbox key in measureAndReport keeps this from over-posting.
+    measureAndReport(route, allowCachedMeasurements === true);
+  }
+
+  // Interactive changes can alter pixels without changing the shell bbox, so
+  // overlaySize is correctly de-duplicated and cannot drive another capture.
+  // Coalesce those changes per immutable route and publish only after two host
+  // animation frames, when the off-screen WebView has painted the mutation.
+  function requestGalFrameDirty(routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    if (route.source !== 'galCard') {
+      return;
+    }
+    var key = routeKey(route);
+    var pending = galDirtySchedules.get(key);
+    if (pending) {
+      // Do not restart an already-armed double-rAF gate: a continuously mutating
+      // popup (animation/progress text) would otherwise postpone capture forever.
+      // Remember one trailing round instead.  The current round still publishes,
+      // and any number of dirty signals during it coalesce into that one retry.
+      pending.dirtyAgain = true;
+      return;
+    }
+    pending = { dirtyAgain: false, round: 0 };
+    galDirtySchedules.set(key, pending);
+    armGalDirtyRound(route, key, pending);
+  }
+
+  function armGalDirtyRound(route, key, pending) {
+    var round = ++pending.round;
+    var raf = (typeof window.requestAnimationFrame === 'function')
+        ? window.requestAnimationFrame
+        : null;
+    var fallbackTimer = null;
+    var finish = function () {
+      if (galDirtySchedules.get(key) !== pending || pending.round !== round) {
+        return;
+      }
+      clearTimerSafe(fallbackTimer);
+      fallbackTimer = null;
+      if (routeKey(activeRoute) !== key) {
+        galDirtySchedules.delete(key);
+        return;
+      }
+      postToHost('galFrameDirty', [], route);
+      if (pending.dirtyAgain) {
+        pending.dirtyAgain = false;
+        armGalDirtyRound(route, key, pending);
+      } else {
+        galDirtySchedules.delete(key);
+      }
+    };
+    if (!raf) {
+      finish();
+      return;
+    }
+    fallbackTimer = setTimerSafe(finish, GAL_DIRTY_RAF_FALLBACK_MS);
+    try {
+      raf(function () {
+        if (routeKey(activeRoute) !== key) {
+          if (galDirtySchedules.get(key) === pending) {
+            galDirtySchedules.delete(key);
+          }
+          return;
+        }
+        // The timeout may have completed this round and armed the one trailing
+        // round on the same pending object. A late rAF from the old round must
+        // not complete or delete that newer work.
+        if (galDirtySchedules.get(key) !== pending ||
+            pending.round !== round) {
+          return;
+        }
+        raf(finish);
+      });
+    } catch (e) {
+      finish();
+    }
+  }
+
+  // Insertion-order index of a frame id (0 = root). -1 when unknown.
+  function layerIndexOf(frameId) {
+    var i = 0;
+    var found = -1;
+    frames.forEach(function (record, id) {
+      if (id === frameId) {
+        found = i;
+      }
+      i++;
+    });
+    return found;
+  }
+
+  // D1 — inject the reveal-gate stylesheet once. The shell defaults to hidden;
+  // it only becomes visible when BOTH data-content-ready and data-reveal-ready
+  // are 'true'. Injected here (not host.html / popup.css) because host.js owns
+  // the shell DOM and the gate must ship with the host even though host.html is
+  // C++-injected-only and carries no <style>. Scoped to .global-lookup-frame-
+  // shell so it never leaks into the in-app popup (which never loads host.js).
+  function ensureStyle() {
+    if (!document || typeof document.createElement !== 'function') {
+      return;
+    }
+    if (document.getElementById(STYLE_ID)) {
+      return;
+    }
+    var style = document.createElement('style');
+    style.id = STYLE_ID;
+    // F2 — outer SHELL chrome (ported from hoshi reader-popup-host.js shell).
+    // The base state stays transparent/borderless until the iframe has loaded
+    // its actual theme. syncFrameShellChrome then transfers the iframe body's
+    // ONE computed fill + border to this fixed viewport shell and disables the
+    // duplicate body chrome. The shell must own the final silhouette: body is a
+    // scrolling document, and its right edge stops before WebView2's reserved
+    // scrollbar gutter, so body-owned radius leaves the visible right corners
+    // square even while the native HRGN correctly rounds a transparent strip
+    // farther out. No hard-coded theme colour lives in the host.
+    //
+    // BUG-709 — NO `box-shadow`. The overlay HWND is a NON-layered, OPAQUE
+    // WebView2 window (global_lookup_window.cpp: "No WS_EX_LAYERED"). On such a
+    // window the WebView2 composition surface has no per-pixel alpha against the
+    // desktop, so a CSS `box-shadow` does NOT read as a soft translucent shadow
+    // over whatever is behind the card — the shadow's blur (0 3px 12px) paints
+    // onto the window's own transparent (=hard dark) surface as an ~11px DARK
+    // HALO ringing the card's corners/edges, which the native rounded window
+    // region (SetWindowRgn) cannot clip away. That halo is exactly the "black
+    // border outside the rounded corners" the user reported. A CSS drop-shadow
+    // is physically impossible on a non-layered WebView2 window (the design
+    // already conceded this), so the shell casts none IN CSS: the rounded
+    // silhouette comes from SetWindowRgn + the body's 1px card border, with
+    // nothing painted outside the card. The real per-card soft shadow is drawn
+    // NATIVELY by the companion layered shadow window (global_lookup_shadow.cpp,
+    // 2026-08-23) sitting right below this HWND — do NOT reintroduce a CSS
+    // box-shadow here on top of it. All rules scoped to
+    // .global-lookup-frame-shell -> the in-app popup (no host.js) is never
+    // touched.
+    // D1 reveal gate: a shell paints only when BOTH data-* flags are 'true'.
+    style.textContent =
+        // D1 reveal gate FIRST (kept as its own rule so the gate contract stays
+        // a single declarative source: a shell defaults hidden until BOTH flags
+        // flip). The F2 chrome below is a SEPARATE .global-lookup-frame-shell
+        // rule (CSS cascades the two), so the gate substring is unchanged.
+        '.global-lookup-frame-shell{visibility:hidden;opacity:0;}' +
+         '.global-lookup-frame-shell{' +
+         'box-sizing:border-box;overflow:hidden;background:transparent;' +
+         'border:0;' +
+         'border-radius:10px;' +
+        // TODO-890 — slide-out close: the shell tweens transform+opacity so a
+        // dismiss slides the card off-screen instead of vanishing instantly
+        // (app-out parity with the in-app _BodySwipeDismissDetector). 200ms
+        // ease-out matches the Flutter side. Scoped to the shell selector so
+        // it never leaks into the in-app popup (which never loads host.js).
+         'transition:transform 200ms ease-out, opacity 200ms ease-out;}' +
+        // Paint the ONE visible border without giving it layout width.  The
+        // iframe body keeps its existing (transparent) border allocation, so
+        // content width, scrollHeight and zoom measurement stay byte-for-byte
+        // compatible while the viewport-stable shell owns the actual pixels.
+        '.global-lookup-frame-shell::after{' +
+        'content:"";position:absolute;inset:0;box-sizing:border-box;' +
+        'border:var(--global-lookup-shell-border-width,0px) ' +
+        'var(--global-lookup-shell-border-style,solid) ' +
+        'var(--global-lookup-shell-border-color,transparent);' +
+        'border-radius:inherit;pointer-events:none;z-index:4;}' +
+        // WebView2 promotes each iframe to its own composition surface.  In the
+        // game-card CapturePreview path that surface can escape the parent's
+        // overflow:hidden clip, leaving the iframe canvas square beyond the
+        // body's already-rounded right corners.  Clip the promoted surface
+        // itself; every shell remains independently rounded inside a cascade.
+        '.global-lookup-frame-shell>iframe{' +
+        'display:block;border-radius:inherit;' +
+        'clip-path:inset(0 round 10px);}' +
+         // TODO-890 — the dismissing class drives the slide-out: translate the
+        // card fully off its own width + margin and fade to 0; visibility stays
+        // visible during the transition (the reveal gate already passed) so the
+        // transitionend fires before the host posts dismissPopupAt to Dart.
+        '.global-lookup-frame-shell.global-lookup-dismissing{' +
+        'transform:translateX(120%);opacity:0;}' +
+        '.global-lookup-frame-shell[' + ATTR_CONTENT_READY + '="true"]' +
+        '[' + ATTR_REVEAL_READY + '="true"]{visibility:visible;opacity:1;}' +
+        // TODO-1067 (子1) — per-shell close-X. Absolutely placed in the shell's
+        // top-right corner, above the iframe (z-index) with its own pointer
+        // events so it is always clickable even over the card content. Monochrome
+        // Segoe glyph to match the overlay icon-font override; dark variant keyed
+        // off the shell data-theme (same as the shadow variant above).
+        '.global-lookup-frame-shell .global-lookup-close{' +
+        'position:absolute;top:2px;right:6px;z-index:5;' +
+        'width:22px;height:22px;line-height:22px;text-align:center;' +
+        'font-family:"Segoe UI Symbol","Segoe UI",sans-serif;' +
+        'font-size:17px;cursor:pointer;pointer-events:auto;' +
+        'color:rgba(60,60,67,0.6);border-radius:11px;' +
+        'transition:background-color 120ms ease-out, color 120ms ease-out;}' +
+        '.global-lookup-frame-shell .global-lookup-close:hover{' +
+        'background:rgba(120,120,128,0.16);color:rgba(60,60,67,0.9);}' +
+        '.global-lookup-frame-shell[data-theme="dark"] .global-lookup-close{' +
+        'color:rgba(235,235,245,0.6);}' +
+        '.global-lookup-frame-shell[data-theme="dark"] ' +
+        '.global-lookup-close:hover{' +
+        'background:rgba(235,235,245,0.16);color:rgba(235,235,245,0.92);}' +
+        // Phase C（弹窗尺寸精细化 2026-07-13）— 瞬态覆盖窗（cascade 模式）ROOT 卡的
+        // 右下角 resize grip：拖它进 native 模态 size 循环（beginWindowResize）。
+        // 必须挂在 SHELL 内（z-index 高于 iframe、pointer-events:auto），
+        // 因为瞬态窗被 native 按 shell 卡矩形做区域裁剪（BUG-749 gap click-through）——
+        // 挂在窗口层的角落 grip 会被裁掉不可见/不可点，只有 root 卡区域在裁剪区内。
+        // 透明无背景（cursor 提示可拖），避免遮挡卡片文字。
+        '.global-lookup-frame-shell .global-lookup-resize-grip{' +
+        'position:absolute;right:0;bottom:0;width:16px;height:16px;' +
+        'z-index:6;cursor:nwse-resize;pointer-events:auto;}';
+    var head = document.head ||
+        (document.getElementsByTagName &&
+            document.getElementsByTagName('head')[0]);
+    (head || document.documentElement || document.body).appendChild(style);
+  }
+
+  function ensureLayer() {
+    ensureStyle();
+    var existing = document.getElementById(LAYER_ID);
+    if (existing) {
+      return existing;
+    }
+    var layer = document.createElement('div');
+    layer.id = LAYER_ID;
+    layer.style.position = 'fixed';
+    layer.style.left = '0';
+    layer.style.top = '0';
+    layer.style.width = '100%';
+    layer.style.height = '100%';
+    layer.style.pointerEvents = 'none';
+    layer.style.zIndex = '2147483000';
+    (document.body || document.documentElement).appendChild(layer);
+    return layer;
+  }
+
+  function applyShellStyle(
+      shell, descriptor, preserveMeasuredHeight, logicalDepth) {
+    var f = (descriptor && descriptor.frame) || {};
+    // F2 — stamp the resolved brightness so the dark shell border/shadow variant
+    // applies (the host document has no data-theme of its own; the render payload
+    // carries it per layer).
+    var theme = descriptor && descriptor.theme;
+    if (theme === 'dark' || theme === 'light') {
+      shell.setAttribute('data-theme', theme);
+    }
+    shell.style.position = 'absolute';
+    // TODO-1189 — establish a per-shell STACKING CONTEXT ordered by insertion
+    // depth (0 = root) so each shell — and the z-index:5 close-X inside it — is
+    // CONFINED to its own context. Without a shell z-index the shells sit at
+    // z-index:auto and every close-X (a POSITIVE z-index) escapes to the shared
+    // parent (#global-lookup-host-layer) stacking level, painting ABOVE all
+    // sibling shells' iframes regardless of DOM order: a parent card's X floated
+    // over the child card stacked on top of it (the "X 穿透图层" bug). Giving each
+    // shell a z-index equal to its depth makes a deeper child shell fully cover
+    // its parent (including the parent's X); only the topmost card's X stays
+    // exposed. Use the incoming payload index as the logical depth. During an
+    // atomic ancestor replacement the physical frames Map intentionally still
+    // contains the retiring suffix until the replacement has rendered, so its
+    // insertion index is not the new stack depth.
+    var stackDepth = (typeof logicalDepth === 'number' &&
+        isFinite(logicalDepth) && logicalDepth >= 0)
+        ? Math.trunc(logicalDepth)
+        : -1;
+    if (stackDepth >= 0) {
+      shell.style.zIndex = String(stackDepth);
+    }
+    shell.style.left = (typeof f.left === 'number' ? f.left : 0) + 'px';
+    shell.style.top = (typeof f.top === 'number' ? f.top : 0) + 'px';
+    if (typeof f.width === 'number') {
+      if (shell.style.width !== f.width + 'px' && shell.__lookupRecord) {
+        shell.__lookupRecord.contentMeasureDirty = true;
+      }
+      shell.style.width = f.width + 'px';
+    }
+    if (typeof f.height === 'number') {
+      var record = shell.__lookupRecord;
+      var height = f.height;
+      // Opening/replacing a child re-sends every surviving ancestor descriptor.
+      // Its planned height is only a ceiling; restoring that max here made an
+      // unchanged root grow for one frame, then shrink back after measurement,
+      // forcing an otherwise-idle iframe viewport repaint. Preserve the clean
+      // measured height when this frame's content and width are unchanged.
+      if (preserveMeasuredHeight === true && record &&
+          !record.contentMeasureDirty && record.measuredContentHeight > 0) {
+        height = Math.min(height, record.measuredContentHeight);
+      }
+      shell.style.height = height + 'px';
+    }
+    shell.style.pointerEvents = 'auto';
+  }
+
+  // C1 — wrap THIS iframe chrome.webview.postMessage so messages from popup.js
+  // (via the adapter, which posts { handler, args, __bridgeId }) pass through the
+  // host first: re-anchor onLinkClick LOCAL rect (args[1]) to full-screen CSS px,
+  // and stamp __frameId on every message for layer attribution. The adapter reads
+  // window.chrome.webview.postMessage FRESH each call, so wrapping after load is
+  // observed by the next callHandler.
+  function wrapFrameBridge(record) {
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win || !win.chrome || !win.chrome.webview) {
+      return;
+    }
+    var currentPost = win.chrome.webview.postMessage;
+    // WindowProxy identity survives an iframe navigation, while the new
+    // document reinstalls popup_bridge_adapter and replaces postMessage. Key
+    // the wrapper by the actual function, not the stable WindowProxy.
+    if (record.wrappedPost && currentPost === record.wrappedPost) {
+      return;
+    }
+    var native = currentPost;
+    if (typeof native !== 'function') {
+      return;
+    }
+    var topPost;
+    try {
+      // Route through the TOP-LEVEL bridge so the single C++ WebMessageReceived
+      // receiver sees the re-anchored message.
+      topPost = window.chrome.webview.postMessage.bind(window.chrome.webview);
+    } catch (e) {
+      topPost = native.bind(win.chrome.webview);
+    }
+    var wrappedPost = function (message) {
+      // A parked physical realm can still finish an old font/bridge Promise.
+      // It has no logical frame owner, so forwarding would relabel stale work
+      // with whichever monotonic id acquires the realm next.
+      if (!record.active) {
+        // The frame adapter stores its Promise resolver before postMessage.
+        // Settle it locally so standby render/font callbacks do not accumulate
+        // forever, while still publishing no host route or native message.
+        if (message && typeof message === 'object' &&
+            typeof message.__bridgeId !== 'undefined' &&
+            typeof win.__fushiBridgeResolve === 'function') {
+          try {
+            win.__fushiBridgeResolve(message.__bridgeId, null);
+          } catch (e) {
+            // The parked realm is already being torn down.
+          }
+        }
+        return;
+      }
+      // A Promise continuation unblocked by an older bridge reply runs as a
+      // microtask after __fushiBridgeResolve. installBridgeRouter temporarily
+      // exposes that reply's original route in this iframe so a follow-up post
+      // cannot be mislabeled with the record's newer render route.
+      var messageRoute = cloneRoute(
+          win.__fushiBridgeReplyRoute || record.route);
+      // A bridge message is emitted from the same UI task that changed the
+      // popup (favorite/mine state, nested selection, zoom action, etc.).  Its
+      // native/Dart reply may cause a second mutation; both are coalesced by the
+      // route-keyed double-rAF gate below.
+      requestGalFrameDirty(messageRoute);
+      // TODO-1067 (子3) — DRIVE THE REVEAL GATE OFF popup.js's authoritative
+      // render signal instead of the body-height heuristic. popup.js calls
+      // flutter_inappwebview.callHandler('popupRendered', scrollHeight) EXACTLY
+      // when a render finishes (incl. the no-results card); it reaches the host
+      // through THIS wrapped bridge. Marking content-ready here means the shell
+      // only paints after popup.js truly rendered its themed card — no "empty
+      // frame paints white, then the glossary fills in" flash, and no missed
+      // no-results card (the old hasContent body>0 heuristic could reveal before
+      // the theme CSS painted). The MutationObserver / safety timer stay as
+      // belt-and-braces (a render that never signals still reveals via safety).
+      // BUG-1139 ③ 陷阱提示：只吃 handler 名，**故意丢掉 args[0]**。那个数字是
+      // popup.js 的 __fushiScrollHeight()，在 CSS `zoom` 下是未乘 z 的 layout px，
+      // 与 shell 几何（host CSS px）不同单位。谁将来拿它去定尺寸，必须先过
+      // frameContentZoom 换算 —— 尺寸的唯一真值是 measureAndReport 的 overlaySize。
+      try {
+        if (message && typeof message === 'object' &&
+            message.handler === 'popupRendered') {
+          record.contentMeasureDirty = true;
+          markContentReady(record, messageRoute);
+        }
+      } catch (e) {
+        // Never let the reveal hook break the message forwarding below.
+      }
+      var out = message;
+      try {
+        out = transformFrameMessage(record, message, messageRoute);
+      } catch (e) {
+        if (message && typeof message === 'object') {
+          out = stampRoute(Object.assign({}, message, {
+            __frameId: record.id,
+          }), messageRoute);
+        } else {
+          out = message;
+        }
+      }
+      topPost(out);
+    };
+    win.chrome.webview.postMessage = wrappedPost;
+    record.wrappedPost = wrappedPost;
+  }
+
+  // Re-anchor + frame-stamp a message posted from record iframe. Pure given the
+  // record current shell geometry; returns a NEW object. Non-onLinkClick messages
+  // are passed through with only __frameId stamped.
+  function transformFrameMessage(record, message, routeSnapshot) {
+    if (!message || typeof message !== 'object') {
+      return message;
+    }
+    var handler = message.handler;
+    var route = cloneRoute(routeSnapshot || (record && record.route));
+    var out = stampRoute({
+      handler: handler,
+      args: message.args,
+      __frameId: record.id,
+    }, route);
+    // TODO-1188 — rewrite the frame-LOCAL bridge id to a host-GLOBAL id and
+    // remember the route (globalId -> {frameId, localId}) so the native reply
+    // (which reaches only the top-level document) is forwarded back to the SOURCE
+    // iframe's adapter with its own local id. The global id stays a plain integer
+    // so the C++ digit scan of "__bridgeId": still extracts it verbatim.
+    if (typeof message.__bridgeId !== 'undefined') {
+      var globalBridgeId = ++bridgeSeq;
+      bridgeRoutes.set(globalBridgeId, {
+        frameId: record.id,
+        localId: message.__bridgeId,
+        route: route,
+      });
+      out.__bridgeId = globalBridgeId;
+    }
+    // TODO-893 v2 (symptom 1) — textSelected (tapping plain glossary text) carries
+    // the SAME arg shape as onLinkClick (args[1] = the clicked word's iframe-LOCAL
+    // rect), so it needs the identical iframe-local -> window-local re-anchor;
+    // otherwise the child card anchors at iframe-internal coords (wrong cascade).
+    if (
+      (handler === 'onLinkClick' || handler === 'textSelected') &&
+      Array.isArray(message.args)
+    ) {
+      var anchor = anchorRectToScreen(record, message.args[1]);
+      var newArgs = message.args.slice();
+      if (anchor) {
+        newArgs[1] = anchor;
+      }
+      out.args = newArgs;
+    }
+    return out;
+  }
+
+  // Convert a child iframe LOCAL rect {x,y,width,height} (CSS px relative to the
+  // iframe viewport) into a full-screen CSS px anchor by adding the frame shell
+  // top-left + FRAME_CONTENT_TOP. Returns null when no usable rect. CSS px
+  // throughout (the dpr boundary is C++ window geometry, never here).
+  function anchorRectToScreen(record, localRect) {
+    if (!localRect || typeof localRect !== 'object') {
+      return null;
+    }
+    var shellLeft = parseFloat(record.shell.style.left) || 0;
+    var shellTop = parseFloat(record.shell.style.top) || 0;
+    var lx = typeof localRect.x === 'number' ? localRect.x : 0;
+    var ly = typeof localRect.y === 'number' ? localRect.y : 0;
+    var lw = typeof localRect.width === 'number' ? localRect.width : 0;
+    var lh = typeof localRect.height === 'number' ? localRect.height : 0;
+    return {
+      x: shellLeft + lx,
+      y: shellTop + FRAME_CONTENT_TOP + ly,
+      width: lw,
+      height: lh,
+    };
+  }
+
+  // TODO-1067 (子1) — build the per-shell close-X. Positioned absolutely in the
+  // shell's top-right; clicking it posts dismissPopupAt[layerIndex] so ONLY this
+  // layer + its children close (the controller collapses the whole stack only
+  // when the ROOT is dismissed, index 0). stopPropagation keeps the click from
+  // also triggering onHostPointerDown's per-layer tapOutside. Returns null when
+  // the DOM lacks createElement (node harness without full DOM) so createRecord
+  // stays robust.
+  function createCloseButton(frameId) {
+    if (!document || typeof document.createElement !== 'function') {
+      return null;
+    }
+    var btn = document.createElement('div');
+    btn.className = 'global-lookup-close';
+    btn.setAttribute('data-close-frame-id', frameId);
+    btn.setAttribute('role', 'button');
+    btn.setAttribute('aria-label', 'Close');
+    // The glyph is set via CSS content (ensureStyle) so theming/font is uniform;
+    // keep a textContent fallback for environments that do not honour ::before.
+    if (typeof btn.textContent !== 'undefined') {
+      btn.textContent = '×'; // multiplication sign ×
+    }
+    var onClose = function (event) {
+      if (event && typeof event.stopPropagation === 'function') {
+        event.stopPropagation();
+      }
+      if (event && typeof event.preventDefault === 'function') {
+        event.preventDefault();
+      }
+      // The physical iframe may have been parked and rebound to a newer logical
+      // child id. Read the live attribute instead of closing over the old id.
+      var liveFrameId = btn.getAttribute('data-close-frame-id') || frameId;
+      var index = layerIndexOf(liveFrameId);
+      if (index >= 0) {
+        var record = frames.get(liveFrameId);
+        postToHost('dismissPopupAt', [index], record && record.route);
+      }
+    };
+    if (typeof btn.addEventListener === 'function') {
+      // pointerdown (capture) so it wins over the host document pointerdown that
+      // also fires for this host-chrome click; click kept as a fallback.
+      btn.addEventListener('pointerdown', onClose, true);
+      btn.addEventListener('click', onClose, true);
+    }
+    return btn;
+  }
+
+  // Phase C（弹窗尺寸精细化 2026-07-13）— 瞬态覆盖窗 ROOT 卡的右下角 resize grip。
+  // mousedown 直接 postToHost('beginWindowResize')（host 顶层 DOM，无需 iframe 桥，
+  // 与面板 grip 一致）：native 收到后 PostMessage(WM_NCLBUTTONDOWN, HTBOTTOMRIGHT)
+  // 进模态 size 循环，松手经 WM_EXITSIZEMOVE 回报窗口 rect 给 Dart 落 overlay 尺寸键。
+  // preventDefault + stopPropagation(capture)：不让这次 mousedown 触发 host 的
+  // 点外关闭 / 拖出选区。返回 null 时（node harness 无 DOM）createRecord 照常健壮。
+  // BUG-1857 — viewport 尺寸（CSS px）。node harness 的假 window 没有 innerWidth，
+  // 取不到就返回 0：beginLiveResize 据此拒绝武装，拖拽退回「松手才跳」的旧观感，
+  // 绝不把 NaN 写进 style。
+  function viewportWidth() {
+    return (typeof window.innerWidth === 'number' && isFinite(window.innerWidth))
+        ? window.innerWidth : 0;
+  }
+
+  function viewportHeight() {
+    return (typeof window.innerHeight === 'number' &&
+            isFinite(window.innerHeight))
+        ? window.innerHeight : 0;
+  }
+
+  function liveResizeRootRecord() {
+    if (!lastRootId) {
+      return null;
+    }
+    var record = frames.get(lastRootId);
+    return (record && record.shell) ? record : null;
+  }
+
+  // grip mousedown 时武装：记下 root 卡当前 CSS 尺寸与 viewport 尺寸。root 尺寸优先读
+  // shell.style（applyShellStyle 可能已把高度封顶到内容），其次 descriptor.frame。
+  function beginLiveResize() {
+    liveResize = null;
+    var record = liveResizeRootRecord();
+    if (!record) {
+      return false;
+    }
+    var vw = viewportWidth();
+    var vh = viewportHeight();
+    if (vw <= 0 || vh <= 0) {
+      return false;
+    }
+    var f = (record.descriptor && record.descriptor.frame) || {};
+    var w = parseFloat(record.shell.style.width);
+    var h = parseFloat(record.shell.style.height);
+    if (!isFinite(w) || w <= 0) w = (typeof f.width === 'number') ? f.width : 0;
+    if (!isFinite(h) || h <= 0) h = (typeof f.height === 'number') ? f.height : 0;
+    if (w <= 0 || h <= 0) {
+      return false;
+    }
+    liveResize = {
+      id: lastRootId, width: w, height: h, viewportW: vw, viewportH: vh
+    };
+    return true;
+  }
+
+  // native WM_EXITSIZEMOVE 调用；renderStack 也调（Dart 权威重排接管，顺带清掉
+  // 「grip 按下但模态循环没起来」的悬空武装，免得下一次嵌套卡改窗口尺寸时误把
+  // root 卡拉大）。
+  function endLiveResize() {
+    liveResize = null;
+  }
+
+  // window resize（WM_SIZE → put_Bounds → Chromium viewport 变化）时每帧调用。
+  // 标记 contentMeasureDirty：松手后 Dart 重排时 shell.style.width 已等于新宽度，
+  // applyShellStyle 那条「宽度变了才置脏」判不到，若不在这里置脏，preserveMeasuredHeight
+  // 会拿旧宽度下量出的内容高度去封顶新卡、且 scheduleMeasure 复用缓存不重量。
+  function handleWindowResize() {
+    if (!liveResize) {
+      return false;
+    }
+    var record = frames.get(liveResize.id);
+    if (!record || !record.shell) {
+      liveResize = null;
+      return false;
+    }
+    var w = liveResize.width + (viewportWidth() - liveResize.viewportW);
+    var h = liveResize.height + (viewportHeight() - liveResize.viewportH);
+    record.shell.style.width =
+        Math.max(LIVE_RESIZE_MIN_PX, Math.round(w)) + 'px';
+    record.shell.style.height =
+        Math.max(LIVE_RESIZE_MIN_PX, Math.round(h)) + 'px';
+    record.contentMeasureDirty = true;
+    return true;
+  }
+
+  function createResizeGrip() {
+    if (!document || typeof document.createElement !== 'function') {
+      return null;
+    }
+    var grip = document.createElement('div');
+    grip.className = 'global-lookup-resize-grip';
+    grip.setAttribute('role', 'button');
+    grip.setAttribute('aria-label', 'Resize');
+    var onDown = function (event) {
+      if (event) {
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+        if (typeof event.stopPropagation === 'function') {
+          event.stopPropagation();
+        }
+      }
+      // BUG-1857 — 先武装 live-fit 再进模态循环，拖拽期间 root 卡随 viewport 长。
+      beginLiveResize();
+      postToHost('beginWindowResize', []);
+    };
+    if (typeof grip.addEventListener === 'function') {
+      grip.addEventListener('mousedown', onDown, true);
+    }
+    return grip;
+  }
+
+  function createRecord(layer, descriptor, standby) {
+    standby = standby === true;
+    var shell = document.createElement('div');
+    shell.className = standby
+        ? 'global-lookup-frame-standby'
+        : 'global-lookup-frame-shell';
+    shell.setAttribute('data-frame-id', descriptor.id);
+    // D1 — start gated-hidden. The two flags flip independently:
+    // content-ready (iframe DOM arrived) + reveal-ready (geometry placed).
+    shell.setAttribute(ATTR_CONTENT_READY, 'false');
+    shell.setAttribute(ATTR_REVEAL_READY, 'false');
+    if (standby) {
+      // Keep the realm laid out so CSS/font discovery really warms WebView2.
+      // display:none would load the document but may defer FontFace decoding.
+      shell.style.position = 'absolute';
+      shell.style.left = '-100000px';
+      shell.style.top = '-100000px';
+      shell.style.width = '360px';
+      shell.style.height = '480px';
+      shell.style.visibility = 'hidden';
+      shell.style.opacity = '0';
+      shell.style.pointerEvents = 'none';
+    }
+
+    var iframe = document.createElement('iframe');
+    // Deliberately NO sandbox attribute (same-origin contentWindow injection).
+    iframe.setAttribute('src', POPUP_SRC);
+    iframe.setAttribute('frameborder', '0');
+    iframe.style.width = '100%';
+    iframe.style.height = '100%';
+    iframe.style.border = '0';
+    iframe.style.background = 'transparent';
+
+    shell.appendChild(iframe);
+    // TODO-1067 (子1) — the app-external overlay is a bare iframe host: the
+    // in-app Flutter chrome (its close affordance) never wraps these shells, so
+    // there was NO way to dismiss a card with the mouse other than a lucky
+    // click-outside (which子5 shows also over-collapsed the whole stack). Draw a
+    // per-shell close-X in the top-right corner (host DOM, NOT inside the iframe)
+    // that dismisses EXACTLY this layer + its children via dismissPopupAt[index].
+    // The X lives on the shell, so `closest('.global-lookup-frame-shell')` in
+    // onHostPointerDown still classifies a stray click as a shell hit; the X's
+    // own handler stops propagation + posts the layer-scoped dismiss so it never
+    // falls through to the per-layer tapOutside / root dismiss.
+    var closeBtn = null;
+    if (!standby) {
+      closeBtn = createCloseButton(descriptor.id);
+      if (closeBtn) {
+        shell.appendChild(closeBtn);
+      }
+    }
+    // Phase C — 只给 ROOT 卡（parentIndex < 0）挂 resize grip：调整的是 overlay
+    // 「最大卡尺寸」真值，子级级联卡由它派生，故不各自加把手。
+    if (!standby && descriptor &&
+        typeof descriptor.parentIndex === 'number' &&
+        descriptor.parentIndex < 0) {
+      var grip = createResizeGrip();
+      if (grip) {
+        shell.appendChild(grip);
+      }
+    }
+    layer.appendChild(shell);
+
+    var record = {
+      id: descriptor.id,
+      parentIndex: descriptor.parentIndex,
+      iframe: iframe,
+      shell: shell,
+      closeButton: closeBtn,
+      descriptor: descriptor,
+      active: !standby,
+      wrappedPost: null,
+      loaded: false,
+      contentReady: false,
+      revealReady: false,
+      // Root shells are protected by the initially-hidden native window. A
+      // nested shell is inside an already-visible HWND, so its first reveal is
+      // gated on the exact bbox + shellRects transaction that includes it.
+      requiredGeometryEpoch: 0,
+      observer: null,
+      dirtyObserver: null,
+      contentSafetyTimer: null,
+      revealSafetyTimer: null,
+      route: cloneRoute(activeRoute),
+      injectedStaticRevision: null,
+      injectedEntriesJs: null,
+      injectedRenderJs: null,
+      injectedSettingsJs: null,
+      staticSettingsRequestRevision: null,
+      waitingForStatic: false,
+      // Reading scrollHeight/offsetHeight forces layout in every same-origin
+      // iframe. Surviving ancestors do not change on a stack truncate, so keep
+      // their last measured height and invalidate it only when content or width
+      // really changes. This removes the depth-proportional reflow that used to
+      // run before every overlaySize report.
+      measuredContentHeight: 0,
+      contentMeasureDirty: true,
+    };
+    shell.__lookupRecord = record;
+    frameSources.set(iframe, descriptor.id);
+
+    iframe.addEventListener('load', function () {
+      record.loaded = true;
+      // A navigation creates a fresh iframe realm even though the host record
+      // survives. Re-apply static settings from the host-level revision cache
+      // before rendering the current dynamic payload.
+      record.injectedStaticRevision = null;
+      record.injectedEntriesJs = null;
+      record.injectedRenderJs = null;
+      record.injectedSettingsJs = null;
+      record.waitingForStatic = false;
+      record.measuredContentHeight = 0;
+      record.contentMeasureDirty = true;
+      wrapFrameBridge(record);
+      watchFrameSelection(record);
+      if (!record.active) {
+        // The document load itself may land on the active card's presentation
+        // task. Defer static/font priming through the same compositor/watchdog
+        // gate used for pool refill so hidden work never blocks that first frame.
+        scheduleStandbyRefill(layer);
+        return;
+      }
+      var injected = injectContent(record);
+      // TODO-1231 P1 — seed the has-child flag on cold load (mirrors the in-app
+      // cold-load _setHasChildPopupJs); renderPayload keeps it in sync after.
+      applyHasChildPopup(record);
+      if (injected) {
+        observeContent(record, record.route);
+      }
+      observeGalFrameDirty(record, record.route);
+      scheduleMeasure(record.route);
+    });
+    return record;
+  }
+
+  var STANDBY_EMPTY_ENTRIES_JS =
+      'try { window.lookupEntries = []; } catch(e) { window.lookupEntries = []; }' +
+      'try { window.kanjiResults = []; } catch(e) { window.kanjiResults = []; }';
+
+  function dropBridgeRoutesForFrame(frameId) {
+    bridgeRoutes.forEach(function (route, globalId) {
+      if (route.frameId === frameId) {
+        bridgeRoutes.delete(globalId);
+      }
+    });
+  }
+
+  function stopRecordCallbacks(record) {
+    if (!record) {
+      return;
+    }
+    if (record.observer && typeof record.observer.disconnect === 'function') {
+      try {
+        record.observer.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.observer = null;
+    }
+    if (record.dirtyObserver &&
+        typeof record.dirtyObserver.disconnect === 'function') {
+      try {
+        record.dirtyObserver.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.dirtyObserver = null;
+    }
+    if (record.contentSafetyTimer != null) {
+      clearTimerSafe(record.contentSafetyTimer);
+      record.contentSafetyTimer = null;
+    }
+    if (record.revealSafetyTimer != null) {
+      clearTimerSafe(record.revealSafetyTimer);
+      record.revealSafetyTimer = null;
+    }
+    clearRecordStaticSettingsRequest(record);
+  }
+
+  function resetParkedRealm(record) {
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win) {
+      return;
+    }
+    try {
+      if (typeof win.__fushiBridgeCancelPending === 'function') {
+        win.__fushiBridgeCancelPending();
+      }
+    } catch (e) {
+      // Older cached popup documents have no cancellation hook.
+    }
+    try {
+      if (typeof win.__fushiPrepareRealmForReuse === 'function') {
+        win.__fushiPrepareRealmForReuse();
+      }
+    } catch (e) {
+      // The fallback generation bump below still invalidates async render work.
+    }
+    try {
+      // Cancel popup.js's incremental tail/font-ready callbacks and stop any
+      // frame-local word audio before this physical realm loses its logical id.
+      win.eval(
+          '(function(){' +
+          'if(typeof window.__fushiPrepareRealmForReuse!=="function"){' +
+          'window._renderGeneration=(window._renderGeneration||0)+1;}' +
+          'try{if(window.__fushiWordAudio){window.__fushiWordAudio.pause();' +
+          'window.__fushiWordAudio.removeAttribute("src");' +
+          'window.__fushiWordAudio.load();window.__fushiWordAudio=null;}}catch(_e){}' +
+          'try{var s=window.getSelection&&window.getSelection();' +
+          'if(s&&s.removeAllRanges)s.removeAllRanges();}catch(_e){}' +
+          'try{window.scrollTo(0,0);}catch(_e){}' +
+          'try{document.documentElement.scrollTop=0;document.body.scrollTop=0;}' +
+          'catch(_e){}' +
+          '})();');
+    } catch (e) {
+      // A not-yet-loaded standby has no realm state to clear.
+    }
+  }
+
+  function destroyRecord(record) {
+    if (!record) {
+      return;
+    }
+    forgetRecordSelection(record);
+    var oldId = record.id;
+    record.active = false;
+    stopRecordCallbacks(record);
+    dropBridgeRoutesForFrame(oldId);
+    // Permanent iframe teardown destroys its realm and therefore cancels every
+    // Promise/audio/timer by construction. Running the expensive *reuse* reset
+    // first only duplicated that work (and forced an eval in every removed
+    // iframe) on the latency-critical stack-close path.
+    try {
+      frameSources.delete(record.iframe);
+    } catch (e) {
+      // WeakMap deletion is best-effort in reduced test harnesses.
+    }
+    if (record.shell && record.shell.parentNode) {
+      record.shell.parentNode.removeChild(record.shell);
+    }
+  }
+
+  function primeStandbyRecord(record, revision) {
+    if (!record || record.active || !record.loaded || revision == null ||
+        record.injectedStaticRevision === revision) {
+      return false;
+    }
+    var staticSettings = staticSettingsByRevision.get(revision);
+    if (!staticSettings) {
+      record.injectedStaticRevision = null;
+      return false;
+    }
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win || typeof win.eval !== 'function') {
+      return false;
+    }
+    try {
+      // Preserve the production order around a harmless empty result, then
+      // render once while hidden. That forces popup.js/CSS/font discovery now,
+      // instead of making the user's first nested selection pay it.
+      win.eval(
+          staticSettings.head + STANDBY_EMPTY_ENTRIES_JS +
+          staticSettings.tail +
+          'window.__hasChildPopup=false;' +
+          'window.renderPopup&&window.renderPopup();');
+      record.injectedStaticRevision = revision;
+      record.injectedEntriesJs = null;
+      record.injectedRenderJs = null;
+      record.injectedSettingsJs = null;
+      record.waitingForStatic = false;
+      clearRecordStaticSettingsRequest(record);
+      // renderPopup makes the configured family discoverable. Explicitly start
+      // every FontFace as well; the promise intentionally remains background.
+      var fonts = record.iframe.contentDocument &&
+          record.iframe.contentDocument.fonts;
+      if (fonts && typeof fonts.forEach === 'function') {
+        fonts.forEach(function (face) {
+          try {
+            var pending = face && typeof face.load === 'function'
+                ? face.load()
+                : null;
+            if (pending && typeof pending.catch === 'function') {
+              pending.catch(function () {});
+            }
+          } catch (e) {
+            // Font correctness still comes from popup.js document.fonts.ready.
+          }
+        });
+      }
+      return true;
+    } catch (e) {
+      record.injectedStaticRevision = null;
+      return false;
+    }
+  }
+
+  function primeStandbyRecords(revision) {
+    if (revision == null || !staticSettingsByRevision.has(revision)) {
+      return;
+    }
+    standbyStaticRevision = revision;
+    var layer = document.getElementById(LAYER_ID);
+    if (layer) {
+      scheduleStandbyRefill(layer);
+    }
+  }
+
+  function ensureStandbyPool(layer) {
+    if (!layer) {
+      return;
+    }
+    while (standbyRecords.length < STANDBY_POOL_SIZE) {
+      var descriptor = {
+        id: STANDBY_ID_PREFIX + (++standbySeq),
+        parentIndex: 0,
+      };
+      var record = createRecord(layer, descriptor, true);
+      standbyRecords.push(record);
+      primeStandbyRecord(record, standbyStaticRevision);
+    }
+  }
+
+  function cancelStandbyRefill() {
+    standbyRefillGeneration++;
+    standbyRefillScheduled = false;
+  }
+
+  function scheduleStandbyRefill(layer) {
+    // A pending ancestor swap deliberately keeps the retiring browsing contexts
+    // alive. Starting another popup.html navigation in that interval competes
+    // with the replacement paint and can revoke the old realm's static state.
+    // Finalisation re-arms the one-look-ahead pool after the atomic swap.
+    if (pendingSuffixSwap || !layer || standbyRefillScheduled) {
+      return;
+    }
+    var needsWork = standbyRecords.length < STANDBY_POOL_SIZE;
+    if (!needsWork && standbyStaticRevision != null &&
+        staticSettingsByRevision.has(standbyStaticRevision)) {
+      for (var i = 0; i < standbyRecords.length; i++) {
+        if (standbyRecords[i].loaded &&
+            standbyRecords[i].injectedStaticRevision !==
+                standbyStaticRevision) {
+          needsWork = true;
+          break;
+        }
+      }
+    }
+    if (!needsWork) {
+      return;
+    }
+    standbyRefillScheduled = true;
+    var generation = standbyRefillGeneration;
+    var finished = false;
+    var watchdog = null;
+    var refill = function () {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      if (watchdog != null) {
+        clearTimerSafe(watchdog);
+        watchdog = null;
+      }
+      if (generation !== standbyRefillGeneration) {
+        return;
+      }
+      try {
+        if (frames.size) {
+          ensureStandbyPool(layer);
+          for (var i = 0; i < standbyRecords.length; i++) {
+            primeStandbyRecord(standbyRecords[i], standbyStaticRevision);
+          }
+        }
+      } finally {
+        // A reduced harness can fire iframe load synchronously from
+        // createRecord(). Keep the scheduled latch set until the new record is
+        // actually in standbyRecords, otherwise load -> refill recurses forever.
+        standbyRefillScheduled = false;
+      }
+    };
+    // Do not start another popup.html navigation in the same presentation turn
+    // as the child we just acquired. Two compositor frames let that hot child
+    // paint first; the replacement realm then warms while the user reads it.
+    var rafScheduled = false;
+    if (typeof window.requestAnimationFrame === 'function') {
+      try {
+        window.requestAnimationFrame(function () {
+          try {
+            window.requestAnimationFrame(refill);
+          } catch (e) {
+            refill();
+          }
+        });
+        rafScheduled = true;
+      } catch (e) {
+        // Fall through to the timer path.
+      }
+    }
+    // The permanently off-screen galCard WebView can suspend rAF. Race the
+    // compositor path with a bounded timer so deeper nesting never falls back
+    // to cold createRecord merely because those callbacks stopped running.
+    watchdog = setTimerSafe(refill, STANDBY_REFILL_WATCHDOG_MS);
+    if (!rafScheduled && watchdog == null) {
+      // Deterministic reduced harnesses have neither API; replenish now there.
+      refill();
+    }
+  }
+
+  function acquireStandbyRecord(layer, descriptor) {
+    if (!descriptor || descriptor.parentIndex < 0 || !standbyRecords.length) {
+      return null;
+    }
+    var record = standbyRecords.shift();
+    var oldId = record.id;
+    stopRecordCallbacks(record);
+    dropBridgeRoutesForFrame(oldId);
+    // Parked resize/font callbacks may have been queued after the previous
+    // cleanup. Invalidate them once more while the wrapper is still inactive,
+    // before this realm receives a new logical id.
+    resetParkedRealm(record);
+    record.active = true;
+    record.id = descriptor.id;
+    record.parentIndex = descriptor.parentIndex;
+    record.descriptor = descriptor;
+    record.route = cloneRoute(activeRoute);
+    record.contentReady = false;
+    record.revealReady = false;
+    record.requiredGeometryEpoch = 0;
+    record.waitingForStatic = false;
+    record.injectedEntriesJs = null;
+    record.injectedRenderJs = null;
+    record.injectedSettingsJs = null;
+    record.hasChildPopup = null;
+    record.measuredContentHeight = 0;
+    record.contentMeasureDirty = true;
+    record.shell.className = 'global-lookup-frame-shell';
+    record.shell.setAttribute('data-frame-id', descriptor.id);
+    record.shell.setAttribute(ATTR_CONTENT_READY, 'false');
+    record.shell.setAttribute(ATTR_REVEAL_READY, 'false');
+    record.shell.style.visibility = '';
+    record.shell.style.opacity = '';
+    record.shell.style.pointerEvents = 'auto';
+    // Do NOT re-append/reparent this mounted shell for DOM ordering: Chromium
+    // navigates a descendant iframe when its ancestor is moved, destroying the
+    // very warm realm this pool exists to preserve. Logical depth and painting
+    // order come from frames insertion order + applyShellStyle's z-index.
+    frameSources.set(record.iframe, descriptor.id);
+    if (!record.closeButton) {
+      record.closeButton = createCloseButton(descriptor.id);
+      if (record.closeButton) {
+        record.shell.appendChild(record.closeButton);
+      }
+    } else {
+      record.closeButton.setAttribute('data-close-frame-id', descriptor.id);
+    }
+    // Replenish only after this acquired child has had a chance to paint.
+    scheduleStandbyRefill(layer);
+    return record;
+  }
+
+  function parkRecord(record, layer) {
+    if (!record || record.parentIndex < 0) {
+      destroyRecord(record);
+      return;
+    }
+    // Prefer the just-used realm (its JS/font state is hottest) over the unused
+    // look-ahead slot, while preserving the strict one-record memory bound.
+    while (standbyRecords.length >= STANDBY_POOL_SIZE) {
+      destroyRecord(standbyRecords.shift());
+    }
+    forgetRecordSelection(record);
+    var oldId = record.id;
+    record.active = false;
+    stopRecordCallbacks(record);
+    dropBridgeRoutesForFrame(oldId);
+    resetParkedRealm(record);
+    try {
+      frameSources.delete(record.iframe);
+    } catch (e) {
+      // no-op
+    }
+    record.id = STANDBY_ID_PREFIX + (++standbySeq);
+    record.parentIndex = 0;
+    record.descriptor = null;
+    record.route = cloneRoute(activeRoute);
+    record.contentReady = false;
+    record.revealReady = false;
+    record.requiredGeometryEpoch = 0;
+    record.waitingForStatic = false;
+    record.injectedEntriesJs = null;
+    record.injectedRenderJs = null;
+    record.injectedSettingsJs = null;
+    record.hasChildPopup = null;
+    record.measuredContentHeight = 0;
+    record.contentMeasureDirty = true;
+    record.shell.className = 'global-lookup-frame-standby';
+    record.shell.setAttribute('data-frame-id', record.id);
+    record.shell.setAttribute(ATTR_CONTENT_READY, 'false');
+    record.shell.setAttribute(ATTR_REVEAL_READY, 'false');
+    record.shell.style.position = 'absolute';
+    record.shell.style.left = '-100000px';
+    record.shell.style.top = '-100000px';
+    record.shell.style.width = '360px';
+    record.shell.style.height = '480px';
+    record.shell.style.visibility = 'hidden';
+    record.shell.style.opacity = '0';
+    record.shell.style.pointerEvents = 'none';
+    if (record.closeButton) {
+      record.closeButton.setAttribute('data-close-frame-id', record.id);
+    }
+    frameSources.set(record.iframe, record.id);
+    standbyRecords.push(record);
+    scheduleStandbyRefill(layer || record.shell.parentNode);
+  }
+
+  function destroyStandbyPool() {
+    cancelStandbyRefill();
+    while (standbyRecords.length) {
+      destroyRecord(standbyRecords.shift());
+    }
+    standbyStaticRevision = null;
+  }
+
+  // D1 — flip a gate flag and, if both are now set, the shell paints (the CSS
+  // attribute selector does the actual reveal). Idempotent.
+  function setGateFlag(record, attr, key) {
+    if (record[key]) {
+      return;
+    }
+    record[key] = true;
+    if (record.shell && typeof record.shell.setAttribute === 'function') {
+      record.shell.setAttribute(attr, 'true');
+    }
+  }
+
+  // The committed transaction must cover the FULL shell. The former left/top
+  // test let a down/right child reveal while its far edge was still outside the
+  // previous HWND — the clipped intermediate frame observed in SGRE.
+  function shellCoveredByCommittedGeometry(record) {
+    if (!record || !record.shell || !committedGeometryBounds) {
+      return false;
+    }
+    var left = parseFloat(record.shell.style.left) || 0;
+    var top = parseFloat(record.shell.style.top) || 0;
+    var width = parseFloat(record.shell.style.width) || 0;
+    var height = parseFloat(record.shell.style.height) || 0;
+    return left >= committedGeometryBounds.left - COVER_EPS &&
+        top >= committedGeometryBounds.top - COVER_EPS &&
+        left + width <= committedGeometryBounds.right + COVER_EPS &&
+        top + height <= committedGeometryBounds.bottom + COVER_EPS;
+  }
+
+  // Root cards may arm immediately because their native window is still hidden.
+  // Nested cards live in an already-visible HWND and require the exact latest
+  // bbox + shellRects ack. The safety timer can request a fresh measurement, but
+  // never bypasses the contract and exposes a clipped card.
+  function maybeFlipRevealReady(record, routeSnapshot) {
+    if (!record) {
+      return;
+    }
+    var route = cloneRoute(routeSnapshot || record.route);
+    if (!sameRoute(record.route, route)) {
+      return;
+    }
+    if (record.revealReady) {
+      if (record.revealSafetyTimer != null) {
+        clearTimerSafe(record.revealSafetyTimer);
+        record.revealSafetyTimer = null;
+      }
+      return;
+    }
+    var isNested = typeof record.parentIndex === 'number' &&
+        record.parentIndex >= 0;
+    var geometryCommitted = !isNested ||
+        (record.requiredGeometryEpoch > 0 &&
+         record.requiredGeometryEpoch === committedGeometryEpoch &&
+         shellCoveredByCommittedGeometry(record));
+    if (geometryCommitted) {
+      if (record.revealSafetyTimer != null) {
+        clearTimerSafe(record.revealSafetyTimer);
+        record.revealSafetyTimer = null;
+      }
+      setGateFlag(record, ATTR_REVEAL_READY, 'revealReady');
+      return;
+    }
+    if (record.revealSafetyTimer == null) {
+      var revealTimer = setTimerSafe(function () {
+        if (!sameRoute(record.route, route)) {
+          return;
+        }
+        if (record.revealSafetyTimer === revealTimer) {
+          record.revealSafetyTimer = null;
+        }
+        scheduleMeasure(route);
+      }, REVEAL_READY_SAFETY_MS);
+      record.revealSafetyTimer = revealTimer;
+    }
+  }
+
+  function markContentReady(record, routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || record.route);
+    if (!sameRoute(record.route, route)) {
+      scheduleMeasure(route);
+      return;
+    }
+    if (record.contentSafetyTimer != null) {
+      clearTimerSafe(record.contentSafetyTimer);
+      record.contentSafetyTimer = null;
+    }
+    if (record.observer && typeof record.observer.disconnect === 'function') {
+      try {
+        record.observer.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.observer = null;
+    }
+    setGateFlag(record, ATTR_CONTENT_READY, 'contentReady');
+    // Content height just changed -> the union bbox may grow. Re-measure
+    // (coalesced) so Dart resizes the window to fit the filled card.
+    // injectContent/width mutations mark the changed record dirty. Reuse clean
+    // ancestor heights so opening one child never forces every parent iframe to
+    // synchronously lay out again.
+    scheduleMeasure(route, true);
+    tryFinalizePendingSuffixSwap();
+  }
+
+  // D1 — observe the SAME-ORIGIN iframe contentDocument.body for real content:
+  // popup.js renders a `.glossary-content` (or the no-results card gives body a
+  // non-zero height). No popup.js change needed (host reads the same-origin DOM
+  // directly). Degrades gracefully where MutationObserver is unavailable (node
+  // harness): fall back to the safety timer / an immediate content check.
+  function observeContent(record, routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || record.route);
+    if (!sameRoute(record.route, route)) {
+      return;
+    }
+    if (record.contentReady) {
+      return;
+    }
+    if (hasContent(record)) {
+      markContentReady(record, route);
+      return;
+    }
+    var body = null;
+    try {
+      var doc = record.iframe.contentDocument;
+      body = doc && doc.body;
+    } catch (e) {
+      body = null;
+    }
+    if (body && typeof window.MutationObserver === 'function') {
+      try {
+        record.observer = new window.MutationObserver(function () {
+          if (hasContent(record)) {
+            markContentReady(record, route);
+          }
+        });
+        record.observer.observe(body, {
+          childList: true,
+          subtree: true,
+          attributes: false,
+        });
+      } catch (e) {
+        record.observer = null;
+      }
+    }
+    // Safety: force content-ready after a budget so a render failure never
+    // leaves the card invisible (mirrors the Dart reveal safety).
+    var contentTimer = setTimerSafe(function () {
+      if (!sameRoute(record.route, route)) {
+        scheduleMeasure(route);
+        return;
+      }
+      if (record.contentSafetyTimer === contentTimer) {
+        record.contentSafetyTimer = null;
+      }
+      markContentReady(record, route);
+    }, CONTENT_READY_SAFETY_MS);
+    record.contentSafetyTimer = contentTimer;
+  }
+
+  // Content readiness is a one-shot gate and disconnects its observer after the
+  // initial popupRendered.  Keep a separate lifetime observer for later visual
+  // mutations (favorite/mine state, inline modals, expanded dictionary rows).
+  function observeGalFrameDirty(record, routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || record.route);
+    if (route.source !== 'galCard' || !sameRoute(record.route, route) ||
+        record.dirtyObserver || typeof window.MutationObserver !== 'function') {
+      return;
+    }
+    var body = null;
+    try {
+      var doc = record.iframe.contentDocument;
+      body = doc && doc.body;
+    } catch (e) {
+      body = null;
+    }
+    if (!body) {
+      return;
+    }
+    try {
+      record.dirtyObserver = new window.MutationObserver(function () {
+        record.contentMeasureDirty = true;
+        scheduleMeasure(record.route);
+        requestGalFrameDirty(record.route);
+      });
+      record.dirtyObserver.observe(body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      });
+    } catch (e) {
+      record.dirtyObserver = null;
+    }
+  }
+
+  // TODO-1067 (子3) — True once popup.js has PAINTED a real card: a rendered
+  // glossary node (.glossary-content) OR the no-results card (.no-results). The
+  // old fallback accepted ANY body with a non-zero rendered height, which let the
+  // gate reveal an empty/pre-theme body (white flash) before popup.js finished.
+  // The authoritative reveal is now popupRendered (wrapFrameBridge); this
+  // structural check only backs the synchronous first-look + MutationObserver, so
+  // tightening it to a real card node removes the height-heuristic false-positive
+  // without losing the no-results path.
+  function hasContent(record) {
+    try {
+      var doc = record.iframe.contentDocument;
+      if (!doc || !doc.body || typeof doc.querySelector !== 'function') {
+        return false;
+      }
+      return !!(doc.querySelector('.glossary-content') ||
+                doc.querySelector('.no-results'));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function descriptorStaticRevision(descriptor) {
+    var value = descriptor && descriptor.staticRevision;
+    return (typeof value === 'number' && isFinite(value) && value > 0)
+        ? Math.trunc(value)
+        : null;
+  }
+
+  // Imported dictionary fonts are the only data URLs in the static settings
+  // large enough to dominate a cold nested lookup. Both the top-level host and
+  // popup.html iframes are served from https://hibiki.popup, so an object URL
+  // created here is same-origin and reusable by every frame realm. Keep the
+  // matcher deliberately narrow to DictionaryFontCss._fontTypes: unrelated data
+  // URLs remain byte-for-byte untouched.
+  var FONT_DATA_URL_RE =
+      /data:(font\/(?:ttf|otf|collection|woff2?));base64,([A-Za-z0-9+/]+={0,2})/g;
+
+  function revokeObjectUrls(urls) {
+    if (!urls || !urls.length || !window.URL ||
+        typeof window.URL.revokeObjectURL !== 'function') {
+      return;
+    }
+    for (var i = 0; i < urls.length; i++) {
+      try {
+        window.URL.revokeObjectURL(urls[i]);
+      } catch (e) {
+        // Revocation is best-effort cleanup. The revision is already dead and
+        // correctness must not depend on a browser accepting a stale URL.
+      }
+    }
+  }
+
+  function staticSettingsWithSharedFontResources(head, tail) {
+    var originalHead = (typeof head === 'string') ? head : '';
+    var originalTail = (typeof tail === 'string') ? tail : '';
+    if ((!originalHead && !originalTail) || typeof window.atob !== 'function' ||
+        typeof window.Blob !== 'function' || !window.URL ||
+        typeof window.URL.createObjectURL !== 'function' ||
+        typeof Uint8Array !== 'function') {
+      // Compatibility fallback for an older/non-browser harness. It preserves
+      // the exact pre-Blob injection body, only without the latency win.
+      return { head: originalHead, tail: originalTail, objectUrls: [] };
+    }
+
+    var objectUrls = [];
+    var urlByDataUrl = new Map();
+    try {
+      var rewriteFontDataUrls = function (source) {
+        return source.replace(FONT_DATA_URL_RE, function (dataUrl, mime, base64) {
+          var reused = urlByDataUrl.get(dataUrl);
+          if (reused) {
+            return reused;
+          }
+          var binary = window.atob(base64);
+          var bytes = new Uint8Array(binary.length);
+          for (var i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
+          }
+          var objectUrl = window.URL.createObjectURL(
+            new window.Blob([bytes], { type: mime }),
+          );
+          urlByDataUrl.set(dataUrl, objectUrl);
+          objectUrls.push(objectUrl);
+          return objectUrl;
+        });
+      };
+      var rewrittenHead = rewriteFontDataUrls(originalHead);
+      var rewrittenTail = rewriteFontDataUrls(originalTail);
+      return {
+        head: rewrittenHead,
+        tail: rewrittenTail,
+        objectUrls: objectUrls,
+      };
+    } catch (e) {
+      // Never trade font correctness for the optimisation. If any decoder/Blob
+      // operation fails, revoke the partial resources and keep the original
+      // self-contained data URL payload for this revision.
+      revokeObjectUrls(objectUrls);
+      return { head: originalHead, tail: originalTail, objectUrls: [] };
+    }
+  }
+
+  function dropDescriptorStaticSource(descriptor) {
+    if (!descriptor || typeof descriptor !== 'object') {
+      return;
+    }
+    // renderPayload stores the descriptor on its frame record. Deleting these
+    // fields is what prevents that record from retaining the ~13 MB source after
+    // staticSettingsByRevision has materialised its shared Blob resource.
+    try {
+      delete descriptor.staticHeadJs;
+      delete descriptor.staticTailJs;
+    } catch (e) {
+      // Plain render descriptors are mutable. Keep a defensive no-op for a
+      // frozen compatibility payload; the resource rewrite still stays valid.
+    }
+  }
+
+  function cacheDescriptorStaticSettings(descriptor) {
+    var revision = descriptorStaticRevision(descriptor);
+    if (revision == null) {
+      return revision;
+    }
+    // A render payload can mention the same revision on every live frame. Only
+    // the first descriptor carries the source, and only it may decode/create the
+    // resource. Never overwrite the cache with a later dynamic-only descriptor.
+    if (staticSettingsByRevision.has(revision)) {
+      dropDescriptorStaticSource(descriptor);
+      return revision;
+    }
+    if (
+        typeof descriptor.staticHeadJs !== 'string' ||
+        typeof descriptor.staticTailJs !== 'string') {
+      return revision;
+    }
+    var staticSettings = staticSettingsWithSharedFontResources(
+      descriptor.staticHeadJs,
+      descriptor.staticTailJs,
+    );
+    staticSettingsByRevision.set(revision, staticSettings);
+    dropDescriptorStaticSource(descriptor);
+    // A static payload satisfies every routed request for this revision.
+    var suffix = '|' + revision;
+    staticSettingsRequests.forEach(function (key) {
+      if (key.endsWith(suffix)) {
+        staticSettingsRequests.delete(key);
+      }
+    });
+    return revision;
+  }
+
+  function requestStaticSettings(record, revision) {
+    var key = routeKey(record && record.route) + '|' + revision;
+    if (revision == null || staticSettingsRequests.has(key)) {
+      return;
+    }
+    staticSettingsRequests.add(key);
+    record.staticSettingsRequestRevision = key;
+    // Include the current host-document geometry counter. Zero identifies a
+    // freshly-recovered realm before its first measurement; Dart can then clear
+    // a coincidentally-equal epoch de-dup without penalising an ordinary child
+    // cache miss in the long-lived document.
+    postToHost(
+        'staticSettingsRequired', [revision, nextGeometryEpoch], record.route);
+  }
+
+  function clearRecordStaticSettingsRequest(record) {
+    if (!record || !record.staticSettingsRequestRevision) {
+      return;
+    }
+    staticSettingsRequests.delete(record.staticSettingsRequestRevision);
+    record.staticSettingsRequestRevision = null;
+  }
+
+  function injectContent(record) {
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win) {
+      return false;
+    }
+    var d = record.descriptor || {};
+    var revision = cacheDescriptorStaticSettings(d);
+    var modern = revision != null &&
+        typeof d.entriesJs === 'string' &&
+        typeof d.renderJs === 'string';
+    try {
+      // Any accepted content injection can change font metrics or body height.
+      // Invalidate before eval so even a synchronous popupRendered observes the
+      // dirty measurement.
+      record.contentMeasureDirty = true;
+      if (!modern) {
+        // Backward compatibility for a cached/pending payload produced by an
+        // older Dart bundle during an in-place development restart.
+        if (typeof d.settingsJs === 'string' && d.settingsJs.length) {
+          win.eval(d.settingsJs);
+        }
+        record.injectedSettingsJs =
+            (typeof d.settingsJs === 'string') ? d.settingsJs : '';
+        record.waitingForStatic = false;
+        clearRecordStaticSettingsRequest(record);
+        syncFrameShellChrome(record);
+        return true;
+      }
+
+      var staticSettings = staticSettingsByRevision.get(revision);
+      var needsStatic = record.injectedStaticRevision !== revision;
+      if (needsStatic && !staticSettings) {
+        // A whole-WebView recovery loses the host cache while Dart still knows
+        // the revision. Keep the shell content-gated and demand one routed
+        // resend; the reply replays this pending dynamic descriptor.
+        record.waitingForStatic = true;
+        requestStaticSettings(record, revision);
+        return false;
+      }
+      var script = '';
+      if (needsStatic) {
+        script += staticSettings.head;
+      }
+      script += d.entriesJs;
+      if (needsStatic) {
+        // Preserve the original exact order: static head -> entries -> static
+        // tail -> per-frame reset/sentence/render body.
+        script += staticSettings.tail;
+      }
+      script += d.renderJs;
+      if (script.length) {
+        win.eval(script);
+      }
+      record.injectedStaticRevision = revision;
+      record.injectedEntriesJs = d.entriesJs;
+      record.injectedRenderJs = d.renderJs;
+      record.injectedSettingsJs = null;
+      record.waitingForStatic = false;
+      clearRecordStaticSettingsRequest(record);
+      syncFrameShellChrome(record);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function ensureFrameChromeOwnerStyle(doc) {
+    if (!doc || typeof doc.createElement !== 'function') {
+      return false;
+    }
+    if (typeof doc.getElementById === 'function' &&
+        doc.getElementById(FRAME_CHROME_STYLE_ID)) {
+      return true;
+    }
+    var style = doc.createElement('style');
+    style.id = FRAME_CHROME_STYLE_ID;
+    // Keep the body's border allocation, padding, min-height and scroll
+    // semantics exactly as authored. Only its pixels move: transparent border
+    // preserves layout while the shell pseudo-element draws the one visible ring.
+    style.textContent =
+        'html.global-lookup.' + FRAME_CHROME_CLASS + ' body{' +
+        'background:transparent!important;' +
+        'border-color:transparent!important;}';
+    var parent = doc.head || doc.documentElement;
+    if (!parent || typeof parent.appendChild !== 'function') {
+      return false;
+    }
+    parent.appendChild(style);
+    return true;
+  }
+
+  function scaledFrameChromePx(value, zoom, fallback) {
+    var px = parseFloat(value);
+    if (!isFinite(px) || px < 0) {
+      return fallback;
+    }
+    return (px * zoom) + 'px';
+  }
+
+  function clearFrameShellChrome(shell) {
+    if (!shell || !shell.style) {
+      return;
+    }
+    shell.style.background = 'transparent';
+    shell.style.border = '0';
+    if (typeof shell.style.setProperty === 'function') {
+      shell.style.setProperty('--global-lookup-shell-border-width', '0px');
+      shell.style.setProperty('--global-lookup-shell-border-style', 'solid');
+      shell.style.setProperty(
+          '--global-lookup-shell-border-color', 'transparent');
+    }
+  }
+
+  // BUG-1609 final root fix — the viewport-stable host shell owns the visible
+  // card fill/border/radius; the scrolling iframe body owns content layout only.
+  // This closes the reserved-scrollbar-gutter hole where native HRGN rounded a
+  // transparent outer strip while the inset body fill still ended in a square
+  // right edge. The values are copied from getComputedStyle AFTER settingsJs, so
+  // light/dark/e-ink, MD3 dynamic colours and panel opacity keep one truth source.
+  // The host script itself is injected from the current bundle at document-start,
+  // so the ownership rule also does not depend on a fresh popup.css cache entry.
+  function syncFrameShellChrome(record) {
+    var classes = null;
+    var shell = record && record.shell;
+    var ownershipRemoved = false;
+    try {
+      var doc = record && record.iframe && record.iframe.contentDocument;
+      var root = doc && doc.documentElement;
+      if (!root || !root.style) {
+        return;
+      }
+      if (typeof root.style.setProperty === 'function') {
+        root.style.setProperty(
+            'background', FRAME_CANVAS_GUARD_BACKGROUND, 'important');
+      } else {
+        // Minimal DOM harness / ancient engine fallback. Inline style still
+        // outranks the cached author stylesheet in both cases.
+        root.style.background = FRAME_CANVAS_GUARD_BACKGROUND;
+      }
+      var body = doc.body;
+      var frame = record.iframe;
+      classes = root.classList;
+      var view = doc.defaultView || (frame && frame.contentWindow);
+      if (!body || !shell || !shell.style || !frame || !frame.style ||
+          !classes || typeof classes.remove !== 'function' ||
+          typeof classes.add !== 'function' || !view ||
+          typeof view.getComputedStyle !== 'function' ||
+          !ensureFrameChromeOwnerStyle(doc)) {
+        return;
+      }
+
+      // Reused frames already carry the ownership class. Remove it briefly so
+      // computed style exposes the freshly injected author theme, then restore
+      // ownership after copying the values to the shell.
+      classes.remove(FRAME_CHROME_CLASS);
+      ownershipRemoved = true;
+      var computed = view.getComputedStyle(body);
+      var background = computed && computed.backgroundColor;
+      if (!background || background === 'transparent' ||
+          background === 'rgba(0, 0, 0, 0)') {
+        // Stylesheet/navigation failure: clear any reused shell theme and leave
+        // the ownership class off, so body remains the self-contained fallback.
+        clearFrameShellChrome(shell);
+        return;
+      }
+      var borderWidth = computed.borderTopWidth || '0px';
+      var borderStyle = computed.borderTopStyle || 'none';
+      var borderColor = computed.borderTopColor || 'transparent';
+      var zoom = frameContentZoom(record);
+      var radius = scaledFrameChromePx(
+          computed.borderTopLeftRadius || '10px', zoom, '10px');
+      var visibleBorderWidth = (borderStyle === 'none' || borderWidth === '0px')
+          ? '0px'
+          : scaledFrameChromePx(borderWidth, zoom, '0px');
+
+      shell.style.background = background;
+      shell.style.border = '0';
+      shell.style.setProperty(
+          '--global-lookup-shell-border-width', visibleBorderWidth);
+      shell.style.setProperty(
+          '--global-lookup-shell-border-style', borderStyle);
+      shell.style.setProperty(
+          '--global-lookup-shell-border-color', borderColor);
+      shell.style.borderRadius = radius;
+      frame.style.borderRadius = radius;
+      frame.style.clipPath = 'inset(0 round ' + radius + ')';
+      classes.add(FRAME_CHROME_CLASS);
+      ownershipRemoved = false;
+    } catch (e) {
+      // Same-origin access is part of the host contract. If navigation failed,
+      // clear stale shell paint and restore body-owned degraded behaviour.
+      if (ownershipRemoved) {
+        clearFrameShellChrome(shell);
+      }
+    }
+  }
+
+  // TODO-1231 P1 — apply THIS frame's has-child-popup boolean on its own cheap
+  // channel: a single `window.__hasChildPopup` assignment on the same-origin
+  // frame realm,
+  // mirroring the in-app _setHasChildPopupJs. Kept OFF settingsJs so a nested
+  // open/close never re-evals the whole card body. popup.js reads
+  // window.__hasChildPopup LIVE at click time (parent-card tap -> close the
+  // child), so setting the variable alone — no renderPopup() — is sufficient
+  // (BUG-434 behaviour preserved). Guarded on the last-applied value so an
+  // unchanged re-render posts nothing.
+  function applyHasChildPopup(record) {
+    var desired = !!(record.descriptor && record.descriptor.hasChildPopup);
+    if (record.hasChildPopup === desired) {
+      return;
+    }
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win) {
+      return;
+    }
+    try {
+      win.__hasChildPopup = desired;
+      record.hasChildPopup = desired;
+    } catch (e) {
+      // No realm yet (node harness / not loaded) -> the next render/load applies.
+    }
+  }
+
+  function clearFrameSelection(record) {
+    if (!record || !record.iframe) {
+      return;
+    }
+    try {
+      var win = record.iframe.contentWindow;
+      if (win && win.fushiSelection &&
+          typeof win.fushiSelection.clearSelection === 'function') {
+        win.fushiSelection.clearSelection();
+        return;
+      }
+      var selection = win && typeof win.getSelection === 'function'
+          ? win.getSelection()
+          : null;
+      if (selection && typeof selection.removeAllRanges === 'function') {
+        selection.removeAllRanges();
+      }
+    } catch (e) {
+      // A navigating/recovering realm will clear its selection on load anyway.
+    }
+  }
+
+  // Reusing the stable root iframe across lookups must not let an observer or
+  // safety timer from the previous lookup mutate the new route's reveal gates.
+  // Tear those callbacks down before swapping the record's route identity; any
+  // callback already queued carries its own old snapshot and will be ignored by
+  // markContentReady/maybeFlipRevealReady.
+  function bindRecordRoute(record, routeSnapshot) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    if (sameRoute(record.route, route)) {
+      record.route = route;
+      return;
+    }
+    // Retire the old route's resend latch before rebinding the stable root. A
+    // cache miss on the new route must be allowed to post its own request.
+    clearRecordStaticSettingsRequest(record);
+    if (record.observer && typeof record.observer.disconnect === 'function') {
+      try {
+        record.observer.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.observer = null;
+    }
+    if (record.dirtyObserver &&
+        typeof record.dirtyObserver.disconnect === 'function') {
+      try {
+        record.dirtyObserver.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.dirtyObserver = null;
+    }
+    if (record.contentSafetyTimer != null) {
+      clearTimerSafe(record.contentSafetyTimer);
+      record.contentSafetyTimer = null;
+    }
+    if (record.revealSafetyTimer != null) {
+      clearTimerSafe(record.revealSafetyTimer);
+      record.revealSafetyTimer = null;
+    }
+    record.route = route;
+    record.contentReady = false;
+    if (record.shell && typeof record.shell.setAttribute === 'function') {
+      record.shell.setAttribute(ATTR_CONTENT_READY, 'false');
+    }
+    if (record.parentIndex >= 0) {
+      record.requiredGeometryEpoch = 0;
+      record.revealReady = false;
+      if (record.shell && typeof record.shell.setAttribute === 'function') {
+        record.shell.setAttribute(ATTR_REVEAL_READY, 'false');
+      }
+    }
+  }
+
+  function pruneStaticSettings(popups) {
+    var live = new Set();
+    for (var i = 0; i < popups.length; i++) {
+      var revision = descriptorStaticRevision(popups[i]);
+      if (revision != null) {
+        live.add(revision);
+      }
+    }
+    staticSettingsByRevision.forEach(function (settings, revision) {
+      if (!live.has(revision)) {
+        for (var i = 0; i < standbyRecords.length; i++) {
+          if (standbyRecords[i].injectedStaticRevision === revision) {
+            // The @font-face in this parked realm points at the soon-revoked
+            // Blob URL. Force the next acquire/prime to install a live revision.
+            standbyRecords[i].injectedStaticRevision = null;
+          }
+        }
+        revokeObjectUrls(settings && settings.objectUrls);
+        staticSettingsByRevision.delete(revision);
+      }
+    });
+    staticSettingsRequests.forEach(function (key) {
+      var separator = key.lastIndexOf('|');
+      var revision = separator >= 0 ? Number(key.substring(separator + 1)) : NaN;
+      if (!live.has(revision)) {
+        staticSettingsRequests.delete(key);
+      }
+    });
+  }
+
+  function renderPayload(layer, descriptor, logicalDepth) {
+    // Materialise the revision before creating/loading any iframe. Otherwise a
+    // nested iframe can win the load race against the root (the only descriptor
+    // carrying staticHeadJs) and unnecessarily round-trip to Dart for a resend.
+    var revision = cacheDescriptorStaticSettings(descriptor);
+    if (revision != null && staticSettingsByRevision.has(revision)) {
+      primeStandbyRecords(revision);
+    }
+    var record = frames.get(descriptor.id);
+    if (!record) {
+      record = acquireStandbyRecord(layer, descriptor) ||
+          createRecord(layer, descriptor, false);
+      frames.set(descriptor.id, record);
+    } else {
+      record.parentIndex = descriptor.parentIndex;
+      record.descriptor = descriptor;
+    }
+    var modern = revision != null &&
+        typeof descriptor.entriesJs === 'string' &&
+        typeof descriptor.renderJs === 'string';
+    var contentChanged = modern
+        ? (record.injectedStaticRevision !== revision ||
+           record.injectedEntriesJs !== descriptor.entriesJs ||
+           record.injectedRenderJs !== descriptor.renderJs)
+        : record.injectedSettingsJs !== descriptor.settingsJs;
+    bindRecordRoute(record, activeRoute);
+    applyShellStyle(
+        record.shell, descriptor, !contentChanged, logicalDepth);
+    // D1 / TODO-1231 v3 — geometry is placed for this layer, so reveal-ready is
+    // eligible. The shell still stays hidden until content-ready also flips (the
+    // CSS gate needs BOTH). reveal-ready flips NOW only if the committed window
+    // origin already covers the shell (root / down-right child); an up/left child
+    // whose window has not yet moved to reach it is HELD so it never paints clipped
+    // — commitLayerShift flips it once the origin catches up.
+    maybeFlipRevealReady(record, record.route);
+    if (record.loaded) {
+      wrapFrameBridge(record);
+      watchFrameSelection(record);
+      observeGalFrameDirty(record, record.route);
+      // BUG-1833 / TODO-1231 P1 — immutable settings are keyed by a small
+      // revision; entries + the per-frame render body are the only per-lookup
+      // strings. This keeps a custom data-URL font out of the hot descriptor and
+      // still skips a parent re-render when only hasChildPopup changed.
+      if (contentChanged) {
+        if (injectContent(record)) {
+          observeContent(record, record.route);
+        }
+      } else if (hasContent(record)) {
+        // TODO-1231 (BUG-583) — the body did not change (same-word re-lookup, or
+        // a nested render re-sending the parent's identical body) AND the frame
+        // already holds a rendered card. That card IS this render's correct
+        // content, so satisfy the (possibly beginLookup-re-gated) content gate
+        // now. Without this, a same-word re-lookup — where renderPayload skips the
+        // re-eval and beginLookup no longer re-observes the stale card — would
+        // wait for a popupRendered that never comes and reveal blank via the Dart
+        // ready-safety only. Gated on hasContent so a freshly-created empty frame
+        // (whose body genuinely has not rendered yet) still follows the
+        // observeContent gate. markContentReady is a no-op when already satisfied
+        // (nested open of a live parent).
+        markContentReady(record, record.route);
+      }
+      applyHasChildPopup(record);
+    }
+    return record;
+  }
+
+  function removeMissing(keepIds) {
+    var keep = new Set(keepIds);
+    var toRemove = [];
+    frames.forEach(function (record, id) {
+      if (!keep.has(id)) {
+        toRemove.push(id);
+      }
+    });
+    // The standby pool has one slot. Parking every removed child in sequence
+    // used to reset child A, destroy it while parking B, reset B, and so on.
+    // Select the deepest/hottest child once; permanently destroy the rest
+    // without a reuse reset, then park only that candidate.
+    var parkCandidate = null;
+    if (keepIds.length) {
+      for (var candidateIndex = toRemove.length - 1;
+           candidateIndex >= 0; candidateIndex--) {
+        var candidate = frames.get(toRemove[candidateIndex]);
+        if (candidate && candidate.parentIndex >= 0) {
+          parkCandidate = candidate;
+          break;
+        }
+      }
+    }
+    for (var i = 0; i < toRemove.length; i++) {
+      var id = toRemove[i];
+      var record = frames.get(id);
+      frames.delete(id);
+      if (!record) {
+        continue;
+      }
+      if (record !== parkCandidate) {
+        destroyRecord(record);
+      }
+    }
+    if (parkCandidate) {
+      parkRecord(parkCandidate);
+    }
+    // BUG-2651 — a removed/parked card takes its selection with it but fires no
+    // selectionchange (its realm is gone or parked), so re-derive the aggregate
+    // here; otherwise native keeps Ctrl+C hijacked for a selection nobody sees.
+    reportSelectionState();
+  }
+
+  function frameDescriptors() {
+    var descriptors = [];
+    frames.forEach(function (record) {
+      if (record && record.descriptor) {
+        descriptors.push(record.descriptor);
+      }
+    });
+    return descriptors;
+  }
+
+  // Detect only a true, same-route ancestor replacement. Pure append
+  // (R -> R,C), pure truncate (R,A -> R), an identical resend and a new root
+  // keep their existing immediate paths. This runs before renderPayload so a
+  // synchronous popupRendered from the new iframe already sees the transaction.
+  function preparePendingSuffixSwap(incomingIds) {
+    pendingSuffixSwap = null;
+    if (!Array.isArray(incomingIds) || incomingIds.length < 2 ||
+        !frames.size) {
+      return false;
+    }
+    var previousIds = [];
+    var sameActiveRoute = true;
+    frames.forEach(function (record, id) {
+      previousIds.push(id);
+      if (!record || !sameRoute(record.route, activeRoute)) {
+        sameActiveRoute = false;
+      }
+    });
+    if (!sameActiveRoute || !previousIds.length ||
+        previousIds[0] !== incomingIds[0]) {
+      return false;
+    }
+    var commonPrefix = 0;
+    var limit = Math.min(previousIds.length, incomingIds.length);
+    while (commonPrefix < limit &&
+           previousIds[commonPrefix] === incomingIds[commonPrefix]) {
+      commonPrefix++;
+    }
+    // Append/identical has no retiring suffix; truncate has no incoming suffix.
+    if (commonPrefix >= previousIds.length ||
+        commonPrefix >= incomingIds.length) {
+      return false;
+    }
+    var incoming = new Set(incomingIds);
+    var retiringIds = [];
+    for (var i = commonPrefix; i < previousIds.length; i++) {
+      if (!incoming.has(previousIds[i])) {
+        retiringIds.push(previousIds[i]);
+      }
+    }
+    if (!retiringIds.length) {
+      return false;
+    }
+    pendingSuffixSwap = {
+      route: cloneRoute(activeRoute),
+      targetIds: incomingIds.slice(),
+      // The full logical suffix is checked, rather than only physically-new ids.
+      // This also handles an identical resend while an earlier swap is pending.
+      incomingSuffixIds: incomingIds.slice(commonPrefix),
+      retiringIds: retiringIds,
+    };
+    cancelStandbyRefill();
+    return true;
+  }
+
+  function schedulePostSwapMeasure(routeSnapshot, afterCapture) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    var raf = (typeof window.requestAnimationFrame === 'function')
+        ? window.requestAnimationFrame
+        : null;
+    if (afterCapture !== true || route.source !== 'galCard' || !raf) {
+      scheduleMeasure(route, true);
+      return;
+    }
+    // armCaptureReady also uses two frames. Queue this after it, then add the
+    // actual measure on frame three so captureReady for the committed transition
+    // epoch is published before the shrink announces a successor epoch.
+    try {
+      raf(function () {
+        try {
+          raf(function () {
+            scheduleMeasure(route, true);
+          });
+        } catch (e) {
+          scheduleMeasure(route, true);
+        }
+      });
+    } catch (e) {
+      scheduleMeasure(route, true);
+    }
+  }
+
+  function tryFinalizePendingSuffixSwap(afterCapture) {
+    var swap = pendingSuffixSwap;
+    if (!swap || !sameRoute(swap.route, activeRoute) ||
+        committedGeometryEpoch <= 0 ||
+        committedGeometryEpoch !== announcedGeometryEpoch) {
+      return false;
+    }
+    for (var i = 0; i < swap.incomingSuffixIds.length; i++) {
+      var record = frames.get(swap.incomingSuffixIds[i]);
+      if (!record || !record.active || !sameRoute(record.route, swap.route) ||
+          !record.contentReady || !record.revealReady ||
+          !shellCoveredByCommittedGeometry(record)) {
+        return false;
+      }
+    }
+    // Clear first so parkRecord/scheduleStandbyRefill can restore the warm pool.
+    // Gate reveal and outgoing teardown happen inside this one JS task, so the
+    // compositor can paint either the old suffix or the complete new suffix,
+    // never the common prefix alone.
+    pendingSuffixSwap = null;
+    removeMissing(swap.targetIds);
+    var layer = document.getElementById(LAYER_ID);
+    scheduleStandbyRefill(layer);
+    pruneStaticSettings(frameDescriptors());
+    // The committed transition geometry intentionally covered old + new. Shrink
+    // the native region only after the replacement is visible.
+    schedulePostSwapMeasure(swap.route, afterCapture === true);
+    return true;
+  }
+
+  // Fast close/prune path. Dart has already validated and truncated its pure
+  // stack; the physical host only needs the surviving id prefix. Their frame
+  // geometry, entries and rendered DOM are unchanged, so re-sending hundreds
+  // of dictionary entries merely to have renderPayload reject them was pure
+  // serialization/ExecuteScript/parse overhead.
+  function retainStack(keepIds) {
+    if (!Array.isArray(keepIds) || !keepIds.length) {
+      return false;
+    }
+    var liveIds = [];
+    frames.forEach(function (_, id) {
+      liveIds.push(id);
+    });
+    if (keepIds.length > liveIds.length) {
+      return false;
+    }
+    for (var i = 0; i < keepIds.length; i++) {
+      if (typeof keepIds[i] !== 'string' || keepIds[i] !== liveIds[i]) {
+        return false;
+      }
+    }
+    for (var j = 0; j < keepIds.length; j++) {
+      var record = frames.get(keepIds[j]);
+      if (!record) {
+        return false;
+      }
+      if (record.descriptor) {
+        record.descriptor.hasChildPopup = j < keepIds.length - 1;
+      }
+      applyHasChildPopup(record);
+    }
+    // Match the in-app nested-close contract: the surviving new leaf no longer
+    // owns the selection that opened the removed child. Use the iframe's full
+    // selection helper (CSS highlights + DOM ranges) without re-rendering it.
+    clearFrameSelection(frames.get(keepIds[keepIds.length - 1]));
+    pendingSuffixSwap = null;
+    removeMissing(keepIds);
+    var layer = document.getElementById(LAYER_ID);
+    scheduleStandbyRefill(layer);
+    var liveDescriptors = [];
+    frames.forEach(function (record) {
+      if (record.descriptor) {
+        liveDescriptors.push(record.descriptor);
+      }
+    });
+    pruneStaticSettings(liveDescriptors);
+    scheduleMeasure(activeRoute, true);
+    return true;
+  }
+
+  // Retire the current transaction without rewinding the process-wide epoch.
+  // A delayed native ack from the retired lookup then fails the equality check
+  // instead of mutating the new lookup's layer or reveal gates.
+  function resetGeometryTransaction() {
+    announcedGeometryEpoch = 0;
+    committedGeometryEpoch = 0;
+    announcedGeometryKey = '';
+    announcedGeometryBounds = null;
+    committedGeometryBounds = null;
+  }
+
+  // TODO-1095 — a NEW hotkey lookup is starting. Dart calls this (via the render
+  // channel) BEFORE the fresh renderStack. Because the root frame id is now
+  // STABLE (the root iframe is reused, not rebuilt), two per-lookup resets that
+  // used to piggy-back on a changing root id must be done explicitly here:
+  //   1. Clear lastBBoxKey so the new card's reveal-driving overlaySize is never
+  //      de-duped away when its union bbox equals the previous lookup's.
+  //   2. RE-GATE the reused root shell: reset data-content-ready to false and
+  //      re-arm the content observer + safety timer, so the reveal WAITS for THIS
+  //      lookup's popupRendered instead of inheriting the previous card's already
+  //      satisfied content-ready (the "audio plays but no popup" mislevel: the
+  //      window revealed before the fresh iframe card had actually rendered).
+  // reveal-ready is left intact (geometry is re-placed by the following
+  // renderStack); only the CONTENT half of the two-flag gate is re-armed.
+  function beginLookup(rootId, route, routeEpoch, lookupEpoch) {
+    activeRoute = normalizeRoute(route, routeEpoch, lookupEpoch);
+    pendingSuffixSwap = null;
+    lastBBoxKey = '';
+    // BUG-749 — native cleared its shell rects on Hide(); force a re-post even
+    // when the fresh card's rects CSV equals the previous lookup's.
+    lastShellRectsKey = '';
+    resetGeometryTransaction();
+    // TODO-1231 v3 (BUG-583) — a NEW hotkey lookup re-reveals the window from a
+    // fresh origin; drop the committed layer origin so a stale NEGATIVE origin left
+    // by a PREVIOUS lookup's up/left cascade cannot falsely mark THIS lookup's
+    // up/left child as already-covered (which would reveal it clipped). Mirrors the
+    // Dart ratchet reset (_ratchetLeft/_ratchetTop = infinity) one layer up. The
+    // real layer transform is re-applied by this lookup's first commitLayerShift.
+    // BUG-859 — reset the layer's DOM transform IN LOCK-STEP with the shadow
+    // offsets. Resetting only the variables left the previous lookup's
+    // translate (layer.style.left/top) applied while shellCoveredByOrigin /
+    // frameIdAtPoint reasoned against the zeroed offsets: the reveal gate was
+    // defeated (a stale-shifted card counted as covered) and any reveal that
+    // bypasses commitLayerShift (legacy Reveal / ready-safety fallback) showed
+    // the fresh root displaced by the stale shift. This lookup's real transform
+    // is re-applied by its first measureAndReport / commitLayerShift.
+    applyLayerOffset(0, 0);
+    // TODO-1345 (BUG-583 深层根因续) — drop the previous lookup's reserved cascade
+    // floor so it can never leak into a fresh lookup (a new lookup re-computes its
+    // own floor from the new cursor position and pushes it via the next renderStack).
+    originFloorLeft = 0;
+    originFloorTop = 0;
+    galOriginRatchetLeft = Infinity;
+    galOriginRatchetTop = Infinity;
+    if (typeof rootId !== 'string' || !rootId) {
+      return;
+    }
+    var record = frames.get(rootId);
+    if (!record) {
+      return; // First-ever lookup for this id: createRecord gates it fresh.
+    }
+    // Re-arm the content half of the reveal gate for the reused shell.
+    record.contentReady = false;
+    if (record.shell && typeof record.shell.setAttribute === 'function') {
+      record.shell.setAttribute(ATTR_CONTENT_READY, 'false');
+    }
+    // BUG-745 — strip the TODO-890 slide-out class off the REUSED root shell.
+    // dismissRootWithSlide adds .global-lookup-dismissing (translateX(120%) +
+    // opacity 0) and NOTHING ever removed it, while the root shell survives
+    // across lookups (stable root id, TODO-1095). After the first slide
+    // dismissal every later card therefore rendered ALREADY slid off-window and
+    // fully transparent: native revealed the window, popupRendered/overlaySize
+    // all fired, but the user saw NOTHING ("第一次正常，之后的弹窗根本不出
+    // 现"). The TODO-1345 floor window made every click-outside take the JS
+    // slide path (clicks always land inside the near-fullscreen window), so a
+    // session was poisoned on its very first dismissal.
+    if (record.shell && record.shell.classList &&
+        typeof record.shell.classList.remove === 'function') {
+      record.shell.classList.remove('global-lookup-dismissing');
+    }
+    // A slide interrupted by this new lookup must not leave the latch stuck.
+    dismissingRoot = false;
+    // TODO-1231 (BUG-583) -- tear down the PREVIOUS lookup's content observer +
+    // safety timer, but DO NOT re-arm an observer off the stale card here. The
+    // reused iframe still holds the previous lookup's `.glossary-content`, so
+    // calling observeContent now would synchronously re-satisfy content-ready
+    // from that STALE card and fire a premature overlaySize -- which revealed the
+    // OLD card at the cursor for a frame (the "第一个弹窗出现时闪") before showAt
+    // parked the window off-screen again for the fresh render. The content gate
+    // is instead re-armed by the FOLLOWING renderStack: a changed body runs
+    // injectContent + observeContent on the NEW card; an unchanged body (same
+    // word) markContentReady's the already-correct content in renderPayload. So
+    // the reveal-driving overlaySize now originates only from the fresh render,
+    // never from the stale card.
+    if (record.observer && typeof record.observer.disconnect === 'function') {
+      try {
+        record.observer.disconnect();
+      } catch (e) {
+        // no-op
+      }
+      record.observer = null;
+    }
+    if (record.contentSafetyTimer != null) {
+      clearTimerSafe(record.contentSafetyTimer);
+      record.contentSafetyTimer = null;
+    }
+  }
+
+  // TODO-1345 (BUG-583 深层根因续) — set the reserved cascade origin floor from the
+  // render payload (Dart's screen-edge-aware headroom). Called from renderStack so
+  // the floor is in place before the following measureAndReport reports the origin.
+  // Guarded: an absent / malformed value leaves the floor at its current (reset) 0
+  // (no reservation). The floor only ever reserves OUTWARD (<= 0); a positive value
+  // would pull the origin INWARD and clip the root, so it is clamped out to 0.
+  function applyOriginFloor(floor) {
+    if (!floor || typeof floor !== 'object') {
+      return;
+    }
+    var l = (typeof floor.left === 'number' && isFinite(floor.left))
+        ? floor.left
+        : 0;
+    var t = (typeof floor.top === 'number' && isFinite(floor.top))
+        ? floor.top
+        : 0;
+    originFloorLeft = l < 0 ? l : 0;
+    originFloorTop = t < 0 ? t : 0;
+  }
+
+  function renderStack(payload) {
+    var popups = (payload && payload.popups) || [];
+    // BUG-1857 — Dart 的权威重排接管 root 尺寸；live-fit 到此为止。
+    endLiveResize();
+    // TODO-1345 — pick up this lookup's reserved origin floor BEFORE the diff +
+    // measure so the very first reveal already commits the headroom-covered origin.
+    applyOriginFloor(payload && payload.originFloor);
+    if (!popups.length) {
+      pendingSuffixSwap = null;
+      removeMissing([]);
+      // BUG-1833 — no lookup is visible, so release the one look-ahead realm
+      // along with its decoded font/static document state.  The next host
+      // activation recreates it before a child lookup can be requested.
+      destroyStandbyPool();
+      pruneStaticSettings([]);
+      lastBBoxKey = '';
+      lastShellRectsKey = '';
+      resetGeometryTransaction();
+      lastRootId = null;
+      return;
+    }
+    var layer = ensureLayer();
+    var ids = [];
+    for (var idIndex = 0; idIndex < popups.length; idIndex++) {
+      var idDescriptor = popups[idIndex];
+      if (idDescriptor && typeof idDescriptor.id === 'string') {
+        ids.push(idDescriptor.id);
+      }
+    }
+    preparePendingSuffixSwap(ids);
+    var renderedIds = [];
+    for (var i = 0; i < popups.length; i++) {
+      var descriptor = popups[i];
+      if (!descriptor || typeof descriptor.id !== 'string') {
+        continue;
+      }
+      renderedIds.push(descriptor.id);
+      renderPayload(layer, descriptor, i);
+    }
+    ids = renderedIds;
+    // TODO-1079 (C) — a changed ROOT frame id means a fresh lookup: clear the
+    // bbox de-dup so the new card's first overlaySize is never suppressed by a
+    // stale identical-bbox key from the previous lookup.
+    var rootId = ids.length ? ids[0] : null;
+    if (rootId !== lastRootId) {
+      lastRootId = rootId;
+      lastBBoxKey = '';
+      lastShellRectsKey = '';
+      resetGeometryTransaction();
+    }
+    tryFinalizePendingSuffixSwap();
+    if (!pendingSuffixSwap) {
+      removeMissing(ids);
+    }
+    // Keep exactly one already-loaded popup realm ahead of the visible stack,
+    // but never make its navigation contend with the card being presented now.
+    if (!pendingSuffixSwap) {
+      scheduleStandbyRefill(layer);
+    }
+    // Static heads can contain a ~13 MB data-URL font. Keep only revisions used
+    // by the live descriptors so theme/font changes do not grow host memory for
+    // the lifetime of the process.
+    pruneStaticSettings(pendingSuffixSwap ? frameDescriptors() : popups);
+    // Dirty/new records still perform a real DOM measurement; unchanged
+    // ancestors reuse their cached content height and keep a stable viewport.
+    scheduleMeasure(activeRoute, true);
+  }
+
+  // D2 — measure every live frame same-origin content height and report the UNION
+  // bounding box of all shells (CSS px) so C++ enlarges the window to fit the
+  // whole stack. Height refined to the iframe content (capped to planned shell
+  // height). devicePixelRatio sent so C++ converts CSS-px box to physical-px
+  // window geometry. De-duped on the box key.
+  function measureAndReport(routeSnapshot, allowCachedMeasurements) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    var routePrefix = routeKey(route) + '|';
+    if (!frames.size) {
+      return;
+    }
+    var waitingForStatic = false;
+    frames.forEach(function (record) {
+      if (sameRoute(record.route, route) && record.waitingForStatic) {
+        waitingForStatic = true;
+      }
+    });
+    // Do not report bootstrap geometry for an empty/stale iframe while its
+    // static settings are missing. The routed resend will inject content and
+    // schedule a fresh measurement; until then the shell must remain invisible.
+    if (waitingForStatic) {
+      return;
+    }
+    // TODO-1231 v2 (BUG-583) — the union bbox has two independently-sourced
+    // corners because they drive DIFFERENT things:
+    //   * MIN-corner (origin): drives the window POSITION (SetWindowPos) AND the
+    //     compensating commitLayerShift(-min) that pins the ROOT card at the
+    //     cursor. A shell's on-screen position is (windowOrigin + layerShift +
+    //     shellLocal) = cursor + shellLocal, so moving the origin does NOT move a
+    //     card — EXCEPT for the ~1 frame where SetWindowPos has landed on the DWM
+    //     window but the commitLayerShift ExecuteScript has NOT yet re-composited
+    //     the WebView2 layer: during that gap the pinned parent card lurches by
+    //     the origin delta, then snaps back (the residual “父弹窗出现子弹窗时闪
+    //     一下”). So the origin must follow ONLY shells the user can already see
+    //     (content-ready): a freshly-opened, still-gated-hidden child that
+    //     cascades UP/LEFT must NOT drag the origin outward — and lurch the parent
+    //     — before it has even rendered. When that child becomes content-ready
+    //     (about to paint) it joins the origin set, so the single origin move
+    //     coincides with the child's own appearance frame (masked).
+    //   * MAX-corner (far edges): drives the window SIZE only. Growing it keeps
+    //     the origin (and thus the layer shift) fixed, so it never moves the
+    //     parent. It therefore includes EVERY placed shell — the window pre-grows
+    //     down/right to cover a not-yet-ready child so that child is not clipped
+    //     when it paints. A DOWN-RIGHT cascade only ever grows the max-corner, so
+    //     the parent is now PERFECTLY still throughout a nested open.
+    // Bootstrap: before ANY shell is content-ready (the very first root reveal,
+    // where there is no visible parent to lurch), the origin falls back to all
+    // placed shells — byte-identical to the pre-fix behaviour, so the first
+    // reveal is unchanged and the existing harness (#11/#15) still passes.
+    var minLeft = Infinity;
+    var minTop = Infinity;
+    var minLeftAll = Infinity;
+    var minTopAll = Infinity;
+    var maxRight = -Infinity;
+    var maxBottom = -Infinity;
+    var shellRects = [];
+    var routedFrameCount = 0;
+    // BUG-2082 — the ROOT card's own measured height (CSS px), reported next to
+    // the union bbox. The gal in-game presenter anchors the root card by the
+    // edge that touches the clicked glyph (bottom edge when the card flips
+    // above the line); the union bbox alone cannot tell the root's height once
+    // nested children extend the union, so the host reports it explicitly.
+    var rootHeight = 0;
+    var firstShellHeight = 0;
+    frames.forEach(function (record) {
+      if (!sameRoute(record.route, route)) {
+        return;
+      }
+      routedFrameCount++;
+      var left = parseFloat(record.shell.style.left) || 0;
+      var top = parseFloat(record.shell.style.top) || 0;
+      var width = parseFloat(record.shell.style.width) || 0;
+      // The descriptor remains the unmodified layout ceiling.  Do not derive the
+      // next measurement from shell.style.height: a previous short result may
+      // later grow (async dictionaries / nested content), and using the already
+      // shortened style would make that shrink permanent.
+      var plannedFrame = (record.descriptor && record.descriptor.frame) || {};
+      var plannedHeight = (typeof plannedFrame.height === 'number' &&
+          isFinite(plannedFrame.height) && plannedFrame.height > 0)
+          ? plannedFrame.height
+          : (parseFloat(record.shell.style.height) || 0);
+      var height = plannedHeight;
+      var measured = measureContentHeight(
+          record, allowCachedMeasurements === true);
+      if (measured > 0) {
+        height = plannedHeight > 0 ? Math.min(plannedHeight, measured) : measured;
+      }
+      // One geometry truth for the promoted iframe surface, per-shell rounded
+      // clip, host hit testing, native region and CapturePreview union.  Before
+      // this assignment bbox/shellRects used the measured bottom while the shell
+      // (and its 100%-height iframe) kept the planned bottom, so CapturePreview
+      // cut through the card before its lower radius and produced square corners.
+      if (height > 0) {
+        record.shell.style.height = height + 'px';
+      }
+      // BUG-749 — collect every placed shell (same left/top/height the bbox
+      // uses) for the native hit/paint region below.
+      shellRects.push([left, top, width, height]);
+      if (firstShellHeight <= 0 && height > 0) {
+        firstShellHeight = height;
+      }
+      if (record.parentIndex < 0 && rootHeight <= 0 && height > 0) {
+        rootHeight = height;
+      }
+      // MAX-corner (window size) + the bootstrap origin fallback see EVERY placed
+      // shell, so the window pre-grows to cover a not-yet-ready child (no clip).
+      if (left < minLeftAll) minLeftAll = left;
+      if (top < minTopAll) minTopAll = top;
+      if (left + width > maxRight) maxRight = left + width;
+      if (top + height > maxBottom) maxBottom = top + height;
+      // MIN-corner (window origin / pin) follows ONLY shells the user can already
+      // see, so a hidden child never moves the pinned parent before it paints.
+      if (record.contentReady) {
+        if (left < minLeft) minLeft = left;
+        if (top < minTop) minTop = top;
+      }
+    });
+    if (!routedFrameCount) {
+      return;
+    }
+    // No content-ready shell yet (bootstrap first reveal): follow all placed
+    // shells so the reveal geometry is identical to the pre-fix behaviour.
+    if (!isFinite(minLeft) || !isFinite(minTop)) {
+      minLeft = minLeftAll;
+      minTop = minTopAll;
+    }
+    // TODO-1345 (BUG-583 深层根因续) — pull the origin OUT to at least the reserved
+    // cascade floor. Applied AFTER the content-ready / bootstrap min so the floor is
+    // a lower bound on how far IN the origin can sit (it only ever moves the origin
+    // outward), never a cap. This is the root fix for the residual parent lurch: an
+    // up/left child that lands WITHIN the floor no longer pulls the origin when it
+    // becomes content-ready (min(shellLeft, floor) == floor while shellLeft >= floor)
+    // — the window origin is frozen from the first reveal, so the pinned parent card
+    // has ZERO displacement. 0 (default / down-right / cursor at an edge) leaves the
+    // origin byte-identical (min(x, 0) never pulls a non-positive x outward).
+    if (originFloorLeft < minLeft) {
+      minLeft = originFloorLeft;
+    }
+    if (originFloorTop < minTop) {
+      minTop = originFloorTop;
+    }
+    // galCard grows only where a real child lands (no large transparent first
+    // frame), then holds that outermost origin until the lookup is dismissed.
+    // Dart applies the same outward-only ratchet at the HWND boundary. Keeping
+    // it here too makes rectsCsv, bbox, layer shift and CapturePreview masking
+    // share one coordinate origin when descendants are removed again.
+    if (route.source === 'galCard') {
+      if (isFinite(galOriginRatchetLeft) &&
+          galOriginRatchetLeft < minLeft) {
+        minLeft = galOriginRatchetLeft;
+      }
+      if (isFinite(galOriginRatchetTop) && galOriginRatchetTop < minTop) {
+        minTop = galOriginRatchetTop;
+      }
+      galOriginRatchetLeft = minLeft;
+      galOriginRatchetTop = minTop;
+    }
+    if (!isFinite(minLeft) || !isFinite(minTop) ||
+        !isFinite(maxRight) || !isFinite(maxBottom)) {
+      return;
+    }
+    // BUG-2123 — 首帧例外，把补偿平移**提前**到 overlaySize 之前。
+    // 下面 TODO-1231 P2 的「窗口先动、内容后跟」次序只为保护**已经画在屏幕上**的
+    // 父卡；本次查词还没提交过任何几何（committedGeometryEpoch === 0）时窗口仍停在
+    // OffscreenX() 之外、对用户不可见，被保护的对象根本不存在，代价却照收：
+    // reserve-to-edge 地板（computeCascadeHeadroomSeed·BUG-670）让**每一次**查词的
+    // bbox 原点都被拉到工作区左上角，于是 RevealStack 的 SetWindowPos +
+    // SWP_SHOWWINDOW 先让窗口带着「平移量仍为 0」的图层可见 —— 根卡就画在窗口本地
+    // (0,0) = 工作区左上角，直到一帧后 ExecuteScript 的 commitLayerShift 才把它搬到
+    // 光标处。用户看到的正是「弹窗先在屏幕左上角闪一下再飞到光标」。
+    // 在 postToHost('overlaySize') 之前落位是安全的：窗口要等这条消息走完一整趟
+    // Dart 往返（overlaySize → _applyOverlayBox → revealStack → SetWindowPos）才第一
+    // 次可见，内容早已合成到位，首帧即正确；随后 C++ 那次 commitLayerShift 带着同样
+    // 的 (minLeft, minTop) 到达，DOM 写入是幂等 no-op，嵌套 / 后续 resize 路径逐字节
+    // 不变。galCard 的窗口永远在屏外（截图后贴进游戏画面），没有可闪的首帧，保持
+    // 原样以免动到 captureReady 的两帧握手。
+    if (route.source !== 'galCard' && committedGeometryEpoch === 0) {
+      applyLayerOffset(minLeft, minTop);
+    }
+    // TODO-1231 P2 — for every LATER transaction (the window is already visible)
+    // do NOT shift the host layer (nor set layerOffset*) HERE. The
+    // layer translation (-minLeft,-minTop) that pins the ROOT card at the cursor
+    // while the window covers the whole cascade bbox must be applied ONLY AFTER
+    // C++ SetWindowPos has moved the window to the new bbox origin. When the host
+    // shifted the layer synchronously (WebView2 compositor, immediate) but the
+    // window only moved a full Dart round-trip later, the two compensating moves
+    // landed on DIFFERENT vsync frames and the parent card visibly lurched then
+    // snapped back (the "几何跳动" half of TODO-1231). C++ RevealStack now calls
+    // commitLayerShift(box.left, box.top) right AFTER SetWindowPos so the window
+    // move and the content shift are causally ordered (window first, content ~1
+    // frame later) instead of racing. Mitigation, not a true atomic commit: the
+    // DWM window and the WebView2 surface cannot move in the SAME frame across the
+    // JS/window boundary, so a ~1 frame residual remains (vs the old multi-frame
+    // desync) — and only for a left/up cascade (dx/dy != 0; down-right stays 0).
+    // BUG-749 — report the per-shell rects (window-relative CSS px: the window
+    // is positioned at the bbox MIN-corner, so window-relative = shell − min)
+    // BEFORE overlaySize. Native clips the opaque overlay window's region to
+    // the UNION of these card rects (global_lookup_window.cpp
+    // ApplyRoundedRegion), so a click in the reserved-floor GAP passes through
+    // to the app below (clipboard panel next-word tap works in ONE click)
+    // instead of being swallowed by a near-fullscreen invisible sheet — the
+    // TODO-1345 floor regression. Posting before overlaySize means the region
+    // is already correct when Dart reveals the window (no clipped first frame).
+    // The window rect/origin itself never changes → BUG-583 zero-motion holds.
+    var rectsCsv = shellRects.map(function (r) {
+      return [r[0] - minLeft, r[1] - minTop, r[2], r[3]].map(function (v) {
+        return Math.round(v * 100) / 100;
+      }).join(',');
+    }).join(';');
+    var rectsKey = routePrefix + rectsCsv;
+    var dpr = (typeof window.devicePixelRatio === 'number' &&
+               window.devicePixelRatio > 0) ? window.devicePixelRatio : 1;
+    if (rootHeight <= 0) {
+      rootHeight = firstShellHeight;
+    }
+    var box = {
+      left: minLeft,
+      top: minTop,
+      width: maxRight - minLeft,
+      height: maxBottom - minTop,
+      rootHeight: rootHeight,
+      dpr: dpr,
+    };
+    // rootHeight is part of the de-dup key: a root that shrinks under a child
+    // still spanning the old bottom leaves the union unchanged, yet the in-game
+    // root placement must follow the new root edge.
+    var key = routePrefix + box.left + ',' + box.top + ',' + box.width + ',' +
+        box.height + ',' + box.rootHeight + ',' + dpr;
+    var geometryKey = key + '|' + rectsCsv;
+    var rectsChanged = rectsKey !== lastShellRectsKey;
+    var bboxChanged = key !== lastBBoxKey;
+    if (!rectsChanged && !bboxChanged &&
+        geometryKey === announcedGeometryKey) {
+      // A replacement logical child can occupy exactly the same already-
+      // committed rectangle as its predecessor. Bind that new hidden record to
+      // the existing transaction without another native round-trip.
+      frames.forEach(function (record) {
+        if (!sameRoute(record.route, route) || record.parentIndex < 0 ||
+            record.revealReady) {
+          return;
+        }
+        record.requiredGeometryEpoch = announcedGeometryEpoch;
+        if (announcedGeometryEpoch === committedGeometryEpoch) {
+          maybeFlipRevealReady(record, route);
+        }
+      });
+      return;
+    }
+    var geometryEpoch = ++nextGeometryEpoch;
+    announcedGeometryEpoch = geometryEpoch;
+    announcedGeometryKey = geometryKey;
+    announcedGeometryBounds = {
+      left: minLeft,
+      top: minTop,
+      right: maxRight,
+      bottom: maxBottom,
+    };
+    // Every not-yet-visible nested record in this measured union waits for this
+    // exact transaction. Already-visible cards are never re-hidden when an
+    // asynchronous dictionary row later changes height, avoiding whole-stack
+    // flashing while still gating the newly-opened child.
+    frames.forEach(function (record) {
+      if (sameRoute(record.route, route) && record.parentIndex >= 0 &&
+          !record.revealReady) {
+        record.requiredGeometryEpoch = geometryEpoch;
+      }
+    });
+    if (rectsChanged) {
+      lastShellRectsKey = rectsKey;
+      // Keep shellRects before overlaySize. WebView2 messages preserve order,
+      // so native applies the HRGN belonging to this transaction before it
+      // resizes/reveals and acknowledges geometryEpoch.
+      postToHost('shellRects', [rectsCsv, geometryEpoch], route);
+    }
+    lastBBoxKey = key;
+    box.geometryEpoch = geometryEpoch;
+    // overlaySize args: [dpr, box]. Dart reveal/resize the window to this CSS-px
+    // box (times dpr at the C++ window boundary). A shellRects-only change still
+    // posts this message so the native region update receives a causal ack.
+    postToHost('overlaySize', [dpr, box], route);
+  }
+
+  // BUG-1139 ③ — 卡片 iframe 的 documentElement 上挂着 CSS `zoom`
+  // （popup_settings_injection 的 head 注入 `= appUiScale × dictionaryFontSize/16`）。
+  // 标准化 CSS zoom 下 scrollHeight/offsetHeight 返回的是**未乘 z 的 layout px**，
+  // 而卡片实际画出 layout × z —— popup.js 的 popupCurrentZoom + `visualStep / z`
+  // 正是同一语义的另一半。z 取不到（未注入 / 非法 / 跨域抛错）一律回落 1。
+  function frameContentZoom(record) {
+    try {
+      var doc = record.iframe.contentDocument;
+      var docEl = doc && doc.documentElement;
+      var z = (docEl && docEl.style) ? parseFloat(docEl.style.zoom) : NaN;
+      return (isFinite(z) && z > 0) ? z : 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+
+  // BUG-1139 ③ — 返回值必须与 shell 几何同单位：**未缩放的 host CSS px**
+  // （host 文档自身从不设 zoom，shell.style.left/top/width/height 都是这个单位）。
+  // 所以 iframe 里量到的 layout px 要先乘回 z，否则 z>1 时 measureAndReport 会把
+  // shell 高度收到只有内容视觉高度的 1/z，union bbox 的 maxBottom 与 shellRects
+  // （→ window region / ApplyRoundedRegion）跟着矮一截，卡片底部被窗口边缘裁掉、
+  // 裁口外直接露出底下的应用 —— 正是本 bug 的原始症状。
+  // Math.ceil 只防子像素短一格；z=1（默认 16px 字号 + 100% 界面大小）时
+  // scrollHeight/offsetHeight 本就是整数，换算是恒等变换，行为逐字节不变。
+  function measureContentHeight(record, allowCachedMeasurement) {
+    if (allowCachedMeasurement === true && !record.contentMeasureDirty &&
+        record.measuredContentHeight > 0) {
+      return record.measuredContentHeight;
+    }
+    try {
+      var doc = record.iframe.contentDocument;
+      if (!doc || !doc.body) {
+        return 0;
+      }
+      var body = doc.body;
+      var docEl = doc.documentElement;
+      var layoutPx = Math.max(
+        body.scrollHeight || 0,
+        body.offsetHeight || 0,
+        docEl ? (docEl.scrollHeight || 0) : 0);
+      if (layoutPx <= 0) {
+        return 0;
+      }
+      var measured = Math.ceil(layoutPx * frameContentZoom(record));
+      record.measuredContentHeight = measured;
+      record.contentMeasureDirty = false;
+      return measured;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  // TODO-1231 P2 — apply the layer translation that pins the ROOT card at the
+  // cursor while the window covers the whole cascade bounding box. Called by C++
+  // RevealStack AFTER SetWindowPos (see measureAndReport), so the window has
+  // already moved to the bbox origin before the content compensates. [bboxLeft]/
+  // [bboxTop] are the union bbox origin (window-local CSS px — the SAME values
+  // Dart sized/positioned the window from), so the layer is translated by their
+  // negation and layerOffset* is kept in lock-step for the hit-test (TODO-1189).
+  // CSS px only (no dpr; the dpr boundary is the C++ window). Bad args default to
+  // 0 (no shift), matching a single popup / down-right cascade.
+  // 图层补偿平移的**唯一**写入口：DOM 平移与 layerOffset*（命中测试 /
+  // frameIdAtPoint 用的同一坐标域）必须锁步，分开写过一次就出过 BUG-859。
+  function applyLayerOffset(l, t) {
+    var layerEl = document.getElementById(LAYER_ID);
+    if (layerEl) {
+      layerEl.style.left = (-l) + 'px';
+      layerEl.style.top = (-t) + 'px';
+    }
+    layerOffsetLeft = l;
+    layerOffsetTop = t;
+  }
+
+  // legacy Reveal 专用的图层复位（BUG-2123）。
+  //
+  // 首帧预落位（见 measureAndReport 的 BUG-2123 分支）把图层推了 (-minLeft,-minTop)，
+  // 这只有在窗口随后被放到 **bbox 原点、bbox 尺寸** 时才对得上。而桌面还有两条 reveal
+  // 旁路**从不**调 commitLayerShift，并且把窗口放在 **光标处、单卡尺寸**：
+  // `_scheduleReadyDrivenSafety` 的 450ms 兜底与 `reveal(scalar)` 路径，两者都进 C++ 的
+  // legacy `GlobalLookupWindow::Reveal`。图层不复位，根卡就被推到 420px 宽的窗口之外
+  // ——用户看到一个**空白弹窗**（TODO-1079 那条「弹窗有时不出现」的老症状）。
+  //
+  // 复位的责任只能在 native：Dart 侧两个调用点都不知道自己最终会走哪条 C++ 路径，
+  // 而 `Reveal` 正是「窗口按光标+单卡尺寸摆好了」这个事实的唯一发生地。
+  function resetLayerOffsetForLegacyReveal() {
+    applyLayerOffset(0, 0);
+    return true;
+  }
+
+  function commitLayerShift(
+      bboxLeft, bboxTop, geometryEpoch, deferSuffixSwapFinalize) {
+    var epoch = (typeof geometryEpoch === 'number' && isFinite(geometryEpoch) &&
+        geometryEpoch > 0) ? Math.trunc(geometryEpoch) : 0;
+    if (epoch > 0) {
+      // Only the latest announced bbox + shellRects transaction owns the layer.
+      // This rejects A's late native callback after B has already been measured.
+      if (epoch !== announcedGeometryEpoch || !announcedGeometryBounds) {
+        return false;
+      }
+      committedGeometryEpoch = epoch;
+      committedGeometryBounds = {
+        left: announcedGeometryBounds.left,
+        top: announcedGeometryBounds.top,
+        right: announcedGeometryBounds.right,
+        bottom: announcedGeometryBounds.bottom,
+      };
+    } else if (announcedGeometryEpoch > 0) {
+      // Once this host uses the epoch contract, a delayed legacy/unstamped
+      // callback must not acknowledge or move its latest geometry.
+      return false;
+    }
+    var l = (typeof bboxLeft === 'number' && isFinite(bboxLeft)) ? bboxLeft : 0;
+    var t = (typeof bboxTop === 'number' && isFinite(bboxTop)) ? bboxTop : 0;
+    // 首帧路径可能已经把同一组值提前落位（见 measureAndReport 的 BUG-2123 分支），
+    // 那时这次写入是幂等 no-op，本函数只剩「提交 bounds + 翻 reveal 门」的职责。
+    applyLayerOffset(l, t);
+    // TODO-1231 v3 (BUG-583) — the window just settled at this origin, so any shell
+    // held hidden because it fell OUTSIDE the previous (narrower) window is now
+    // covered; flip its reveal-ready so it paints IN PLACE, coincident with the
+    // window/layer settling — no clipped-then-jump. Idempotent (covered shells that
+    // already revealed are a no-op); content-ready is gated separately, so a child
+    // still waits for its own popupRendered before actually painting.
+    frames.forEach(function (record) {
+      maybeFlipRevealReady(record);
+    });
+    if (deferSuffixSwapFinalize !== true) {
+      tryFinalizePendingSuffixSwap();
+    }
+    return true;
+  }
+
+  // The galgame surface is captured into a bitmap immediately after Dart hears
+  // that the off-screen window reached its final geometry.  SetWindowPos and
+  // ExecuteScript only order the HWND resize before this DOM mutation; they do
+  // not mean WebView2 has presented the resized DOM yet.  A capture in that gap
+  // can contain both the old and new layout.  Gate the capture on two animation
+  // frames in the host realm, and stamp the immutable lookup route so a late
+  // frame from an older lookup cannot publish pixels for the current one. A
+  // bounded timer preserves liveness when Chromium suspends rAF for the parked
+  // off-screen WebView; the same route/epoch/token gate owns both completions.
+  function armCaptureReady(
+      routeSnapshot, physicalWidth, physicalHeight, geometryEpoch) {
+    var route = cloneRoute(routeSnapshot || activeRoute);
+    if (route.source !== 'galCard') {
+      return;
+    }
+    var epoch = (typeof geometryEpoch === 'number' && isFinite(geometryEpoch) &&
+        geometryEpoch > 0) ? Math.trunc(geometryEpoch) : 0;
+    if (epoch <= 0 || epoch !== committedGeometryEpoch ||
+        epoch !== announcedGeometryEpoch) {
+      return;
+    }
+    var key = routeKey(route);
+    // Resize/commit can converge more than once inside one lookup route, and
+    // physical width/height may remain equal while the layer origin changes.
+    // Only the latest commit is allowed to satisfy Dart's pending capture.
+    // Use an object identity rather than a route-local integer. The completed
+    // token is removed from the map, so a numeric counter derived from the map
+    // could otherwise restart at 1 and let a very late rAF consume a newer arm
+    // for the same route/epoch (ABA).
+    var token = {};
+    galCaptureReadySchedules.set(key, token);
+    var raf = (typeof window.requestAnimationFrame === 'function')
+        ? window.requestAnimationFrame
+        : null;
+    var fallbackTimer = null;
+    var finished = false;
+    var postIfCurrent = function () {
+      if (finished) {
+        return;
+      }
+      var current = galCaptureReadySchedules.get(key) === token &&
+          routeKey(activeRoute) === key &&
+          epoch === committedGeometryEpoch &&
+          epoch === announcedGeometryEpoch;
+      finished = true;
+      clearTimerSafe(fallbackTimer);
+      fallbackTimer = null;
+      if (galCaptureReadySchedules.get(key) === token) {
+        galCaptureReadySchedules.delete(key);
+      }
+      if (!current) {
+        return;
+      }
+      postToHost(
+          'captureReady', [physicalWidth, physicalHeight, epoch], route);
+    };
+    if (!raf) {
+      postIfCurrent();
+      return;
+    }
+    // A permanently off-screen WebView2 can expose requestAnimationFrame while
+    // suspending its callbacks. Prefer two paint opportunities, but do not let
+    // Dart wait forever for a callback Chromium may never schedule.
+    fallbackTimer = setTimerSafe(
+        postIfCurrent, GAL_CAPTURE_READY_RAF_FALLBACK_MS);
+    try {
+      raf(function () {
+        if (routeKey(activeRoute) !== key ||
+            galCaptureReadySchedules.get(key) !== token ||
+            epoch !== committedGeometryEpoch ||
+            epoch !== announcedGeometryEpoch) {
+          postIfCurrent();
+          return;
+        }
+        try {
+          raf(postIfCurrent);
+        } catch (e) {
+          postIfCurrent();
+        }
+      });
+    } catch (e) {
+      postIfCurrent();
+    }
+  }
+
+  function commitLayerShiftAndArmCapture(
+      bboxLeft, bboxTop, routeSnapshot, physicalWidth, physicalHeight,
+      geometryEpoch) {
+    if (!commitLayerShift(
+        bboxLeft, bboxTop, geometryEpoch, true)) {
+      return false;
+    }
+    armCaptureReady(
+        routeSnapshot, physicalWidth, physicalHeight, geometryEpoch);
+    tryFinalizePendingSuffixSwap(true);
+    return true;
+  }
+
+  // TODO-890 — slide the ROOT card off-screen, THEN post dismiss. Adds the
+  // .global-lookup-dismissing class (CSS transitions transform+opacity), waits
+  // for transitionend on the root shell, and only then posts dismissPopupAt([0])
+  // so the Dart hide() lands AFTER the slide-out finishes (no instant vanish).
+  // A safety timer mirrors the CSS duration so a missing transitionend (node
+  // harness / reduced-motion) still posts. Idempotent per root shell.
+  var SLIDE_OUT_MS = 200;
+  var dismissingRoot = false;
+  function dismissRootWithSlide() {
+    if (dismissingRoot) {
+      return;
+    }
+    var rootId = null;
+    frames.forEach(function (record, id) {
+      if (rootId === null) {
+        rootId = id;
+      }
+    });
+    var record = rootId !== null ? frames.get(rootId) : null;
+    var route = cloneRoute((record && record.route) || activeRoute);
+    var shell = record && record.shell;
+    if (!shell || typeof shell.setAttribute !== 'function' ||
+        !shell.classList || typeof shell.classList.add !== 'function') {
+      // No animatable shell (node harness fake DOM without classList): post now.
+      postToHost('dismissPopupAt', [0], route);
+      return;
+    }
+    dismissingRoot = true;
+    var posted = false;
+    var post = function () {
+      if (posted) {
+        return;
+      }
+      posted = true;
+      dismissingRoot = false;
+      postToHost('dismissPopupAt', [0], route);
+    };
+    if (typeof shell.addEventListener === 'function') {
+      shell.addEventListener('transitionend', function onEnd(e) {
+        if (e && e.propertyName && e.propertyName !== 'transform' &&
+            e.propertyName !== 'opacity') {
+          return;
+        }
+        if (typeof shell.removeEventListener === 'function') {
+          shell.removeEventListener('transitionend', onEnd);
+        }
+        post();
+      });
+    }
+    shell.classList.add('global-lookup-dismissing');
+    // Safety: fire even if transitionend never arrives.
+    setTimerSafe(post, SLIDE_OUT_MS + 50);
+  }
+
+  // TODO-1067 (子5) — insertion-order id of the DEEPEST shell containing (x,y),
+  // or null when the point is outside every shell. "Deepest" (last matching in
+  // insertion order) so an overlapping cascade attributes the click to the child
+  // card on top, not the root beneath it. Used by the host click handlers to
+  // decide per-layer close vs root dismiss.
+  function frameIdAtPoint(x, y) {
+    var deepest = null;
+    frames.forEach(function (record, id) {
+      // TODO-1189 — record.shell.style.left/top are coordinates INSIDE the layer,
+      // which measureAndReport shifted by (-layerOffsetLeft, -layerOffsetTop) to
+      // pin the union bbox to the window origin. The incoming (x, y) is in WINDOW
+      // coordinates (C++ WH_MOUSE_LL forwards window-relative CSS px), so map each
+      // shell back to window space by subtracting the layer offset. Without this
+      // a nested sub-popup pushed off the cursor (minLeft/minTop < 0) is hit-
+      // tested against stale un-shifted coords and a click ON its card is misread
+      // as an empty gap, wrongly dismissing the whole stack. Offsets are 0 for a
+      // single popup / down-right cascade, so this is a no-op there.
+      var left = (parseFloat(record.shell.style.left) || 0) - layerOffsetLeft;
+      var top = (parseFloat(record.shell.style.top) || 0) - layerOffsetTop;
+      var width = parseFloat(record.shell.style.width) || 0;
+      var height = parseFloat(record.shell.style.height) || 0;
+      if (x >= left && x <= left + width && y >= top && y <= top + height) {
+        deepest = id;
+      }
+    });
+    return deepest;
+  }
+
+  // C3 / TODO-1067 (子5) — capture-phase pointerdown on the HOST document. A
+  // click that lands on a shell is a CARD interaction: DEFER to popup.js running
+  // inside that iframe, which owns the PER-LAYER close decision (tap parent card
+  // body -> close child, via the __hasChildPopup guard wired by the render body).
+  // The host must NOT also post a dismiss here or it double-fires with popup.js
+  // and races the stack. Only a click that hits NO shell at all (true empty space
+  // in the bbox window / a cascade gap) dismisses the root. This is exactly why
+  // "click the first popup, everything closes" happened: the host used to nuke
+  // the root whenever its coarse hit-test missed the visual card; deferring card
+  // clicks to popup.js's per-layer path fixes it (SUB5) while the close-X (SUB1)
+  // gives the mouse an explicit per-layer affordance.
+  function onHostPointerDown(event) {
+    var t = event && event.target;
+    if (t && typeof t.closest === 'function' &&
+        t.closest('.global-lookup-frame-shell')) {
+      // On a shell: let popup.js (inside the iframe) decide per-layer. The
+      // close-X has its own stopPropagation handler, so it never reaches here.
+      return;
+    }
+    dismissRootWithSlide();
+  }
+
+  // E2 / TODO-1067 (子5) — C++ WH_MOUSE_LL forwards a global click already
+  // converted to host CSS px relative to the window so the host can hit-test
+  // shells (geometry truth lives here). A click INSIDE a shell is a card
+  // interaction -> DEFER to popup.js's own document handler (per-layer close via
+  // __hasChildPopup); the host must not post a competing dismiss (double-fire /
+  // stack race). Only a click OUTSIDE every shell (true gap) dismisses the root.
+  // Returns whether the click hit any shell (C++ uses it for logging).
+  function handleGlobalClick(x, y) {
+    var frameId = frameIdAtPoint(x, y);
+    if (frameId != null) {
+      return true; // Card hit: popup.js owns the per-layer decision.
+    }
+    // BUG-749 — post the root dismiss IMMEDIATELY (no TODO-890 slide-out).
+    // With the shell-union window region the SAME physical gap click also
+    // lands in the app below (region hole) and may start a NEW lookup there
+    // (clipboard panel word tap → lookupText). A dismiss delayed 200ms by the
+    // slide would post AFTER the fresh card seeded and kill it (stale-dismiss
+    // race); posted now it always precedes the new lookup's stack reset
+    // (searchDictionary alone takes longer than the bridge round-trip).
+    postToHost('dismissPopupAt', [0]);
+    return false;
+  }
+
+  // BUG-1166 — C++ 把「落在卡片上、且按着 Ctrl/Alt」的滚轮交到这里。
+  //
+  // 为什么这条路必须存在：那格滚轮已被 WH_MOUSE_LL 钩子吞掉（否则会穿到底下的
+  // galgame），而窗口线程若用 PostMessage 合成一条 WM_MOUSEWHEEL 补回去，修饰键
+  // 会在边界上丢失 —— Chromium 取 ctrlKey/altKey 读的是 GetKeyState，而合成消息不
+  // 更新线程键状态表，覆盖窗又是 WS_EX_NOACTIVATE、不在前台输入队列里。于是修饰键
+  // 只能作为**数据**送到这一层，由 JS 合成一条带显式 flag 的 WheelEvent。
+  //
+  // 判定语义仍然全部留在既有 JS 里，host 不做策略（绑定真值 __fushiEntryWheelBindings
+  // 在 popup.js，用户可改键位；缩放档距在 Dart）：
+  //   ctrlKey → _globalLookupZoomWheelJs 的 window wheel 监听 → callHandler
+  //             ('popupZoomFontStep') → jsMessage → Dart maybeHandleOverlayZoomFontStep
+  //   altKey  → popup.js __fushiPopupWheelListener 的 popupEntryWheelAction → 换词条
+  //
+  // (x, y) 与 handleGlobalClick 同一坐标系（窗口内 CSS px）；deltaY 已由 C++ 转成
+  // **DOM 约定**（向上滚为负），所以 JS 侧收到的与真滚轮完全同构。
+  // 返回是否真的派发了（false = 落在卡片外/无 realm，调用方不必处理）。
+  function handleGlobalWheel(x, y, deltaY, ctrlKey, altKey, shiftKey) {
+    var frameId = frameIdAtPoint(x, y);
+    if (frameId == null) return false;
+    var record = frames.get(frameId);
+    if (!record || !record.iframe) return false;
+    var win = null;
+    try {
+      win = record.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win) return false;
+    var doc = win.document || record.iframe.contentDocument;
+    if (!doc || typeof doc.dispatchEvent !== 'function') return false;
+    var init = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      deltaX: 0,
+      deltaY: deltaY,
+      deltaZ: 0,
+      deltaMode: 0,
+      ctrlKey: !!ctrlKey,
+      altKey: !!altKey,
+      shiftKey: !!shiftKey,
+      metaKey: false,
+    };
+    var evt = null;
+    // 真实 WebView2 走这条：构造真 WheelEvent，composedPath()/preventDefault() 等
+    // 一应俱全，下游监听分辨不出它是合成的。
+    if (typeof win.WheelEvent === 'function') {
+      try {
+        evt = new win.WheelEvent('wheel', init);
+      } catch (e) {
+        evt = null;
+      }
+    }
+    if (!evt) {
+      // 无 WheelEvent 构造器（node harness / 极老 realm）：退化成同形字面量，
+      // 保证契约仍可被断言，且真实浏览器永远走不到这里。
+      evt = { type: 'wheel' };
+      for (var k in init) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) evt[k] = init[k];
+      }
+      evt.preventDefault = function () {};
+      evt.composedPath = function () { return []; };
+    }
+    try {
+      doc.dispatchEvent(evt);
+    } catch (e) {
+      return false;
+    }
+    requestGalFrameDirty(record.route);
+    return true;
+  }
+
+  function topPopupId() {
+    var last = null;
+    frames.forEach(function (record, id) {
+      last = id;
+    });
+    return last;
+  }
+
+  function frameIdForIframe(iframe) {
+    return frameSources.has(iframe) ? frameSources.get(iframe) : null;
+  }
+
+  // 手柄重设计 P5 — Dart 侧手柄独占路由（GamepadService → native gamepadAction
+  // → 本 host）：把动作转发进**顶层**卡片帧的 popup.js 既有入口，与滚轮/键盘
+  // 同一批执行体（fushiFocusDictionaryEntryMove / fushiPopupMineFirstEntry /
+  // fushiPopupPlayFirstAudio / fushiPopupScrollBy），不另起桥。帧不可用 /
+  // 入口缺席一律返回 false（no-op），绝不抛——本函数由 fire-and-forget 的
+  // ExecuteScript 调用，异常只会淹死在 WebView 控制台里。
+  function gamepadAction(action, dy) {
+    var record = null;
+    var id = topPopupId();
+    if (id !== null) {
+      record = frames.get(id);
+    }
+    var win = frameWindowOf(record);
+    if (!win) {
+      return false;
+    }
+    // 卡片是离屏渲染后 blit 进游戏 Layer 的，requestGalFrameDirty 是唯一的重采触发。
+    // observeGalFrameDirty 的 MutationObserver 只看 childList/subtree/attributes/
+    // characterData —— **滚动不是 DOM mutation**，所以右摇杆滚卡片不补这一句在游戏里
+    // 画面纹丝不动；词条切换的「滚进视口」分量同理，光靠 class 变更那次 dirty 的
+    // double-rAF 恰好晚于滚动落定并不保证。handleGlobalWheel 正因为这个在派发完
+    // wheel 之后也显式调了同一句（见该函数末尾）。
+    var acted = false;
+    try {
+      if (action === 'next' || action === 'prev') {
+        acted = typeof win.fushiFocusDictionaryEntryMove === 'function' &&
+            win.fushiFocusDictionaryEntryMove(action) === 'moved';
+      } else if (action === 'mine') {
+        if (typeof win.fushiPopupMineFirstEntry === 'function') {
+          win.fushiPopupMineFirstEntry();
+          acted = true;
+        }
+      } else if (action === 'audio') {
+        if (typeof win.fushiPopupPlayFirstAudio === 'function') {
+          win.fushiPopupPlayFirstAudio();
+          acted = true;
+        }
+      } else if (action === 'scroll') {
+        if (typeof win.fushiPopupScrollBy === 'function') {
+          win.fushiPopupScrollBy(dy || 0);
+          acted = true;
+        } else {
+          var el = win.document &&
+              (win.document.scrollingElement || win.document.documentElement);
+          if (el && typeof el.scrollBy === 'function') {
+            el.scrollBy(0, dy || 0);
+            acted = true;
+          }
+        }
+      }
+    } catch (e) {
+      return false;
+    }
+    if (acted) {
+      requestGalFrameDirty(record.route);
+    }
+    return acted;
+  }
+
+  // TODO-1188 — the contentWindow of a frame record, or null when unavailable
+  // (cross-origin guard / torn-down iframe / node harness).
+  function frameWindowOf(record) {
+    if (!record) {
+      return null;
+    }
+    try {
+      return record.iframe.contentWindow;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // TODO-1188 — install the top-level bridge-reply router. Native
+  // (global_lookup_window.cpp: ResolveBridge for the deferred audio/favorite
+  // handlers, and the immediate null-resolve for the read-only ones) calls
+  // window.__fushiBridgeResolve(globalId, jsonValue) on THIS top-level document.
+  // The global id was minted in transformFrameMessage and maps back to the source
+  // iframe + its frame-local id; forward the reply to exactly that iframe's
+  // adapter so the awaited callHandler Promise there resolves. No route -> defer
+  // to the top-level adapter (the host itself issues no bridge calls, so this is
+  // normally a no-op); a spurious/duplicate reply with no route is dropped rather
+  // than broadcast, so two frames sharing a local id can never mis-resolve.
+  function installBridgeRouter() {
+    var priorResolve = (typeof window.__fushiBridgeResolve === 'function')
+        ? window.__fushiBridgeResolve
+        : null;
+    window.__fushiBridgeResolve = function (globalId, jsonValue) {
+      var route = bridgeRoutes.get(globalId);
+      if (route) {
+        bridgeRoutes.delete(globalId);
+        var win = frameWindowOf(frames.get(route.frameId));
+        if (win && typeof win.__fushiBridgeResolve === 'function') {
+          try {
+            // Keep the originating route visible through the Promise microtask
+            // scheduled by the frame adapter's resolve(). Clearing on the next
+            // macrotask means chained popup.js callHandler posts retain the old
+            // route even if a newer lookup has already rebound the stable frame.
+            win.__fushiBridgeReplyRoute = cloneRoute(route.route);
+            win.__fushiBridgeResolve(route.localId, jsonValue);
+            // The Promise continuation runs as a microtask before the first
+            // animation frame below.  Arm here as well as on the outbound
+            // message so async bridge results (favorite/mining/button state)
+            // are captured even when they update a DOM property that the
+            // MutationObserver cannot see.
+            requestGalFrameDirty(route.route);
+            var replyWindow = win;
+            setTimerSafe(function () {
+              try {
+                delete replyWindow.__fushiBridgeReplyRoute;
+              } catch (e) {
+                replyWindow.__fushiBridgeReplyRoute = null;
+              }
+            }, 0);
+          } catch (e) {
+            // Never let one frame's resolve throw break the router.
+          }
+        }
+        return;
+      }
+      if (priorResolve) {
+        try {
+          priorResolve(globalId, jsonValue);
+        } catch (e) {
+          // no-op
+        }
+      }
+    };
+  }
+  installBridgeRouter();
+
+  if (document && typeof document.addEventListener === 'function') {
+    document.addEventListener('pointerdown', onHostPointerDown, true);
+  }
+
+  // D1 — read the {contentReady, revealReady, visible} gate state of a frame.
+  // visible mirrors the CSS gate (both flags true). For diagnostics + the host
+  // test harness; never used to drive rendering (the CSS attribute selector is
+  // the single visibility source).
+  function frameGateState(frameId) {
+    var record = frames.get(frameId);
+    if (!record) {
+      return null;
+    }
+    return {
+      contentReady: !!record.contentReady,
+      revealReady: !!record.revealReady,
+      visible: !!record.contentReady && !!record.revealReady,
+      requiredGeometryEpoch: record.requiredGeometryEpoch || 0,
+      committedGeometryEpoch: committedGeometryEpoch,
+      announcedGeometryEpoch: announcedGeometryEpoch,
+    };
+  }
+
+  // TODO-1190 — highlight the searched word inside a PARENT frame's popup.js
+  // realm. When a nested lookup opens off a clicked word, the in-app popup marks
+  // that word with a CSS Custom Highlight in the PARENT card
+  // (dictionary_popup_webview.highlightSelection); the app-external overlay never
+  // did, so the source word in the parent card was left unmarked. The controller
+  // resolves the parent's insertion-order frame index + the matched char count
+  // and calls this; we find that frame and eval popup.js's own
+  // window.fushiSelection.highlightSelection(count) inside its iframe realm (the
+  // popup.js selection already spans the just-clicked word). No-op on a bad index
+  // / count / missing frame so a failed highlight never breaks the lookup.
+  function highlightFrame(frameIndex, count, token) {
+    if (typeof frameIndex !== 'number' || frameIndex < 0) {
+      return false;
+    }
+    if (typeof count !== 'number' || !(count > 0)) {
+      return false;
+    }
+    var i = 0;
+    var target = null;
+    frames.forEach(function (record) {
+      if (i === frameIndex) {
+        target = record;
+      }
+      i++;
+    });
+    if (!target) {
+      return false;
+    }
+    var win = null;
+    try {
+      win = target.iframe.contentWindow;
+    } catch (e) {
+      win = null;
+    }
+    if (!win || typeof win.eval !== 'function') {
+      return false;
+    }
+    // BUG-2054 — everything that can throw stays INSIDE this try (the function's
+    // contract, stated above, is that a failed highlight never breaks the
+    // lookup): win.eval, the shell-geometry read inside anchorRectToScreen and
+    // postToHost alike. Dart AWAITS this report before it places the child card,
+    // so a throw here would also strand that wait until its timeout.
+    try {
+      var bounds = win.eval(
+          'window.fushiSelection && ' +
+          'window.fushiSelection.highlightSelection ? ' +
+          'window.fushiSelection.highlightSelection(' + count + ') : null;');
+      // highlightSelection also RETURNS the matched word's bbox in the parent
+      // iframe's own viewport: it unions every getClientRects() fragment, so on
+      // a WRAPPED selection its bottom is the LAST line. The child card would
+      // otherwise be anchored on selection.js's getSelectionRect() — the FIRST
+      // CHARACTER's rect (textSelected fires before the dictionary runs, so the
+      // matched length is unknown then) — which on a wrapped selection covers
+      // only the tapped line, leaving the child card on top of the second one.
+      // Reported through the SAME iframe-local -> window-local transform the
+      // original anchor took (in-app cards do it via reanchorNestedPopupToWord).
+      var anchor = anchorRectToScreen(target, bounds);
+      var usable = !!anchor && anchor.width > 0 && anchor.height > 0;
+      // Always answer a TOKENED request — Dart is waiting on it before placing
+      // the child card, and a silent drop would cost it the full timeout. An
+      // unusable bbox reports null: Dart then keeps the first-character anchor.
+      if (typeof token === 'number') {
+        postToHost('nestedWordAnchor', [frameIndex, usable ? anchor : null, token],
+            cloneRoute((target && target.route) || activeRoute));
+      }
+    } catch (e) {
+      if (typeof token === 'number') {
+        postToHost('nestedWordAnchor', [frameIndex, null, token],
+            cloneRoute((target && target.route) || activeRoute));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // BUG-1127 — drive the overlay AUTO-READ through popup.js's own HTML5
+  // <audio> (the unified fast path, same playWordAudio the manual ♪ button
+  // uses) instead of the Dart/libmpv round-trip. [frameId] is the target frame
+  // (the controller passes the STABLE root id — always loaded after prewarm;
+  // audio is realm-agnostic so the entry's own frame does not matter). The
+  // iframe realm reports the REAL audio.play() outcome as a
+  // { handler: 'wordAudioPlayed', args: [token, ok] } message through its
+  // WRAPPED chrome.webview.postMessage (host-stamped, routed to Dart's
+  // _onJsMessage like every popup.js message). A missing/unloaded frame or an
+  // eval failure reports false from the HOST realm via postToHost so the Dart
+  // completer resolves immediately instead of waiting out its 5s timeout —
+  // Dart then falls back to its own player (never a silent drop, BUG-1093
+  // contract).
+  function playWordAudioInFrame(frameId, url, token) {
+    const record = frames.get(frameId);
+    const route = cloneRoute((record && record.route) || activeRoute);
+    let win = null;
+    if (record?.loaded) {
+      try {
+        win = record.iframe.contentWindow;
+      } catch (e) {
+        win = null;
+      }
+    }
+    if (!win || typeof win.eval !== 'function') {
+      postToHost('wordAudioPlayed', [token, false, 'FrameNotLoaded'], route);
+      return false;
+    }
+    try {
+      // BUG-1204：回报第三个参数 = 失败原因（popup.js 的 playWordAudio 存在
+      // window.__fushiWordAudioLastError 上）。Dart 端按位置读且早已 `length >= 2`
+      // 守卫，多带一个参数对旧端完全无害。`play` 缺失是另一类失败（realm 里没装
+      // popup.js），给它自己的原因串，不与 play() 的 DOMException 混为一谈。
+      win.eval(
+          '(function () {' +
+          'var reason = function () {' +
+          'try { return String(window.__fushiWordAudioLastError || ""); }' +
+          ' catch (_) { return ""; }' +
+          '};' +
+          'var report = function (ok, why) {' +
+          'try { window.chrome.webview.postMessage(' +
+          '{ handler: "wordAudioPlayed", args: [' + token + ', ok === true,' +
+          ' String(why == null ? reason() : why)] }' +
+          '); } catch (_) { /* bridge gone: Dart times out and falls back */ }' +
+          '};' +
+          'try {' +
+          'var play = window.__fushiPlayWordAudioUrl;' +
+          'if (!play) { report(false, "PlayFunctionMissing"); return; }' +
+          'Promise.resolve(play(' + JSON.stringify(url) + '))' +
+          '.then(function (r) { report(r === true); },' +
+          ' function (e) { report(false, (e && e.name) || "PlayThrew"); });' +
+          '} catch (e) { report(false, (e && e.name) || "EvalThrew"); }' +
+          '})();');
+      return true;
+    } catch (error) {
+      window.console?.debug?.(
+          '[global-lookup] word audio frame eval failed', error);
+      postToHost('wordAudioPlayed',
+          [token, false, (error && error.name) || 'FrameEvalFailed'], route);
+      return false;
+    }
+  }
+
+  // BUG-2651 (issue #1581) — 覆盖窗带 WS_EX_NOACTIVATE、永不拿键盘焦点，用户在卡片里
+  // 划选后按 Ctrl+C，那一下落在前台应用上，复制走的是**前台应用**的选区。native 只在
+  // 「卡片里真有非空选区」时才临时接管 Ctrl+C（RegisterHotKey），所以这里负责两件事：
+  //   · 每个卡片 iframe 的 selectionchange 汇总成一个布尔，**变化时**才上报
+  //     overlaySelection（native 就地消费，不转发 Dart）；
+  //   · 热键命中时 native 经 selectedText() 取文本，自己写剪贴板（卡片没焦点，页面内
+  //     execCommand('copy') / navigator.clipboard 都不可靠）。
+  // 选区可能同时残留在多个同源 iframe 里（在 B 里划选不会清 A 的选区），所以记下
+  // 最近一次产生非空选区的 realm，取文本时优先它，避免复制到一段旧选区。
+  var lastSelectionWindow = null;
+  var lastReportedSelection = false;
+
+  function selectionTextOf(win) {
+    try {
+      var selection = win && typeof win.getSelection === 'function'
+          ? win.getSelection()
+          : null;
+      if (!selection || selection.isCollapsed) {
+        return '';
+      }
+      return String(selection.toString() || '');
+    } catch (e) {
+      // A navigating/recovering realm has no readable selection.
+      return '';
+    }
+  }
+
+  function selectedText() {
+    var text = selectionTextOf(lastSelectionWindow);
+    if (text) {
+      return text;
+    }
+    text = selectionTextOf(window);
+    if (text) {
+      return text;
+    }
+    var found = '';
+    frames.forEach(function (record) {
+      if (found || !record || !record.iframe) {
+        return;
+      }
+      try {
+        found = selectionTextOf(record.iframe.contentWindow);
+      } catch (e) {
+        found = '';
+      }
+    });
+    return found;
+  }
+
+  function reportSelectionState() {
+    var has = selectedText() !== '';
+    if (has === lastReportedSelection) {
+      return;
+    }
+    lastReportedSelection = has;
+    postToHost('overlaySelection', [has]);
+  }
+
+  // Native reset its own view to "no selection" (the hotkey fired but
+  // selectedText() came back empty). Align the de-dup state with it, then
+  // re-derive: otherwise the next real selection compares equal to a stale
+  // `true` and is never reported, and Ctrl+C falls back to the foreground app.
+  function resetSelectionReport() {
+    lastReportedSelection = false;
+    reportSelectionState();
+  }
+
+  // Must run BEFORE the shell leaves the DOM: a detached iframe's contentWindow
+  // is null, so the identity check against lastSelectionWindow is impossible
+  // afterwards.
+  function forgetRecordSelection(record) {
+    var win = null;
+    try {
+      win = record && record.iframe ? record.iframe.contentWindow : null;
+    } catch (e) {
+      win = null;
+    }
+    if (win && lastSelectionWindow === win) {
+      lastSelectionWindow = null;
+    }
+  }
+
+  function onRealmSelectionChange(win) {
+    if (selectionTextOf(win)) {
+      lastSelectionWindow = win;
+    } else if (lastSelectionWindow === win) {
+      lastSelectionWindow = null;
+    }
+    reportSelectionState();
+  }
+
+  // 每次 iframe 导航都是新 realm：按 realm 打标记幂等挂监听（与 wrapFrameBridge 同一
+  // 调用点，load 与复用两条路都经过）。
+  function watchFrameSelection(record) {
+    var win = null;
+    try {
+      win = record && record.iframe ? record.iframe.contentWindow : null;
+    } catch (e) {
+      win = null;
+    }
+    if (!win || win.__fushiSelectionWatched) {
+      return;
+    }
+    try {
+      var doc = win.document;
+      if (!doc || typeof doc.addEventListener !== 'function') {
+        return;
+      }
+      doc.addEventListener('selectionchange', function () {
+        onRealmSelectionChange(win);
+      });
+      win.__fushiSelectionWatched = true;
+    } catch (e) {
+      // Cross-realm access failed (navigating) -> the next load re-attaches.
+    }
+  }
+
+  if (typeof document.addEventListener === 'function') {
+    document.addEventListener('selectionchange', function () {
+      onRealmSelectionChange(window);
+    });
+  }
+
+  window.__globalLookupHost = {
+    __installed: true,
+    selectedText: selectedText,
+    resetSelectionReport: resetSelectionReport,
+    _watchFrameSelection: watchFrameSelection,
+    renderStack: renderStack,
+    retainStack: retainStack,
+    beginLookup: beginLookup,
+    topPopupId: topPopupId,
+    frameIdForIframe: frameIdForIframe,
+    layerIndexOf: layerIndexOf,
+    highlightFrame: highlightFrame,
+    playWordAudioInFrame: playWordAudioInFrame,
+    frameIdAtPoint: frameIdAtPoint,
+    handleGlobalClick: handleGlobalClick,
+    handleGlobalWheel: handleGlobalWheel,
+    armGalFrameDirty: requestGalFrameDirty,
+    requestGalFrameDirty: requestGalFrameDirty,
+    gamepadAction: gamepadAction,
+    measureAndReport: measureAndReport,
+    commitLayerShift: commitLayerShift,
+    resetLayerOffsetForLegacyReveal: resetLayerOffsetForLegacyReveal,
+    commitLayerShiftAndArmCapture: commitLayerShiftAndArmCapture,
+    frameGateState: frameGateState,
+    dismissRootWithSlide: dismissRootWithSlide,
+    // BUG-1857 — grip 拖拽期间 root 卡跟随 viewport；endLiveResize 由 native
+    // WM_EXITSIZEMOVE 调，handleWindowResize 同时挂在 window resize 上（导出给
+    // node harness 直接驱动）。
+    beginLiveResize: beginLiveResize,
+    endLiveResize: endLiveResize,
+    handleWindowResize: handleWindowResize,
+    _frames: frames,
+    // TODO-1188 — exposed for the node bridge-routing harness only (never used to
+    // drive behaviour): the live globalId -> {frameId, localId} route map.
+    _bridgeRoutes: bridgeRoutes,
+  };
+
+  function startStandbyPrewarm() {
+    ensureStandbyPool(ensureLayer());
+  }
+
+  // BUG-1833 — load popup.html, its scripts/styles, and the iframe bridge while
+  // the root host is idle.  A Shift/nested lookup can then rebind this realm
+  // instead of paying WebView2 document creation on the interaction path.
+  if (document.readyState === 'loading' &&
+      typeof window.addEventListener === 'function') {
+    window.addEventListener('DOMContentLoaded', startStandbyPrewarm,
+        {once: true});
+  } else {
+    startStandbyPrewarm();
+  }
+  // BUG-1857 — 模态 size 循环里每次 WM_SIZE → put_Bounds 都会到这里；未武装时 no-op。
+  if (typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', handleWindowResize);
+  }
+})();

@@ -1,0 +1,288 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/asr_host/asr_host.dart' show isAsrSupported;
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/models/module_id.dart';
+import 'package:fushi/src/settings/settings_context.dart';
+import 'package:fushi/src/settings/settings_search.dart';
+import 'package:fushi/src/settings/settings_destination.dart';
+import 'package:fushi/src/settings/settings_schema_appearance.dart';
+import 'package:fushi/src/settings/settings_schema_lookup.dart';
+import 'package:fushi/src/settings/settings_schema_manga.dart';
+import 'package:fushi/src/settings/settings_schema_models.dart';
+import 'package:fushi/src/settings/settings_schema_profiles.dart';
+import 'package:fushi/src/settings/settings_schema_reading.dart';
+import 'package:fushi/src/settings/settings_schema_storage.dart';
+import 'package:fushi/src/settings/settings_schema_system.dart';
+import 'package:fushi/src/settings/settings_schema_video.dart';
+
+List<SettingsDestination> _destinations() => <SettingsDestination>[
+  buildAppearanceDestination(),
+  // 听书并入阅读：它的分区由 buildReadingDestination 展开，取阅读一条即已覆盖。
+  buildReadingDestination(),
+  buildMangaDestination(),
+  buildVideoDestination(),
+  buildLookupDestination(),
+  buildModelsDestination(),
+  buildProfilesDestination(),
+  buildStorageDestination(),
+  buildSystemDestination(),
+];
+
+SettingsSection _section(SettingsDestination destination, String id) =>
+    destination.sections.singleWhere((SettingsSection s) => s.id == id);
+
+SettingsItem _item(SettingsDestination destination, String id) => destination
+    .sections
+    .expand((SettingsSection s) => s.items)
+    .singleWhere((SettingsItem i) => i.id == id);
+
+void main() {
+  test('ordinary sections have unique persistent identities', () {
+    final List<String?> ids = _destinations()
+        .expand((SettingsDestination d) => d.sections)
+        .map((SettingsSection s) => s.id)
+        .toList();
+    expect(ids, everyElement(isNotNull));
+    expect(ids.toSet(), hasLength(ids.length));
+  });
+
+  test('video groups follow playback, picture, subtitles, audio, controls', () {
+    // 2026-10 重排：播放 → 显示（下接四个折叠的 mpv 画面进阶组）→ 字幕外观 →
+    // 字幕行为与来源 → 音频 → 控制与手势 → 截图与片段 → 弹幕 → 媒体库 →
+    // 高级（Lua）→ 播放中专属。
+    expect(
+      buildVideoDestination().sections.map((SettingsSection s) => s.id),
+      <String>[
+        'video.section.playback',
+        'video.section.display',
+        'video.section.quality',
+        'video.section.hdr',
+        'video.section.geometry',
+        'video.section.color',
+        'video.section.subtitles',
+        'video.section.subtitle_behavior',
+        'video.section.audio',
+        'video.section.controls',
+        'video.section.capture',
+        'video.section.danmaku',
+        'video.section.library',
+        'video.section.advanced',
+        'video.section.session',
+      ],
+    );
+    expect(
+      buildVideoDestination().sections
+          .singleWhere((SettingsSection s) => s.id == 'video.section.subtitles')
+          .items
+          .first
+          .id,
+      'video.subtitle.preview',
+      reason: 'The subtitle style preview leads the subtitle group.',
+    );
+    for (final SettingsSection section in buildVideoDestination().sections) {
+      final bool advanced = <String>{
+        'video.section.hdr',
+        'video.section.quality',
+        'video.section.geometry',
+        'video.section.color',
+        'video.section.audio',
+        'video.section.advanced',
+      }.contains(section.id);
+      expect(
+        section.presentation,
+        advanced
+            ? SettingsSectionPresentation.collapsed
+            : SettingsSectionPresentation.alwaysExpanded,
+      );
+    }
+  });
+
+  test(
+    'reading groups gestures together and places advanced typography last',
+    () {
+      expect(
+        buildReadingDestination().sections.map((SettingsSection s) => s.id),
+        <String>[
+          'reading.section.mode',
+          // #1351 的 VN 设置组（本轮重构的基底还没有它），位置紧跟阅读模式：
+          // 它整组只在 VN 模式下可见，排在模式选择之后最自然。
+          'reading.section.visual_novel',
+          'reading.section.typography',
+          'reading.section.page_turn_input',
+          'reading.section.page_turn_direction',
+          'reading.section.chrome',
+          'reading.section.statistics',
+          'reading.section.advanced_typography',
+          // 听书 2026-08-24 并入阅读：两个分区排在阅读各组之后（见
+          // buildListeningSections）。同一本 EPUB 的「读」与「听」从此同分类。
+          'listening.section.playback',
+          'listening.section.floating_lyric',
+          // 悬浮字幕外观与排版（默认折叠，与 galgame 浮窗「窗口与可读性」同构）。
+          'listening.section.floating_lyric_appearance',
+        ],
+      );
+    },
+  );
+
+  test('optional feature switches remain outside collapsed groups', () {
+    for (final (SettingsDestination destination, String sectionId)
+        in <(SettingsDestination, String)>[
+          (buildReadingDestination(), 'listening.section.floating_lyric'),
+          (buildVideoDestination(), 'video.section.danmaku'),
+          (buildMangaDestination(), 'manga.section.ocr'),
+          (buildLookupDestination(), 'lookup.section.integrations'),
+        ]) {
+      expect(
+        _section(destination, sectionId).presentation,
+        SettingsSectionPresentation.alwaysExpanded,
+      );
+    }
+  });
+
+  test(
+    'ASR and OCR managers are reachable subpages using existing body widgets',
+    () {
+      for (final (SettingsDestination destination, String itemId)
+          in <(SettingsDestination, String)>[
+            (buildModelsDestination(), 'listening.asr_models'),
+            (buildModelsDestination(), 'models.ocr'),
+            (buildModelsDestination(), 'storage.ocr_models'),
+            (buildMangaDestination(), 'manga.ocr'),
+          ]) {
+        final SettingsNavigationItem navigation =
+            _item(destination, itemId) as SettingsNavigationItem;
+        final SettingsDestination child = navigation.child!();
+        expect(child.id, destination.id);
+        expect(child.body, isNotNull);
+        expect(
+          child.sections,
+          isEmpty,
+          reason:
+              'The model manager already owns its cards; avoid a nested card.',
+        );
+      }
+    },
+  );
+
+  test(
+    'ASR models have one global Models owner independent of module settings',
+    () {
+      final List<SettingsDestination> owners = _destinations()
+          .where(
+            (SettingsDestination d) => d.sections.any(
+              (SettingsSection s) => s.items.any(
+                (SettingsItem i) => i.id == 'listening.asr_models',
+              ),
+            ),
+          )
+          .toList();
+      expect(
+        owners.map((SettingsDestination d) => d.id),
+        <SettingsDestinationId>[SettingsDestinationId.models],
+      );
+      final SettingsDestination models = owners.single;
+      expect(
+        models.visible,
+        isNull,
+        reason: 'Global models must not be gated by the listening module',
+      );
+      final List<SettingsSearchEntry> results =
+          flattenVisibleSettings(<SettingsDestination>[
+                models,
+              ], _GlobalModelContext())
+              .where(
+                (SettingsSearchEntry e) => e.item.id == 'listening.asr_models',
+              )
+              .toList();
+      expect(results, hasLength(isAsrSupported ? 1 : 0));
+      if (isAsrSupported) {
+        expect(results.single.destination.id, SettingsDestinationId.models);
+        expect(results.single.hasRevealTarget, isTrue);
+        expect(
+          results.single.sectionTitle,
+          _section(models, 'models.section.kinds').title,
+        );
+      }
+    },
+  );
+
+  test(
+    'lookup audio and external application entries belong to their own groups',
+    () {
+      final SettingsDestination lookup = buildLookupDestination();
+      expect(
+        _section(lookup, 'lookup.section.dictionaries').items
+            .whereType<SettingsNavigationItem>()
+            .map((SettingsNavigationItem i) => i.id),
+        isNot(contains('lookup.browser_extension')),
+      );
+      expect(
+        _section(
+          lookup,
+          'lookup.section.integrations',
+        ).items.map((SettingsItem i) => i.id),
+        contains('lookup.browser_extension'),
+      );
+      expect(
+        _section(lookup, 'lookup.section.audio').items.first.id,
+        buildManageAudioSourcesItem().id,
+      );
+    },
+  );
+
+  test(
+    'catalog endpoint is separate from OCR and data root belongs to storage',
+    () {
+      final SettingsDestination manga = buildMangaDestination();
+      expect(
+        _section(
+          manga,
+          'manga.section.catalog',
+        ).items.map((SettingsItem i) => i.id),
+        contains('manga.online_catalog_base_url'),
+      );
+      expect(
+        _section(
+          manga,
+          'manga.section.ocr',
+        ).items.map((SettingsItem i) => i.id),
+        isNot(contains('manga.online_catalog_base_url')),
+      );
+      expect(
+        _item(buildStorageDestination(), 'sync.data_storage_location'),
+        isA<SettingsCustomItem>(),
+      );
+      expect(
+        buildSystemDestination().sections
+            .expand((SettingsSection s) => s.items)
+            .map((SettingsItem i) => i.id),
+        isNot(contains('sync.data_storage_location')),
+      );
+    },
+  );
+}
+
+/// Global resources must not require a listening configuration or a live host.
+///
+/// The only state exposed is module visibility with **every module off**: the
+/// Models page's LLM row is gated by the services module, while ASR models must
+/// stay reachable regardless.
+class _GlobalModelContext implements SettingsContext {
+  @override
+  AppModel get appModel => _NoModulesAppModel();
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw StateError(
+    'Unexpected context dependency: ${invocation.memberName}',
+  );
+}
+
+class _NoModulesAppModel implements AppModel {
+  @override
+  ModuleVisibility get moduleVisibility => const ModuleVisibility(<ModuleId>{});
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw StateError(
+    'Unexpected AppModel dependency: ${invocation.memberName}',
+  );
+}

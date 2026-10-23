@@ -1,0 +1,564 @@
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:integration_test/integration_test.dart';
+
+import 'support/test_app_launcher.dart';
+import 'package:fushi/main.dart' as app;
+import 'package:fushi/media.dart';
+import 'package:fushi_engine/epub/epub_importer.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/pages/implementations/reader_fushi_page.dart';
+import 'package:fushi/src/reader/reader_desktop_chrome.dart'
+    show kReaderDesktopHeaderHeight;
+
+import 'helpers/focus_driver.dart';
+import 'helpers/generate_test_epub.dart' show EpubGenerator;
+import 'test_helpers.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+
+/// TODO-975 floating/collapsible reader chrome — remaining interaction behaviors
+/// device-layer (real-DOM) verification.
+///
+/// 975 core geometry (BUG-470 top progress first-load inset) already proven by
+/// reader_top_progress_inset_dom_test.dart. This test covers behaviors NOT
+/// covered there, all on a freshly imported paginated EPUB, asserting on the
+/// real CSS variables injected into the WebView (--chrome-top-inset /
+/// --chrome-bottom-inset) plus the body first-line getBoundingClientRect().top:
+///
+///  1. Reclaim blank: show_top_progress_bar ON->OFF reclaims the 18px reserve.
+///     reader_chrome_floating topProgressReserve returns 0 when progress is
+///     disabled. 注意 BUG-2387 起 --chrome-top-inset 恒含 48px 顶部工具栏预留，
+///     故本 goal 断言的是「回收 18px 后只剩顶栏那份」，不是归 0。
+///  2. Floating does not take text space (975 core ask): top progress floating
+///     false->true 回收进度条那 18px。同样因 BUG-2387，断言的是**差值**恰为
+///     18px，而不是 --chrome-top-inset 归 0（那会把顶栏预留和进度条预留混成
+///     一个数，且顶栏预留归 0 正是 BUG-2387 的病）。
+///  3. Bottom tap-reveal no-layout-shift: tap_empty_hide_chrome false->true
+///     drops --chrome-bottom-inset from (bar height ~56px) to system inset only;
+///     onTapEmpty reveal keeps --chrome-bottom-inset unchanged.
+///  4. click-only switch (2026-09-14): after reveal, pumping well past the old
+///     auto-hide duration must leave the floating chrome on screen — nothing
+///     but a click may close it — and a second onTapEmpty does close it.
+///
+/// Triggering: prefs via ReaderFushiSource.instance.toggleXxx() (fire-and-forget
+/// async, pump to land); reader re-anchor via the same settings-UI notify entry
+/// ReaderFushiSource.onChromeReanchorLive?.call() (clears transient +
+/// _applyChromeInsetsAndReanchor pushes new inset to WebView); bottom tap reveal
+/// via the real JS bridge window.flutter_inappwebview.callHandler('onTapEmpty')
+/// (reader_selection_scripts.dart:652 -> webview.part.dart:1320 onTapEmpty
+/// handler -> _handleFloatingChromeReveal).
+///
+/// Run (Windows offscreen harness, non-blocking + auto proxy):
+///   powershell -ExecutionPolicy Bypass -File tool/run_windows_itest.ps1
+///       integration_test/reader_chrome_floating_itest.dart
+void main() {
+  final IntegrationTestWidgetsFlutterBinding binding =
+      IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+
+  testWidgets(
+    'TODO-975: floating/collapsible reader chrome — reclaim, no-layout-shift, '
+    'tap-reveal, auto-hide (real DOM insets)',
+    timeout: const Timeout(Duration(minutes: 6)),
+    (WidgetTester tester) async {
+      final List<FlutterErrorDetails> errors = [];
+      final FlutterExceptionHandler? oldHandler = FlutterError.onError;
+      FlutterError.onError = (FlutterErrorDetails details) {
+        errors.add(details);
+        debugPrint('[CHROME975] FlutterError: ${details.exceptionAsString()}');
+      };
+
+      try {
+        await launchFushiTestApp();
+        expect(await waitForHome(tester), isTrue, reason: 'Home within 90s');
+        await tester.pump(const Duration(seconds: 2));
+
+        // Defaults now float: top progress ON, top floating ON, bottom floating
+        // (tap_empty_hide_chrome) ON. Assert once so a silently-changed default
+        // fails loudly here.
+        expect(ReaderFushiSource.instance.showTopProgressBar, isTrue,
+            reason: 'top progress must default ON.');
+        expect(ReaderFushiSource.instance.topProgressFloating, isTrue,
+            reason: 'top progress must default to floating.');
+        expect(ReaderFushiSource.instance.tapEmptyToHideChrome, isTrue,
+            reason: 'bottom bar must default to floating.');
+
+        // This test exercises the squeeze -> floating transition, so force both
+        // back to the squeeze baseline BEFORE the reader mounts (prefs land in
+        // the single app DB and are read on first load).
+        ReaderFushiSource.instance.toggleTopProgressFloating();
+        ReaderFushiSource.instance.toggleTapEmptyToHideChrome();
+        await _pumpForPref(tester);
+        expect(ReaderFushiSource.instance.topProgressFloating, isFalse,
+            reason: 'forced squeeze baseline: top floating off.');
+        expect(ReaderFushiSource.instance.tapEmptyToHideChrome, isFalse,
+            reason: 'forced squeeze baseline: bottom floating off.');
+
+        // BUG-1106：Tab 遍历前必须先开实验焦点导航开关——关闭（默认）时裸 Tab 被全局
+        // 中和成 DoNothingIntent，而集成测试跑在全新隔离根上、偏好恒为默认值。
+        await enableFocusNavigation(tester);
+        final FocusDriver driver = FocusDriver(tester);
+
+        await _openBooksTab(tester, driver);
+        final String bookKey = await _seedTestBook(tester);
+
+        // 不经书架卡片：[_activateBook] 直接驱动 AppModel.openMedia（与卡片 onTap
+        // 同一调用），书架列表是否已刷出与本测试要量的 chrome inset 几何无关。原先
+        // 这里等书架卡片入树，是本测试唯一的不确定点——刷不出来就整条挂在前置上、
+        // 下面的 DOM 断言一条都跑不到（实测撞到过）。
+        await _activateBook(tester, bookKey);
+        await tester.pump(const Duration(seconds: 3));
+
+        for (int i = 0;
+            i < 40 && find.byType(ReaderFushiPage).evaluate().isEmpty;
+            i++) {
+          await tester.pump(const Duration(milliseconds: 250));
+        }
+        expect(find.byType(ReaderFushiPage), findsOneWidget,
+            reason: 'ReaderFushiPage must mount after openMedia.');
+
+        const Key webViewKey = ValueKey<String>('fushi_webview');
+        bool webViewPresent = false;
+        for (int i = 0; i < 180; i++) {
+          await tester.pump(const Duration(milliseconds: 500));
+          if (find.byKey(webViewKey).evaluate().isNotEmpty) {
+            webViewPresent = true;
+            break;
+          }
+          if (i % 20 == 0) debugPrint('[CHROME975] waiting for WebView i=$i');
+        }
+        expect(webViewPresent, isTrue, reason: 'WebView present');
+
+        const Key contentReadyKey = ValueKey<String>('fushi_content_ready');
+        bool contentReady = false;
+        for (int i = 0; i < 120; i++) {
+          await tester.pump(const Duration(milliseconds: 500));
+          if (find.byKey(contentReadyKey).evaluate().isNotEmpty) {
+            contentReady = true;
+            break;
+          }
+        }
+        expect(contentReady, isTrue, reason: 'Reader content ready within 60s');
+
+        final eval = ReaderFushiPage.debugEvaluateJavascript;
+        expect(eval, isNotNull,
+            reason: 'Reader debug JS hook must be set (debug/profile build).');
+
+        // ── DOM probes ────────────────────────────────────────────────
+        Future<double> readCssVar(String name) async {
+          final Object? raw = await eval!(
+            '(function(){var v=getComputedStyle(document.documentElement)'
+            ".getPropertyValue('$name');return parseFloat(v)||0;})()",
+          );
+          return double.tryParse(raw.toString()) ?? -1;
+        }
+
+        Future<double> readChromeTopInset() => readCssVar('--chrome-top-inset');
+        Future<double> readChromeBottomInset() =>
+            readCssVar('--chrome-bottom-inset');
+
+        Future<Map<String, dynamic>> readFirstTextLine() async {
+          final Object? raw = await eval!(jsFirstTextLineProbe);
+          final dynamic decoded = jsonDecode(raw.toString());
+          return decoded == null
+              ? <String, dynamic>{}
+              : (decoded as Map<String, dynamic>);
+        }
+
+        Future<double> firstLineTop() async {
+          final Map<String, dynamic> line = await readFirstTextLine();
+          return (line['top'] as num?)?.toDouble() ?? -1;
+        }
+
+        // pump until a DOM reading stably satisfies a predicate, or time out.
+        Future<double> settleCssVar(
+          Future<double> Function() read,
+          bool Function(double) ok, {
+          int maxPolls = 40,
+        }) async {
+          double value = -1;
+          for (int i = 0; i < maxPolls; i++) {
+            await tester.pump(const Duration(milliseconds: 300));
+            value = await read();
+            if (ok(value)) break;
+          }
+          return value;
+        }
+
+        const double kTopReservePx = 18.0; // _infoFontSize(12) * 1.5
+        const double kEps = 1.5;
+        // BUG-2387 起 --chrome-top-inset 恒含顶部工具栏预留（顶栏不透明，正文不得
+        // 排到它下面）。本测试原先把 top-inset 当成「只由进度条构成」，谓词
+        // `v >= 18` 会被这 48px 直接满足、settle 立刻返回，后续读数在尚未 settle
+        // 时就被采走（实测底栏 inset 读到 28 而非 ~56）。故所有绝对值预期都加上它。
+        const double kHeaderPx = kReaderDesktopHeaderHeight;
+
+        // ───────────────────────────────────────────────────────────────
+        // Baseline: top squeeze ON -> top-inset has 18px reserve; bottom squeeze
+        // -> bottom-inset has bar height (~56px). The 975 "old behavior" control.
+        // ───────────────────────────────────────────────────────────────
+        // 只等顶栏那份落地。进度条预留经 `_showTopProgress` 门控、需要
+        // `_progressTotalChars > 0`（BUG-470），本机实测在基线采样窗口内并不总能
+        // 落地；把它写进等待条件会让 settle 空转到超时。进度条那 18px 由 goal1 /
+        // goal2 的**差值**断言负责，那里才是它真正被测量的地方。
+        final double baseTopInset = await settleCssVar(
+          readChromeTopInset,
+          (v) => v >= kHeaderPx - 1.0,
+        );
+        final double baseBottomInset = await readChromeBottomInset();
+        final double baseFirstTop = await firstLineTop();
+        debugPrint('[CHROME975] BASELINE topInset=$baseTopInset '
+            'bottomInset=$baseBottomInset firstTop=$baseFirstTop');
+
+        expect(baseTopInset, greaterThanOrEqualTo(kHeaderPx - 1.0),
+            reason: 'baseline: --chrome-top-inset 至少含顶栏预留 ${kHeaderPx}px'
+                '（BUG-2387：顶栏不透明，正文不得排到它下面）。got=$baseTopInset');
+        expect(baseFirstTop, greaterThanOrEqualTo(kHeaderPx - 1.0),
+            reason: 'baseline: 正文首行须落在顶栏下沿之下。got=$baseFirstTop');
+        // System bottom inset is usually 0 on desktop; assert "clearly > 0" with
+        // a wide tolerance rather than coupling to the exact scaled height.
+        expect(baseBottomInset, greaterThan(30.0),
+            reason: 'baseline: bottom squeeze, --chrome-bottom-inset has bar '
+                'height (~56px). got=$baseBottomInset');
+
+        // ───────────────────────────────────────────────────────────────
+        // Goal 1: reclaim blank. show_top_progress_bar ON->OFF -> top-inset
+        // back to 0, first line top back to ~0.
+        // ───────────────────────────────────────────────────────────────
+        ReaderFushiSource.instance.toggleShowTopProgressBar();
+        await _pumpForPref(tester);
+        expect(ReaderFushiSource.instance.showTopProgressBar, isFalse,
+            reason: 'progress-off pref must land false');
+        ReaderFushiSource.onChromeReanchorLive?.call();
+
+        final double offTopInset = await settleCssVar(
+          readChromeTopInset,
+          (v) => v <= kHeaderPx + 1.0,
+        );
+        final double offFirstTop = await firstLineTop();
+        debugPrint('[CHROME975] PROGRESS-OFF topInset=$offTopInset '
+            'firstTop=$offFirstTop');
+
+        expect(offTopInset, lessThanOrEqualTo(kHeaderPx + 1.0),
+            reason: 'goal1: 关进度回收那 ${kTopReservePx}px，只剩顶栏预留 '
+                '${kHeaderPx}px。got=$offTopInset');
+        expect(offFirstTop, lessThanOrEqualTo(kHeaderPx + kTopReservePx - 1.0),
+            reason: 'goal1: 关进度后正文首行上移进原进度条带。'
+                'got=$offFirstTop');
+
+        // ───────────────────────────────────────────────────────────────
+        // Goal 2: floating does not take text space. Restore progress ON (now
+        // squeeze, 18px), then switch to floating -> top-inset back to 0, first
+        // line top back to ~0 (strip overlays body, not pushed down).
+        // ───────────────────────────────────────────────────────────────
+        ReaderFushiSource.instance.toggleShowTopProgressBar(); // restore ON
+        await _pumpForPref(tester);
+        expect(ReaderFushiSource.instance.showTopProgressBar, isTrue);
+        ReaderFushiSource.onChromeReanchorLive?.call();
+        final double reTopInset = await settleCssVar(
+          readChromeTopInset,
+          (v) => v >= kHeaderPx - 1.0,
+        );
+        expect(reTopInset, greaterThanOrEqualTo(kHeaderPx - 1.0),
+            reason: 'precondition: 顶栏预留仍在。got=$reTopInset');
+        // 挤压态下的正文首行位置，作为下面「切悬浮应上移 18px」的基线。
+        final double reFirstTop = await firstLineTop();
+
+        ReaderFushiSource.instance.toggleTopProgressFloating(); // to floating
+        await _pumpForPref(tester);
+        expect(ReaderFushiSource.instance.topProgressFloating, isTrue,
+            reason: 'top floating pref must land true');
+        ReaderFushiSource.onChromeReanchorLive?.call();
+
+        // BUG-2387 起 `--chrome-top-inset` 恒含 48px 顶部工具栏预留（顶栏是不透明
+        // 面，正文不得排到它下面），故本 goal 不再断言它归 0——那会把「顶栏预留」
+        // 和「进度条预留」两件事混成一个数。真正要钉的不变式是**差值**：把顶部进度
+        // 切成悬浮，应当且仅应当回收进度条那 18px。
+        final double floatTopInset = await settleCssVar(
+          readChromeTopInset,
+          (v) => v <= reTopInset - (kTopReservePx - 1.0),
+        );
+        final double floatFirstTop = await firstLineTop();
+        final double reclaimed = reTopInset - floatTopInset;
+        debugPrint('[CHROME975] TOP-FLOATING topInset=$floatTopInset '
+            'firstTop=$floatFirstTop reclaimed=$reclaimed');
+
+        expect(reclaimed, greaterThanOrEqualTo(kTopReservePx - 1.0),
+            reason: 'goal2: 顶部进度切悬浮应回收进度条预留（约 ${kTopReservePx}px）。'
+                'squeeze=$reTopInset floating=$floatTopInset '
+                'reclaimed=$reclaimed');
+        expect(reclaimed, lessThanOrEqualTo(kTopReservePx + kEps),
+            reason: 'goal2: 只应回收进度条那一份，不得连顶栏的 48px 一起回收'
+                '（正文会被工具栏压住，BUG-2387）。reclaimed=$reclaimed');
+        expect(floatFirstTop,
+            lessThanOrEqualTo(reFirstTop - (kTopReservePx - 1.0)),
+            reason: 'goal2: 悬浮后正文首行应上移约 ${kTopReservePx}px（进度条不再占位）。'
+                'squeezeFirstTop=$reFirstTop floatingFirstTop=$floatFirstTop');
+
+        await takeScreenshot(binding, 'todo975_top_floating_no_layout_shift');
+
+        // ───────────────────────────────────────────────────────────────
+        // Goal 3: bottom tap-reveal no-layout-shift. tap_empty_hide_chrome
+        // false->true drops bottom-inset to system inset only; JS bridge
+        // onTapEmpty reveals the bar -> bottom-inset unchanged (floating bottom
+        // bar does not take text space, visible body height does not shrink).
+        // ───────────────────────────────────────────────────────────────
+        ReaderFushiSource.instance.toggleTapEmptyToHideChrome();
+        await _pumpForPref(tester);
+        expect(ReaderFushiSource.instance.tapEmptyToHideChrome, isTrue,
+            reason: 'bottom floating pref must land true');
+        ReaderFushiSource.onChromeReanchorLive?.call();
+
+        final double floatBottomInset = await settleCssVar(
+          readChromeBottomInset,
+          (v) => v <= 5.0,
+        );
+        debugPrint('[CHROME975] BOTTOM-FLOATING(hidden) '
+            'bottomInset=$floatBottomInset');
+        expect(floatBottomInset, lessThan(baseBottomInset - 20.0),
+            reason:
+                'goal3: bottom floating -> --chrome-bottom-inset drops from '
+                'bar height ($baseBottomInset) to system inset only. '
+                'got=$floatBottomInset');
+
+        // Diagnostic: confirm the JS bridge + handler are reachable from the
+        // debug eval context before relying on it to reveal the bar.
+        final Object? bridgeProbe = await eval!(
+          '(function(){try{return JSON.stringify({fiw:typeof window.'
+          'flutter_inappwebview,ch:typeof (window.flutter_inappwebview&&'
+          'window.flutter_inappwebview.callHandler)});}catch(e){return '
+          'JSON.stringify({err:String(e)});}})()',
+        );
+        debugPrint('[CHROME975] bridgeProbe=$bridgeProbe');
+
+        // Reveal the floating bottom bar via the real JS bridge. Dispatch off
+        // the synchronous eval stack (setTimeout) so the callHandler
+        // postMessage is delivered on the WebView message pump, then give it
+        // generous wall-clock time + pumps to land the Dart-side setState.
+        await eval(
+          'setTimeout(function(){window.flutter_inappwebview.callHandler('
+          "'onTapEmpty');},0)",
+        );
+        // Witness the reveal on TWO surfaces:
+        //  * top progress strip (fushi_progress) - floating, gated only on
+        //    _chromeTransientVisible (_topProgressShouldPaint), so it is the
+        //    _showChrome-independent proof the shared reveal flag flipped.
+        //  * bottom bar - this seeded book has NO audiobook, so the bottom
+        //    chrome is the settings bar (_buildSettingsBar, no ValueKey), not
+        //    the audiobook play bar (fushi_play_bar). Its unique headphones
+        //    (audio-import) IconButton is the direct bottom-bar witness.
+        final Finder bottomBarWitness =
+            find.widgetWithIcon(IconButton, FushiIcons.audiobook);
+        bool progressRevealed = false;
+        bool bottomBarRevealed = false;
+        for (int i = 0; i < 40; i++) {
+          await tester.pump(const Duration(milliseconds: 200));
+          progressRevealed = find
+              .byKey(const ValueKey<String>('fushi_progress'))
+              .evaluate()
+              .isNotEmpty;
+          bottomBarRevealed = bottomBarWitness.evaluate().isNotEmpty;
+          if (progressRevealed && bottomBarRevealed) break;
+        }
+        final double revealedBottomInset = await readChromeBottomInset();
+        debugPrint('[CHROME975] BOTTOM-FLOATING(revealed) '
+            'progressRevealed=$progressRevealed '
+            'bottomBarRevealed=$bottomBarRevealed '
+            'bottomInset=$revealedBottomInset');
+
+        // The tap-reveal state machine (_handleFloatingChromeReveal) flips
+        // the single _chromeTransientVisible flag shared by both floating
+        // surfaces. Assert the tap revealed the floating bottom bar (975
+        // decision #3: tap-empty reveals the floating chrome) AND the top
+        // progress strip (both share the transient flag).
+        expect(bottomBarRevealed, isTrue,
+            reason: 'goal3: onTapEmpty must reveal the floating bottom bar '
+                '(settings-bar audio-import icon appears).');
+        expect(progressRevealed, isTrue,
+            reason: 'goal3: the shared transient-visible flag also reveals '
+                'the floating top progress strip.');
+        // Core: inset unchanged after reveal (floating overlay does not push the
+        // body / shrink the visible body height).
+        expect((revealedBottomInset - floatBottomInset).abs(),
+            lessThanOrEqualTo(kEps),
+            reason: 'goal3: revealing the floating bottom bar must NOT change '
+                '--chrome-bottom-inset (no layout shift). '
+                'hidden=$floatBottomInset revealed=$revealedBottomInset');
+
+        await takeScreenshot(binding, 'todo975_bottom_floating_revealed');
+
+        // ───────────────────────────────────────────────────────────────
+        // Goal 4: the revealed chrome STAYS. 2026-09-14 the user made the
+        // floating chrome a pure click switch: a tap opens it, another tap
+        // closes it, and nothing else does — no hover, no timer. Waiting out
+        // the old auto-hide duration must leave both surfaces on screen; only
+        // the second onTapEmpty takes them away.
+        // ───────────────────────────────────────────────────────────────
+        final int autoHideMs = ReaderFushiSource.instance.autoHideChromeMillis;
+        debugPrint('[CHROME975] former auto-hide millis=$autoHideMs');
+        await tester.pump(Duration(milliseconds: autoHideMs + 400));
+        for (int i = 0; i < 10; i++) {
+          await tester.pump(const Duration(milliseconds: 200));
+        }
+        final bool progressStayed = find
+            .byKey(const ValueKey<String>('fushi_progress'))
+            .evaluate()
+            .isNotEmpty;
+        final bool bottomStayed = bottomBarWitness.evaluate().isNotEmpty;
+        debugPrint('[CHROME975] NO-AUTO-HIDE progressStayed=$progressStayed '
+            'bottomStayed=$bottomStayed');
+        expect(progressStayed && bottomStayed, isTrue,
+            reason: 'goal4: the floating chrome must NOT vanish on its own '
+                '(waited ${autoHideMs}ms, the old auto-hide duration). '
+                'Only a second click may close it.');
+
+        // A second tap-empty closes both surfaces — the other half of the
+        // switch, and the only way back to a hidden chrome.
+        await eval(
+          'setTimeout(function(){window.flutter_inappwebview.callHandler('
+          "'onTapEmpty');},0)",
+        );
+        bool clickHidden = false;
+        for (int i = 0; i < 25; i++) {
+          await tester.pump(const Duration(milliseconds: 200));
+          final bool progressGone = find
+              .byKey(const ValueKey<String>('fushi_progress'))
+              .evaluate()
+              .isEmpty;
+          final bool bottomGone = bottomBarWitness.evaluate().isEmpty;
+          if (progressGone && bottomGone) {
+            clickHidden = true;
+            break;
+          }
+        }
+        debugPrint('[CHROME975] CLICK-HIDE clickHidden=$clickHidden');
+        expect(clickHidden, isTrue,
+            reason: 'goal4: a second click must close both revealed floating '
+                'surfaces (top progress + bottom bar).');
+
+        // ── Restore prefs + exit ────────────────────────────────────────
+        ReaderFushiSource.instance.toggleTopProgressFloating();
+        ReaderFushiSource.instance.toggleTapEmptyToHideChrome();
+        await _pumpForPref(tester);
+
+        final NavigatorState nav =
+            Navigator.of(tester.element(find.byType(Scaffold).first));
+        nav.pop();
+        await tester.pump(const Duration(seconds: 2));
+        await tester.pumpAndSettle();
+
+        assertStrictErrors(errors);
+        debugPrint('[CHROME975] === TODO-975 FLOATING CHROME TEST PASSED ===');
+      } finally {
+        FlutterError.onError = oldHandler;
+      }
+    },
+  );
+}
+
+/// Give the fire-and-forget async pref setter a few frames to land.
+Future<void> _pumpForPref(WidgetTester tester) async {
+  for (int i = 0; i < 8; i++) {
+    await tester.pump(const Duration(milliseconds: 150));
+  }
+}
+
+/// Locate the first visible body text block and return its client rect (JSON).
+/// Same probe as reader_top_progress_inset_dom_test.dart.
+const String jsFirstTextLineProbe = r'''
+(function(){
+  function visible(el){
+    var r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    var cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    return (el.textContent || '').trim().length > 0;
+  }
+  var nodes = document.querySelectorAll('p,div,span,li,blockquote,h1,h2,h3');
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var hasChildBlock = false;
+    for (var j = 0; j < el.children.length; j++) {
+      if (visible(el.children[j])) { hasChildBlock = true; break; }
+    }
+    if (hasChildBlock) continue;
+    if (!visible(el)) continue;
+    var r = el.getBoundingClientRect();
+    return JSON.stringify({
+      top: r.top,
+      bottom: r.bottom,
+      tag: el.tagName,
+      text: (el.textContent || '').trim().substr(0, 12)
+    });
+  }
+  return JSON.stringify(null);
+})()
+''';
+
+/// Bring the Books tab to front.
+Future<void> _openBooksTab(WidgetTester tester, FocusDriver driver) async {
+  final List<Finder> navTargets = findPrimaryNavigationTargets();
+  if (navTargets.isEmpty) return;
+  final bool focused = await driver.focusWidget(navTargets.first);
+  expect(focused, isTrue, reason: 'Books tab must be reachable by focus');
+  await driver.activate();
+  await tester.pump(const Duration(milliseconds: 500));
+}
+
+/// Import a fresh synthetic EPUB (no audiobook), return its book key.
+Future<String> _seedTestBook(WidgetTester tester) async {
+  final ProviderContainer container = ProviderScope.containerOf(
+    tester.element(find.byType(MaterialApp).first),
+  );
+  final AppModel appModel = container.read(appProvider);
+  for (int i = 0; i < 120 && !appModel.isInitialised; i++) {
+    await tester.pump(const Duration(milliseconds: 500));
+  }
+  expect(appModel.isInitialised, isTrue,
+      reason: 'AppModel must be initialised before importing a book');
+
+  final Uint8List bytes = EpubGenerator().generate();
+  final String bookKey = await EpubImporter.import(
+    db: appModel.database,
+    bytes: bytes,
+    fileName: 'test_chrome_floating.epub',
+  );
+  debugPrint('[CHROME975] Imported test EPUB as book key=$bookKey');
+
+  container.invalidate(fushiBooksProvider(JapaneseLanguage.instance));
+  await tester.pumpAndSettle();
+  return bookKey;
+}
+
+/// Deterministically open the shelf book (same approach as
+/// reader_top_progress_inset_dom_test._activateBook): resolve MediaItem from key
+/// and drive AppModel.openMedia directly (bypassing the focus tree, TODO-783).
+Future<void> _activateBook(WidgetTester tester, String bookKey) async {
+  final BuildContext appContext =
+      tester.element(find.byType(MaterialApp).first);
+  final ProviderContainer container = ProviderScope.containerOf(appContext);
+  final AppModel appModel = container.read(appProvider);
+
+  final ConsumerStatefulElement appElement = tester
+      .element(find.byType(app.FushiReaderApp)) as ConsumerStatefulElement;
+  final WidgetRef ref = appElement;
+
+  final MediaItem? item =
+      await ReaderFushiSource.instance.mediaItemForBookKey(bookKey);
+  expect(item, isNotNull,
+      reason: 'Seeded book must resolve to a MediaItem (key=$bookKey)');
+
+  unawaited(appModel.openMedia(
+    ref: ref,
+    mediaSource: ReaderFushiSource.instance,
+    item: item!,
+  ));
+  for (int i = 0; i < 8; i++) {
+    await tester.pump(const Duration(milliseconds: 250));
+  }
+}

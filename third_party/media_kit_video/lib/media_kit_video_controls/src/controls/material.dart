@@ -1,0 +1,2724 @@
+/// This file is a part of media_kit (https://github.com/media-kit/media-kit).
+///
+/// Copyright © 2021 & onwards, Hitesh Kumar Saini <saini123hitesh@gmail.com>.
+/// All rights reserved.
+/// Use of this source code is governed by MIT license that can be found in the LICENSE file.
+// ignore_for_file: non_constant_identifier_names
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:material_ui/material_ui.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:media_kit_video/media_kit_video_controls/src/controls/extensions/duration.dart';
+import 'package:media_kit_video/media_kit_video_controls/src/controls/methods/video_state.dart';
+import 'package:media_kit_video/media_kit_video_controls/src/controls/widgets/video_controls_theme_data_injector.dart';
+
+/// Fushi patch (BUG-1485): injection point for the horizontal drag-to-seek
+/// pixel→time mapping.
+///
+/// Upstream hard-codes `seconds = dragDx * duration / horizontalGestureSensitivity`,
+/// i.e. the seek amount per pixel scales with the **total duration** — a 2h movie
+/// flies ~48 minutes across one screen width. Hosts that want a duration-decoupled
+/// (and/or non-linear, user-configurable) mapping supply this resolver instead;
+/// when it is `null` the upstream formula is used verbatim.
+///
+/// [dragDx] is the signed horizontal displacement from the drag origin in logical
+/// pixels (positive = forward). Returns the signed delta to apply to [position];
+/// the resolver is responsible for keeping `position + delta` inside
+/// `[Duration.zero, duration]`.
+typedef HorizontalSeekResolver = Duration Function({
+  required double dragDx,
+  required double surfaceWidth,
+  required Duration duration,
+  required Duration position,
+});
+
+/// {@template material_video_controls}
+///
+/// [Video] controls which use Material design.
+///
+/// {@endtemplate}
+Widget MaterialVideoControls(VideoState state) {
+  return const VideoControlsThemeDataInjector(
+    child: _MaterialVideoControls(),
+  );
+}
+
+/// [MaterialVideoControlsThemeData] available in this [context].
+MaterialVideoControlsThemeData _theme(BuildContext context) =>
+    FullscreenInheritedWidget.maybeOf(context) == null
+        ? MaterialVideoControlsTheme.maybeOf(context)?.normal ??
+            kDefaultMaterialVideoControlsThemeData
+        : MaterialVideoControlsTheme.maybeOf(context)?.fullscreen ??
+            kDefaultMaterialVideoControlsThemeDataFullscreen;
+
+/// Default [MaterialVideoControlsThemeData].
+const kDefaultMaterialVideoControlsThemeData = MaterialVideoControlsThemeData();
+
+/// Default [MaterialVideoControlsThemeData] for fullscreen.
+const kDefaultMaterialVideoControlsThemeDataFullscreen =
+    MaterialVideoControlsThemeData(
+  displaySeekBar: true,
+  automaticallyImplySkipNextButton: true,
+  automaticallyImplySkipPreviousButton: true,
+  volumeGesture: true,
+  brightnessGesture: true,
+  seekGesture: true,
+  gesturesEnabledWhileControlsVisible: true,
+  seekOnDoubleTap: true,
+  seekOnDoubleTapEnabledWhileControlsVisible: true,
+  visibleOnMount: false,
+  speedUpOnLongPress: false,
+  speedUpFactor: 2.0,
+  verticalGestureSensitivity: 100,
+  horizontalGestureSensitivity: 1000,
+  backdropColor: Color(0x66000000),
+  padding: null,
+  controlsHoverDuration: Duration(seconds: 3),
+  controlsTransitionDuration: Duration(milliseconds: 300),
+  bufferingIndicatorBuilder: null,
+  volumeIndicatorBuilder: null,
+  brightnessIndicatorBuilder: null,
+  seekIndicatorBuilder: null,
+  speedUpIndicatorBuilder: null,
+  primaryButtonBar: [
+    Spacer(flex: 2),
+    MaterialSkipPreviousButton(),
+    Spacer(),
+    MaterialPlayOrPauseButton(iconSize: 56.0),
+    Spacer(),
+    MaterialSkipNextButton(),
+    Spacer(flex: 2),
+  ],
+  topButtonBar: [],
+  topButtonBarMargin: EdgeInsets.symmetric(
+    horizontal: 16.0,
+  ),
+  bottomButtonBar: [
+    MaterialPositionIndicator(),
+    Spacer(),
+    MaterialFullscreenButton(),
+  ],
+  bottomButtonBarMargin: EdgeInsets.only(
+    left: 16.0,
+    right: 8.0,
+    bottom: 42.0,
+  ),
+  buttonBarHeight: 56.0,
+  buttonBarButtonSize: 24.0,
+  buttonBarButtonColor: Color(0xFFFFFFFF),
+  seekBarMargin: EdgeInsets.only(
+    left: 16.0,
+    right: 16.0,
+    bottom: 42.0,
+  ),
+  seekBarHeight: 2.4,
+  seekBarContainerHeight: 36.0,
+  seekBarColor: Color(0x3DFFFFFF),
+  seekBarPositionColor: Color(0xFFFF0000),
+  seekBarBufferColor: Color(0x3DFFFFFF),
+  seekBarThumbSize: 12.8,
+  seekBarThumbColor: Color(0xFFFF0000),
+  seekBarAlignment: Alignment.bottomCenter,
+  shiftSubtitlesOnControlsVisibilityChange: false,
+);
+
+/// {@template material_video_controls_theme_data}
+///
+/// Theming related data for [MaterialVideoControls]. These values are used to theme the descendant [MaterialVideoControls].
+///
+/// {@endtemplate}
+class MaterialVideoControlsThemeData {
+  // BEHAVIOR
+
+  /// Whether to display seek bar.
+  final bool displaySeekBar;
+
+  /// Whether a skip next button should be displayed if there are more than one videos in the playlist.
+  final bool automaticallyImplySkipNextButton;
+
+  /// Whether a skip previous button should be displayed if there are more than one videos in the playlist.
+  final bool automaticallyImplySkipPreviousButton;
+
+  /// Whether to modify volume on vertical drag gesture on the right side of the screen.
+  final bool volumeGesture;
+
+  /// Whether to modify screen brightness on vertical drag gesture on the left side of the screen.
+  final bool brightnessGesture;
+
+  /// Whether to seek on horizontal drag gesture.
+  final bool seekGesture;
+
+  /// Whether to allow gesture controls to work while controls are visible.
+  /// NOTE: This option is ignored when gestures are false.
+  final bool gesturesEnabledWhileControlsVisible;
+
+  /// Whether to enable double tap to seek on left or right side of the screen.
+  final bool seekOnDoubleTap;
+
+  /// Whether to allow double tap to seek on left or right side of the screen to work while controls are visible.
+  /// NOTE: This option is ignored when [seekOnDoubleTap] is false.
+  final bool seekOnDoubleTapEnabledWhileControlsVisible;
+
+  /// `seekOnDoubleTapLayoutTapsRatios` defines the width proportions for the interactive areas
+  /// responsible for seek actions (backward seek, instant tap, forward seek) when a double tap
+  /// occurs on the video widget. This property divides the video widget into three segments
+  /// horizontally. Each integer in the list represents the relative width of each segment.
+  /// By default, the value `[1, 1, 1]` means that the video widget is equally divided into three
+  /// segments: the left segment for backward seek, the middle segment for instant tap (usually show and hide controls),
+  /// and the right segment for forward seek. Adjusting these values changes the width of the interactive areas
+  /// for each double tap action.
+  final List<int> seekOnDoubleTapLayoutTapsRatios;
+
+  /// `seekOnDoubleTapLayoutWidgetRatios` defines the width proportions for the visual indicators or
+  /// widgets that appear during the double tap actions (backward seek, instant tap, forward seek).
+  /// Similar to `seekOnDoubleTapLayoutTapsRatios`, it divides the area where these indicators are
+  /// displayed into three segments. Each integer in the list represents the relative width of each
+  /// segment where the corresponding indicators will be shown. The default `[1, 1, 1]` equally divides
+  /// the space for each indicator. Modifying these values can change the layout of the seek indicators,
+  /// giving more or less space to each one based on the specified ratios.
+  final List<int> seekOnDoubleTapLayoutWidgetRatios;
+
+  /// Duration of seek on double tap backward.
+  final Duration seekOnDoubleTapBackwardDuration;
+
+  /// Duration of seek on double tap forward.
+  final Duration seekOnDoubleTapForwardDuration;
+
+  /// Whether the controls are initially visible.
+  final bool visibleOnMount;
+
+  /// Whether to speed up on long press.
+  final bool speedUpOnLongPress;
+
+  /// Factor to speed up on long press.
+  final double speedUpFactor;
+
+  /// Gesture sensitivity on vertical drag gestures, the higher the value is the less sensitive the gesture.
+  final double verticalGestureSensitivity;
+
+  /// Gesture sensitivity on horizontal drag gestures, the higher the value is the less sensitive the gesture.
+  ///
+  /// NOTE (Fushi patch, BUG-1485): ignored when [horizontalSeekResolver] is
+  /// non-null — the resolver fully replaces the built-in mapping.
+  final double horizontalGestureSensitivity;
+
+  /// Fushi patch (BUG-1485): replaces the built-in horizontal drag-to-seek
+  /// pixel→time mapping. See [HorizontalSeekResolver]. `null` = upstream formula.
+  final HorizontalSeekResolver? horizontalSeekResolver;
+
+  /// Color of backdrop that comes up when controls are visible.
+  final Color? backdropColor;
+
+  // GENERIC
+
+  /// Padding around the controls.
+  ///
+  /// * Default: `EdgeInsets.zero`
+  /// * FullScreen: `MediaQuery.of(context).padding`
+  ///
+  /// NOTE: In fullscreen, this will be safe area (set [padding] to [EdgeInsets.zero] to disable safe area)
+  final EdgeInsets? padding;
+
+  /// [Duration] after which the controls will be hidden when there is no mouse movement.
+  final Duration controlsHoverDuration;
+
+  /// [Duration] for which the controls will be animated when shown or hidden.
+  final Duration controlsTransitionDuration;
+
+  /// Builder for the buffering indicator.
+  final Widget Function(BuildContext)? bufferingIndicatorBuilder;
+
+  /// Custom builder for volume indicator.
+  final Widget Function(BuildContext, double)? volumeIndicatorBuilder;
+
+  /// Custom builder for brightness indicator.
+  final Widget Function(BuildContext, double)? brightnessIndicatorBuilder;
+
+  /// Optional callback called when volume should be changed (0.0 to 1.0).
+  /// If not provided, volume gestures will be disabled.
+  final void Function(double)? onVolumeChanged;
+
+  /// Optional initial volume value (0.0 to 1.0). Defaults to 0.5.
+  final double? initialVolume;
+
+  /// Optional callback called when brightness should be changed (0.0 to 1.0).
+  /// If not provided, brightness gestures will be disabled.
+  final void Function(double)? onBrightnessChanged;
+
+  /// Optional initial brightness value (0.0 to 1.0). Defaults to 0.5.
+  final double? initialBrightness;
+
+  /// Optional callback called when brightness should be reset on dispose.
+  final void Function()? onBrightnessReset;
+
+  /// Custom builder for seek indicator.
+  final Widget Function(BuildContext, Duration)? seekIndicatorBuilder;
+
+  /// Custom builder for seek indicator.
+  final Widget Function(BuildContext, double)? speedUpIndicatorBuilder;
+
+  // BUTTON BAR
+
+  /// Buttons to be displayed in the primary button bar.
+  final List<Widget> primaryButtonBar;
+
+  /// Buttons to be displayed in the top button bar.
+  final List<Widget> topButtonBar;
+
+  /// Margin around the top button bar.
+  final EdgeInsets topButtonBarMargin;
+
+  /// Buttons to be displayed in the bottom button bar.
+  final List<Widget> bottomButtonBar;
+
+  /// Margin around the button bar.
+  final EdgeInsets bottomButtonBarMargin;
+
+  /// Height of the button bar.
+  final double buttonBarHeight;
+
+  /// Size of the button bar buttons.
+  final double buttonBarButtonSize;
+
+  /// Color of the button bar buttons.
+  final Color buttonBarButtonColor;
+
+  // SEEK BAR
+
+  /// Margin around the seek bar.
+  final EdgeInsets seekBarMargin;
+
+  /// Height of the seek bar.
+  final double seekBarHeight;
+
+  /// Height of the seek bar [Container].
+  final double seekBarContainerHeight;
+
+  /// [Color] of the seek bar.
+  final Color seekBarColor;
+
+  /// [Color] of the playback position section in the seek bar.
+  final Color seekBarPositionColor;
+
+  /// [Color] of the playback buffer section in the seek bar.
+  final Color seekBarBufferColor;
+
+  /// Size of the seek bar thumb.
+  final double seekBarThumbSize;
+
+  /// [Color] of the seek bar thumb.
+  final Color seekBarThumbColor;
+
+  /// [Alignment] of seek bar inside the seek bar container.
+  final Alignment seekBarAlignment;
+
+  /// Fushi patch (glass design system): corner radius of the seek bar track
+  /// (and its buffer / position fills). `0` (default) keeps the upstream
+  /// square-ended track pixel-for-pixel.
+  final double seekBarRadius;
+
+  /// Fushi patch (glass design system): track height while the seek bar is
+  /// pressed / dragged (iOS 26 thickens the scrubber under the finger). `null`
+  /// (default) keeps the upstream constant [seekBarHeight].
+  final double? seekBarActiveHeight;
+
+  // SUBTITLE
+
+  /// Whether to shift the subtitles upwards when the controls are visible.
+  final bool shiftSubtitlesOnControlsVisibilityChange;
+
+  // VISIBILITY (Fushi patch)
+
+  /// Optional notifier the controls push their real `visible` state into on
+  /// every change (tap toggle / auto-hide timer / mount). Fushi consumes this
+  /// single source of truth for its subtitle dodge instead of duplicating the
+  /// visibility state machine with a separate timer that drifts out of phase
+  /// (TODO-364). Null (upstream default) = no publishing, behaviour identical to
+  /// pub.dev. See third_party/media_kit_video/PATCHES.md.
+  final ValueNotifier<bool>? visibilityNotifier;
+
+  // AUTO-HIDE TIMER RESTART (Fushi patch)
+
+  /// Optional [Listenable] the host pokes to *restart* the controls auto-hide
+  /// timer without toggling visibility. On mobile the controls' hide timer is
+  /// only reset by a full-screen tap or a seek — pressing the bottom button-bar
+  /// buttons (play / skip forward / back) does NOT reset it, so the controls
+  /// vanish 3s after the last tap even while the user is still pressing a button
+  /// (mis-tap on the video underneath, TODO-1059). The host (Fushi) fires this
+  /// signal from those button presses; the controls listen and, while visible,
+  /// cancel + reschedule the hide timer for another [controlsHoverDuration].
+  /// Null (upstream default) = no listener, behaviour identical to pub.dev.
+  /// See third_party/media_kit_video/PATCHES.md.
+  final Listenable? restartHideTimerSignal;
+
+  /// Optional host-driven "keep the controls up" hold (Fushi patch), mobile
+  /// counterpart of [MaterialDesktopVideoControlsThemeData.holdVisible]: while
+  /// its value is `true` the auto-hide timer does not hide the bar (a popup
+  /// opened from a bar button — the "⋮" overflow menu — must not lose its
+  /// anchor under the user's finger); when it drops back to `false` the
+  /// auto-hide countdown restarts.
+  /// Null (upstream default) = no hold, behaviour identical to pub.dev.
+  /// See third_party/media_kit_video/PATCHES.md.
+  final ValueListenable<bool>? holdVisible;
+
+  // SEEK START (Fushi patch)
+
+  /// Optional callback fired the moment the user starts dragging / tapping the
+  /// seek bar. The seek bar drives `player.seek` directly inside media_kit and
+  /// exposes no host-level seek hook, so Fushi uses this to invalidate its
+  /// "active jump target" snapshot (TODO-565): without it, dragging the bar to
+  /// an earlier cue during the brief in-flight grace window of a list tap would
+  /// be mis-detected as the in-flight seek and snap the highlight back to the
+  /// stale target. Null (upstream default) = no callback, behaviour identical to
+  /// pub.dev. See third_party/media_kit_video/PATCHES.md.
+  final void Function()? onSeekStart;
+
+  /// Fushi patch (BUG-796 follow-up): fires when the user **commits** a seek-bar
+  /// seek (drag release / tap), with the target [Duration]. The seek bar drives
+  /// `player.seek` directly inside media_kit, bypassing the host's
+  /// `VideoPlayerController.seekMs` in-flight protection; Fushi uses this to
+  /// re-sync the subtitle to the destination + suppress the lagging post-seek
+  /// position (else seeking to a gap, esp. while paused, leaves the previous
+  /// subtitle on screen). Null (upstream default) = no callback, behaviour
+  /// identical to pub.dev. See third_party/media_kit_video/PATCHES.md.
+  final void Function(Duration)? onSeekEnd;
+
+  /// Fushi patch (BUG-2731 follow-up): fires right after a **committed** seek
+  /// has been handed to `player.seek`, with that call's [Future]. `player.seek`
+  /// first waits on the player's internal lock (and video-controller
+  /// initialisation) before the mpv command is actually issued; until then the
+  /// old content keeps playing normally. Fushi waits on this future before it
+  /// starts treating "playing, not buffering, advancing" as evidence that the
+  /// seek has finished, so a slow dispatch can't clear the in-flight target
+  /// early. Null (upstream default) = no callback, behaviour identical to
+  /// pub.dev. See third_party/media_kit_video/PATCHES.md.
+  final void Function(Future<void> seek)? onSeekDispatched;
+
+  /// Fushi patch (M3 Expressive chrome): host-painted seek-bar track. Null
+  /// (upstream default) = upstream track. Gestures stay in the fork. See
+  /// PATCHES.md.
+  final VideoSeekBarTrackBuilder? seekBarTrackBuilder;
+
+  /// Fushi patch (BUG-2731 follow-up): the base position that **relative**
+  /// seeks (horizontal swipe, double-tap ±N s) are measured from. On a remote
+  /// stream a seek re-buffers for seconds while `player.state.position` still
+  /// reports the pre-seek position; measuring the next swipe from it silently
+  /// drops the first swipe's displacement ("the HUD keeps showing ±0:00, I can
+  /// only nudge it"). The host returns its in-flight seek target when one is
+  /// pending, else the live position. Null (upstream default) =
+  /// `player.state.position`, behaviour identical to pub.dev. See
+  /// third_party/media_kit_video/PATCHES.md.
+  final Duration Function()? relativeSeekBasePosition;
+
+  /// {@macro material_video_controls_theme_data}
+  const MaterialVideoControlsThemeData({
+    this.displaySeekBar = true,
+    this.automaticallyImplySkipNextButton = true,
+    this.automaticallyImplySkipPreviousButton = true,
+    this.volumeGesture = false,
+    this.brightnessGesture = false,
+    this.seekGesture = false,
+    this.gesturesEnabledWhileControlsVisible = true,
+    this.seekOnDoubleTap = false,
+    this.seekOnDoubleTapEnabledWhileControlsVisible = true,
+    this.seekOnDoubleTapLayoutTapsRatios = const [1, 1, 1],
+    this.seekOnDoubleTapLayoutWidgetRatios = const [1, 1, 1],
+    this.seekOnDoubleTapBackwardDuration = const Duration(seconds: 10),
+    this.seekOnDoubleTapForwardDuration = const Duration(seconds: 10),
+    this.visibleOnMount = false,
+    this.speedUpOnLongPress = false,
+    this.speedUpFactor = 2.0,
+    this.verticalGestureSensitivity = 100,
+    this.horizontalGestureSensitivity = 1000,
+    this.horizontalSeekResolver,
+    this.backdropColor = const Color(0x66000000),
+    this.padding,
+    this.controlsHoverDuration = const Duration(seconds: 3),
+    this.controlsTransitionDuration = const Duration(milliseconds: 300),
+    this.bufferingIndicatorBuilder,
+    this.volumeIndicatorBuilder,
+    this.brightnessIndicatorBuilder,
+    this.onVolumeChanged,
+    this.initialVolume,
+    this.onBrightnessChanged,
+    this.initialBrightness,
+    this.onBrightnessReset,
+    this.seekIndicatorBuilder,
+    this.speedUpIndicatorBuilder,
+    this.primaryButtonBar = const [
+      Spacer(flex: 2),
+      MaterialSkipPreviousButton(),
+      Spacer(),
+      MaterialPlayOrPauseButton(iconSize: 48.0),
+      Spacer(),
+      MaterialSkipNextButton(),
+      Spacer(flex: 2),
+    ],
+    this.topButtonBar = const [],
+    this.topButtonBarMargin = const EdgeInsets.symmetric(horizontal: 16.0),
+    this.bottomButtonBar = const [
+      MaterialPositionIndicator(),
+      Spacer(),
+      MaterialFullscreenButton(),
+    ],
+    this.bottomButtonBarMargin = const EdgeInsets.only(left: 16.0, right: 8.0),
+    this.buttonBarHeight = 56.0,
+    this.buttonBarButtonSize = 24.0,
+    this.buttonBarButtonColor = const Color(0xFFFFFFFF),
+    this.seekBarMargin = EdgeInsets.zero,
+    this.seekBarHeight = 2.4,
+    this.seekBarContainerHeight = 36.0,
+    this.seekBarColor = const Color(0x3DFFFFFF),
+    this.seekBarPositionColor = const Color(0xFFFF0000),
+    this.seekBarBufferColor = const Color(0x3DFFFFFF),
+    this.seekBarThumbSize = 12.8,
+    this.seekBarThumbColor = const Color(0xFFFF0000),
+    this.seekBarAlignment = Alignment.bottomCenter,
+    this.seekBarRadius = 0.0,
+    this.seekBarActiveHeight,
+    this.shiftSubtitlesOnControlsVisibilityChange = false,
+    this.visibilityNotifier,
+    this.restartHideTimerSignal,
+    this.holdVisible,
+    this.onSeekStart,
+    this.onSeekEnd,
+    this.onSeekDispatched,
+    this.relativeSeekBasePosition,
+    this.seekBarTrackBuilder,
+  });
+
+  /// Creates a copy of this [MaterialVideoControlsThemeData] with the given fields replaced by the non-null parameter values.
+  MaterialVideoControlsThemeData copyWith({
+    bool? displaySeekBar,
+    bool? automaticallyImplySkipNextButton,
+    bool? automaticallyImplySkipPreviousButton,
+    bool? volumeGesture,
+    bool? brightnessGesture,
+    bool? seekGesture,
+    bool? gesturesEnabledWhileControlsVisible,
+    bool? seekOnDoubleTap,
+    bool? seekOnDoubleTapEnabledWhileControlsVisible,
+    List<int>? seekOnDoubleTapLayoutTapsRatios,
+    List<int>? seekOnDoubleTapLayoutWidgetRatios,
+    Duration? seekOnDoubleTapBackwardDuration,
+    Duration? seekOnDoubleTapForwardDuration,
+    bool? visibleOnMount,
+    bool? speedUpOnLongPress,
+    double? speedUpFactor,
+    double? verticalGestureSensitivity,
+    double? horizontalGestureSensitivity,
+    HorizontalSeekResolver? horizontalSeekResolver,
+    Color? backdropColor,
+    Duration? controlsHoverDuration,
+    Duration? controlsTransitionDuration,
+    Widget Function(BuildContext)? bufferingIndicatorBuilder,
+    Widget Function(BuildContext, double)? volumeIndicatorBuilder,
+    Widget Function(BuildContext, double)? brightnessIndicatorBuilder,
+    void Function(double)? onVolumeChanged,
+    double? initialVolume,
+    void Function(double)? onBrightnessChanged,
+    double? initialBrightness,
+    void Function()? onBrightnessReset,
+    Widget Function(BuildContext, Duration)? seekIndicatorBuilder,
+    Widget Function(BuildContext, double)? speedUpIndicatorBuilder,
+    List<Widget>? primaryButtonBar,
+    List<Widget>? topButtonBar,
+    EdgeInsets? topButtonBarMargin,
+    List<Widget>? bottomButtonBar,
+    EdgeInsets? bottomButtonBarMargin,
+    double? buttonBarHeight,
+    double? buttonBarButtonSize,
+    Color? buttonBarButtonColor,
+    EdgeInsets? seekBarMargin,
+    double? seekBarHeight,
+    double? seekBarContainerHeight,
+    Color? seekBarColor,
+    Color? seekBarPositionColor,
+    Color? seekBarBufferColor,
+    double? seekBarThumbSize,
+    Color? seekBarThumbColor,
+    Alignment? seekBarAlignment,
+    double? seekBarRadius,
+    double? seekBarActiveHeight,
+    bool? shiftSubtitlesOnControlsVisibilityChange,
+    ValueNotifier<bool>? visibilityNotifier,
+    Listenable? restartHideTimerSignal,
+    ValueListenable<bool>? holdVisible,
+    void Function()? onSeekStart,
+    void Function(Duration)? onSeekEnd,
+    void Function(Future<void> seek)? onSeekDispatched,
+    Duration Function()? relativeSeekBasePosition,
+    VideoSeekBarTrackBuilder? seekBarTrackBuilder,
+  }) {
+    return MaterialVideoControlsThemeData(
+      displaySeekBar: displaySeekBar ?? this.displaySeekBar,
+      automaticallyImplySkipNextButton: automaticallyImplySkipNextButton ??
+          this.automaticallyImplySkipNextButton,
+      automaticallyImplySkipPreviousButton:
+          automaticallyImplySkipPreviousButton ??
+              this.automaticallyImplySkipPreviousButton,
+      volumeGesture: volumeGesture ?? this.volumeGesture,
+      brightnessGesture: brightnessGesture ?? this.brightnessGesture,
+      seekGesture: seekGesture ?? this.seekGesture,
+      gesturesEnabledWhileControlsVisible:
+          gesturesEnabledWhileControlsVisible ??
+              this.gesturesEnabledWhileControlsVisible,
+      seekOnDoubleTap: seekOnDoubleTap ?? this.seekOnDoubleTap,
+      seekOnDoubleTapEnabledWhileControlsVisible:
+          seekOnDoubleTapEnabledWhileControlsVisible ??
+              this.seekOnDoubleTapEnabledWhileControlsVisible,
+      seekOnDoubleTapLayoutTapsRatios: seekOnDoubleTapLayoutTapsRatios ??
+          this.seekOnDoubleTapLayoutTapsRatios,
+      seekOnDoubleTapLayoutWidgetRatios: seekOnDoubleTapLayoutWidgetRatios ??
+          this.seekOnDoubleTapLayoutWidgetRatios,
+      seekOnDoubleTapBackwardDuration: seekOnDoubleTapBackwardDuration ??
+          this.seekOnDoubleTapBackwardDuration,
+      seekOnDoubleTapForwardDuration:
+          seekOnDoubleTapForwardDuration ?? this.seekOnDoubleTapForwardDuration,
+      visibleOnMount: visibleOnMount ?? this.visibleOnMount,
+      speedUpOnLongPress: speedUpOnLongPress ?? this.speedUpOnLongPress,
+      speedUpFactor: speedUpFactor ?? this.speedUpFactor,
+      verticalGestureSensitivity:
+          verticalGestureSensitivity ?? this.verticalGestureSensitivity,
+      horizontalGestureSensitivity:
+          horizontalGestureSensitivity ?? this.horizontalGestureSensitivity,
+      horizontalSeekResolver:
+          horizontalSeekResolver ?? this.horizontalSeekResolver,
+      backdropColor: backdropColor ?? this.backdropColor,
+      controlsHoverDuration:
+          controlsHoverDuration ?? this.controlsHoverDuration,
+      controlsTransitionDuration:
+          controlsTransitionDuration ?? this.controlsTransitionDuration,
+      bufferingIndicatorBuilder:
+          bufferingIndicatorBuilder ?? this.bufferingIndicatorBuilder,
+      volumeIndicatorBuilder:
+          volumeIndicatorBuilder ?? this.volumeIndicatorBuilder,
+      brightnessIndicatorBuilder:
+          brightnessIndicatorBuilder ?? this.brightnessIndicatorBuilder,
+      onVolumeChanged: onVolumeChanged ?? this.onVolumeChanged,
+      initialVolume: initialVolume ?? this.initialVolume,
+      onBrightnessChanged: onBrightnessChanged ?? this.onBrightnessChanged,
+      initialBrightness: initialBrightness ?? this.initialBrightness,
+      onBrightnessReset: onBrightnessReset ?? this.onBrightnessReset,
+      seekIndicatorBuilder: seekIndicatorBuilder ?? this.seekIndicatorBuilder,
+      speedUpIndicatorBuilder:
+          speedUpIndicatorBuilder ?? this.speedUpIndicatorBuilder,
+      primaryButtonBar: primaryButtonBar ?? this.primaryButtonBar,
+      topButtonBar: topButtonBar ?? this.topButtonBar,
+      topButtonBarMargin: topButtonBarMargin ?? this.topButtonBarMargin,
+      bottomButtonBar: bottomButtonBar ?? this.bottomButtonBar,
+      bottomButtonBarMargin:
+          bottomButtonBarMargin ?? this.bottomButtonBarMargin,
+      buttonBarHeight: buttonBarHeight ?? this.buttonBarHeight,
+      buttonBarButtonSize: buttonBarButtonSize ?? this.buttonBarButtonSize,
+      buttonBarButtonColor: buttonBarButtonColor ?? this.buttonBarButtonColor,
+      seekBarMargin: seekBarMargin ?? this.seekBarMargin,
+      seekBarHeight: seekBarHeight ?? this.seekBarHeight,
+      seekBarContainerHeight:
+          seekBarContainerHeight ?? this.seekBarContainerHeight,
+      seekBarColor: seekBarColor ?? this.seekBarColor,
+      seekBarPositionColor: seekBarPositionColor ?? this.seekBarPositionColor,
+      seekBarBufferColor: seekBarBufferColor ?? this.seekBarBufferColor,
+      seekBarThumbSize: seekBarThumbSize ?? this.seekBarThumbSize,
+      seekBarThumbColor: seekBarThumbColor ?? this.seekBarThumbColor,
+      seekBarAlignment: seekBarAlignment ?? this.seekBarAlignment,
+      seekBarRadius: seekBarRadius ?? this.seekBarRadius,
+      seekBarActiveHeight: seekBarActiveHeight ?? this.seekBarActiveHeight,
+      shiftSubtitlesOnControlsVisibilityChange:
+          shiftSubtitlesOnControlsVisibilityChange ??
+              this.shiftSubtitlesOnControlsVisibilityChange,
+      visibilityNotifier: visibilityNotifier ?? this.visibilityNotifier,
+      restartHideTimerSignal:
+          restartHideTimerSignal ?? this.restartHideTimerSignal,
+      holdVisible: holdVisible ?? this.holdVisible,
+      onSeekStart: onSeekStart ?? this.onSeekStart,
+      onSeekEnd: onSeekEnd ?? this.onSeekEnd,
+      onSeekDispatched: onSeekDispatched ?? this.onSeekDispatched,
+      relativeSeekBasePosition:
+          relativeSeekBasePosition ?? this.relativeSeekBasePosition,
+      seekBarTrackBuilder: seekBarTrackBuilder ?? this.seekBarTrackBuilder,
+    );
+  }
+}
+
+/// {@template material_video_controls_theme}
+///
+/// Inherited widget which provides [MaterialVideoControlsThemeData] to descendant widgets.
+///
+/// {@endtemplate}
+class MaterialVideoControlsTheme extends InheritedWidget {
+  final MaterialVideoControlsThemeData normal;
+  final MaterialVideoControlsThemeData fullscreen;
+  const MaterialVideoControlsTheme({
+    super.key,
+    required this.normal,
+    required this.fullscreen,
+    required super.child,
+  });
+
+  static MaterialVideoControlsTheme? maybeOf(BuildContext context) {
+    return context
+        .dependOnInheritedWidgetOfExactType<MaterialVideoControlsTheme>();
+  }
+
+  static MaterialVideoControlsTheme of(BuildContext context) {
+    final MaterialVideoControlsTheme? result = maybeOf(context);
+    assert(
+      result != null,
+      'No [MaterialVideoControlsTheme] found in [context]',
+    );
+    return result!;
+  }
+
+  @override
+  bool updateShouldNotify(MaterialVideoControlsTheme oldWidget) =>
+      !identical(normal, oldWidget.normal) ||
+      !identical(fullscreen, oldWidget.fullscreen);
+}
+
+/// {@macro material_video_controls}
+class _MaterialVideoControls extends StatefulWidget {
+  const _MaterialVideoControls();
+
+  @override
+  State<_MaterialVideoControls> createState() => _MaterialVideoControlsState();
+}
+
+/// {@macro material_video_controls}
+class _MaterialVideoControlsState extends State<_MaterialVideoControls> {
+  late bool mount;
+  late bool visible;
+  Timer? _timer;
+  // Fushi patch (TODO-1059): the host's restart-hide-timer signal we are
+  // currently subscribed to, kept so dispose() / a theme change can detach the
+  // exact listener we attached (the theme's listenable identity can change).
+  Listenable? _restartHideTimerSignal;
+
+  /// Fushi patch: the host hold currently bound (see
+  /// [MaterialVideoControlsThemeData.holdVisible]).
+  ValueListenable<bool>? _holdVisible;
+
+  /// Fushi patch: the host currently holds the controls up — the auto-hide
+  /// timer must not hide them.
+  bool get _held => _holdVisible?.value ?? false;
+
+  double _brightnessValue = 0.0;
+  bool _brightnessIndicator = false;
+  Timer? _brightnessTimer;
+  double _currentRate = 1.0;
+  double _volumeValue = 0.0;
+  bool _volumeIndicator = false;
+  Timer? _volumeTimer;
+
+  void Function()? _onBrightnessReset;
+
+  Offset _dragInitialDelta =
+      Offset.zero; // Initial position for horizontal drag
+  // Fushi patch (BUG-1485): retyped from `int swipeDuration` (whole seconds) to
+  // a `Duration` so a host-supplied [HorizontalSeekResolver] can express
+  // sub-second deltas (the old whole-second quantisation made fine-grained
+  // scrubbing impossible).
+  Duration swipeDuration = Duration.zero; // Duration to seek in video
+  bool showSwipeDuration = false; // Whether to show the seek duration overlay
+
+  /// Fushi patch (BUG-3354): what the seek indicator displays. The indicator
+  /// fades out (AnimatedOpacity) after release, and it keeps rebuilding during
+  /// that fade. [swipeDuration] is the *pending commit* and must be zeroed on
+  /// release (BUG-1485), so an indicator reading it showed "base + 0:00" — the
+  /// drag's starting position — for the whole fade, although the seek itself
+  /// went to the right place. The displayed delta is separate state: written
+  /// on every drag update, never cleared on release.
+  Duration _swipeIndicatorDuration = Duration.zero;
+
+  bool _speedUpIndicator = false;
+  late /* private */ var playlist = controller(context).player.state.playlist;
+  late bool buffering = controller(context).player.state.buffering;
+
+  bool _mountSeekBackwardButton = false;
+  bool _mountSeekForwardButton = false;
+  bool _hideSeekBackwardButton = false;
+  bool _hideSeekForwardButton = false;
+  Timer? _timerSeekBackwardButton;
+  Timer? _timerSeekForwardButton;
+
+  final ValueNotifier<Duration> _seekBarDeltaValueNotifier =
+      ValueNotifier<Duration>(Duration.zero);
+
+  final List<StreamSubscription> subscriptions = [];
+
+  double get subtitleVerticalShiftOffset =>
+      (_theme(context).padding?.bottom ?? 0.0) +
+      (_theme(context).bottomButtonBarMargin.vertical) +
+      (_theme(context).bottomButtonBar.isNotEmpty
+          ? _theme(context).buttonBarHeight
+          : 0.0);
+  Offset? _tapPosition;
+
+  // Fushi patch: whether the current tap / drag went down on the controls
+  // chrome ([VideoControlsChromeRegion]: a bar, the gaps between its buttons,
+  // the seek bar). Such a pointer belongs to the controls, not the picture: it
+  // must not toggle the controls, double-tap seek or start a swipe. Decided by
+  // a real hit test at pointer-down instead of insets guessing the bar height.
+  bool _tapDownOnChrome = false;
+  bool _dragDownOnChrome = false;
+
+  bool _hitsChrome(Offset globalPosition) =>
+      VideoControlsChromeRegion.hitsRegion(
+        globalPosition: globalPosition,
+        viewId: View.of(context).viewId,
+      );
+
+  void _handleDoubleTapDown(TapDownDetails details) {
+    _tapDownOnChrome = _hitsChrome(details.globalPosition);
+    setState(() {
+      _tapPosition = details.localPosition;
+    });
+  }
+
+  void _handleSurfaceDragDown(DragDownDetails details) {
+    _dragDownOnChrome = _hitsChrome(details.globalPosition);
+  }
+
+  /// Fushi patch: a tap on the chrome only keeps the visible controls alive.
+  void _handleSurfaceTap() {
+    if (_tapDownOnChrome && visible) {
+      _armHideTimer();
+      return;
+    }
+    onTap();
+  }
+
+  void _handleLongPress() {
+    setState(() {
+      _speedUpIndicator = true;
+    });
+    _currentRate = controller(context).player.state.rate;
+    controller(context).player.setRate(_theme(context).speedUpFactor);
+  }
+
+  void _handleLongPressEnd(LongPressEndDetails details) {
+    setState(() {
+      _speedUpIndicator = false;
+    });
+    controller(context).player.setRate(_currentRate);
+  }
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (subscriptions.isEmpty) {
+      mount = _theme(context).visibleOnMount;
+      visible = _theme(context).visibleOnMount;
+      _volumeValue = _theme(context).initialVolume ?? 0.5;
+      _brightnessValue = _theme(context).initialBrightness ?? 0.5;
+      _onBrightnessReset = _theme(context).onBrightnessReset;
+
+      subscriptions.addAll(
+        [
+          controller(context).player.stream.playlist.listen(
+            (event) {
+              setState(() {
+                playlist = event;
+              });
+            },
+          ),
+          controller(context).player.stream.buffering.listen(
+            (event) {
+              setState(() {
+                buffering = event;
+              });
+            },
+          ),
+        ],
+      );
+
+      // Publish the initial visibility so the host's mirror starts in phase
+      // with this State (Fushi patch, TODO-364). Deferred to a post-frame
+      // callback: didChangeDependencies runs during mount, and a synchronous
+      // notifier write could re-enter a host listener's setState mid-build.
+      final ValueNotifier<bool>? notifier = _theme(context).visibilityNotifier;
+      if (notifier != null) {
+        final bool initialVisible = visible;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) notifier.value = initialVisible;
+        });
+      }
+
+      if (_theme(context).visibleOnMount) {
+        _timer = Timer(
+          _theme(context).controlsHoverDuration,
+          () {
+            if (mounted && !_held) {
+              setState(() {
+                visible = false;
+              });
+              _publishVisibility();
+              unshiftSubtitle();
+            }
+          },
+        );
+      }
+    }
+
+    // Fushi patch (TODO-1059): (re)bind the host's restart-hide-timer signal.
+    // Runs on every didChangeDependencies (not gated by subscriptions.isEmpty)
+    // because the theme — and thus the signal's identity — can change across
+    // rebuilds; detach the old one and attach the current one when it differs.
+    final Listenable? signal = _theme(context).restartHideTimerSignal;
+    if (!identical(signal, _restartHideTimerSignal)) {
+      _restartHideTimerSignal?.removeListener(_restartHideTimer);
+      _restartHideTimerSignal = signal;
+      _restartHideTimerSignal?.addListener(_restartHideTimer);
+    }
+    // Fushi patch: (re)bind the host's hold, same lifecycle as the signal above.
+    final ValueListenable<bool>? hold = _theme(context).holdVisible;
+    if (!identical(hold, _holdVisible)) {
+      _holdVisible?.removeListener(_onHoldChanged);
+      _holdVisible = hold;
+      _holdVisible?.addListener(_onHoldChanged);
+    }
+  }
+
+  /// Fushi patch: the hold was released — give the bar a fresh auto-hide
+  /// countdown instead of hiding it the instant the popup closes.
+  void _onHoldChanged() {
+    if (_held) return;
+    _restartHideTimer();
+  }
+
+  /// Fushi patch (TODO-1059): restart the auto-hide timer without toggling
+  /// visibility, fired by the host when a bottom button-bar button is pressed.
+  /// Only acts while the controls are already [visible] (a press on a visible
+  /// button should keep them alive); does nothing when hidden (the button isn't
+  /// on screen to be pressed, and we must not silently un-hide). Mirrors the
+  /// visible-branch timer reset in [onTap]: cancel the pending hide and schedule
+  /// a fresh [controlsHoverDuration], so holding / repeatedly tapping seek keeps
+  /// the controls up instead of vanishing under the finger.
+  void _restartHideTimer() {
+    if (!mounted || !visible) return;
+    _timer?.cancel();
+    _timer = Timer(_theme(context).controlsHoverDuration, () {
+      if (mounted && !_held) {
+        setState(() {
+          visible = false;
+        });
+        _publishVisibility();
+        unshiftSubtitle();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    for (final subscription in subscriptions) {
+      subscription.cancel();
+    }
+    _onBrightnessReset?.call();
+    _timerSeekBackwardButton?.cancel();
+    _timerSeekForwardButton?.cancel();
+    // Fushi patch (TODO-1059): detach the host's restart-hide-timer listener.
+    _restartHideTimerSignal?.removeListener(_restartHideTimer);
+    _restartHideTimerSignal = null;
+    _holdVisible?.removeListener(_onHoldChanged);
+    _holdVisible = null;
+    super.dispose();
+  }
+
+  void shiftSubtitle() {
+    if (_theme(context).shiftSubtitlesOnControlsVisibilityChange) {
+      state(context).setSubtitleViewPadding(
+        state(context).widget.subtitleViewConfiguration.padding +
+            EdgeInsets.fromLTRB(
+              0.0,
+              0.0,
+              0.0,
+              subtitleVerticalShiftOffset,
+            ),
+      );
+    }
+  }
+
+  void unshiftSubtitle() {
+    if (_theme(context).shiftSubtitlesOnControlsVisibilityChange) {
+      state(context).setSubtitleViewPadding(
+        state(context).widget.subtitleViewConfiguration.padding,
+      );
+    }
+  }
+
+  /// Push the current real [visible] into the host's single-source-of-truth
+  /// notifier (Fushi patch, TODO-364). Called after every [visible] mutation so
+  /// the host's subtitle dodge follows this State's authoritative visibility
+  /// instead of a separate, drift-prone mirror. No-op when unmounted or when no
+  /// notifier was injected (upstream default).
+  void _publishVisibility() {
+    if (!mounted) return;
+    _theme(context).visibilityNotifier?.value = visible;
+  }
+
+  void onTap() {
+    if (!visible) {
+      setState(() {
+        mount = true;
+        visible = true;
+      });
+      _publishVisibility();
+      shiftSubtitle();
+      _armHideTimer();
+    } else {
+      setState(() {
+        visible = false;
+      });
+      _publishVisibility();
+      unshiftSubtitle();
+      _timer?.cancel();
+    }
+  }
+
+  void _armHideTimer() {
+    _timer?.cancel();
+    _timer = Timer(_theme(context).controlsHoverDuration, () {
+      if (mounted && !_held) {
+        setState(() {
+          visible = false;
+        });
+        _publishVisibility();
+        unshiftSubtitle();
+      }
+    });
+  }
+
+  void onDoubleTapSeekBackward() {
+    setState(() {
+      _mountSeekBackwardButton = true;
+    });
+  }
+
+  void onDoubleTapSeekForward() {
+    setState(() {
+      _mountSeekForwardButton = true;
+    });
+  }
+
+  /// Fushi patch (BUG-2731 follow-up): where relative seeks start from. A
+  /// pending seek's target wins over the lagging `player.state.position`, so
+  /// back-to-back swipes / double-taps accumulate instead of overwriting each
+  /// other. See [MaterialVideoControlsThemeData.relativeSeekBasePosition].
+  Duration _relativeSeekBase(BuildContext context) =>
+      _theme(context).relativeSeekBasePosition?.call() ??
+      controller(context).player.state.position;
+
+  /// Fushi patch (BUG-2731 follow-up): the base snapshotted when the current
+  /// horizontal drag started. Re-reading [_relativeSeekBase] on every update
+  /// would make the HUD / preview jump mid-drag whenever the host's in-flight
+  /// target lands or clears; one drag measures from one base. Null = no drag.
+  Duration? _swipeBase;
+
+  /// Base for the drag in progress (snapshot), else the live relative base.
+  Duration _currentSwipeBase(BuildContext context) =>
+      _swipeBase ?? _relativeSeekBase(context);
+
+  /// Fushi patch (BUG-2731 follow-up): commit a relative seek and hand the
+  /// dispatch [Future] to the host (see
+  /// [MaterialVideoControlsThemeData.onSeekDispatched]).
+  void _dispatchSeek(BuildContext context, Duration target) {
+    final Future<void> seek = controller(context).player.seek(target);
+    _theme(context).onSeekDispatched?.call(seek);
+  }
+
+  void onHorizontalDragUpdate(DragUpdateDetails details) {
+    if (_dragInitialDelta == Offset.zero) {
+      _dragInitialDelta = details.localPosition;
+      _swipeBase = _relativeSeekBase(context);
+      return;
+    }
+
+    final resolver = _theme(context).horizontalSeekResolver;
+    if (resolver != null) {
+      // Fushi patch (BUG-1485): host-supplied mapping. Signed drag displacement
+      // from the drag origin, positive = forward.
+      final delta = resolver(
+        dragDx: details.localPosition.dx - _dragInitialDelta.dx,
+        surfaceWidth: widgetWidth(context),
+        duration: controller(context).player.state.duration,
+        position: _currentSwipeBase(context),
+      );
+      setState(() {
+        swipeDuration = delta;
+        _swipeIndicatorDuration = delta;
+        showSwipeDuration = true;
+        _seekBarDeltaValueNotifier.value = delta;
+      });
+      return;
+    }
+
+    final diff = _dragInitialDelta.dx - details.localPosition.dx;
+    final duration = controller(context).player.state.duration.inSeconds;
+    final position = _currentSwipeBase(context).inSeconds;
+
+    final seconds =
+        -(diff * duration / _theme(context).horizontalGestureSensitivity)
+            .round();
+    final relativePosition = position + seconds;
+
+    if (relativePosition <= duration && relativePosition >= 0) {
+      setState(() {
+        swipeDuration = Duration(seconds: seconds);
+        _swipeIndicatorDuration = swipeDuration;
+        showSwipeDuration = true;
+        _seekBarDeltaValueNotifier.value = Duration(seconds: seconds);
+      });
+    }
+  }
+
+  void onHorizontalDragEnd() {
+    if (swipeDuration != Duration.zero) {
+      // Fushi patch (BUG-2731 follow-up): measured from the pending seek
+      // target when one is in flight, not the lagging player position.
+      Duration newPosition = _currentSwipeBase(context) + swipeDuration;
+      newPosition = newPosition.clamp(
+        Duration.zero,
+        controller(context).player.state.duration,
+      );
+      // Fushi patch (BUG-2731): surface the committed target like the seek
+      // bars do (BUG-796 follow-up), so the host knows where playback is headed
+      // while the seek is still in flight. See PATCHES.md.
+      _theme(context).onSeekEnd?.call(newPosition);
+      _dispatchSeek(context, newPosition);
+    }
+
+    _swipeBase = null;
+    setState(() {
+      _dragInitialDelta = Offset.zero;
+      showSwipeDuration = false;
+      // Fushi patch (BUG-1485): clear the committed delta, otherwise a following
+      // degenerate drag (one that never reaches a second update) would re-apply
+      // the previous drag's delta on release.
+      swipeDuration = Duration.zero;
+    });
+  }
+
+  bool _isInSegment(double localX, int segmentIndex) {
+    // Local variable with the list of ratios
+    List<int> segmentRatios = _theme(context).seekOnDoubleTapLayoutTapsRatios;
+
+    int totalRatios = segmentRatios.reduce((a, b) => a + b);
+
+    double segmentWidthMultiplier = widgetWidth(context) / totalRatios;
+    double start = 0;
+    double end;
+
+    for (int i = 0; i < segmentRatios.length; i++) {
+      end = start + (segmentWidthMultiplier * segmentRatios[i]);
+
+      // Check if the current index matches the segmentIndex and if localX falls within it
+      if (i == segmentIndex && localX >= start && localX <= end) {
+        return true;
+      }
+
+      // Set the start of the next segment
+      start = end;
+    }
+
+    // If localX does not fall within the specified segment
+    return false;
+  }
+
+  bool _isInRightSegment(double localX) {
+    return _isInSegment(localX, 2);
+  }
+
+  bool _isInLeftSegment(double localX) {
+    return _isInSegment(localX, 0);
+  }
+
+  void setVolume(double value) {
+    _theme(context).onVolumeChanged?.call(value);
+    setState(() {
+      _volumeValue = value;
+      _volumeIndicator = true;
+    });
+    _volumeTimer?.cancel();
+    _volumeTimer = Timer(const Duration(milliseconds: 200), () {
+      if (mounted) {
+        setState(() {
+          _volumeIndicator = false;
+        });
+      }
+    });
+  }
+
+  void setBrightness(double value) {
+    _theme(context).onBrightnessChanged?.call(value);
+    setState(() {
+      _brightnessValue = value;
+      _brightnessIndicator = true;
+    });
+    _brightnessTimer?.cancel();
+    _brightnessTimer = Timer(const Duration(milliseconds: 200), () {
+      if (mounted) {
+        setState(() {
+          _brightnessIndicator = false;
+        });
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var seekOnDoubleTapEnabledWhileControlsAreVisible =
+        (_theme(context).seekOnDoubleTap &&
+            _theme(context).seekOnDoubleTapEnabledWhileControlsVisible);
+    assert(_theme(context).seekOnDoubleTapLayoutTapsRatios.length == 3,
+        "The number of seekOnDoubleTapLayoutTapsRatios must be 3, i.e. [1, 1, 1]");
+    assert(_theme(context).seekOnDoubleTapLayoutWidgetRatios.length == 3,
+        "The number of seekOnDoubleTapLayoutWidgetRatios must be 3, i.e. [1, 1, 1]");
+    return Theme(
+      data: Theme.of(context).copyWith(
+        focusColor: const Color(0x00000000),
+        hoverColor: const Color(0x00000000),
+        splashColor: const Color(0x00000000),
+        highlightColor: const Color(0x00000000),
+      ),
+
+      /// Add [Directionality] to ltr to avoid wrong animation of sides.
+      child: Directionality(
+        textDirection: TextDirection.ltr,
+        child: Focus(
+          focusNode: videoViewParametersNotifier(context).value.focusNode,
+          autofocus: true,
+          child: Material(
+            elevation: 0.0,
+            borderOnForeground: false,
+            animationDuration: Duration.zero,
+            color: const Color(0x00000000),
+            shadowColor: const Color(0x00000000),
+            surfaceTintColor: const Color(0x00000000),
+            child: Stack(
+              clipBehavior: Clip.none,
+              alignment: Alignment.center,
+              children: [
+                // Controls:
+                AnimatedOpacity(
+                  curve: Curves.easeInOut,
+                  opacity: visible ? 1.0 : 0.0,
+                  duration: _theme(context).controlsTransitionDuration,
+                  onEnd: () {
+                    setState(() {
+                      if (!visible) {
+                        mount = false;
+                      }
+                    });
+                  },
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    alignment: Alignment.center,
+                    children: [
+                      Positioned.fill(
+                        child: Container(
+                          color: _theme(context).backdropColor,
+                        ),
+                      ),
+                      // Fushi patch (TODO-1073/BUG-555): tap hit-region MUST
+                      // cover the whole video area, otherwise a single tap in an
+                      // inset band can no longer toggle the controls back on.
+                      // Upstream lumped the "show controls" [onTap] together
+                      // with the drag recognizers inside one [Positioned.fill]
+                      // that is inset by 16.0 + [subtitleVerticalShiftOffset] at
+                      // the bottom -- an inset that only exists to keep edge
+                      // *drags* (swipe to reveal status/nav bar, back gesture)
+                      // from being hijacked. Split the responsibilities with a
+                      // parent/child gesture path, not sibling Stack layers:
+                      //   * this full-cover parent handles tap/long/double-tap,
+                      //   * the inset child handles only horizontal/vertical drag.
+                      // A Stack sibling above the tap layer would terminate hit
+                      // testing before the full-cover tap layer sees the pointer,
+                      // which is why iOS could only reveal controls from the
+                      // small regions outside the inset drag layer.
+                      Positioned.fill(
+                        // Fushi patch (TODO-916): route "show controls" through
+                        // the gesture arena's [onTap] instead of a raw
+                        // [Listener.onPointerDown]. A pointer-down fires
+                        // synchronously without arena arbitration, so the old
+                        // wiring toggled the controls on every press -- including
+                        // the initial down of a long-press (speed-up) -- making the
+                        // control bar flash in/out and shoving the subtitle box
+                        // mid-tap (breaking subtitle word lookup). With [onTap]
+                        // the long-press / double-tap recognizers win the arena and
+                        // the controls only appear on a real single tap.
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.translucent,
+                          onTap: _handleSurfaceTap,
+                          onTapDown: _handleDoubleTapDown,
+                          onDoubleTapDown: _handleDoubleTapDown,
+                          onLongPress: _theme(context).speedUpOnLongPress
+                              ? _handleLongPress
+                              : null,
+                          onLongPressEnd: _theme(context).speedUpOnLongPress
+                              ? _handleLongPressEnd
+                              : null,
+                          onDoubleTap: () {
+                            if (_tapPosition == null || _tapDownOnChrome) {
+                              return;
+                            }
+                            if (_isInRightSegment(_tapPosition!.dx)) {
+                              if ((!mount && _theme(context).seekOnDoubleTap) ||
+                                  seekOnDoubleTapEnabledWhileControlsAreVisible) {
+                                onDoubleTapSeekForward();
+                              }
+                            } else {
+                              if (_isInLeftSegment(_tapPosition!.dx)) {
+                                if ((!mount &&
+                                        _theme(context).seekOnDoubleTap) ||
+                                    seekOnDoubleTapEnabledWhileControlsAreVisible) {
+                                  onDoubleTapSeekBackward();
+                                }
+                              }
+                            }
+                          },
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              // We are adding 16.0 boundary around the actual
+                              // controls (which contain the vertical drag gesture
+                              // detectors). This will make the hit-test on edges
+                              // (e.g. swiping to: show status-bar, show
+                              // navigation-bar, go back in navigation) not
+                              // activate the swipe gesture annoyingly.
+                              // Fushi patch (TODO-1073/BUG-555): this layer
+                              // carries ONLY drag recognizers; tap/long-press
+                              // stay on the full-cover parent so every point can
+                              // reveal the controls.
+                              // The bottom inset stays a fixed dead zone (also
+                              // while the bar is hidden). Fushi patch: a drag
+                              // that goes down on the visible chrome is
+                              // additionally dropped via [_dragDownOnChrome].
+                              Positioned.fill(
+                                left: 16.0,
+                                top: 16.0,
+                                right: 16.0,
+                                bottom: 16.0 + subtitleVerticalShiftOffset,
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.translucent,
+                                  onHorizontalDragDown: _handleSurfaceDragDown,
+                                  onVerticalDragDown: _handleSurfaceDragDown,
+                                  onHorizontalDragUpdate: (details) {
+                                    if (_dragDownOnChrome) return;
+                                    if ((!mount &&
+                                            _theme(context).seekGesture) ||
+                                        (_theme(context).seekGesture &&
+                                            _theme(context)
+                                                .gesturesEnabledWhileControlsVisible)) {
+                                      onHorizontalDragUpdate(details);
+                                    }
+                                  },
+                                  onHorizontalDragEnd: (details) {
+                                    onHorizontalDragEnd();
+                                  },
+                                  onVerticalDragUpdate: (e) async {
+                                    if (_dragDownOnChrome) return;
+                                    final delta = e.delta.dy;
+                                    final Offset position = e.localPosition;
+
+                                    if (position.dx <=
+                                        widgetWidth(context) / 2) {
+                                      // Left side of screen swiped
+                                      if ((!mount &&
+                                              _theme(context)
+                                                  .brightnessGesture &&
+                                              _theme(context)
+                                                      .onBrightnessChanged !=
+                                                  null) ||
+                                          (_theme(context).brightnessGesture &&
+                                              _theme(context)
+                                                  .gesturesEnabledWhileControlsVisible &&
+                                              _theme(context)
+                                                      .onBrightnessChanged !=
+                                                  null)) {
+                                        final brightness = _brightnessValue -
+                                            delta /
+                                                _theme(context)
+                                                    .verticalGestureSensitivity;
+                                        final result =
+                                            brightness.clamp(0.0, 1.0);
+                                        setBrightness(result);
+                                      }
+                                    } else {
+                                      // Right side of screen swiped
+
+                                      if ((!mount &&
+                                              _theme(context).volumeGesture &&
+                                              _theme(context).onVolumeChanged !=
+                                                  null) ||
+                                          (_theme(context).volumeGesture &&
+                                              _theme(context)
+                                                  .gesturesEnabledWhileControlsVisible &&
+                                              _theme(context).onVolumeChanged !=
+                                                  null)) {
+                                        final volume = _volumeValue -
+                                            delta /
+                                                _theme(context)
+                                                    .verticalGestureSensitivity;
+                                        final result = volume.clamp(0.0, 1.0);
+                                        setVolume(result);
+                                      }
+                                    }
+                                  },
+                                  child: Container(
+                                    color: const Color(0x00000000),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      if (mount)
+                        Padding(
+                          padding: _theme(context).padding ??
+                              (
+                                  // Add padding in fullscreen!
+                                  isFullscreen(context)
+                                      ? MediaQuery.of(context).padding
+                                      : EdgeInsets.zero),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.start,
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              // Fushi patch: chrome hit-test marker, see
+                              // [VideoControlsChromeRegion].
+                              VideoControlsChromeRegion(
+                                child: Container(
+                                  height: _theme(context).buttonBarHeight,
+                                  margin: _theme(context).topButtonBarMargin,
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.max,
+                                    mainAxisAlignment: MainAxisAlignment.start,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.center,
+                                    children: _theme(context).topButtonBar,
+                                  ),
+                                ),
+                              ),
+                              // Only display [primaryButtonBar] if [buffering] is false.
+                              Expanded(
+                                child: AnimatedOpacity(
+                                  curve: Curves.easeInOut,
+                                  opacity: buffering ? 0.0 : 1.0,
+                                  duration: _theme(context)
+                                      .controlsTransitionDuration,
+                                  child: Center(
+                                    child: VideoControlsChromeRegion(
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.center,
+                                        children:
+                                            _theme(context).primaryButtonBar,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                              VideoControlsChromeRegion(
+                                  child: Stack(
+                                alignment: Alignment.bottomCenter,
+                                children: [
+                                  if (_theme(context).displaySeekBar)
+                                    MaterialSeekBar(
+                                      onSeekStart: () {
+                                        _theme(context).onSeekStart?.call();
+                                        _timer?.cancel();
+                                      },
+                                      onSeekEnd: (Duration target) {
+                                        // Fushi patch (BUG-796 follow-up):
+                                        // surface the committed seek target to the
+                                        // host so it re-syncs the subtitle +
+                                        // suppresses the lagging post-seek
+                                        // position. See PATCHES.md.
+                                        _theme(context).onSeekEnd?.call(target);
+                                        _timer = Timer(
+                                          _theme(context).controlsHoverDuration,
+                                          () {
+                                            if (mounted && !_held) {
+                                              setState(() {
+                                                visible = false;
+                                              });
+                                              _publishVisibility();
+                                              unshiftSubtitle();
+                                            }
+                                          },
+                                        );
+                                      },
+                                    ),
+                                  Container(
+                                    height: _theme(context).buttonBarHeight,
+                                    margin:
+                                        _theme(context).bottomButtonBarMargin,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.max,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.start,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.center,
+                                      children: _theme(context).bottomButtonBar,
+                                    ),
+                                  ),
+                                ],
+                              )),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                // Double-Tap Seek Seek-Bar:
+                if (!mount)
+                  if (_mountSeekBackwardButton ||
+                      _mountSeekForwardButton ||
+                      showSwipeDuration)
+                    Column(
+                      children: [
+                        const Spacer(),
+                        Stack(
+                          alignment: Alignment.bottomCenter,
+                          children: [
+                            if (_theme(context).displaySeekBar)
+                              MaterialSeekBar(
+                                delta: _seekBarDeltaValueNotifier,
+                                // Fushi patch (BUG-2731 follow-up): preview
+                                // from the same base the commit will use.
+                                deltaBase: () => _currentSwipeBase(context),
+                              ),
+                            Container(
+                              height: _theme(context).buttonBarHeight,
+                              margin: _theme(context).bottomButtonBarMargin,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                // Buffering Indicator.
+                IgnorePointer(
+                  child: Padding(
+                    padding: _theme(context).padding ??
+                        (
+                            // Add padding in fullscreen!
+                            isFullscreen(context)
+                                ? MediaQuery.of(context).padding
+                                : EdgeInsets.zero),
+                    child: Column(
+                      children: [
+                        Container(
+                          height: _theme(context).buttonBarHeight,
+                          margin: _theme(context).topButtonBarMargin,
+                        ),
+                        Expanded(
+                          child: Center(
+                            child: TweenAnimationBuilder<double>(
+                              tween: Tween<double>(
+                                begin: 0.0,
+                                end: buffering ? 1.0 : 0.0,
+                              ),
+                              duration:
+                                  _theme(context).controlsTransitionDuration,
+                              builder: (context, value, child) {
+                                // Only mount the buffering indicator if the opacity is greater than 0.0.
+                                // This has been done to prevent redundant resource usage in [CircularProgressIndicator].
+                                if (value > 0.0) {
+                                  return Opacity(
+                                    opacity: value,
+                                    child: _theme(context)
+                                            .bufferingIndicatorBuilder
+                                            ?.call(context) ??
+                                        child!,
+                                  );
+                                }
+                                return const SizedBox.shrink();
+                              },
+                              child: const CircularProgressIndicator(
+                                color: Color(0xFFFFFFFF),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Container(
+                          height: _theme(context).buttonBarHeight,
+                          margin: _theme(context).bottomButtonBarMargin,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                // Volume Indicator.
+                IgnorePointer(
+                  child: AnimatedOpacity(
+                    curve: Curves.easeInOut,
+                    opacity: (!mount ||
+                                _theme(context)
+                                    .gesturesEnabledWhileControlsVisible) &&
+                            _volumeIndicator
+                        ? 1.0
+                        : 0.0,
+                    duration: _theme(context).controlsTransitionDuration,
+                    child: _theme(context)
+                            .volumeIndicatorBuilder
+                            ?.call(context, _volumeValue) ??
+                        Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: const Color(0x88000000),
+                            borderRadius: BorderRadius.circular(64.0),
+                          ),
+                          height: 52.0,
+                          width: 108.0,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Container(
+                                height: 52.0,
+                                width: 42.0,
+                                alignment: Alignment.centerRight,
+                                child: Icon(
+                                  _volumeValue == 0.0
+                                      ? Icons.volume_off
+                                      : _volumeValue < 0.5
+                                          ? Icons.volume_down
+                                          : Icons.volume_up,
+                                  color: const Color(0xFFFFFFFF),
+                                  size: 24.0,
+                                ),
+                              ),
+                              const SizedBox(width: 8.0),
+                              Expanded(
+                                child: Text(
+                                  '${(_volumeValue * 100.0).round()}%',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 14.0,
+                                    color: Color(0xFFFFFFFF),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 16.0),
+                            ],
+                          ),
+                        ),
+                  ),
+                ),
+                // Brightness Indicator.
+                IgnorePointer(
+                  child: AnimatedOpacity(
+                    curve: Curves.easeInOut,
+                    opacity: (!mount ||
+                                _theme(context)
+                                    .gesturesEnabledWhileControlsVisible) &&
+                            _brightnessIndicator
+                        ? 1.0
+                        : 0.0,
+                    duration: _theme(context).controlsTransitionDuration,
+                    child: _theme(context)
+                            .brightnessIndicatorBuilder
+                            ?.call(context, _brightnessValue) ??
+                        Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: const Color(0x88000000),
+                            borderRadius: BorderRadius.circular(64.0),
+                          ),
+                          height: 52.0,
+                          width: 108.0,
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            crossAxisAlignment: CrossAxisAlignment.center,
+                            children: [
+                              Container(
+                                height: 52.0,
+                                width: 42.0,
+                                alignment: Alignment.centerRight,
+                                child: Icon(
+                                  _brightnessValue < 1.0 / 3.0
+                                      ? Icons.brightness_low
+                                      : _brightnessValue < 2.0 / 3.0
+                                          ? Icons.brightness_medium
+                                          : Icons.brightness_high,
+                                  color: const Color(0xFFFFFFFF),
+                                  size: 24.0,
+                                ),
+                              ),
+                              const SizedBox(width: 8.0),
+                              Expanded(
+                                child: Text(
+                                  '${(_brightnessValue * 100.0).round()}%',
+                                  textAlign: TextAlign.center,
+                                  style: const TextStyle(
+                                    fontSize: 14.0,
+                                    color: Color(0xFFFFFFFF),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 16.0),
+                            ],
+                          ),
+                        ),
+                  ),
+                ),
+                // Speedup Indicator.
+                IgnorePointer(
+                  child: Padding(
+                    padding: _theme(context).padding ??
+                        (
+                            // Add padding in fullscreen!
+                            isFullscreen(context)
+                                ? MediaQuery.of(context).padding
+                                : EdgeInsets.zero),
+                    child: Column(
+                      children: [
+                        Container(
+                          height: _theme(context).buttonBarHeight,
+                          margin: _theme(context).topButtonBarMargin,
+                        ),
+                        Expanded(
+                          child: AnimatedOpacity(
+                            duration:
+                                _theme(context).controlsTransitionDuration,
+                            opacity: _speedUpIndicator ? 1 : 0,
+                            child: _theme(context)
+                                    .speedUpIndicatorBuilder
+                                    ?.call(context,
+                                        _theme(context).speedUpFactor) ??
+                                Container(
+                                  alignment: Alignment.topCenter,
+                                  child: Container(
+                                    margin: const EdgeInsets.all(16.0),
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: const Color(0x88000000),
+                                      borderRadius: BorderRadius.circular(64.0),
+                                    ),
+                                    height: 48.0,
+                                    width: 108.0,
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.center,
+                                      children: [
+                                        const SizedBox(width: 16.0),
+                                        Expanded(
+                                          child: Text(
+                                            '${_theme(context).speedUpFactor.toStringAsFixed(1)}x',
+                                            textAlign: TextAlign.center,
+                                            style: const TextStyle(
+                                              fontSize: 14.0,
+                                              color: Color(0xFFFFFFFF),
+                                            ),
+                                          ),
+                                        ),
+                                        Container(
+                                          height: 48.0,
+                                          width: 48.0 - 16.0,
+                                          alignment: Alignment.centerRight,
+                                          child: const Icon(
+                                            Icons.fast_forward,
+                                            color: Color(0xFFFFFFFF),
+                                            size: 24.0,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 16.0),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                          ),
+                        ),
+                        Container(
+                          height: _theme(context).buttonBarHeight,
+                          margin: _theme(context).bottomButtonBarMargin,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                // Seek Indicator.
+                IgnorePointer(
+                  child: AnimatedOpacity(
+                    duration: _theme(context).controlsTransitionDuration,
+                    opacity: showSwipeDuration ? 1 : 0,
+                    // Fushi patch (BUG-3354): the displayed delta, not the
+                    // pending commit (which release zeroes mid-fade).
+                    child: _theme(context)
+                            .seekIndicatorBuilder
+                            ?.call(context, _swipeIndicatorDuration) ??
+                        Container(
+                          alignment: Alignment.center,
+                          decoration: BoxDecoration(
+                            color: const Color(0x88000000),
+                            borderRadius: BorderRadius.circular(64.0),
+                          ),
+                          height: 52.0,
+                          width: 108.0,
+                          child: Text(
+                            _swipeIndicatorDuration > Duration.zero
+                                ? "+ ${_swipeIndicatorDuration.label()}"
+                                : "- ${_swipeIndicatorDuration.label()}",
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              fontSize: 14.0,
+                              color: Color(0xFFFFFFFF),
+                            ),
+                          ),
+                        ),
+                  ),
+                ),
+
+                // Double-Tap Seek Button(s):
+                if (!mount || seekOnDoubleTapEnabledWhileControlsAreVisible)
+                  if (_mountSeekBackwardButton || _mountSeekForwardButton)
+                    Positioned.fill(
+                      child: Row(
+                        children: [
+                          Expanded(
+                            flex: _theme(context)
+                                .seekOnDoubleTapLayoutWidgetRatios[0],
+                            child: _mountSeekBackwardButton
+                                ? AnimatedOpacity(
+                                    opacity: _hideSeekBackwardButton ? 0 : 1.0,
+                                    duration: const Duration(milliseconds: 200),
+                                    child: _BackwardSeekIndicator(
+                                      duration: _theme(context)
+                                          .seekOnDoubleTapBackwardDuration,
+                                      onChanged: (value) {
+                                        _seekBarDeltaValueNotifier.value =
+                                            -value;
+                                      },
+                                      onSubmitted: (value) {
+                                        _timerSeekBackwardButton?.cancel();
+                                        _timerSeekBackwardButton = Timer(
+                                          const Duration(milliseconds: 200),
+                                          () {
+                                            setState(() {
+                                              _hideSeekBackwardButton = false;
+                                              _mountSeekBackwardButton = false;
+                                            });
+                                          },
+                                        );
+
+                                        setState(() {
+                                          _hideSeekBackwardButton = true;
+                                        });
+                                        // Fushi patch (BUG-2731 follow-up):
+                                        // measured from the pending seek target.
+                                        var result =
+                                            _relativeSeekBase(context) - value;
+                                        result = result.clamp(
+                                          Duration.zero,
+                                          controller(context)
+                                              .player
+                                              .state
+                                              .duration,
+                                        );
+                                        // Fushi patch (BUG-2731): see
+                                        // onHorizontalDragEnd.
+                                        _theme(context).onSeekEnd?.call(result);
+                                        _dispatchSeek(context, result);
+                                      },
+                                    ),
+                                  )
+                                : const SizedBox(),
+                          ),
+                          //Area in the middle where the double-tap seek buttons are ignored in
+                          if (_theme(context)
+                                  .seekOnDoubleTapLayoutWidgetRatios[1] >
+                              0)
+                            Spacer(
+                              flex: _theme(context)
+                                  .seekOnDoubleTapLayoutWidgetRatios[1],
+                            ),
+                          Expanded(
+                            flex: _theme(context)
+                                .seekOnDoubleTapLayoutWidgetRatios[2],
+                            child: _mountSeekForwardButton
+                                ? AnimatedOpacity(
+                                    opacity: _hideSeekForwardButton ? 0 : 1.0,
+                                    duration: const Duration(milliseconds: 200),
+                                    child: _ForwardSeekIndicator(
+                                      duration: _theme(context)
+                                          .seekOnDoubleTapForwardDuration,
+                                      onChanged: (value) {
+                                        _seekBarDeltaValueNotifier.value =
+                                            value;
+                                      },
+                                      onSubmitted: (value) {
+                                        _timerSeekForwardButton?.cancel();
+                                        _timerSeekForwardButton = Timer(
+                                            const Duration(milliseconds: 200),
+                                            () {
+                                          if (_hideSeekForwardButton) {
+                                            setState(() {
+                                              _hideSeekForwardButton = false;
+                                              _mountSeekForwardButton = false;
+                                            });
+                                          }
+                                        });
+                                        setState(() {
+                                          _hideSeekForwardButton = true;
+                                        });
+
+                                        // Fushi patch (BUG-2731 follow-up):
+                                        // measured from the pending seek target.
+                                        var result =
+                                            _relativeSeekBase(context) + value;
+                                        result = result.clamp(
+                                          Duration.zero,
+                                          controller(context)
+                                              .player
+                                              .state
+                                              .duration,
+                                        );
+                                        // Fushi patch (BUG-2731): see
+                                        // onHorizontalDragEnd.
+                                        _theme(context).onSeekEnd?.call(result);
+                                        _dispatchSeek(context, result);
+                                      },
+                                    ),
+                                  )
+                                : const SizedBox(),
+                          ),
+                        ],
+                      ),
+                    ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  double widgetWidth(BuildContext context) =>
+      (context.findRenderObject() as RenderBox).paintBounds.width;
+}
+
+// SEEK BAR
+
+/// Material design seek bar.
+class MaterialSeekBar extends StatefulWidget {
+  final ValueNotifier<Duration>? delta;
+
+  /// Fushi patch (BUG-2731 follow-up): base position the [delta] preview is
+  /// added to. Null = `player.state.position` (upstream).
+  final Duration Function()? deltaBase;
+  final VoidCallback? onSeekStart;
+
+  /// Fushi patch (BUG-796 follow-up): retyped from `VoidCallback?` to carry the
+  /// committed seek target [Duration] to the host (theme `onSeekEnd`). See
+  /// third_party/media_kit_video/PATCHES.md.
+  final void Function(Duration)? onSeekEnd;
+
+  const MaterialSeekBar({
+    super.key,
+    this.delta,
+    this.deltaBase,
+    this.onSeekStart,
+    this.onSeekEnd,
+  });
+
+  @override
+  MaterialSeekBarState createState() => MaterialSeekBarState();
+}
+
+class MaterialSeekBarState extends State<MaterialSeekBar> {
+  bool tapped = false;
+  double slider = 0.0;
+
+  late bool playing = controller(context).player.state.playing;
+  late Duration position = controller(context).player.state.position;
+  late Duration duration = controller(context).player.state.duration;
+  late Duration buffer = controller(context).player.state.buffer;
+
+  final List<StreamSubscription> subscriptions = [];
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  void listener() {
+    setState(() {
+      final delta = widget.delta?.value ?? Duration.zero;
+      final base =
+          widget.deltaBase?.call() ?? controller(context).player.state.position;
+      position = base + delta;
+    });
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    widget.delta?.addListener(listener);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (subscriptions.isEmpty && widget.delta == null) {
+      subscriptions.addAll(
+        [
+          controller(context).player.stream.playing.listen((event) {
+            setState(() {
+              playing = event;
+            });
+          }),
+          controller(context).player.stream.completed.listen((event) {
+            setState(() {
+              position = Duration.zero;
+            });
+          }),
+          controller(context).player.stream.position.listen((event) {
+            // Fushi patch (TODO-1243): mirror of the desktop seek bar. Drop
+            // redundant frame-rate rebuilds — drag already suppresses position
+            // (uses `slider`); while not dragging, quantize to
+            // kPositionUiThrottleStep so the fill re-rasters at ~5fps instead of
+            // the libmpv frame rate (integrated-GPU load when controls visible).
+            if (tapped) return;
+            final Duration next = event.floorTo(kPositionUiThrottleStep);
+            if (next == position) return;
+            setState(() {
+              position = next;
+            });
+          }),
+          controller(context).player.stream.duration.listen((event) {
+            setState(() {
+              duration = event;
+            });
+          }),
+          controller(context).player.stream.buffer.listen((event) {
+            setState(() {
+              buffer = event;
+            });
+          }),
+        ],
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.delta?.removeListener(listener);
+    for (final subscription in subscriptions) {
+      subscription.cancel();
+    }
+    super.dispose();
+  }
+
+  void onPointerMove(PointerMoveEvent e, BoxConstraints constraints) {
+    // Fushi patch (BUG-566, mirrors BUG-235): bail out if this State was
+    // already disposed. `controller(context)` below dereferences
+    // `State.context`; after dispose (Fushi tears down the controls subtree
+    // on fullscreen enter/exit and on episode switch via
+    // VideoControlsFocusGate) that throws
+    // "Null check operator used on a null value". Mirrors the existing
+    // `if (mounted)` guard in `setState`. See third_party/media_kit_video/PATCHES.md.
+    if (!mounted) return;
+    final percent = e.localPosition.dx / constraints.maxWidth;
+    setState(() {
+      tapped = true;
+      slider = percent.clamp(0.0, 1.0);
+    });
+    controller(context).player.seek(duration * slider);
+  }
+
+  void onPointerDown() {
+    widget.onSeekStart?.call();
+    setState(() {
+      tapped = true;
+    });
+  }
+
+  void onPointerUp() {
+    // Fushi patch (BUG-566, mirrors BUG-235): guard against use-after-dispose.
+    // The pointer-up event can arrive after the controls widget tree is
+    // unmounted (release the seek bar drag right as the player exits
+    // fullscreen / switches episode), and `controller(context)` below
+    // dereferences the now-null `State.context`, crashing with
+    // "Null check operator used on a null value" at this line. Bail out when
+    // unmounted, matching the State's existing `if (mounted)` setState guard.
+    // See third_party/media_kit_video/PATCHES.md.
+    if (!mounted) return;
+    // Fushi patch (BUG-796 follow-up): carry the committed seek target so the
+    // host can re-sync the subtitle to the destination + suppress the lagging
+    // post-seek position (progress-bar seek bypasses seekMs). See PATCHES.md.
+    widget.onSeekEnd?.call(duration * slider);
+    setState(() {
+      // Explicitly set the position to prevent the slider from jumping.
+      tapped = false;
+      position = duration * slider;
+    });
+    // Fushi patch (BUG-2731 follow-up): hand the dispatch future to the host.
+    final Future<void> seek =
+        controller(context).player.seek(duration * slider);
+    _theme(context).onSeekDispatched?.call(seek);
+  }
+
+  void onPanStart(DragStartDetails e, BoxConstraints constraints) {
+    final percent = e.localPosition.dx / constraints.maxWidth;
+    setState(() {
+      tapped = true;
+      slider = percent.clamp(0.0, 1.0);
+    });
+  }
+
+  void onPanDown(DragDownDetails e, BoxConstraints constraints) {
+    final percent = e.localPosition.dx / constraints.maxWidth;
+    setState(() {
+      tapped = true;
+      slider = percent.clamp(0.0, 1.0);
+    });
+  }
+
+  void onPanUpdate(DragUpdateDetails e, BoxConstraints constraints) {
+    final percent = e.localPosition.dx / constraints.maxWidth;
+    setState(() {
+      tapped = true;
+      slider = percent.clamp(0.0, 1.0);
+    });
+  }
+
+  /// Returns the current playback position in percentage.
+  double get positionPercent {
+    if (position == Duration.zero || duration == Duration.zero) {
+      return 0.0;
+    } else {
+      final value = position.inMilliseconds / duration.inMilliseconds;
+      return value.clamp(0.0, 1.0);
+    }
+  }
+
+  /// Returns the current playback buffer position in percentage.
+  double get bufferPercent {
+    if (buffer == Duration.zero || duration == Duration.zero) {
+      return 0.0;
+    } else {
+      final value = buffer.inMilliseconds / duration.inMilliseconds;
+      return value.clamp(0.0, 1.0);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Fushi patch (TODO-1243): isolate the seek bar into its own compositor
+    // layer so its ~5fps fill re-raster (kPositionUiThrottleStep throttle) does
+    // not re-record the full-screen controls picture it shares with the
+    // full-video-area gradient scrims. Caps the re-raster to the thin seek bar
+    // bounds regardless of window size (integrated-GPU 100% load on large
+    // windows). See third_party/media_kit_video/PATCHES.md.
+    return RepaintBoundary(child: _buildSeekBarBody(context));
+  }
+
+  Widget _buildSeekBarBody(BuildContext context) {
+    return Container(
+      clipBehavior: Clip.none,
+      margin: _theme(context).seekBarMargin,
+      child: LayoutBuilder(
+        builder: (context, constraints) => MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: GestureDetector(
+            onHorizontalDragUpdate: (_) {},
+            onPanStart: (e) => onPanStart(e, constraints),
+            onPanDown: (e) => onPanDown(e, constraints),
+            onPanUpdate: (e) => onPanUpdate(e, constraints),
+            child: Listener(
+              onPointerMove: (e) => onPointerMove(e, constraints),
+              onPointerDown: (e) => onPointerDown(),
+              onPointerUp: (e) => onPointerUp(),
+              child: Container(
+                color: Colors.transparent,
+                width: constraints.maxWidth,
+                alignment: _theme(context).seekBarAlignment,
+                height: _theme(context).seekBarContainerHeight,
+                // Fushi patch (M3 Expressive chrome): host-painted track.
+                child: _theme(context).seekBarTrackBuilder != null
+                    ? SizedBox(
+                        width: constraints.maxWidth,
+                        height: _theme(context).seekBarContainerHeight,
+                        child: _theme(context).seekBarTrackBuilder!(
+                          context,
+                          VideoSeekBarVisual(
+                            position: tapped ? slider : positionPercent,
+                            buffer: bufferPercent,
+                            hover: tapped ? slider : null,
+                            hovering: false,
+                            dragging: tapped,
+                            playing: playing,
+                            duration: duration,
+                            alignment: _theme(context).seekBarAlignment,
+                          ),
+                        ),
+                      )
+                    : Stack(
+                  clipBehavior: Clip.none,
+                  alignment: Alignment.bottomCenter,
+                  children: [
+                    Container(
+                      width: constraints.maxWidth,
+                      // Fushi patch (glass design system): optional thicker
+                      // track while pressed + rounded track; defaults keep the
+                      // upstream constant-height square track.
+                      height: tapped &&
+                              _theme(context).seekBarActiveHeight != null
+                          ? _theme(context).seekBarActiveHeight
+                          : _theme(context).seekBarHeight,
+                      alignment: Alignment.bottomLeft,
+                      color: _theme(context).seekBarRadius > 0
+                          ? null
+                          : _theme(context).seekBarColor,
+                      decoration: _theme(context).seekBarRadius > 0
+                          ? BoxDecoration(
+                              color: _theme(context).seekBarColor,
+                              borderRadius: BorderRadius.circular(
+                                _theme(context).seekBarRadius,
+                              ),
+                            )
+                          : null,
+                      clipBehavior: _theme(context).seekBarRadius > 0
+                          ? Clip.antiAlias
+                          : Clip.none,
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        alignment: Alignment.bottomLeft,
+                        children: [
+                          Container(
+                            width: constraints.maxWidth * bufferPercent,
+                            color: _theme(context).seekBarBufferColor,
+                          ),
+                          Container(
+                            width: tapped
+                                ? constraints.maxWidth * slider
+                                : constraints.maxWidth * positionPercent,
+                            color: _theme(context).seekBarPositionColor,
+                          ),
+                        ],
+                      ),
+                    ),
+                    Positioned(
+                      left: tapped
+                          ? (constraints.maxWidth -
+                                  _theme(context).seekBarThumbSize / 2) *
+                              slider
+                          : (constraints.maxWidth -
+                                  _theme(context).seekBarThumbSize / 2) *
+                              positionPercent,
+                      bottom: -1.0 * _theme(context).seekBarThumbSize / 2 +
+                          _theme(context).seekBarHeight / 2,
+                      child: Container(
+                        width: _theme(context).seekBarThumbSize,
+                        height: _theme(context).seekBarThumbSize,
+                        decoration: BoxDecoration(
+                          color: _theme(context).seekBarThumbColor,
+                          borderRadius: BorderRadius.circular(
+                            _theme(context).seekBarThumbSize / 2,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// BUTTON: PLAY/PAUSE
+
+/// A material design play/pause button.
+class MaterialPlayOrPauseButton extends StatefulWidget {
+  /// Overriden icon size for [MaterialSkipPreviousButton].
+  final double? iconSize;
+
+  /// Overriden icon color for [MaterialSkipPreviousButton].
+  final Color? iconColor;
+
+  const MaterialPlayOrPauseButton({
+    super.key,
+    this.iconSize,
+    this.iconColor,
+  });
+
+  @override
+  MaterialPlayOrPauseButtonState createState() =>
+      MaterialPlayOrPauseButtonState();
+}
+
+class MaterialPlayOrPauseButtonState extends State<MaterialPlayOrPauseButton>
+    with SingleTickerProviderStateMixin {
+  late final animation = AnimationController(
+    vsync: this,
+    value: controller(context).player.state.playing ? 1 : 0,
+    duration: const Duration(milliseconds: 200),
+  );
+
+  StreamSubscription<bool>? subscription;
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    subscription ??= controller(context).player.stream.playing.listen((event) {
+      if (event) {
+        animation.forward();
+      } else {
+        animation.reverse();
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    animation.dispose();
+    subscription?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      onPressed: controller(context).player.playOrPause,
+      iconSize: widget.iconSize ?? _theme(context).buttonBarButtonSize,
+      color: widget.iconColor ?? _theme(context).buttonBarButtonColor,
+      icon: IgnorePointer(
+        child: AnimatedIcon(
+          progress: animation,
+          icon: AnimatedIcons.play_pause,
+          size: widget.iconSize ?? _theme(context).buttonBarButtonSize,
+          color: widget.iconColor ?? _theme(context).buttonBarButtonColor,
+        ),
+      ),
+    );
+  }
+}
+
+// BUTTON: SKIP NEXT
+
+/// Material design skip next button.
+class MaterialSkipNextButton extends StatelessWidget {
+  /// Icon for [MaterialSkipNextButton].
+  final Widget? icon;
+
+  /// Overriden icon size for [MaterialSkipNextButton].
+  final double? iconSize;
+
+  /// Overriden icon color for [MaterialSkipNextButton].
+  final Color? iconColor;
+
+  const MaterialSkipNextButton({
+    super.key,
+    this.icon,
+    this.iconSize,
+    this.iconColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_theme(context).automaticallyImplySkipNextButton ||
+        (controller(context).player.state.playlist.medias.length > 1 &&
+            _theme(context).automaticallyImplySkipNextButton)) {
+      return IconButton(
+        onPressed: controller(context).player.next,
+        icon: icon ?? const Icon(Icons.skip_next),
+        iconSize: iconSize ?? _theme(context).buttonBarButtonSize,
+        color: iconColor ?? _theme(context).buttonBarButtonColor,
+      );
+    }
+    return const SizedBox.shrink();
+  }
+}
+
+// BUTTON: SKIP PREVIOUS
+
+/// Material design skip previous button.
+class MaterialSkipPreviousButton extends StatelessWidget {
+  /// Icon for [MaterialSkipPreviousButton].
+  final Widget? icon;
+
+  /// Overriden icon size for [MaterialSkipPreviousButton].
+  final double? iconSize;
+
+  /// Overriden icon color for [MaterialSkipPreviousButton].
+  final Color? iconColor;
+
+  const MaterialSkipPreviousButton({
+    super.key,
+    this.icon,
+    this.iconSize,
+    this.iconColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_theme(context).automaticallyImplySkipPreviousButton ||
+        (controller(context).player.state.playlist.medias.length > 1 &&
+            _theme(context).automaticallyImplySkipPreviousButton)) {
+      return IconButton(
+        onPressed: controller(context).player.previous,
+        icon: icon ?? const Icon(Icons.skip_previous),
+        iconSize: iconSize ?? _theme(context).buttonBarButtonSize,
+        color: iconColor ?? _theme(context).buttonBarButtonColor,
+      );
+    }
+    return const SizedBox.shrink();
+  }
+}
+
+// BUTTON: FULL SCREEN
+
+/// Material design fullscreen button.
+class MaterialFullscreenButton extends StatelessWidget {
+  /// Icon for [MaterialFullscreenButton].
+  final Widget? icon;
+
+  /// Overriden icon size for [MaterialFullscreenButton].
+  final double? iconSize;
+
+  /// Overriden icon color for [MaterialFullscreenButton].
+  final Color? iconColor;
+
+  const MaterialFullscreenButton({
+    super.key,
+    this.icon,
+    this.iconSize,
+    this.iconColor,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      onPressed: () => toggleFullscreen(context),
+      icon: icon ??
+          (isFullscreen(context)
+              ? const Icon(Icons.fullscreen_exit)
+              : const Icon(Icons.fullscreen)),
+      iconSize: iconSize ?? _theme(context).buttonBarButtonSize,
+      color: iconColor ?? _theme(context).buttonBarButtonColor,
+    );
+  }
+}
+
+// BUTTON: CUSTOM
+
+/// Material design custom button.
+class MaterialCustomButton extends StatelessWidget {
+  /// Icon for [MaterialCustomButton].
+  final Widget? icon;
+
+  /// Icon size for [MaterialCustomButton].
+  final double? iconSize;
+
+  /// Icon color for [MaterialCustomButton].
+  final Color? iconColor;
+
+  /// The callback that is called when the button is tapped or otherwise activated.
+  final VoidCallback onPressed;
+
+  const MaterialCustomButton({
+    super.key,
+    this.icon,
+    this.iconSize,
+    this.iconColor,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      onPressed: onPressed,
+      icon: icon ?? const Icon(Icons.settings),
+      padding: EdgeInsets.zero,
+      iconSize: iconSize ?? _theme(context).buttonBarButtonSize,
+      color: iconColor ?? _theme(context).buttonBarButtonColor,
+    );
+  }
+}
+
+// POSITION INDICATOR
+
+/// Material design position indicator.
+class MaterialPositionIndicator extends StatefulWidget {
+  /// Overriden [TextStyle] for the [MaterialPositionIndicator].
+  final TextStyle? style;
+  const MaterialPositionIndicator({super.key, this.style});
+
+  @override
+  MaterialPositionIndicatorState createState() =>
+      MaterialPositionIndicatorState();
+}
+
+class MaterialPositionIndicatorState extends State<MaterialPositionIndicator> {
+  late Duration position = controller(context).player.state.position;
+  late Duration duration = controller(context).player.state.duration;
+
+  final List<StreamSubscription> subscriptions = [];
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (subscriptions.isEmpty) {
+      subscriptions.addAll(
+        [
+          controller(context).player.stream.position.listen((event) {
+            // Fushi patch (TODO-1243): the clock text only shows whole seconds,
+            // so quantizing to kPositionUiThrottleStep (which divides 1000ms)
+            // yields the identical string while collapsing ~60fps rebuilds to
+            // ~5fps. Skip setState entirely when the quantized value is unchanged.
+            final Duration next = event.floorTo(kPositionUiThrottleStep);
+            if (next == position) return;
+            setState(() {
+              position = next;
+            });
+          }),
+          controller(context).player.stream.duration.listen((event) {
+            setState(() {
+              duration = event;
+            });
+          }),
+        ],
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final subscription in subscriptions) {
+      subscription.cancel();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Fushi patch (TODO-1243): isolate the mm:ss clock so its second-boundary
+    // repaint does not re-raster the shared full-screen controls picture (same
+    // integrated-GPU root cause as the seek bar). See PATCHES.md.
+    return RepaintBoundary(
+      child: Text(
+        '${position.label(reference: duration)} / ${duration.label(reference: duration)}',
+        style: widget.style ??
+            TextStyle(
+              height: 1.0,
+              fontSize: 12.0,
+              color: _theme(context).buttonBarButtonColor,
+            ),
+      ),
+    );
+  }
+}
+
+class _BackwardSeekIndicator extends StatefulWidget {
+  final Duration duration;
+  final void Function(Duration) onChanged;
+  final void Function(Duration) onSubmitted;
+  const _BackwardSeekIndicator({
+    required this.duration,
+    required this.onChanged,
+    required this.onSubmitted,
+  });
+
+  @override
+  State<_BackwardSeekIndicator> createState() => _BackwardSeekIndicatorState();
+}
+
+class _BackwardSeekIndicatorState extends State<_BackwardSeekIndicator> {
+  late Duration value = widget.duration;
+
+  Timer? timer;
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    timer = Timer(const Duration(milliseconds: 400), () {
+      widget.onSubmitted.call(value);
+    });
+  }
+
+  void increment() {
+    timer?.cancel();
+    timer = Timer(const Duration(milliseconds: 400), () {
+      widget.onSubmitted.call(value);
+    });
+    widget.onChanged.call(value);
+    setState(() {
+      value += const Duration(seconds: 10);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Color(0x88767676),
+            Color(0x00767676),
+          ],
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+        ),
+      ),
+      child: InkWell(
+        splashColor: const Color(0x44767676),
+        onTap: increment,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const Icon(
+                Icons.fast_rewind,
+                size: 24.0,
+                color: Color(0xFFFFFFFF),
+              ),
+              const SizedBox(height: 8.0),
+              Text(
+                '${value.inSeconds} seconds',
+                style: const TextStyle(
+                  fontSize: 12.0,
+                  color: Color(0xFFFFFFFF),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ForwardSeekIndicator extends StatefulWidget {
+  final Duration duration;
+  final void Function(Duration) onChanged;
+  final void Function(Duration) onSubmitted;
+  const _ForwardSeekIndicator({
+    required this.duration,
+    required this.onChanged,
+    required this.onSubmitted,
+  });
+
+  @override
+  State<_ForwardSeekIndicator> createState() => _ForwardSeekIndicatorState();
+}
+
+class _ForwardSeekIndicatorState extends State<_ForwardSeekIndicator> {
+  late Duration value = widget.duration;
+
+  Timer? timer;
+
+  @override
+  void setState(VoidCallback fn) {
+    if (mounted) {
+      super.setState(fn);
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    timer = Timer(const Duration(milliseconds: 400), () {
+      widget.onSubmitted.call(value);
+    });
+  }
+
+  void increment() {
+    timer?.cancel();
+    timer = Timer(const Duration(milliseconds: 400), () {
+      widget.onSubmitted.call(value);
+    });
+    widget.onChanged.call(value);
+    setState(() {
+      value += const Duration(seconds: 10);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Color(0x00767676),
+            Color(0x88767676),
+          ],
+          begin: Alignment.centerLeft,
+          end: Alignment.centerRight,
+        ),
+      ),
+      child: InkWell(
+        splashColor: const Color(0x44767676),
+        onTap: increment,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              const Icon(
+                Icons.fast_forward,
+                size: 24.0,
+                color: Color(0xFFFFFFFF),
+              ),
+              const SizedBox(height: 8.0),
+              Text(
+                '${value.inSeconds} seconds',
+                style: const TextStyle(
+                  fontSize: 12.0,
+                  color: Color(0xFFFFFFFF),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

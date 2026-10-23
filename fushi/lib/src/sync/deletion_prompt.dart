@@ -1,0 +1,490 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/sync/deletion_disclosure.dart';
+import 'package:fushi/src/utils/components/fushi_staggered_entrance.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi_engine/sync/deletion_propagation.dart';
+import 'package:fushi/src/sync/deletion_propagation_availability.dart';
+import 'package:fushi/src/sync/deletion_prompt_preferences.dart';
+import 'package:fushi/src/sync/sync_conflict_prompter.dart'
+    show ConflictSource, PromptQueue;
+import 'package:fushi/src/sync/sync_repository.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+/// 通用「删除范围」确认弹窗：正文 + 「从所有设备删除」勾选框 +
+/// 「同时删除本地文件」勾选框（仅 [localFilesSubtitle] 非 null 时渲染）+
+/// 「记住这些选择」勾选框。未记住时两个删除选项都采用安全默认值 false；传 [db] 时
+/// 会恢复并更新用户明确要求记住的组合值。
+/// 确认返回用户的 [DeleteDecision]（scope：勾选=syncEverywhere 传播 / 不勾=
+/// keepLocalOnly 仅本机；deleteLocalFiles：是否连磁盘上的原始文件一起删）；取消返回
+/// null。供书架/视频/有声书等各删除入口共用（书架另有 ReaderHistoryDeleteDialog
+/// 变体）。
+///
+/// [localFilesSubtitle] 一个参数同时编码「摆不摆勾选框」和「摆的话说什么」——这两件
+/// 事本来就是一个决定：null = 这条目没有本机可删的原件（视频是 http(s) 远端流；书 /
+/// 有声书没有显式登记在 app 目录之外的音频），非 null = 摆，且这句话必须如实说清
+/// 删的是什么。拆成 `offerLocalFiles` + 可选副标题会出现「摆了框但说的是一句通用
+/// 谎话」的非法组合。
+///
+/// 勾选框顺序：同步在前、删本地文件在后。破坏性最强的那个不该是列表第一行、也不该
+/// 是 Tab 焦点第一个落点。
+///
+/// TODO-2470 死角②：传 [db] 时先查本机有没有删除传播通道（
+/// [hasDeletionPropagationChannel]，纯本地零网络），没有就不渲染那个兑现不了的勾选框，
+/// 改渲染一行说明。查询在 `showAppDialog` **之前**做完，弹窗自身仍是纯同步 widget、
+/// 不做 IO。[db] 省略时保持旧行为（恒显示），供不便拿到 db 的入口与既有测试使用。
+Future<DeleteDecision?> showDeleteScopeConfirm(
+  BuildContext context, {
+  required String title,
+  required String message,
+  DeletionDisclosure? disclosure,
+  FushiDatabase? db,
+  String? localFilesSubtitle,
+  String? statisticsSubtitle,
+}) async {
+  final DeletePromptPreferenceStore? preferenceStore =
+      db == null ? null : DeletePromptPreferenceStore(db);
+  final DeletePromptRememberedChoices? rememberedChoices =
+      await preferenceStore?.load();
+  final bool canSyncEverywhere =
+      db == null || await hasDeletionPropagationChannel(SyncRepository(db));
+  if (!context.mounted) return null;
+  return showAppDialog<DeleteDecision>(
+    context: context,
+    builder: (_) => _DeleteScopeConfirmDialog(
+      title: title,
+      message: message,
+      disclosure: disclosure,
+      canSyncEverywhere: canSyncEverywhere,
+      localFilesSubtitle: localFilesSubtitle,
+      statisticsSubtitle: statisticsSubtitle,
+      rememberedChoices: rememberedChoices,
+      onPersistChoices: preferenceStore?.write,
+    ),
+  );
+}
+
+class _DeleteScopeConfirmDialog extends StatefulWidget {
+  const _DeleteScopeConfirmDialog({
+    required this.title,
+    required this.message,
+    this.disclosure,
+    this.canSyncEverywhere = true,
+    this.localFilesSubtitle,
+    this.statisticsSubtitle,
+    this.rememberedChoices,
+    this.onPersistChoices,
+  });
+  final String title;
+  final String message;
+  final DeletionDisclosure? disclosure;
+
+  /// false = 本机无任何删除传播通道，勾了也不可能生效 → 不渲染勾选框，恒 keepLocalOnly。
+  final bool canSyncEverywhere;
+
+  /// null = 这条目没有本机可删的原件 → 不渲染勾选框，恒 deleteLocalFiles=false。
+  /// 非 null = 渲染，且这句副标题必须如实说清这个入口到底删什么。
+  final String? localFilesSubtitle;
+
+  /// null = 这个入口不提供「同时删除统计数据」→ 恒 deleteStatistics=false。
+  /// 非 null = 渲染勾选行，副标题如实说清删掉的是哪些统计口径。
+  ///
+  /// 与另外两个勾选不同，它**不进**「记住这些选择」，每次都从未勾开始（见
+  /// [DeleteStatisticsRow]）。
+  final String? statisticsSubtitle;
+  final DeletePromptRememberedChoices? rememberedChoices;
+  final Future<void> Function(DeletePromptRememberedChoices?)?
+      onPersistChoices;
+
+  @override
+  State<_DeleteScopeConfirmDialog> createState() =>
+      _DeleteScopeConfirmDialogState();
+}
+
+class _DeleteScopeConfirmDialogState extends State<_DeleteScopeConfirmDialog> {
+  late bool _syncDelete;
+  late bool _deleteLocalFiles;
+  bool _deleteStatistics = false;
+  late bool _rememberChoices;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncDelete = widget.rememberedChoices?.syncEverywhere ?? false;
+    _deleteLocalFiles = widget.rememberedChoices?.deleteLocalFiles ?? false;
+    _rememberChoices = widget.rememberedChoices != null;
+  }
+
+  Future<void> _confirm() async {
+    if (_saving) return;
+    setState(() => _saving = true);
+    final DeletePromptRememberedChoices? choices = _rememberChoices
+        ? DeletePromptRememberedChoices(
+            syncEverywhere: _syncDelete,
+            deleteLocalFiles: _deleteLocalFiles,
+          )
+        : null;
+    try {
+      await widget.onPersistChoices?.call(choices);
+    } catch (error, stackTrace) {
+      debugPrint('Delete prompt preference write failed: $error\n$stackTrace');
+    }
+    if (!mounted) return;
+    Navigator.pop(
+      context,
+      DeleteDecision(
+        scope: widget.canSyncEverywhere && _syncDelete
+            ? DeleteScope.syncEverywhere
+            : DeleteScope.keepLocalOnly,
+        deleteLocalFiles:
+            widget.localFilesSubtitle != null && _deleteLocalFiles,
+        deleteStatistics:
+            widget.statisticsSubtitle != null && _deleteStatistics,
+      ),
+    );
+  }
+
+  /// 披露跟着两个二级勾选翻面：勾了哪个，对应条目就从「会被保留」挪进「会被删除」。
+  DeletionDisclosure _shownDisclosure(DeletionDisclosure base) {
+    DeletionDisclosure shown = base;
+    if (_deleteLocalFiles) shown = shown.withLocalFilesDeleted();
+    if (_deleteStatistics) shown = shown.withStatisticsDeleted();
+    return shown;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return FushiDialogFrame(
+      maxWidth: 420,
+      maxHeightFactor: 0.74,
+      // 底部「取消 / 删除」钉住，只让正文滚：M3E 分组勾选卡把正文撑高后，整框
+      // 一起滚会把「删除」推到 74% 高度之外，矮窗口（800x600）里要先滚才按得到。
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        scrollable: true,
+        title: widget.title,
+        leadingIcon: FushiIcons.delete,
+        bodyPadding: EdgeInsets.fromLTRB(
+            tokens.spacing.card, 0, tokens.spacing.card, tokens.spacing.gap),
+        footerPadding: EdgeInsets.fromLTRB(tokens.spacing.card,
+            tokens.spacing.gap, tokens.spacing.card, tokens.spacing.card),
+        body: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(widget.message, style: tokens.type.listSubtitle),
+            if (widget.disclosure != null) ...<Widget>[
+              SizedBox(height: tokens.spacing.gap),
+              DeletionDisclosureView(
+                disclosure: _shownDisclosure(widget.disclosure!),
+              ),
+            ],
+            SizedBox(height: tokens.spacing.gap),
+            if (!widget.canSyncEverywhere) ...<Widget>[
+              const DeleteScopeUnavailableNote(),
+              SizedBox(height: tokens.spacing.gap / 2),
+            ],
+            // M3E：勾选项收成一组分段卡片（首尾大圆角、行间 2）。
+            FushiGroupedList(
+              children: <Widget>[
+                if (widget.canSyncEverywhere)
+                  DeleteConfirmCheckboxRow(
+                    title: t.delete_scope_sync_everywhere,
+                    subtitle: _syncDelete
+                        ? t.delete_scope_sync_everywhere_desc
+                        : t.delete_scope_keep_local_desc,
+                    value: _syncDelete,
+                    onChanged: (bool v) => setState(() => _syncDelete = v),
+                  ),
+                if (widget.localFilesSubtitle != null)
+                  DeleteLocalFilesRow(
+                    value: _deleteLocalFiles,
+                    subtitle: widget.localFilesSubtitle!,
+                    onChanged: (bool v) =>
+                        setState(() => _deleteLocalFiles = v),
+                  ),
+                if (widget.statisticsSubtitle != null)
+                  DeleteStatisticsRow(
+                    value: _deleteStatistics,
+                    subtitle: widget.statisticsSubtitle!,
+                    onChanged: (bool v) =>
+                        setState(() => _deleteStatistics = v),
+                  ),
+                if (widget.canSyncEverywhere ||
+                    widget.localFilesSubtitle != null)
+                  DeleteRememberChoicesRow(
+                    value: _rememberChoices,
+                    onChanged: (bool v) =>
+                        setState(() => _rememberChoices = v),
+                  ),
+              ],
+            ),
+          ],
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: [
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.pop(context, null),
+              child: Text(t.dialog_cancel),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              isDestructiveAction: true,
+              onPressed: _saving ? null : _confirm,
+              child: Text(t.dialog_delete),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 一条删除候选 + 已解析的展示标题（itemKey 是 bookKey/bookUid/displayName，用户看不懂，
+/// 由调用方预先解析成书名/视频名再传入）。
+class DeletionCandidateView {
+  const DeletionCandidateView({required this.candidate, required this.title});
+  final DeletionPropagationCandidate candidate;
+  final String title;
+}
+
+/// 应用用户确认的删除：逐条按 mediaType 删本地（keepLocalOnly，绝不回写墓碑）。
+typedef ApplyDeletions = Future<void> Function(
+    List<DeletionPropagationCandidate> confirmed);
+
+/// 「其他设备已删除这些，本地也删？」逐条确认弹窗：候选列表 + 复选框（默认勾选），
+/// 「全选 / 删除选中 / 取消」。确认返回勾选的候选列表；取消返回 null。
+class DeletionPromptDialog extends StatefulWidget {
+  const DeletionPromptDialog({required this.views, super.key});
+
+  final List<DeletionCandidateView> views;
+
+  @override
+  State<DeletionPromptDialog> createState() => _DeletionPromptDialogState();
+}
+
+class _DeletionPromptDialogState extends State<DeletionPromptDialog> {
+  late final Set<int> _checked;
+
+  @override
+  void initState() {
+    super.initState();
+    // 默认全选：同步删除是用户在源设备的明确意图，接收端默认跟随，用户可逐条取消保留。
+    _checked = <int>{for (int i = 0; i < widget.views.length; i++) i};
+  }
+
+  void _toggle(int i) => setState(() {
+        if (!_checked.remove(i)) _checked.add(i);
+      });
+
+  void _selectAll() => setState(() {
+        if (_checked.length == widget.views.length) {
+          _checked.clear();
+        } else {
+          _checked
+            ..clear()
+            ..addAll(<int>[for (int i = 0; i < widget.views.length; i++) i]);
+        }
+      });
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return FushiDialogFrame(
+      maxWidth: 460,
+      maxHeightFactor: 0.8,
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        title: t.delete_prompt_title,
+        leadingIcon: FushiIcons.deleteSweep,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Padding(
+              padding: EdgeInsets.only(bottom: tokens.spacing.gap),
+              child: Text(t.delete_prompt_message,
+                  style: tokens.type.listSubtitle),
+            ),
+            Flexible(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(
+                  maxHeight: MediaQuery.of(context).size.height * 0.44,
+                ),
+                child: FushiEntranceScope(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: widget.views.length,
+                    // M3E：候选是分段卡片（首尾大圆角、行间 2），错峰进场。
+                    itemBuilder: fushiStaggeredItemBuilder(
+                      (BuildContext context, int i) {
+                        final DeletionCandidateView v = widget.views[i];
+                        return FushiGroupedListItem(
+                          index: i,
+                          count: widget.views.length,
+                          child: DeleteConfirmCheckboxRow(
+                            title: v.title,
+                            value: _checked.contains(i),
+                            destructive: true,
+                            onChanged: (bool _) => _toggle(i),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: [
+            adaptiveDialogAction(
+              context: context,
+              onPressed: _selectAll,
+              child: Text(t.delete_prompt_select_all),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.pop(context, null),
+              child: Text(t.dialog_cancel),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              isDestructiveAction: true,
+              onPressed: () => Navigator.pop(
+                context,
+                <DeletionPropagationCandidate>[
+                  for (final int i in _checked) widget.views[i].candidate,
+                ],
+              ),
+              child: Text(t.delete_prompt_delete_selected),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 决定「删除确认框是否/此刻弹」+ 会话级防骚扰，经全局 navigatorKey 弹出并应用用户
+/// 确认的删除，随后推进删除墓碑消费基线（已复核到 highWaterMs，压制已看过的、放行更新
+/// 的删除）。范式仿 [SyncConflictPrompter]：纯内存单飞 + 随会话失效。
+class DeletionPromptPrompter with PromptQueue {
+  bool dialogOpen = false;
+  final Set<String> _snoozed = <String>{};
+
+  static String _fp(DeletionPropagationCandidate c) =>
+      '${c.mediaType}|${c.itemKey}';
+
+  bool shouldPrompt({
+    required List<DeletionCandidateView> views,
+    required ConflictSource source,
+    required bool inBook,
+  }) {
+    if (views.isEmpty) return false;
+    if (dialogOpen) return false;
+    if (source == ConflictSource.background) return false;
+    if (source == ConflictSource.auto) {
+      if (inBook) return false;
+      final bool allSnoozed = views.every(
+          (DeletionCandidateView v) => _snoozed.contains(_fp(v.candidate)));
+      if (allSnoozed) return false;
+    }
+    return true;
+  }
+
+  void _markDismissed(List<DeletionCandidateView> views) {
+    for (final DeletionCandidateView v in views) {
+      _snoozed.add(_fp(v.candidate));
+    }
+  }
+
+  /// 按 [shouldPrompt] 决策弹出确认框。用户确认（返回非 null 选择）→ [applyDeletions]
+  /// 删本地 + **逐通道**推进基线到 [highWaterMsByScope]（本轮各通道已复核的最大删除
+  /// 时刻）；取消（null）→ 本会话静默这批候选、不推进基线（下次会话再提醒）。
+  ///
+  /// BUG-1579：基线按通道分槽，故这里收的是「槽位 → 时刻」而不是一个标量。用一条
+  /// 通道的时刻去推另一条通道的基线，会让后者还没复核过的删除被永久压制。
+  ///
+  /// BUG-1571：双通道 sweep 逐通道调 present，两批候选会在同一次 sweep 内先后到达。
+  /// 经 [PromptQueue] 串行排队呈现——旧实现在第一批弹窗还开着时把第二批直接判掉且
+  /// 不 snooze、不推进基线，那批删除就此静默消失。
+  Future<void> present({
+    required GlobalKey<NavigatorState> navigatorKey,
+    required FushiDatabase db,
+    required List<DeletionCandidateView> views,
+    required Map<String, int> highWaterMsByScope,
+    required ApplyDeletions applyDeletions,
+    required ConflictSource source,
+    required bool inBook,
+  }) =>
+      enqueuePrompt(() => _presentNow(
+            navigatorKey: navigatorKey,
+            db: db,
+            views: views,
+            highWaterMsByScope: highWaterMsByScope,
+            applyDeletions: applyDeletions,
+            source: source,
+            inBook: inBook,
+          ));
+
+  Future<void> _presentNow({
+    required GlobalKey<NavigatorState> navigatorKey,
+    required FushiDatabase db,
+    required List<DeletionCandidateView> views,
+    required Map<String, int> highWaterMsByScope,
+    required ApplyDeletions applyDeletions,
+    required ConflictSource source,
+    required bool inBook,
+  }) async {
+    if (!shouldPrompt(views: views, source: source, inBook: inBook)) return;
+    final BuildContext? ctx = navigatorKey.currentContext;
+    if (ctx == null) return; // navigatorKey 未 attach，null 安全。
+    dialogOpen = true;
+    try {
+      final List<DeletionPropagationCandidate>? confirmed =
+          await showAppDialog<List<DeletionPropagationCandidate>>(
+        context: ctx,
+        barrierDismissible: false,
+        builder: (_) => DeletionPromptDialog(views: views),
+      );
+      if (confirmed == null) {
+        // 取消 = 稍后再提醒：本会话静默，基线不动。
+        _markDismissed(views);
+        return;
+      }
+      if (confirmed.isNotEmpty) await applyDeletions(confirmed);
+      // 用户已复核这批（无论删了几条）→ 逐通道推进基线，压制已看过的删除，放行更新的。
+      final SyncRepository repo = SyncRepository(db);
+      for (final MapEntry<String, int> e in highWaterMsByScope.entries) {
+        if (e.value <= 0) continue;
+        await repo.setDeletionTombstonesBaselineMs(
+            SyncChannelScope.byId(e.key), e.value);
+      }
+    } finally {
+      dialogOpen = false;
+    }
+  }
+}

@@ -1,0 +1,521 @@
+import 'package:flutter/rendering.dart' show ScrollDirection;
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/utils/components/fushi_motion_tokens.dart';
+import 'package:fushi/src/focus/fushi_focus_scroll.dart';
+import 'package:fushi/src/utils/components/fushi_design_tokens.dart';
+import 'package:fushi/src/utils/components/settings_shared.dart'
+    show SettingsRowIconProbe, settingsRowHasLeadingIcon;
+import 'package:fushi/src/settings/settings_context.dart';
+import 'package:fushi/src/settings/settings_destination.dart';
+import 'package:fushi/src/settings/settings_search_synonyms.dart';
+
+/// item 的可搜索标题：普通项就是 [SettingsItem.title]；[SettingsCustomItem]
+/// 的 title 通常为空（正文由 builder 自绘），可用
+/// [SettingsCustomItem.searchTitle] 显式 opt-in。空串 = 不可搜。
+///
+/// 给了 [context] 就走 [SettingsItem.resolveTitle]，让带 [SettingsItem.titleBuilder]
+/// 的行（诊断分区那三条带实时计数的）在搜索结果里显示的标题与列表里那条一致。
+String settingsItemSearchTitle(SettingsItem item, [SettingsContext? context]) {
+  if (item is SettingsCustomItem) {
+    final String? custom = item.searchTitle;
+    if (custom != null && custom.isNotEmpty) return custom;
+  }
+  return context == null ? item.title : item.resolveTitle(context);
+}
+
+/// 设置搜索的一条可命中条目（已展平：分类 → 分区 → 配置项）。
+class SettingsSearchEntry {
+  const SettingsSearchEntry({
+    required this.destination,
+    required this.item,
+    this.sectionTitle,
+    this.isBodyEntry = false,
+    this.hasRevealTarget = true,
+    this.subPagePath = const <SettingsNavigationItem>[],
+    String? resolvedTitle,
+    String? resolvedSubtitle,
+    this.optionLabels = const <String>[],
+  }) : _resolvedTitle = resolvedTitle,
+       _resolvedSubtitle = resolvedSubtitle;
+
+  /// 展平时就地求好的说明（带 [SettingsItem.subtitleBuilder] 的行，说明随运行期
+  /// 状态变化；搜索要按用户此刻看到的那句匹配）。
+  final String? _resolvedSubtitle;
+
+  /// 选择类行的选项标签（分段 / 下拉）：搜「竖排」能直达排版方向那一行。
+  final List<String> optionLabels;
+
+  /// 打分与高亮用的说明文字。
+  String? get subtitle => _resolvedSubtitle ?? item.subtitle;
+
+  /// 标题没命中、但说明或选项命中时，结果行里额外露出的那句（高亮用）；
+  /// 标题已命中时返回 null（不重复占行）。
+  String? matchedDetail(String query) {
+    if (settingsSearchMatchRanges(title, query).isNotEmpty) return null;
+    final String? sub = subtitle;
+    if (sub != null && settingsSearchMatchRanges(sub, query).isNotEmpty) {
+      return sub;
+    }
+    for (final String label in optionLabels) {
+      if (settingsSearchMatchRanges(label, query).isNotEmpty) return label;
+    }
+    return null;
+  }
+
+  /// 展平时就地求好的标题（带 [SettingsItem.titleBuilder] 的行才有意义）。
+  final String? _resolvedTitle;
+
+  /// 所属**顶层**分类（子页里的行也指向其顶层分类——宽屏切换主从选中、窄屏
+  /// push 详情页都以它为起点）。
+  final SettingsDestination destination;
+  final String? sectionTitle;
+  final SettingsItem item;
+
+  /// 从顶层分类走到 [item] 所在页要依次推入的子页（[SettingsNavigationItem.child]
+  /// 链）；空 = 行就在顶层分类里。
+  final List<SettingsNavigationItem> subPagePath;
+
+  /// 由自绘正文元数据合成。是否可精确定位由 hasRevealTarget 单独声明。
+  final bool isBodyEntry;
+  final bool hasRevealTarget;
+
+  /// 打分与结果展示用的标题（custom 项取 searchTitle，见
+  /// [settingsItemSearchTitle]）。
+  String get title => _resolvedTitle ?? settingsItemSearchTitle(item);
+}
+
+/// 搜索结果副标题的「分类 › 分区」面包屑（框架级去重）。
+///
+/// 当分区标题为空、或与所属 destination 标题相同（如「系统」destination 里一个
+/// 同名「系统」section），只显示 destination 标题，消灭「系统 › 系统」这一整类
+/// 语义重复——而不是逐个改命名。分区名有独立含义时才拼成「分类 › 分区」。
+String settingsSearchBreadcrumb(SettingsSearchEntry entry) {
+  final String destination = entry.destination.title;
+  final String? section = entry.sectionTitle;
+  if (section == null || section.isEmpty || section == destination) {
+    return destination;
+  }
+  return '$destination › $section';
+}
+
+/// 结果已按分类分组展示时的「位置」行：只剩分区 / 子页链（不重复分类名）；
+/// 行就在分类顶层且没有分区标题时为空串。
+String settingsSearchLocation(SettingsSearchEntry entry) {
+  final String? section = entry.sectionTitle;
+  if (section == null ||
+      section.isEmpty ||
+      section == entry.destination.title) {
+    return '';
+  }
+  return section;
+}
+
+/// 把查询切成小写词元（空白分隔，去空）。
+List<String> settingsSearchTokens(String query) => query
+    .trim()
+    .toLowerCase()
+    .split(RegExp(r'\s+'))
+    .where((String token) => token.isNotEmpty)
+    .toList(growable: false);
+
+/// [text] 里所有命中查询词元的区间（大小写不敏感、合并重叠、升序），供高亮。
+/// 只高亮字面命中；同义词扩展命中的不画高亮（字面上不存在）。
+List<TextRange> settingsSearchMatchRanges(String text, String query) {
+  final List<String> tokens = settingsSearchTokens(query);
+  if (tokens.isEmpty || text.isEmpty) return const <TextRange>[];
+  final String lower = text.toLowerCase();
+  // 小写化可能改变长度（少数语言）；长度不一致时放弃高亮而不是错位。
+  if (lower.length != text.length) return const <TextRange>[];
+  final List<TextRange> ranges = <TextRange>[];
+  for (final String token in tokens) {
+    int from = 0;
+    while (true) {
+      final int at = lower.indexOf(token, from);
+      if (at < 0) break;
+      ranges.add(TextRange(start: at, end: at + token.length));
+      from = at + token.length;
+    }
+  }
+  if (ranges.isEmpty) return const <TextRange>[];
+  ranges.sort((TextRange a, TextRange b) => a.start.compareTo(b.start));
+  final List<TextRange> merged = <TextRange>[ranges.first];
+  for (final TextRange range in ranges.skip(1)) {
+    final TextRange last = merged.last;
+    if (range.start <= last.end) {
+      if (range.end > last.end) {
+        merged[merged.length - 1] = TextRange(
+          start: last.start,
+          end: range.end,
+        );
+      }
+    } else {
+      merged.add(range);
+    }
+  }
+  return merged;
+}
+
+/// 把当前可见的 schema 展平成搜索条目列表。
+///
+/// 只收有可搜索标题的项（见 [settingsItemSearchTitle]：custom 项默认 title 为空
+/// 跳过，声明 searchTitle 后进入索引）。可见性用与渲染完全相同的
+/// [SettingsDestination.visibleSections] 谓词求值，搜索结果绝不会指向一个
+/// 当前平台/状态下根本不显示的行。
+List<SettingsSearchEntry> flattenVisibleSettings(
+  List<SettingsDestination> destinations,
+  SettingsContext context,
+) {
+  final List<SettingsSearchEntry> entries = <SettingsSearchEntry>[];
+  for (final SettingsDestination destination in destinations) {
+    if (!destination.isVisible(context)) continue;
+    _flattenPageInto(
+      entries,
+      root: destination,
+      page: destination,
+      context: context,
+      subPagePath: const <SettingsNavigationItem>[],
+      pageTitle: null,
+    );
+  }
+  return entries;
+}
+
+/// 子页最大嵌套层数（见 [_flattenPageInto] 里为什么必须有上限）。
+const int _kSubPageMaxDepth = 3;
+
+/// 展平一页（顶层分类或子页）的可见行；遇到带 [SettingsNavigationItem.child] 的
+/// 导航行就递归进子页——子页的行也是 schema item，与顶层行同等进索引，面包屑
+/// 变成「分类 › 子页 › 分区」。
+void _flattenPageInto(
+  List<SettingsSearchEntry> entries, {
+  required SettingsDestination root,
+  required SettingsDestination page,
+  required SettingsContext context,
+  required List<SettingsNavigationItem> subPagePath,
+  required String? pageTitle,
+}) {
+  // Body forms use the same recursive navigation path as schema controls.
+  for (final SettingsBodySearchEntry bodyEntry in page.bodySearchEntries) {
+    if (!bodyEntry.isVisible(context)) continue;
+    entries.add(
+      SettingsSearchEntry(
+        destination: root,
+        sectionTitle: pageTitle,
+        subPagePath: subPagePath,
+        item: SettingsCustomItem(
+          id: bodyEntry.id,
+          searchTitle: bodyEntry.title,
+          subtitle: bodyEntry.subtitle,
+          builder: (_) => const SizedBox.shrink(),
+        ),
+        isBodyEntry: true,
+        hasRevealTarget: bodyEntry.hasRevealTarget,
+      ),
+    );
+  }
+  for (final SettingsSection section in page.visibleSections(context)) {
+    final String? sectionTitle = _joinBreadcrumb(pageTitle, section.title);
+    for (final SettingsItem item in section.items) {
+      final String title = settingsItemSearchTitle(item, context);
+      if (title.isNotEmpty) {
+        entries.add(
+          SettingsSearchEntry(
+            destination: root,
+            sectionTitle: sectionTitle,
+            item: item,
+            resolvedTitle: title,
+            resolvedSubtitle: item.resolveSubtitle(context),
+            optionLabels: _optionLabelsOf(item, context),
+            subPagePath: subPagePath,
+          ),
+        );
+      }
+      if (item is! SettingsNavigationItem) continue;
+      final SettingsDestination Function()? childBuilder = item.child;
+      if (childBuilder == null) continue;
+      // 深度上限：`child` 是闭包，每次调用返回**新实例**，所以基于 identical 的
+      // 环检测无效。A 的子页是 B、B 的子页又是 A 这种写法会让索引器在用户往搜索框
+      // 敲第一个字符时直接栈溢出（`_buildSearchResults` 每次击键都重新展平）。
+      // 三层已经远超现有形态（分类 › 子页 › 子页）。
+      if (subPagePath.length >= _kSubPageMaxDepth) {
+        assert(
+          false,
+          '设置子页嵌套超过 $_kSubPageMaxDepth 层：'
+          '要么 schema 真的这么深，要么 child 闭包成了环',
+        );
+        continue;
+      }
+      final SettingsDestination child = childBuilder();
+      if (!child.isVisible(context)) continue;
+      _flattenPageInto(
+        entries,
+        root: root,
+        page: child,
+        context: context,
+        subPagePath: <SettingsNavigationItem>[...subPagePath, item],
+        pageTitle: _joinBreadcrumb(pageTitle, child.title),
+      );
+    }
+  }
+}
+
+List<String> _optionLabelsOf(SettingsItem item, SettingsContext context) {
+  if (item is SettingsSegmentedItem) {
+    return <String>[
+      for (final SettingsSegmentOption<dynamic> option in item.optionsFor(
+        context,
+      ))
+        option.label,
+    ];
+  }
+  if (item is SettingsCustomItem) {
+    return item.searchKeywords?.call(context) ?? const <String>[];
+  }
+  return const <String>[];
+}
+
+String? _joinBreadcrumb(String? head, String? tail) {
+  if (head == null || head.isEmpty) return tail;
+  if (tail == null || tail.isEmpty) return head;
+  return '$head › $tail';
+}
+
+/// 纯过滤：大小写不敏感子串匹配，命中位置决定排序权重
+/// （标题前缀 < 标题包含 < 副标题/分区/分类包含），稳定排序保持 schema 原序。
+List<SettingsSearchEntry> filterSettingsEntries(
+  List<SettingsSearchEntry> entries,
+  String query, {
+  int maxResults = 50,
+}) {
+  final List<String> tokens = settingsSearchTokens(query);
+  if (tokens.isEmpty) return const <SettingsSearchEntry>[];
+  final String q = tokens.join(' ');
+  // 每个词元的同义词扩展（含自身）：「深色」也能搜到标题写「暗色」的项。
+  final List<List<String>> alternates = <List<String>>[
+    for (final String token in tokens) settingsSearchSynonymsOf(token),
+  ];
+
+  int scoreOf(SettingsSearchEntry e) {
+    final String title = e.title.toLowerCase();
+    // 整串前缀 / 包含仍是最强信号（单词元时与旧打分一致）。
+    if (title.startsWith(q)) return 0;
+    if (title.contains(q)) return 1;
+    final String detail = <String?>[
+      e.subtitle,
+      ...e.optionLabels,
+    ].whereType<String>().join('\n').toLowerCase();
+    final String location = <String?>[
+      e.sectionTitle,
+      e.destination.title,
+      // 分类副标题也算命中面：它就印在一级列表上、是用户看得见的分类描述，
+      // 搜不到它才是意外。合并类分类尤其依赖这条——「听书」并入「阅读」后，
+      // 「听书」只剩在阅读的 summary 里出现（见 buildReadingDestination）。
+      e.destination.summary,
+    ].whereType<String>().join('\n').toLowerCase();
+    // 多词元：每个词元都得在某处命中（AND）。分数取最弱一项：全在标题 = 1，
+    // 有词元落在说明 / 选项 = 2，落在位置（分区 / 分类）= 3，只靠同义词 = 4。
+    int worst = 0;
+    for (int i = 0; i < tokens.length; i++) {
+      final String token = tokens[i];
+      final int hit;
+      if (title.contains(token)) {
+        hit = 1;
+      } else if (detail.contains(token)) {
+        hit = 2;
+      } else if (location.contains(token)) {
+        hit = 3;
+      } else if (alternates[i].any(
+        (String alt) =>
+            alt != token && (title.contains(alt) || detail.contains(alt)),
+      )) {
+        hit = 4;
+      } else {
+        return -1;
+      }
+      if (hit > worst) worst = hit;
+    }
+    return worst;
+  }
+
+  final List<(int, SettingsSearchEntry)> scored =
+      <(int, SettingsSearchEntry)>[];
+  for (final SettingsSearchEntry e in entries) {
+    final int score = scoreOf(e);
+    if (score >= 0) scored.add((score, e));
+  }
+  // List.sort 不稳定；按 (score, 原始下标) 排序保证同分保持 schema 顺序。
+  final List<int> order = List<int>.generate(scored.length, (int i) => i);
+  order.sort((int a, int b) {
+    final int byScore = scored[a].$1.compareTo(scored[b].$1);
+    return byScore != 0 ? byScore : a.compareTo(b);
+  });
+  return <SettingsSearchEntry>[
+    for (final int i in order.take(maxResults)) scored[i].$2,
+  ];
+}
+
+/// 跨页面传递「进入详情后要滚到并高亮哪一项」的一次性挂点。
+///
+/// 搜索结果点击时写入目标 item id；目标行随后在任意详情容器里被
+/// [SettingsSearchTarget] 构建时消费（包上 [SettingsRevealTarget] 滚动定位 +
+/// 短暂高亮），消费即清除。模块级单槽足够：同一时刻只可能有一个"跳转中"的
+/// 目标，且消费点唯一。
+class SettingsSearchReveal {
+  SettingsSearchReveal._();
+
+  static String? _pendingItemId;
+  static int generation = 0;
+  static String? get pendingItemId => _pendingItemId;
+  static set pendingItemId(String? value) {
+    _pendingItemId = value;
+    if (value != null) generation++;
+  }
+}
+
+/// Real row anchor for both schema controls and custom configuration forms.
+///
+/// 不改变行外观，所以实现 [SettingsRowIconProbe]：分组判 Apple 分隔线缩进时
+/// 看穿本落点包装。
+class SettingsSearchTarget extends StatefulWidget
+    implements SettingsRowIconProbe {
+  const SettingsSearchTarget({
+    super.key,
+    required this.id,
+    required this.child,
+  });
+
+  final String id;
+  final Widget child;
+
+  @override
+  bool get settingsRowHasIcon => settingsRowHasLeadingIcon(child);
+
+  @override
+  State<SettingsSearchTarget> createState() => _SettingsSearchTargetState();
+}
+
+class _SettingsSearchTargetState extends State<SettingsSearchTarget> {
+  /// 本落点消费到的那次跳转请求的代号；非空期间一直包着 [SettingsRevealTarget]。
+  ///
+  /// BUG-3027：挂点消费即清，但宿主页面紧接着会整树重建（M3E 浮动页头在首帧后
+  /// 回报实测高度 → SettingsKitScaffold setState → 正文 bodyBuilder 重新构建）。
+  /// 若每次 build 只看挂点，第二次 build 就把包装拆掉：定位与高亮都随之丢失。
+  int? _revealGeneration;
+
+  @override
+  Widget build(BuildContext context) {
+    if (SettingsSearchReveal.pendingItemId == widget.id) {
+      _revealGeneration = SettingsSearchReveal.generation;
+      SettingsSearchReveal.pendingItemId = null;
+    }
+    final int? generation = _revealGeneration;
+    if (generation == null) return widget.child;
+    return SettingsRevealTarget(
+      key: ValueKey<String>('settings-reveal.${widget.id}.$generation'),
+      child: widget.child,
+    );
+  }
+}
+
+/// 搜索跳转的落点包装：首帧后把自己滚进视口（滚动统一委托 FushiFocusScroll——
+/// 焦点架构守卫禁止 lib/src 各处自持 ensureVisible 实现；非懒详情容器里恒可用，
+/// 见 material renderer 的 SingleChildScrollView 契约），并用主题色短暂闪烁一次
+/// 帮助用户锁定视线。
+///
+/// BUG-3027：叠放的 M3E 页头 / 跳转条在首帧之后才回报实测高度，正文顶部让位
+/// （`MediaQuery.paddingOf(context).top`）随之变大、内容整体下移——首帧算好的
+/// 定位就落空了（靠近页尾的行被推出视口底部）。所以让位变化时重新定位，直到
+/// 用户亲手滚动（userScrollDirection 离开 idle）为止。
+class SettingsRevealTarget extends StatefulWidget {
+  const SettingsRevealTarget({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<SettingsRevealTarget> createState() => _SettingsRevealTargetState();
+}
+
+class _SettingsRevealTargetState extends State<SettingsRevealTarget> {
+  double? _topInset;
+  ScrollPosition? _position;
+  bool _following = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _scheduleReveal();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final ScrollPosition? position = Scrollable.maybeOf(context)?.position;
+    if (!identical(position, _position)) {
+      _position?.removeListener(_onScroll);
+      _position = _following ? position : null;
+      _position?.addListener(_onScroll);
+    }
+    final double topInset = MediaQuery.paddingOf(context).top;
+    final double? previous = _topInset;
+    _topInset = topInset;
+    if (previous != null && previous != topInset && _following) {
+      _scheduleReveal();
+    }
+  }
+
+  void _onScroll() {
+    final ScrollPosition? position = _position;
+    if (position == null ||
+        position.userScrollDirection == ScrollDirection.idle) {
+      return;
+    }
+    // 用户接手滚动：此后让位再变也不把他拽回来。
+    _following = false;
+    position.removeListener(_onScroll);
+    _position = null;
+  }
+
+  void _scheduleReveal() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_following) return;
+      // eink 下滚动动画归零（连续重绘=残影），直接跳到目标位置。
+      FushiFocusScroll.ensureVisible(
+        context,
+        duration: fushiMotionDuration(context, FushiMotion.medium),
+      );
+    });
+  }
+
+  @override
+  void dispose() {
+    _position?.removeListener(_onScroll);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Color highlight = Theme.of(context).colorScheme.primary;
+    // MD3 守卫：圆角一律走 design tokens，不自持字面量。
+    final BorderRadius radius = FushiDesignTokens.of(
+      context,
+    ).radii.controlRadius;
+    // eink 下闪烁衰减动画归零：TweenAnimationBuilder duration zero 直接落在
+    // end（透明），不闪不残影；定位仍由上面的滚动完成。
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 1, end: 0),
+      // 高亮衰减：取 FushiMotion.long 的三倍（≈1.35s），同样随墨水屏 / 减弱动态效果归零。
+      duration: fushiMotionDuration(context, FushiMotion.long * 3),
+      curve: Curves.easeOut,
+      child: widget.child,
+      builder: (BuildContext context, double value, Widget? child) {
+        return DecoratedBox(
+          decoration: BoxDecoration(
+            color: highlight.withValues(alpha: 0.14 * value),
+            borderRadius: radius,
+          ),
+          child: child,
+        );
+      },
+    );
+  }
+}

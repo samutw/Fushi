@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+		<key>NSMicrophoneUsageDescription</key>
+		<string>Fushi needs the microphone to record audio for your Anki cards.</string>
+		<key>NSAppleMusicUsageDescription</key>
+		<string>Fushi accesses your media library to import audio files for audiobooks and Anki cards.</string>
+		<key>NSCameraUsageDescription</key>
+		<string>Fushi uses the camera to capture images to add to your Anki cards and to scan pairing QR codes from your other devices.</string>
+		<key>NSPhotoLibraryUsageDescription</key>
+		<string>Fushi accesses your photo library to pick images to add to your Anki cards.</string>
+		<key>NSLocalNetworkUsageDescription</key>
+		<string>Fushi connects to your other Fushi devices on your local network to sync your library and to stream games from your computer.</string>
+		<key>NSBonjourServices</key>
+		<array>
+			<string>_fushi-sync._tcp</string>
+		</array>
+		<key>CFBundleDevelopmentRegion</key>
+		<string>$(DEVELOPMENT_LANGUAGE)</string>
+		<key>CFBundleDisplayName</key>
+		<string>Fushi</string>
+		<key>CFBundleExecutable</key>
+		<string>$(EXECUTABLE_NAME)</string>
+		<key>CFBundleIdentifier</key>
+		<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+		<key>CFBundleInfoDictionaryVersion</key>
+		<string>6.0</string>
+		<key>CFBundleName</key>
+		<string>Fushi</string>
+		<key>CFBundlePackageType</key>
+		<string>APPL</string>
+		<key>CFBundleShortVersionString</key>
+		<string>$(FLUTTER_BUILD_NAME)</string>
+		<key>CFBundleSignature</key>
+		<string>????</string>
+		<key>CFBundleVersion</key>
+		<string>$(FLUTTER_BUILD_NUMBER)</string>
+		<key>LSRequiresIPhoneOS</key>
+		<true/>
+		<key>UILaunchStoryboardName</key>
+		<string>LaunchScreen</string>
+		<key>UIMainStoryboardFile</key>
+		<string>Main</string>
+		<key>UISupportedInterfaceOrientations</key>
+		<array>
+			<string>UIInterfaceOrientationPortrait</string>
+			<string>UIInterfaceOrientationLandscapeLeft</string>
+			<string>UIInterfaceOrientationLandscapeRight</string>
+		</array>
+		<key>UISupportedInterfaceOrientations~ipad</key>
+		<array>
+			<string>UIInterfaceOrientationPortrait</string>
+			<string>UIInterfaceOrientationPortraitUpsideDown</string>
+			<string>UIInterfaceOrientationLandscapeLeft</string>
+			<string>UIInterfaceOrientationLandscapeRight</string>
+		</array>
+		<key>UIViewControllerBasedStatusBarAppearance</key>
+		<false/>
+		<key>UIStatusBarHidden</key>
+		<false/>
+		<!-- 解放 ProMotion 120Hz：置 false（或缺省）时 CoreAnimation 把 Flutter
+		     渲染钉在 60fps 上限，读书/滚动在 120Hz 机型上明显掉刷新率。true =
+		     允许高于 60fps 的帧率，交由系统按内容需求调度。 -->
+		<key>CADisableMinimumFrameDurationOnPhone</key>
+		<false/>
+		<key>UIApplicationSceneManifest</key>
+			<dict>
+				<key>UIApplicationSupportsMultipleScenes</key>
+				<false/>
+				<key>UISceneConfigurations</key>
+				<dict>
+					<key>UIWindowSceneSessionRoleApplication</key>
+					<array>
+						<dict>
+							<key>UISceneClassName</key>
+							<string>UIWindowScene</string>
+							<key>UISceneDelegateClassName</key>
+							<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+							<key>UISceneConfigurationName</key>
+							<string>flutter</string>
+							<key>UISceneStoryboardFile</key>
+							<string>Main</string>
+						</dict>
+					</array>
+				</dict>
+			</dict>
+		<!-- BUG-2456：关掉引擎自带的 deep linking（Flutter ≥ 3.27 缺省为开）。
+		     fushi:// 的每一条 URL（AnkiMobile x-callback、OAuth 回跳）都由
+		     SceneDelegate → app.fushi.reader/url_events 通道自己处理，从来不是
+		     Navigator 路由名；引擎若再把它推成 pushRouteInformation，框架会
+		     pushNamed('/') 在当前页面上面再压一个 HomePage（「跳回主页」）。 -->
+		<key>FlutterDeepLinkingEnabled</key>
+		<false/>
+			<key>CFBundleURLTypes</key>
+		<array>
+			<dict>
+				<key>CFBundleTypeRole</key>
+				<string>Editor</string>
+				<key>CFBundleURLSchemes</key>
+				<array>
+					<string>com.googleusercontent.apps.963096957716-a5iep3fd7jqsef4vdb2c4nq7mm7i3rnn</string>
+				</array>
+			</dict>
+			<dict>
+				<key>CFBundleTypeRole</key>
+				<string>Editor</string>
+				<key>CFBundleURLSchemes</key>
+				<array>
+					<string>fushi</string>
+				</array>
+			</dict>
+		</array>
+		<key>LSApplicationQueriesSchemes</key>
+		<array>
+			<string>anki</string>
+			<!--
+				更新落地入口（见 lib/src/utils/misc/update_landing.dart）：TestFlight
+				安装的包指向 itms-beta://，上架后 App Store 安装的包指向 itms-apps://。
+				不登记这两个 scheme，url_launcher 的 canLaunchUrl 探测会一律判 false，
+				按钮就成了点了没反应。
+			-->
+			<string>itms-beta</string>
+			<string>itms-apps</string>
+		</array>
+		<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+		<!--
+			BUG-2558：后台音频。缺这个键时 iOS 在 app 进后台那一刻就挂起进程，有声书
+			立刻断声——锁屏听书、切到别的 app 继续听、控制中心的播放控件全都不成立，
+			而 audio_service 的 Now Playing / 远程控制也就跟着形同虚设（插件装了、
+			`AVAudioSessionCategory.playback` 也配了，缺的只是这条声明）。
+			「后台播放有声书时照常计学习统计」这条行为在 iOS 上同样以它为前提：进程
+			被挂起就没有播放态可言，统计判据自然也永远走不到那条豁免。
+			audio 之外只多声明 fetch 一项：「反馈有新回复时通知我」靠 BGTaskScheduler
+			的 app refresh 在后台问一次反馈进度（feedback_reply_background.dart），
+			BGAppRefreshTask 需要 fetch 模式。多声明的模式会在审核时被要求逐条举证用途。
+		-->
+		<key>UIBackgroundModes</key>
+		<array>
+			<string>audio</string>
+			<string>fetch</string>
+		</array>
+		<!--
+			BGTaskScheduler 允许提交的任务 identifier。必须与 Dart 侧
+			kFeedbackReplyTaskName、AppDelegate 里 WorkmanagerPlugin.registerPeriodicTask
+			的 identifier 逐字一致：没登记的 identifier 提交时系统直接抛异常。
+		-->
+		<key>BGTaskSchedulerPermittedIdentifiers</key>
+		<array>
+			<string>app.fushi.feedback-reply-check</string>
+		</array>
+		<!--
+			出口合规声明。不写这个键的话，每个上传到 TestFlight 的构建都会卡在
+			「缺少出口合规信息」，必须去 App Store Connect 网页上手动答一遍问卷才
+			能分发给测试员 —— CI 自动发布就没有意义了。
+			false = 不使用「非豁免加密」：Fushi 只用系统提供的 HTTPS/TLS（同步、
+			词典下载、TMDB/dandanplay 等 API），没有自实现或专有的加密算法，属于
+			Apple 明确列出的豁免范围。若将来引入自研加密（例如端到端加密的互联
+			同步），必须回头改这个值并补交年度自分类报告。
+		-->
+		<key>ITSAppUsesNonExemptEncryption</key>
+		<false/>
+		<!-- 刻意不开 UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace：iOS 只能整份共享
+		     Documents（书正文 / 有声书 / 视频 / 词典资源 / 错误日志 / 待回写草稿全在里面），用户在「文件」App
+		     里删改会让库条目指向丢失的文件。复习备份要带走走备份页的「另存为 / 分享」（系统分享面板 →
+		     存储到文件 / AirDrop），恢复走「从文件恢复」（系统文件选择器）。
+		     守卫：test/ios/info_plist_file_sharing_guard_test.dart -->
+</dict>
+</plist>

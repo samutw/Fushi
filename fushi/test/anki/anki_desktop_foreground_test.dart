@@ -1,0 +1,350 @@
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_anki/fushi_anki.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+
+/// 「在 Anki 中打开」后 Anki 只闪任务栏、不跳到前台的修复守卫。
+///
+/// 现象分两半（用户实测）：Anki 的「浏览」窗口没开时能跳出来；已在后台开着时只闪。
+/// 原因是后者走 Anki 内部「raise 一个已存在窗口」的路径，被 Windows 前台锁定降级
+/// 成闪任务栏。解锁权只属于当时的前台进程（Fushi），所以 [AnkiConnectRepository]
+/// 必须在 guiBrowse **前**把前台权限让渡给 Anki 进程、**后**再兜底强拉一次。
+///
+/// 这里钉的是编排（顺序 / loopback 门 / fail-soft），真实 Win32 调用由
+/// [AnkiDesktopForegroundBackend] 替身隔离——测试环境没有 Anki 窗口可激活。
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    AnkiDesktopForeground.raiseRetryInterval = Duration.zero;
+  });
+
+  tearDown(() {
+    AnkiDesktopForeground.debugBackend = null;
+    AnkiDesktopForeground.raiseRetryInterval =
+        const Duration(milliseconds: 120);
+  });
+
+  /// 把 HTTP 侧的 action 与前台调用记进**同一条**时间线，才能钉住先后顺序。
+  MockClient clientRecording(List<String> events) {
+    return MockClient((http.Request req) async {
+      final Map<String, dynamic> body =
+          jsonDecode(req.body) as Map<String, dynamic>;
+      events.add('http:${body['action']}');
+      return http.Response(jsonEncode({'result': null, 'error': null}), 200);
+    });
+  }
+
+  test('本机 Anki：先让渡前台权限，再发 guiBrowse，最后兜底强拉', () async {
+    final List<String> events = <String>[];
+    final _FakeForegroundBackend backend = _FakeForegroundBackend(
+      events: events,
+      ankiPid: 4321,
+      // 让渡没生效（Anki 没能自己上来），兜底这一路必须走到。
+      foregroundPidSequence: <int?>[null, 4321],
+    );
+    AnkiDesktopForeground.debugBackend = backend;
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(client: clientRecording(events)),
+    );
+
+    final bool ok = await repo.openNoteInAnki(305);
+
+    expect(ok, isTrue);
+    expect(events, <String>[
+      'listen:8765',
+      'find',
+      'allow:4321',
+      'http:guiBrowse',
+      'foreground?',
+      'raise:4321',
+      'foreground?',
+    ]);
+  });
+
+  test('让渡已生效（前台已归 Anki）时不再强拉窗口', () async {
+    final List<String> events = <String>[];
+    AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+      events: events,
+      ankiPid: 4321,
+      foregroundPidSequence: <int?>[4321],
+    );
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(client: clientRecording(events)),
+    );
+
+    await repo.openNoteInAnki(305);
+
+    expect(
+        events,
+        <String>[
+          'listen:8765',
+          'find',
+          'allow:4321',
+          'http:guiBrowse',
+          'foreground?'
+        ],
+        reason: 'Anki 自己已经上来了，再 SetForegroundWindow 只会抢焦点');
+  });
+
+  test('远端 AnkiConnect（非 loopback）完全不碰本机窗口', () async {
+    final List<String> events = <String>[];
+    AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+      events: events,
+      ankiPid: 4321,
+      foregroundPidSequence: <int?>[null],
+    );
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(
+        client: clientRecording(events),
+        host: '192.168.1.34',
+      ),
+    );
+
+    final bool ok = await repo.openNoteInAnki(305);
+
+    expect(ok, isTrue);
+    expect(events, <String>['http:guiBrowse'],
+        reason: '另一台机器上的 Anki，激活本机窗口毫无意义');
+  });
+
+  test('本机找不到 Anki 窗口时降级为纯 guiBrowse（不抛、不空转重试）', () async {
+    final List<String> events = <String>[];
+    AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+      events: events,
+      ankiPid: null,
+      foregroundPidSequence: <int?>[null],
+    );
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(client: clientRecording(events)),
+    );
+
+    final bool ok = await repo.openNoteInAnki(305);
+
+    expect(ok, isTrue);
+    expect(events, <String>['listen:8765', 'find', 'http:guiBrowse']);
+  });
+
+  test('窗口一次没拉上来时重试，且总次数有上限', () async {
+    final List<String> events = <String>[];
+    AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+      events: events,
+      ankiPid: 4321,
+      foregroundPidSequence: <int?>[null],
+      raiseSucceeds: false,
+    );
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(client: clientRecording(events)),
+    );
+
+    await repo.openNoteInAnki(305);
+
+    expect(events.where((String e) => e == 'raise:4321').length, 3,
+        reason: '重试上限，避免前台被别的程序占住时无限循环');
+  });
+
+  test('前台激活抛错不得影响「在 Anki 中打开」的结果', () async {
+    AnkiDesktopForeground.debugBackend = _ThrowingForegroundBackend();
+    final AnkiConnectRepository repo = AnkiConnectRepository(
+      service: AnkiConnectService(client: clientRecording(<String>[])),
+    );
+
+    expect(await repo.openNoteInAnki(305), isTrue);
+  });
+
+  /// BUG-1837：认 Anki 进程的判据。用户装的 `anki.exe` 在新 launcher 架构下只是个
+  /// 启动器——**一个窗口都没有**，真正跑 aqt、持有全部窗口、监听 AnkiConnect 端口的
+  /// 是 venv 里的 `pythonw.exe`。所以「窗口所属进程的 exe 叫 anki.exe」必然落空，
+  /// 整套让渡 + 兜底空转，症状精确回到 BUG-1641 修复前（浏览窗已开着时只闪任务栏）。
+  group('认 Anki 进程（BUG-1837）', () {
+    test('进程名判据落空时，仍按「谁在监听 AnkiConnect 端口」找到 Anki', () async {
+      final List<String> events = <String>[];
+      AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+        events: events,
+        // 新 launcher 架构：没有任何窗口的属主进程叫 anki.exe。
+        ankiPid: null,
+        listenerPid: 13324,
+        foregroundPidSequence: <int?>[null, 13324],
+      );
+      final AnkiConnectRepository repo = AnkiConnectRepository(
+        service: AnkiConnectService(client: clientRecording(events)),
+      );
+
+      final bool ok = await repo.openNoteInAnki(305);
+
+      expect(ok, isTrue);
+      expect(events, <String>[
+        'listen:8765',
+        'allow:13324',
+        'http:guiBrowse',
+        'foreground?',
+        'raise:13324',
+        'foreground?',
+      ], reason: '端口判据命中就够了，不必再问进程名；让渡与兜底都必须打在 13324 上');
+    });
+
+    test('端口判据用的是这个 service 的真实端口，不是硬编码 8765', () async {
+      final List<String> events = <String>[];
+      AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+        events: events,
+        ankiPid: null,
+        listenerPid: 777,
+        foregroundPidSequence: <int?>[777],
+      );
+      final AnkiConnectRepository repo = AnkiConnectRepository(
+        service: AnkiConnectService(
+          client: clientRecording(events),
+          port: 8790,
+        ),
+      );
+
+      await repo.openNoteInAnki(305);
+
+      expect(events.first, 'listen:8790');
+    });
+
+    test('监听表读不到时退回进程名判据（旧版单进程 Anki 仍能被认出）', () {
+      final List<String> events = <String>[];
+      final _FakeForegroundBackend backend = _FakeForegroundBackend(
+        events: events,
+        ankiPid: 4321,
+        listenerPid: null,
+        foregroundPidSequence: <int?>[null],
+      );
+
+      expect(AnkiDesktopForeground.resolveAnkiProcessId(backend, 8765), 4321);
+      expect(events, <String>['listen:8765', 'find']);
+    });
+  });
+
+  /// 代装 AnkiConnect 要拿 `anki.exe` 的路径。刻意只认**正在运行的进程**报出来
+  /// 的路径，而不去注册表或默认安装目录里猜：绿色版、自定义安装位置、多版本
+  /// 共存都会让猜测失准，而进程自己报的永远是真在跑的那一个。
+  group('findRunningAnkiExecutable', () {
+    test('取正在运行的 Anki 进程自己报出的完整路径', () {
+      final List<String> events = <String>[];
+      AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+        events: events,
+        ankiPid: 4321,
+        foregroundPidSequence: <int?>[4321],
+        ankiExecutablePath: r'C:\Program Files\Anki\anki.exe',
+      );
+
+      expect(
+        AnkiDesktopForeground.findRunningAnkiExecutable(),
+        r'C:\Program Files\Anki\anki.exe',
+      );
+      expect(events, <String>['find', 'imagePath:4321']);
+    });
+
+    test('Anki 没在运行时返回 null，不去别处猜路径', () {
+      final List<String> events = <String>[];
+      AnkiDesktopForeground.debugBackend = _FakeForegroundBackend(
+        events: events,
+        ankiPid: null,
+        foregroundPidSequence: <int?>[null],
+        ankiExecutablePath: r'C:\Program Files\Anki\anki.exe',
+      );
+
+      expect(AnkiDesktopForeground.findRunningAnkiExecutable(), isNull);
+      // 没有 pid 就不该再去问路径。
+      expect(events, <String>['find']);
+    });
+
+    test('Win32 不可用时 fail-soft 返回 null，不把异常抛给调用方', () {
+      AnkiDesktopForeground.debugBackend = _ThrowingForegroundBackend();
+
+      expect(AnkiDesktopForeground.findRunningAnkiExecutable(), isNull);
+    });
+  });
+}
+
+/// 记录调用时间线的 Win32 替身。
+class _FakeForegroundBackend implements AnkiDesktopForegroundBackend {
+  _FakeForegroundBackend({
+    required this.events,
+    required this.ankiPid,
+    required List<int?> foregroundPidSequence,
+    this.raiseSucceeds = true,
+    this.ankiExecutablePath,
+    this.listenerPid,
+  }) : _foregroundPidSequence = foregroundPidSequence;
+
+  final List<String> events;
+  final int? ankiPid;
+  final bool raiseSucceeds;
+  final String? ankiExecutablePath;
+
+  /// 监听 AnkiConnect 端口的进程；null = 监听表读不到（退回进程名判据）。
+  final int? listenerPid;
+
+  /// 依次返回的「当前前台进程」；用完后保持最后一个值。
+  final List<int?> _foregroundPidSequence;
+  int _foregroundReads = 0;
+
+  @override
+  int? findProcessListeningOnPort(int port) {
+    events.add('listen:$port');
+    return listenerPid;
+  }
+
+  @override
+  int? findAnkiProcessId() {
+    events.add('find');
+    return ankiPid;
+  }
+
+  @override
+  bool allowSetForegroundWindow(int pid) {
+    events.add('allow:$pid');
+    return true;
+  }
+
+  @override
+  bool isForegroundOwnedByProcess(int pid) {
+    events.add('foreground?');
+    final int index = _foregroundReads < _foregroundPidSequence.length
+        ? _foregroundReads
+        : _foregroundPidSequence.length - 1;
+    _foregroundReads++;
+    return _foregroundPidSequence[index] == pid;
+  }
+
+  @override
+  bool raiseTopWindowOfProcess(int pid) {
+    events.add('raise:$pid');
+    return raiseSucceeds;
+  }
+
+  @override
+  String? processImagePath(int pid) {
+    events.add('imagePath:$pid');
+    return ankiExecutablePath;
+  }
+}
+
+class _ThrowingForegroundBackend implements AnkiDesktopForegroundBackend {
+  @override
+  int? findProcessListeningOnPort(int port) =>
+      throw StateError('iphlpapi unavailable');
+
+  @override
+  int? findAnkiProcessId() => throw StateError('user32 unavailable');
+
+  @override
+  bool allowSetForegroundWindow(int pid) =>
+      throw StateError('user32 unavailable');
+
+  @override
+  bool isForegroundOwnedByProcess(int pid) =>
+      throw StateError('user32 unavailable');
+
+  @override
+  bool raiseTopWindowOfProcess(int pid) =>
+      throw StateError('user32 unavailable');
+
+  @override
+  String? processImagePath(int pid) => throw StateError('user32 unavailable');
+}

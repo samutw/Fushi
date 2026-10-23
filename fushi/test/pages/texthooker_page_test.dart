@@ -1,0 +1,715 @@
+import 'dart:io';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/lookup/gal_attached_text_controller.dart';
+import 'package:fushi/src/lookup/gal_lookup_surface_profile.dart';
+import 'package:fushi/src/mining/gal_hook_session_controller.dart';
+import 'package:fushi/src/pages/implementations/gal_attached_lookup_workbench.dart';
+import 'package:fushi/src/pages/implementations/gal_workbench_chrome.dart';
+import 'package:fushi/src/pages/implementations/texthooker_page.dart';
+import 'package:fushi/src/platform/platform_providers.dart';
+import 'package:fushi/src/sync/texthooker_service.dart';
+import 'package:fushi/src/utils/components/fushi_material_components.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import '../helpers/test_platform_services.dart';
+
+/// 健康卡 Anki 行接真实配置状态（BUG-1007）后，页面 watch AnkiViewModel →
+/// ankiRepositoryProvider → platformServicesProvider，测试需注入 fake 平台服务。
+Widget _wrapPage(Widget home) {
+  return ProviderScope(
+    overrides: <Override>[
+      platformServicesProvider.overrideWithValue(testPlatformServices()),
+    ],
+    child: MaterialApp(home: home),
+  );
+}
+
+/// 点选台词列表第一句：点卡片左上角的「时间 · 来源」元信息行（不点正文——正文逐字
+/// 可点，会走查词而不是选句）。
+Future<void> _selectFirstLine(WidgetTester tester) async {
+  final Finder card = find.byWidgetPredicate((Widget widget) {
+    final Key? key = widget.key;
+    return widget is FushiCard &&
+        key is ValueKey<String> &&
+        RegExp(r'^game-line-\d').hasMatch(key.value);
+  });
+  expect(card, findsWidgets, reason: '台词列表里应至少有一句');
+  await tester.tapAt(tester.getTopLeft(card.first) + const Offset(24, 20));
+  await tester.pumpAndSettle();
+}
+
+void main() {
+  test(
+    'quote-only Hook display uses only the matching active game profile',
+    () {
+      const String sha =
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      const GalLookupReferenceClientV1 client = GalLookupReferenceClientV1(
+        widthPx: 1920,
+        heightPx: 1080,
+        dpi: 96,
+      );
+      final GalLookupSurfaceProfileV1 profile = GalLookupSurfaceProfileV1(
+        exePath: r'C:\Games\Test\game.exe',
+        exeSha256: sha,
+        mode: GalLookupSurfaceMode.auto,
+        unsafeLeftClickAccepted: false,
+        variants: <GalLookupSurfaceVariantV1>[
+          GalLookupSurfaceVariantV1(
+            aspectRatio: client.aspectRatio,
+            referenceClient: client,
+            bodyRect: GalAttachedTextController.defaultBodyRect,
+            layout: const GalLookupTextLayoutV1(quotedTextOnly: true),
+            slot: GalLookupCalibrationSlotV1.dialogue,
+          ),
+          GalLookupSurfaceVariantV1(
+            aspectRatio: client.aspectRatio,
+            referenceClient: client,
+            bodyRect: GalAttachedTextController.defaultBodyRect,
+            layout: const GalLookupTextLayoutV1(),
+            slot: GalLookupCalibrationSlotV1.narration,
+          ),
+        ],
+      );
+      const String source = '浜田「第一行。\n第二行」尾注';
+      ({String text, int sourceOffset}) visible({
+        bool currentSession = true,
+        String sessionExecutable = r'C:\Games\Test\game.exe',
+        String attachedSha256 = sha,
+        GalLookupSurfaceProfileV1? selectedProfile,
+        String text = source,
+      }) => galLookupVisibleHookLineText(
+        source: text,
+        currentSession: currentSession,
+        sessionExecutable: sessionExecutable,
+        attachedExecutable: r'C:\Games\Test\game.exe',
+        attachedSha256: attachedSha256,
+        profile: selectedProfile ?? profile,
+        client: client,
+      );
+
+      expect(visible(), (text: '「第一行。\n第二行」', sourceOffset: 2));
+      expect(visible(text: '浜田 の説明'), (text: '浜田 の説明', sourceOffset: 0));
+      expect(visible(currentSession: false).text, source);
+      expect(
+        visible(sessionExecutable: r'C:\Games\Other\game.exe').text,
+        source,
+      );
+      expect(visible(attachedSha256: 'b' * 64).text, source);
+      expect(
+        visible(
+          selectedProfile: profile.copyWith(
+            variants: <GalLookupSurfaceVariantV1>[profile.variants.last],
+          ),
+        ).text,
+        source,
+      );
+      expect(
+        visible(
+          selectedProfile: profile.copyWith(
+            variants: <GalLookupSurfaceVariantV1>[profile.variants.first],
+          ),
+        ).text,
+        '「第一行。\n第二行」',
+        reason: 'A single calibrated slot is the shared fallback.',
+      );
+    },
+  );
+
+  setUp(() {
+    // AnkiViewModel.loadSettings 走 SharedPreferences——测试环境需 mock 初始值。
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+    TexthookerService.instance.clear();
+  });
+  tearDown(() => TexthookerService.instance.clear());
+
+  testWidgets('renders incoming lines reactively', (WidgetTester tester) async {
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    expect(find.text('第'), findsNothing);
+
+    TexthookerService.instance.appendLine('第一行');
+    await tester.pump();
+    // 分词后可能拆成多个 span，逐字降级时「第」是独立 span。
+    expect(find.textContaining('第'), findsWidgets);
+
+    TexthookerService.instance.appendLine('第二行');
+    await tester.pump();
+    expect(find.textContaining('二'), findsWidgets);
+  });
+
+  testWidgets('Hook HTML break displays on the next row', (
+    WidgetTester tester,
+  ) async {
+    final TexthookerLineEntry entry = TexthookerService.instance.appendLine(
+      '前<br>後',
+    )!;
+    expect(entry.text, '前\n後');
+
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    final Finder first = find.text('前');
+    final Finder second = find.text('後');
+    expect(first, findsOneWidget);
+    expect(second, findsOneWidget);
+    expect(
+      tester.getTopLeft(second).dy,
+      greaterThan(tester.getTopLeft(first).dy),
+    );
+  });
+
+  testWidgets('BUG-1597 bulk line uses a folded lightweight text widget', (
+    WidgetTester tester,
+  ) async {
+    final String bulkText = '历史台词' * 250;
+    TexthookerService.instance.appendLine(bulkText);
+
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    final String lineId = TexthookerService.instance.entries.single.id;
+    final Finder textFinder = find.byKey(
+      ValueKey<String>('game-line-lightweight-text-$lineId'),
+    );
+    expect(textFinder, findsOneWidget);
+    expect(tester.widget<Text>(textFinder).maxLines, 4);
+    expect(
+      find.text('Bulk text detected. Character lookup is paused.'),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.byKey(ValueKey<String>('game-line-expand-$lineId')));
+    await tester.pump();
+    expect(tester.widget<Text>(textFinder).maxLines, isNull);
+  });
+
+  testWidgets('clear button empties the list', (WidgetTester tester) async {
+    TexthookerService.instance.appendLine('行X');
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+    expect(find.textContaining('行'), findsWidgets);
+
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pump();
+    expect(find.textContaining('行'), findsNothing);
+  });
+
+  testWidgets('Luna-style text thread selector filters mixed hook output', (
+    WidgetTester tester,
+  ) async {
+    TexthookerService.instance.appendLine(
+      '坏线程文本',
+      textThreadKey: 'luna:bad',
+      textThreadLabel: 'Luna 0x1000',
+      textHookCode: 'HS932@1000',
+      nativeTextThreadId: 0x1000,
+    );
+    TexthookerService.instance.appendLine(
+      '干净台词',
+      textThreadKey: 'luna:clean',
+      textThreadLabel: 'SiglusEngine 0x2000',
+      textHookCode: 'HS932@2000',
+      nativeTextThreadId: 0x2000,
+    );
+    // v12 的下拉行数来自 native 预览区，而非已发布文本环；补齐真实会话会提供的
+    // 预览快照，避免用旧的 DropdownButton 隐藏测宽副本冒充可交互菜单项。
+    TexthookerService.instance
+        .applyTextThreadPreviews(const <TexthookerThreadPreview>[
+          TexthookerThreadPreview(
+            nativeThreadId: 0x1000,
+            text: '坏线程文本',
+            observedLineCount: 1,
+            observedArtifactCount: 1,
+            isArtifact: true,
+          ),
+          TexthookerThreadPreview(
+            nativeThreadId: 0x2000,
+            text: '干净台词',
+            observedLineCount: 1,
+            observedArtifactCount: 0,
+            isArtifact: false,
+          ),
+        ]);
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    expect(
+      find.byKey(const ValueKey<String>('game-text-thread-selector')),
+      findsOneWidget,
+    );
+    // v12 契约（BUG-1193）：带线程身份的行在用户显式选中之前一行都不发布。
+    // 两条行仍在诊断 buffer 里（它们正是选择器的原材料），但工作台此刻
+    // 必须是空的。旧断言在这里期望「干净台词」已经可见，那是 v12 之前
+    // 「不选 = 全部线程」的旧语义。
+    expect(TexthookerService.instance.lines, contains('坏线程文本'));
+    expect(TexthookerService.instance.lines, contains('干净台词'));
+    expect(
+      find.textContaining('干'),
+      findsNothing,
+      reason: 'v12：未显式选线程时带线程身份的行一行也不得发布',
+    );
+    expect(find.textContaining('坏'), findsNothing);
+
+    await tester.tap(
+      find.byKey(const ValueKey<String>('game-text-thread-selector')),
+    );
+    await tester.pumpAndSettle();
+    // 点真实 MenuItemButton，避免 `.last` 落到旧 DropdownMenu 的隐藏测宽副本。
+    final Finder cleanThreadItem = find.widgetWithText(
+      MenuItemButton,
+      'SiglusEngine 0x2000 · 1',
+    );
+    expect(cleanThreadItem, findsOneWidget);
+    await tester.tap(cleanThreadItem);
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('干'), findsWidgets);
+    expect(find.textContaining('坏'), findsNothing);
+  });
+
+  testWidgets('BUG-1315：无线程身份的行不受线程选择门控，未选线程也必须发布', (
+    WidgetTester tester,
+  ) async {
+    // 带线程身份的行：v12 起未被显式选中就不发布。
+    TexthookerService.instance.appendLine(
+      'フックした台詞',
+      textThreadKey: 'luna:hooked',
+      textThreadLabel: 'LunaHook 0x3000',
+      textHookCode: 'HS932@3000',
+      nativeTextThreadId: 0x3000,
+    );
+    // WebSocket / Textractor 端点的行不带 textThreadKey，永远进不了线程目录，
+    // 也就永远没有下拉项能选中它。拿「有没有选线程」去门控它等于永久丢弃，
+    // 而且用户无法自救——下拉里只会有上面那条 hook 线程。
+    TexthookerService.instance.appendLine(
+      'ソケット行',
+      source: TexthookerLineSource.websocket,
+      sourceLabel: 'ws://127.0.0.1:6677',
+    );
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    expect(
+      find.textContaining('ソ'),
+      findsWidgets,
+      reason: '无线程身份的行不归属任何候选线程，必须无条件进入工作台',
+    );
+    expect(
+      find.textContaining('詞'),
+      findsNothing,
+      reason: 'v12：带线程身份的行未被显式选中就不发布（BUG-1193 契约不得松动）',
+    );
+  });
+
+  testWidgets('thread selector lists discovered TextRender before any output', (
+    WidgetTester tester,
+  ) async {
+    TexthookerService.instance.registerTextThread(
+      key: 'luna:textrender',
+      label: 'TextRender · 0xf94600',
+      hookCode: 'HS932@f94600',
+      nativeThreadId: 0x9,
+    );
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    await tester.tap(
+      find.byKey(const ValueKey<String>('game-text-thread-selector')),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('TextRender · 0xf94600 · 0'), findsWidgets);
+  });
+
+  testWidgets(
+    'inactive workbench exposes low-frequency actions without a menu',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+      await tester.pump();
+
+      // 三点「更多」菜单已删：低频入口直接摊在工具栏上，不再需要先展开菜单。
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-more')),
+        findsNothing,
+        reason: '工具栏 overflow 菜单已删除，入口必须直接可见',
+      );
+      // byType 对泛型是精确匹配（PopupMenuButton<X> 不匹配 PopupMenuButton<Object?>），
+      // 所以这里用「三点图标」这个用户可见特征做守卫，换个泛型参数绕不过去。
+      expect(
+        find.byIcon(Icons.more_vert),
+        findsNothing,
+        reason: '捕获工作台工具栏不得再出现任何 overflow 菜单',
+      );
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-health')),
+        findsOneWidget,
+      );
+      expect(find.byTooltip('Health status'), findsOneWidget);
+      expect(
+        find.byTooltip('Manage audio tracks'),
+        findsNothing,
+        reason: 'PR #455 将会话音轨改为仅在活动会话显示的工具栏直达入口',
+      );
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-tracks')),
+        findsNothing,
+      );
+      // 降级策略入口取代了旧的 bool 开关项，按钮 tooltip 直接显示当前档位（默认 full）。
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-audio-fallback')),
+        findsOneWidget,
+      );
+      expect(
+        find.byTooltip('Audio fallback · Allow mixed audio'),
+        findsOneWidget,
+        reason: '三档策略入口必须显示当前档位，否则用户不知道自己在哪一档',
+      );
+      expect(
+        find.byTooltip('Allow audio fallback'),
+        findsNothing,
+        reason: '旧的 bool「允许音频降级」开关已被三档策略取代',
+      );
+      // BUG-1191：超分改成**每游戏一档**后，入口挪到了游戏库卡片的右键菜单
+      // （`games_library_page.dart` 的 `_menuItems`）——这里不该再有它。工作台是
+      // 「当前会话」的界面，而档位是「这个游戏」的属性，放这儿只会诱使人以为改的是
+      // 全局值。守卫用 `textContaining`：档位后缀（「· 关闭」）变了也照样红。
+      expect(
+        find.textContaining('Game window upscaling'),
+        findsNothing,
+        reason: '超分档位是每游戏属性，入口在游戏库卡片菜单，不在捕获工作台',
+      );
+    },
+  );
+
+  testWidgets('embedded mode reuses parent scaffold and exposes back action', (
+    WidgetTester tester,
+  ) async {
+    bool returned = false;
+    TexthookerService.instance.appendLine('嵌入行');
+    await tester.pumpWidget(
+      _wrapPage(
+        Scaffold(
+          body: TexthookerPage(
+            embedded: true,
+            onShowLibrary: () => returned = true,
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(
+      find.byType(Scaffold),
+      findsOneWidget,
+      reason: '嵌入工作台不得再创建第二层 Scaffold',
+    );
+    expect(find.byType(AppBar), findsNothing);
+    expect(find.textContaining('嵌'), findsWidgets);
+
+    await tester.tap(find.byIcon(Icons.arrow_back));
+    expect(returned, isTrue);
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pump();
+    expect(find.textContaining('嵌'), findsNothing);
+  });
+
+  testWidgets(
+    'embedded header keeps flattened actions without overflow at 520px',
+    (WidgetTester tester) async {
+      // 低频入口从三点菜单摊平后，嵌入模式页头动作数翻倍。页头动作区靠
+      // ConstrainedBox + 横向 SingleChildScrollView 兜底，窄窗必须是「可滚动」而不是
+      // RenderFlex overflow，更不能把入口整个丢掉。
+      await tester.binding.setSurfaceSize(const Size(520, 760));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      await tester.pumpWidget(
+        _wrapPage(const Scaffold(body: TexthookerPage(embedded: true))),
+      );
+      await tester.pump();
+
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: '摊平后的页头在窄窗不得 RenderFlex overflow',
+      );
+      // 平台无关的两个入口在任何桌面/移动平台都必须在（Windows 专属的浮窗 / 外部窗口
+      // 挖矿按钮受 Platform.isWindows 门控，不在此断言，免得 CI（Linux）假红）。
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-audio-fallback')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey<String>('game-toolbar-health')),
+        findsOneWidget,
+      );
+      expect(find.byIcon(Icons.more_vert), findsNothing);
+    },
+  );
+
+  // 2026-10 工作台重做：「本句音轨」不再常驻占栏——没选中台词时不出现；选中一句后
+  // 宽屏（≥ kGalWorkbenchWideBreakpoint）从右侧展开详情侧板，窄屏在底部升起「本句」
+  // 条，点「本句音轨」开底部 sheet（同一张音轨卡）。
+  for (final Size size in <Size>[
+    const Size(520, 760),
+    const Size(1000, 760),
+    const Size(1440, 850),
+  ]) {
+    testWidgets('capture console lays out at ${size.width.toInt()}px', (
+      WidgetTester tester,
+    ) async {
+      await tester.binding.setSurfaceSize(size);
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      TexthookerService.instance.appendLine('レスポンシブ確認');
+      await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+      await tester.pump();
+
+      expect(tester.takeException(), isNull);
+      expect(find.textContaining('Live lines'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey<String>('game-session-overview')),
+        findsOneWidget,
+      );
+      // 健康状态是工具组里的图标按钮 + 对话框，不常驻。
+      expect(find.text('Health status'), findsNothing);
+      // 未选中台词：没有详情侧板，也没有底部本句条。
+      expect(find.text('Tracks for this line'), findsNothing);
+      expect(
+        find.byKey(const ValueKey<String>('game-line-detail-pane')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const ValueKey<String>('game-selected-line-bar')),
+        findsNothing,
+      );
+
+      await _selectFirstLine(tester);
+
+      expect(tester.takeException(), isNull);
+      final bool wide = size.width >= kGalWorkbenchWideBreakpoint;
+      if (wide) {
+        expect(
+          find.byKey(const ValueKey<String>('game-line-detail-pane')),
+          findsOneWidget,
+        );
+        expect(find.text('Tracks for this line'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey<String>('game-selected-line-bar')),
+          findsNothing,
+        );
+        // 关闭：侧板收起，台词列表拿回全部宽度。
+        await tester.tap(
+          find.byKey(const ValueKey<String>('game-line-tracks-close')),
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey<String>('game-line-detail-pane')),
+          findsNothing,
+        );
+      } else {
+        expect(
+          find.byKey(const ValueKey<String>('game-line-detail-pane')),
+          findsNothing,
+        );
+        expect(
+          find.byKey(const ValueKey<String>('game-selected-line-bar')),
+          findsOneWidget,
+        );
+        expect(find.text('Tracks for this line'), findsNothing);
+        await tester.tap(
+          find.byKey(const ValueKey<String>('game-selected-line-open-tracks')),
+        );
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+        expect(find.text('Tracks for this line'), findsOneWidget);
+        expect(find.textContaining('レスポンシブ確認'), findsWidgets);
+      }
+    });
+  }
+
+  testWidgets('empty workbench offers the next step instead of a dead end', (
+    WidgetTester tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 850));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(
+      find.byKey(const ValueKey<String>('game-lines-empty')),
+      findsOneWidget,
+    );
+    expect(find.text('Tracks for this line'), findsNothing);
+    if (Platform.isWindows) {
+      // 未开始捕获：空状态直接给「启动并捕获 / 附着并捕获」。
+      expect(
+        find.byKey(const ValueKey<String>('game-empty-launch')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey<String>('game-empty-attach')),
+        findsOneWidget,
+      );
+    }
+  });
+
+  test('attached lookup status enum is always localized', () {
+    // 此前 `status.name` 原样上屏，界面出现「状态: disabled」。
+    final Set<String> labels = <String>{};
+    for (final GalAttachedTextStatus status in GalAttachedTextStatus.values) {
+      final String label = galAttachedTextStatusLabel(status);
+      expect(label.trim(), isNotEmpty, reason: '$status 缺本地化文案');
+      expect(label, isNot(status.name), reason: '$status 仍把枚举名原样上屏');
+      labels.add(label);
+      galAttachedTextStatusTone(status);
+      galAttachedTextStatusIcon(status);
+    }
+    expect(
+      labels.length,
+      GalAttachedTextStatus.values.length,
+      reason: '每个状态的文案应互不相同',
+    );
+    expect(
+      galAttachedTextStatusLabel(GalAttachedTextStatus.disabled),
+      t.game_lookup_attached_status_disabled,
+    );
+  });
+
+  testWidgets('选中线程被行上限淘汰后重建下拉不触发断言（BUG-952）', (WidgetTester tester) async {
+    // 把 session 选到一个 service 里并不存在的线程 key —— 等价于该线程被 500 行上限
+    // 淘汰/清空后 value 落在 items 之外。修复前 DropdownButton 会断言红屏。
+    await GalHookSessionController.instance.selectTextThread(
+      0x1,
+      threadKey: 'luna:evicted',
+    );
+    addTearDown(
+      () => GalHookSessionController.instance.selectTextThread(
+        null,
+        threadKey: null,
+      ),
+    );
+    TexthookerService.instance.appendLine(
+      '别的线程行',
+      textThreadKey: 'luna:other',
+      textThreadLabel: 'Other 0x2',
+      textHookCode: 'HS932@2',
+    );
+    await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+    await tester.pump();
+
+    expect(
+      tester.takeException(),
+      isNull,
+      reason: '选中线程被淘汰后 value 应回退占位「全部」，不得触发 DropdownButton 断言',
+    );
+    expect(
+      find.byKey(const ValueKey<String>('game-text-thread-selector')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('保活 tab 被 TickerMode 隐藏时查词浮层置 inert，恢复可见时复原（BUG-953）', (
+    WidgetTester tester,
+  ) async {
+    final ValueNotifier<bool> visible = ValueNotifier<bool>(true);
+    addTearDown(visible.dispose);
+    await tester.pumpWidget(
+      _wrapPage(
+        Scaffold(
+          body: ValueListenableBuilder<bool>(
+            valueListenable: visible,
+            builder: (BuildContext context, bool v, _) =>
+                TickerMode(enabled: v, child: const TexthookerPage()),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    bool inert() =>
+        (tester.state(find.byType(TexthookerPage)) as dynamic).debugOverlayInert
+            as bool;
+
+    expect(inert(), isFalse, reason: '可见时查词浮层不应 inert');
+
+    visible.value =
+        false; // 等价于切到别的 home tab（games 被 Offstage 隐藏 + TickerMode off）
+    await tester.pump();
+    expect(
+      inert(),
+      isTrue,
+      reason: 'tab 隐藏时必须把 root Overlay 里的查词浮层收起，防跨 tab 残留遮挡',
+    );
+
+    visible.value = true;
+    await tester.pump();
+    expect(inert(), isFalse, reason: '重新可见时恢复浮层');
+  });
+
+  testWidgets('mounted lookup overlay survives TickerMode dependency rebuild', (
+    WidgetTester tester,
+  ) async {
+    final ValueNotifier<bool> visible = ValueNotifier<bool>(true);
+    addTearDown(visible.dispose);
+    await tester.pumpWidget(
+      _wrapPage(
+        Scaffold(
+          body: ValueListenableBuilder<bool>(
+            valueListenable: visible,
+            builder: (BuildContext context, bool v, _) =>
+                TickerMode(enabled: v, child: const TexthookerPage()),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    final dynamic state = tester.state(find.byType(TexthookerPage));
+    state.debugMountPopupOverlayForTesting();
+    await tester.pump();
+
+    visible.value = false;
+    await tester.pump();
+
+    expect(
+      tester.takeException(),
+      isNull,
+      reason:
+          'TickerMode changes during build must not synchronously dirty '
+          'the root OverlayEntry and corrupt the layout queue',
+    );
+  });
+
+  group('injectActiveSentence（BUG-954：fallback 制卡带上活跃台词）', () {
+    test('fields 无 sentence + 有活跃台词 → 注入活跃台词，其它字段不变', () {
+      final Map<String, String> r = injectActiveSentence(<String, String>{
+        'expression': '語',
+      }, 'これは台詞です。');
+      expect(r['sentence'], 'これは台詞です。');
+      expect(r['expression'], '語');
+    });
+
+    test('fields 已有非空 sentence → 不覆盖调用方句子', () {
+      final Map<String, String> r = injectActiveSentence(<String, String>{
+        'sentence': '既存の文',
+      }, '活跃台詞');
+      expect(r['sentence'], '既存の文');
+    });
+
+    test('无活跃台词 / 空串 → 原样返回', () {
+      expect(
+        injectActiveSentence(<String, String>{'a': 'b'}, null),
+        <String, String>{'a': 'b'},
+      );
+      expect(
+        injectActiveSentence(<String, String>{'a': 'b'}, ''),
+        <String, String>{'a': 'b'},
+      );
+    });
+  });
+}

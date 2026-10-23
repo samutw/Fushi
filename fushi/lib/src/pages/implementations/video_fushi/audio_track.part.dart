@@ -1,0 +1,161 @@
+// GENERATED-NOTE: extracted from video_fushi_page.dart (TODO-590 batch9).
+part of '../video_fushi_page.dart';
+
+/// Audio-track domain methods extracted via part-of (TODO-590 batch9); shared
+/// private scope. Behaviour-preserving: bodies are verbatim except the lone
+/// `setState(() => _currentAudioTrackId = track.id)` rebuild inside
+/// [_selectAudioTrack] is routed through the main shell's `_rebuild(...)`
+/// forwarder (the established part paradigm — an extension cannot call the
+/// @protected `State.setState` directly). Everything else is moved
+/// character-for-character.
+///
+/// Covers persisted audio-track restoration ([_restoreAudioTrack]), explicit
+/// track selection ([_selectAudioTrack]), the settings-panel entry point
+/// ([_showAudioTrackMenu], TODO-1351 now routes to the settings sheet's `audio`
+/// category), the in-panel audio-track UI ([_buildAudioTrackSettingsSection]) and
+/// the shared track-label helper ([_trackLabel], also consumed by the
+/// subtitle/remote domains).
+///
+/// The instance field (`_currentAudioTrackId`), the `_VideoSidePanelKind` enum,
+/// and every collaborator getter/method (`_videoChromeColorScheme`,
+/// `_showVideoSidePanel`, `_showOsd`, the `widget.repo` audio-track persistence,
+/// the controller's `audioTracks` / `selectAudioTrack`) stay in the main shell;
+/// the extension reads/calls instance members through the shared private scope.
+extension _VideoAudioTrack on _VideoFushiPageState {
+  /// 若有持久化音轨偏好 [_currentAudioTrackId]，在 [controller] 的 audioTracks 里
+  /// 按 id 匹配并切换，恢复用户上次选的音轨（退出重进 / 换集复用）。
+  ///
+  /// audioTracks 在 libmpv `open` 后才**逐步**填充，时机随设备/首帧不定。旧实现固定
+  /// 等 300ms 后**单次**匹配，列表此刻常仍为空 → 匹配不到、且不重试 → 用户报「音频
+  /// 切换退出重进又得重新弄」。改为**有界轮询**：每 200ms 重试，最多 ~4s，直到列表里
+  /// 出现目标轨再切；期间换片/卸载（`_controller != controller`）即放弃。
+  Future<void> _restoreAudioTrack(VideoPlayerController controller) async {
+    if (controller.isBlurayNavigationSession) return;
+    final String? wantId = _currentAudioTrackId;
+    if (wantId == null || wantId.isEmpty) return;
+    for (int attempt = 0; attempt < 20; attempt++) {
+      if (!mounted || _controller != controller) return;
+      for (final AudioTrack track in controller.audioTracks) {
+        if (track.id == wantId) {
+          await controller.selectAudioTrack(track);
+          return;
+        }
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+    }
+  }
+
+  /// 选中某音轨：切轨 + 持久化 id（换集复用）+ SnackBar。
+  Future<void> _selectAudioTrack(
+    VideoPlayerController controller,
+    AudioTrack track,
+  ) async {
+    if (_discLearningBlocked) return;
+    final String bookUid = _activeBookUid;
+    final int generation = _episodeLoadSeq;
+    await controller.selectAudioTrack(track);
+    if (!mounted || generation != _episodeLoadSeq) return;
+    // 同系列音轨记忆（schema v52）：合集内选音轨写系列级，全系列共享（换集/从书架
+    // 重进任一集都读到）；单文件视频（无合集）仍走 per-book，行为与旧版一致。
+    //
+    // BUG-1636 → 播放偏好同步泛化批：远端播放在 client 无 VideoBooks 行（旧路径
+    // `updateAudioTrackId(远端uid)` 是静默 0 行 UPDATE，选轨退出即丢）——按稳定
+    // 远端 uid（合集连播 = 当前成员 id，与断点键 [_remotePositionKeyForIndex]
+    // 同构）落带戳键对 + 上报 host（逐字段 LWW，host 本机与其它设备跟随）。
+    // 卡片片段回看中暂存、继续观看时补存（BUG-3490）：key 在切换当时捕获。
+    final bool remote = _isRemote;
+    final (String uid, _) = _remotePositionKeyForIndex(_currentEpisode);
+    final int? collectionId = widget.playlistCollectionId;
+    await _saveReviewableChoice(_ReviewChoiceKind.audioTrack, () async {
+      if (remote) {
+        final int nowMs = await _stampRemoteStringPref(
+          videoRemoteAudioTrackPrefKey(uid),
+          videoRemoteAudioTrackAtPrefKey(uid),
+          track.id,
+        );
+        _pushRemotePlayback(
+          uid,
+          VideoPlaybackSyncState(audioTrackId: track.id, audioTrackAt: nowMs),
+        );
+      } else {
+        if (collectionId != null) {
+          // 系列级写入内聚盖戳：repo 会把值 + now 镜像进全体视频成员的互联键对。
+          await widget.repo.updateCollectionAudioTrackId(
+            collectionId,
+            track.id,
+          );
+        } else {
+          await widget.repo.updateAudioTrackId(bookUid, track.id);
+          // 本机镜像盖戳（互联 LWW 载体）：否则对端上报过一次后，本机选轨（row
+          // 无戳恒 0）永远输给旧戳、再也传不出去。
+          await _stampRemoteStringPref(
+            videoRemoteAudioTrackPrefKey(bookUid),
+            videoRemoteAudioTrackAtPrefKey(bookUid),
+            track.id,
+          );
+        }
+      }
+    });
+    if (!mounted || generation != _episodeLoadSeq) return;
+    _rebuild(() => _currentAudioTrackId = track.id);
+    _showOsd(
+      t.video_audio_track_switched(
+        label: _trackLabel(track.title, track.language, track.id),
+      ),
+    );
+  }
+
+  /// 弹音轨切换（顶栏 ♪ 按钮 / 右键菜单共用）。TODO-1351：音轨切换收进设置面板的
+  /// 「音频」分类（取代原来外面浮的音轨侧栏），此入口直接把设置面板开在 `audio` tab。
+  void _showAudioTrackMenu(
+    VideoPlayerController _, {
+    VideoControlSlot? sourceSlot,
+  }) {
+    _showPlayerSettings(sourceSlot: sourceSlot, initialCategory: 'audio');
+  }
+
+  /// TODO-1351：设置面板「音频」分类里的音轨切换区（取代外面浮的音轨侧栏）。用
+  /// [Builder] 让配色随设置面板自身主题解析（M3E 下是面板中性深色主题：选中轨是
+  /// secondaryContainer 圆角色块 + onSecondaryContainer 前景；Apple 照旧强调色）。轨列表
+  /// 读 controller 的 audioTracks、选中态 [_currentAudioTrackId]，点某轨走既有
+  /// [_selectAudioTrack]（切轨 + 持久化 + OSD）。空列表显示占位。
+  Widget _buildAudioTrackSettingsSection(VideoPlayerController controller) {
+    return Builder(
+      builder: (BuildContext context) {
+        final Color? selectedFg = videoPanelSelectedForeground(context);
+        final List<AudioTrack> tracks = controller.audioTracks;
+        if (tracks.isEmpty) {
+          return FushiListTileControl(
+            dense: true,
+            leading: const FushiIcon(Icons.audiotrack),
+            title: Text(t.video_audio_track_empty),
+            enabled: false,
+          );
+        }
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            for (final AudioTrack track in tracks)
+              FushiListTileControl(
+                dense: true,
+                leading: const FushiIcon(Icons.audiotrack),
+                title: Text(_trackLabel(track.title, track.language, track.id)),
+                selected: _currentAudioTrackId == track.id,
+                selectedColor: selectedFg,
+                trailing: _currentAudioTrackId == track.id
+                    ? FushiIcon(Icons.check, color: selectedFg)
+                    : null,
+                onTap: () => unawaited(_selectAudioTrack(controller, track)),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  String _trackLabel(String? title, String? language, String id) {
+    if ((title ?? '').isNotEmpty) return title!;
+    if ((language ?? '').isNotEmpty) return language!;
+    return id;
+  }
+}

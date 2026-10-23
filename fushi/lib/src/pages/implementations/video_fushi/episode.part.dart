@@ -1,0 +1,602 @@
+// GENERATED-NOTE: extracted from video_fushi_page.dart (TODO-590 batch4).
+part of '../video_fushi_page.dart';
+
+/// episode (剧集底部横向轨道 + 自动连播倒计时) domain methods extracted via
+/// part-of (TODO-590 batch4); shared private scope. Behaviour-preserving: bodies
+/// are verbatim copies — this domain references no `setState(` (so no `_rebuild(`
+/// forwarding). UI 巡检 PR-4 后 [_buildAutoAdvanceOverlay] 引用了一个 host
+/// `static`（`_VideoFushiPageState._videoBottomChromeBaseline`，倒计时卡几何
+/// 推导），按 batch3 惯例全限定。`kAutoPlayNextCountdownSeconds` is a
+/// top-level const in `video_episode_start_policy.dart` (already imported by the
+/// main shell), not a host-class static, so it stays a bare reference. The
+/// `_episodeListVisible` / `_autoAdvanceCountdownNotifier` notifiers, their
+/// timers/fields, and the `_episodes` / `_currentEpisode` playlist state stay in
+/// the main shell; the build-subtree parent `_videoWithSubtitlePanel` (subtitle
+/// domain) keeps calling the extracted `_episodeOverlayPanel` through shared private
+/// scope.
+extension _VideoEpisode on _VideoFushiPageState {
+  void _handlePlaybackCompleted() {
+    if (_controller?.isBlurayNavigationSession == true) return;
+    if (_sourceReviewActive) return;
+    final int? positionMs = _controller?.positionMs;
+    if (positionMs != null) {
+      unawaited(
+        _reportRemotePlaybackStopped(
+          info: _effectiveRemoteInfo,
+          client: _effectiveRemoteClient,
+          positionMs: positionMs,
+          generation: _remotePlaybackGeneration,
+        ),
+      );
+    }
+    if (!mounted) return;
+    // 有下一集才连播（单集 / 末集 / 越界不推进，停在本集结束）。
+    final int cur = _currentEpisode;
+    final int? nextEpisode =
+        (_episodes.length > 1 && cur >= 0 && cur < _episodes.length - 1)
+        ? cur + 1
+        : null;
+    // TODO-639　三门控(自动连播开关/有下一集/未在换集)任一不满足都停在本集结束。
+    if (!shouldAutoPlayNextOnCompletion(
+      autoPlayNextEnabled: appModel.videoAutoPlayNext,
+      hasNextEpisode: nextEpisode != null,
+      alreadyAdvancing: _autoAdvanceInFlight,
+    )) {
+      return;
+    }
+    // 不直接进下一集，先弹一个可取消的倒计时 OSD(「N 秒后播放下一集 · 取消」)。
+    // 倒计时归零→进下一集；用户点取消→停在本集([_cancelAutoAdvanceCountdown])。
+    _startAutoAdvanceCountdown(nextEpisode!);
+  }
+
+  /// 启动自动连播倒计时(TODO-639)。每秒 -1，归零调 [_runAutoAdvance] 进下一集。
+  void _startAutoAdvanceCountdown(int targetEpisode) {
+    _autoAdvanceCountdownTimer?.cancel();
+    _autoAdvanceCountdownTarget = targetEpisode;
+    _autoAdvanceCountdownNotifier.value = kAutoPlayNextCountdownSeconds;
+    _autoAdvanceCountdownTimer = Timer.periodic(const Duration(seconds: 1), (
+      _,
+    ) {
+      if (!mounted) {
+        _cancelAutoAdvanceCountdown();
+        return;
+      }
+      final int remaining = (_autoAdvanceCountdownNotifier.value ?? 0) - 1;
+      if (remaining <= 0) {
+        final int? target = _autoAdvanceCountdownTarget;
+        _cancelAutoAdvanceCountdown();
+        if (target != null) _runAutoAdvance(target);
+      } else {
+        _autoAdvanceCountdownNotifier.value = remaining;
+      }
+    });
+  }
+
+  /// 取消 / 清掉自动连播倒计时(用户点「取消」、倒计时归零推进前、或页面销毁时)。
+  void _cancelAutoAdvanceCountdown() {
+    _autoAdvanceCountdownTimer?.cancel();
+    _autoAdvanceCountdownTimer = null;
+    _autoAdvanceCountdownTarget = null;
+    _autoAdvanceCountdownNotifier.value = null;
+  }
+
+  /// 真正进下一集(倒计时归零后调用)。重入由 [_autoAdvanceInFlight] 守。
+  void _runAutoAdvance(int targetEpisode) {
+    if (_autoAdvanceInFlight) return;
+    if (!mounted) return;
+    _autoAdvanceInFlight = true;
+    unawaited(() async {
+      try {
+        if (!mounted) return;
+        await _switchEpisode(
+          targetEpisode,
+          intent: EpisodeStartIntent.autoAdvance,
+        );
+      } catch (e, stack) {
+        debugPrint('[VideoFushiPage] auto-advance failed: $e\n$stack');
+      } finally {
+        _autoAdvanceInFlight = false;
+      }
+    }());
+  }
+
+  /// 切到第 [index] 集。统一合集 Phase 3：本地每集是独立 VideoBooks 行 → 换集 =
+  /// pushReplacement 到该集的单视频页；远端保持原地 host 驱动换流。切前先把当前集
+  /// 精确位置补记落库（tick 只整秒写，补这一下避免丢尾部几百 ms），确保回到本集精确续播。
+  Future<void> _switchEpisode(
+    int index, {
+    required EpisodeStartIntent intent,
+    bool openBlurayMenu = false,
+  }) async {
+    if (!openBlurayMenu && (index < 0 || index >= _episodes.length)) return;
+    if (!openBlurayMenu && index == _currentEpisode) return;
+    // TODO-639：任何换集（手动上/下一集、列表选集、倒计时推进）都先清掉挂着的自动连播
+    // 倒计时 overlay，避免它停在旧目标上。
+    _cancelAutoAdvanceCountdown();
+
+    // TODO-885: 远端播放列表换集——本端无 VideoBooks 行，先把当前集精确位置落按集
+    // prefs（_persistRemotePosition 用 _currentEpisode），再按 episodeIndex 向 host
+    // 重新建流（_loadRemoteEpisode 内 ++_episodeLoadSeq 取代慢路径旧集）。
+    if (_isRemote) {
+      final int? curPos = _controller?.positionMs;
+      if (curPos != null) {
+        final RemoteVideoInfo? currentInfo = _effectiveRemoteInfo;
+        final RemoteVideoClient? currentClient = _effectiveRemoteClient;
+        final int currentGeneration = _remotePlaybackGeneration;
+        // BUG-2119：与本地分支同律，远端换集也不等落库。
+        // `_persistRemotePosition` 里两次 `setPref` 加一次 `updatePosition` 走同一条
+        // 连接，任一次事务 COMMIT 抛错，异常就从这里逃逸——`_loadRemoteEpisode` 永不
+        // 执行、`_currentEpisode` 不推进，互联 / Jellyfin / 流媒体书的换集按钮、剧集
+        // 列表、连播全部失灵，与本地分支此前那条同形。
+        persistInBackground(
+          persist: () => _persistRemotePositionAndReportPlaybackStopped(
+            uid: _activeBookUid,
+            positionMs: curPos,
+            info: currentInfo,
+            client: currentClient,
+            generation: currentGeneration,
+          ),
+          onPersistError: (Object error, StackTrace stack) => ErrorLogService
+              .instance
+              .log('VideoFushiPage.switchRemoteEpisodePersist', error, stack),
+        );
+      }
+      _watchTracker?.onEpisodeChanged();
+      // 视频源扩展取流是秒到几十秒级：这段时间旧集不能继续响着播——先停，换集 OSD
+      // （[_buildRemoteSwitchOverlay]）接手反馈；新集 load 内 autoPlay 起播。
+      await _controller?.pause();
+      if (!mounted) return;
+      await _loadRemoteEpisode(index, startIntent: intent);
+      return;
+    }
+
+    // 反馈（无编号，子代理发现）：本地换集的 pause / pushReplacement 之间隔着 await，
+    // 手动点选与自动连播倒计时归零可同时进入（`_autoAdvanceInFlight` 只挡连播自己）。
+    // 第二次进来会再压一页新集页，并对已被第一次摘掉的本页路由再 removeRoute（抛
+    // 异常）。本页同一时刻只允许一次本地换集在飞；先到者为准，后到者丢弃——它们的
+    // 目标集在第一次完成后本页已被替换，不再有意义。远端换集不受此限（它靠
+    // `_episodeLoadSeq` 让后一次请求取代前一次）。
+    if (!mounted || _localEpisodeSwitchInFlight) return;
+    _localEpisodeSwitchInFlight = true;
+    try {
+      // 统一合集 Phase 3：本地每集是独立 VideoBooks 行 → 换集 = pushReplacement 到兄弟集
+      // 的单视频页（同 playlistCollectionId 让新页仍带剧集面板/上下集/连播；_activeBookUid
+      // 恒为当前集，整套单视频 load/cue/收藏/持久化机制原样复用）。先落当前集精确位置
+      // （tick 只整秒写，补这一下避免丢尾部几百 ms）；新页 _init 从该集行 lastPositionMs 续播。
+      final String? targetUid = openBlurayMenu
+          ? _activeBookUid
+          : _episodes[index].bookUid;
+      if (targetUid == null) return;
+      // BUG-839：全屏播放时 app 全屏路由压在剧集页之上（fullscreen.part.dart 推到 root
+      // navigator）。裸 pushReplacement 会替换掉栈顶的**全屏路由**、把本集页漏在栈里 →
+      // 每连播一集残留一层、ESC 需逐层退。
+      //
+      // BUG-2043：BUG-839 的第一版修法是「先 pop 全屏路由再 pushReplacement、新页就绪再重进
+      // 全屏」。pop 会经 media_kit 的 PopScope 触发一次**原生退全屏**（Windows：runner 还原
+      // 窗口矩形 + app 标题栏闪现），新页就绪后再进一次——一次换集窗口尺寸来回抖两轮，
+      // Windows 同步 resize 与 media_kit 纹理拆建叠在一起偶发卡死 / 布局错位；字幕列表
+      // 也随旧页一起丢。现在改为**接管**：新页直接压在全屏路由之上（原生全屏全程不退），
+      // 以 initialFullscreen 承接原生全屏所有权、就绪后压自己的全屏路由；本页随即用
+      // removeRoute 静默摘掉旧全屏路由与本页——removeRoute 不经 pop，不触发 PopScope 的
+      // 原生退全屏，栈仍恒平（[home, 新集页] → 新集页就绪后 [home, 新集页, 新全屏路由]）。
+      // 新页若就绪失败 / 中途退出，由它自己释放原生全屏（[_releaseHandedOverNativeFullscreen]）。
+      final PageRoute<void>? oldFullscreenRoute = _videoFullscreenRoute;
+      // 捕获 NavigatorState / 本页路由（在 await 前），避免跨 async gap 用 context。
+      final NavigatorState navigator = Navigator.of(context);
+      final NavigatorState rootNavigator = Navigator.of(
+        context,
+        rootNavigator: true,
+      );
+      final Route<Object?>? currentRoute = ModalRoute.of(context);
+      // 「接管 vs 顶替」与「是否把原生全屏交给新页」收敛进纯函数（真值表单测：
+      // test/media/video/video_episode_start_policy_test.dart）。这里不再手写布尔
+      // 表达式，杜绝「条件被改成恒真/恒假、接管块整体变死代码」这类源码守卫抓不到的回归。
+      final EpisodeSwitchPlan plan = resolveEpisodeSwitchPlan(
+        fullscreenRouteActive: oldFullscreenRoute?.isActive ?? false,
+        ownsHandedOverNativeFullscreen: _ownsHandedOverNativeFullscreen,
+        hasCurrentRoute: currentRoute != null,
+      );
+      final int? curPos = _controller?.positionMs;
+      if (curPos != null) {
+        // BUG-2119：换集不等落库（同退出汇聚点 [_handleBackOrExit]）。此前 `await`
+        // 在这里——连接被毒化时 `setPref` 事务 COMMIT 抛错 / 挂死，换集按钮、剧集列表、
+        // 连播全部卡死。drift 请求已同步排进队列，新页读该集行排在它之后。
+        persistInBackground(
+          persist: () => _persistPosition(_activeBookUid, curPos),
+          onPersistError: (Object error, StackTrace stack) => ErrorLogService
+              .instance
+              .log('VideoFushiPage.switchEpisodePersist', error, stack),
+        );
+      }
+      // BUG-823：本地换集用 pushReplacement，Flutter 语义下旧路由要等新页入场过渡动画
+      // 结束才被移除并 dispose（旧页 dispose 里才 _controller?.dispose() 停播）。过渡窗口
+      // 内旧页 controller 仍在放音，而新页 _init 已新建 player 并 autoPlay 起播 → 两条音轨
+      // 短暂同响（观感：切集时上一个视频还在播）。换集前先 pause 旧播放器，音轨即刻静音，
+      // 不再依赖延迟 dispose。远端分支同样先 pause（在线源扩展取流可达数十秒，旧集不能响着等）。
+      await _controller?.pause();
+      if (!context.mounted) return;
+      final Route<void> nextRoute = adaptivePageRoute<void>(
+        context: context,
+        builder: (_) => VideoFushiPage.neutralized(
+          bookUid: targetUid,
+          openBlurayMenu: openBlurayMenu,
+          repo: widget.repo,
+          playlistCollectionId: widget.playlistCollectionId,
+          // BUG-2043：字幕列表随集常驻——换集前开着就带到新页，不再随旧页一起丢。
+          initialSubtitleListVisible: _subtitleListVisible.value,
+          initialFullscreen: plan.handOverNativeFullscreen,
+          sourceReviewSession: _sourceReviewSession,
+        ),
+      );
+      if (plan.mode == EpisodeSwitchMode.replace) {
+        await navigator.pushReplacement<void, void>(nextRoute);
+        return;
+      }
+      // 原生全屏所有权随 initialFullscreen 交给新页：本页不再在 dispose 里释放它，
+      // 挂着的一次性重进全屏回调也不得再压路由（本页马上被摘）。
+      _ownsHandedOverNativeFullscreen = false;
+      _didInitialFullscreen = true;
+      unawaited(navigator.push<void>(nextRoute));
+      if (oldFullscreenRoute != null && oldFullscreenRoute.isActive) {
+        rootNavigator.removeRoute<void>(oldFullscreenRoute);
+      }
+      // `!` 安全：走到这里 plan.mode == takeover，而 takeover 蕴含入参
+      // hasCurrentRoute 为真（见 [resolveEpisodeSwitchPlan]——摘不掉本页会漏栈，
+      // 所以拿不到 ModalRoute 时它一律退回 replace 并在上面早退）。
+      navigator.removeRoute<Object?>(currentRoute!);
+    } finally {
+      _localEpisodeSwitchInFlight = false;
+    }
+  }
+
+  /// 剧集列表入口（控制条剧集按钮）。保留 `_showEpisodeList` 作为控制条入口，
+  /// 呈现层由 [_episodeOverlayPanel] 在视频底部画非模态横向轨道。
+  void _showEpisodeList() {
+    _toggleEpisodeList();
+  }
+
+  /// 翻转剧集横向轨道可见性（控制条剧集按钮入口）。
+  ///
+  /// 与字幕列表（[_toggleSubtitleJumpList]）保持互斥：开剧集轨道先关字幕列表
+  /// （[_subtitleListVisible]）与任何打开的浮层（[_videoSidePanel]），避免多个
+  /// 浏览/设置表面同时争抢视频空间。打开时唤醒控制条让用户看到入口。
+  void _toggleEpisodeList() {
+    final bool next = !_episodeListVisible.value;
+    if (next) {
+      _clearRailHover();
+      // 与浮层互斥：开剧集轨道前关掉任何打开的浮层（设置/音轨/倍速等）。
+      _hideVideoControlEditOverlay(revealControls: false);
+      // 与字幕列表互斥：同一时刻右栏只占其一。
+      if (_subtitleListVisible.value) {
+        _closeSubtitleJumpList();
+      }
+      _episodeListVisible.value = true;
+      if (_videoSidePanel.value != null) {
+        _hideVideoSidePanel();
+      }
+      _markControlsVisible(false);
+      _focusOwnership.reclaim(FocusReclaimCause.overlayClosed);
+    } else {
+      _closeEpisodeList();
+    }
+  }
+
+  /// 关闭剧集轨道。**三条关闭路径的单一真相源**：面板头部 ×
+  /// 按钮（[VideoEpisodePanel.onClose]）、Esc 键、控制条剧集按钮（后两者经
+  /// [_toggleEpisodeList] 的关闭分支）都调它，避免「关闭副作用各写一份」分叉。关闭时
+  /// 必须：隐藏列表（[_episodeListVisible]）、唤回控制条（[_pokeControlsVisible]）、把焦点
+  /// 归还视频（[_focusOwnership]，否则键盘 / 手柄后续失焦）。
+  void _closeEpisodeList() {
+    _episodeListVisible.value = false;
+    _pokeControlsVisible();
+    _focusOwnership.reclaim(FocusReclaimCause.overlayClosed);
+  }
+
+  /// 点剧集列表里某集：切到该集（复用 [_switchEpisode]）。换集后保持列表常驻（用户可
+  /// 连续浏览/切集）；当前集高亮由面板按 currentIndex
+  /// 自动跟随。
+  void _handleEpisodeListTap(int index) {
+    _pokeControlsVisible();
+    _switchEpisode(index, intent: EpisodeStartIntent.listSelect);
+  }
+
+  /// 把内部集表示 [_PlaylistEpisodeRef] 解析成面板要的 [VideoEpisodeEntry]。
+  ///
+  /// 封面来源判断**不在这里手写分支**——统一走 [resolveMediaCoverImage]：本地集给
+  /// `coverPath`、互联远端集给 `coverUrl` + 稳定缓存键，解析器按固定优先级出图。
+  ///
+  /// v68 Jellyfin 对齐三件套：
+  /// * 集名：集级刮削集名优先（[_PlaylistEpisodeRef.displayTitle]），回落文件名；
+  /// * 封面回退链的合集段：本集无图 → 合集 titleCard → backdrop
+  ///   （Episode Primary → Series Thumb → Backdrop 的本仓版），此前直接掉到
+  ///   灰色占位图标；
+  /// * 看完/在看角标（Jellyfin played 勾）：轨道本就支持，把数据喂上。
+  /// 旧单行 playlist 远端模型（`RemoteVideoEpisode`）不下发封面，全部图源皆空 →
+  /// 返回 null，面板退回纯序号形态。
+  ///
+  /// 结果按输入身份 memo（见 [_episodePanelEntriesMemo]）：面板常驻在树里、页面
+  /// 每次 setState 都重建它，不 memo 就是每帧对全部 N 集重跑正则 + 重建 provider。
+  List<VideoEpisodeEntry> _episodePanelEntries() {
+    final RemoteCoverFetcher? fetcher = remoteCoverFetcherFor(
+      widget.remoteClient ?? _resolvedStreamClient,
+    );
+    final List<VideoEpisodeEntry>? memo = _episodePanelEntriesMemo;
+    if (memo != null &&
+        identical(_episodePanelEntriesEpisodes, _episodes) &&
+        identical(_episodePanelEntriesFetcher, fetcher) &&
+        identical(_episodePanelEntriesImages, _playlistCollectionImages)) {
+      return memo;
+    }
+    final ImageProvider? seriesFallback = _playlistSeriesFallbackCover();
+    // 集号**整批**解析（BUG-2369）：逐个文件名解析在「不补零」的目录里会
+    // 1..9 解不出、10.. 解得出，一半卡片掉回顺位号；整批交给解析器，解不出的
+    // 由同目录兄弟文件差分补齐。键与下面查表口径必须一致。
+    final List<String> numberKeys = <String>[
+      for (final _PlaylistEpisodeRef e in _episodes)
+        e.path.isNotEmpty ? e.path : e.title,
+    ];
+    final List<int?> numbers = parsedEpisodeNumbersOf(numberKeys);
+    final Map<String, int?> numberByKey = <String, int?>{
+      for (int i = 0; i < numberKeys.length; i++) numberKeys[i]: numbers[i],
+    };
+    final List<VideoEpisodeEntry> entries = <VideoEpisodeEntry>[
+      for (final _PlaylistEpisodeRef e in _episodes)
+        VideoEpisodeEntry(
+          title: e.displayTitle ?? e.title,
+          // 角标集号取**文件名解析值**而非列表下标（BUG-1544）：缺集时下标必然
+          // 说谎。远端集无路径 → 退回按标题解析；再解不出由卡片回落顺位号。
+          episodeNumber: numberByKey[e.path.isNotEmpty ? e.path : e.title],
+          // 季分组与合集详情页季 tab 同源（文件名纯函数，BUG-2520）：多季合集
+          // 在播放器内也能切季，而不是一条混着 S01/S02/PV 的长轨道。
+          groupKey: collectionGroupKeyForFilename(
+            e.path.isNotEmpty ? e.path : e.title,
+          ),
+          cover:
+              resolveMediaCoverImage(
+                kind: MediaKind.video,
+                localPath: e.coverPath,
+                remoteUrl: e.coverUrl,
+                remoteFetcher: fetcher,
+                remoteCacheKey: e.coverCacheKey,
+              ) ??
+              seriesFallback,
+          completed: e.completed,
+          started: e.started,
+          progress: e.progress,
+        ),
+    ];
+    _episodePanelEntriesEpisodes = _episodes;
+    _episodePanelEntriesFetcher = fetcher;
+    _episodePanelEntriesImages = _playlistCollectionImages;
+    return _episodePanelEntriesMemo = entries;
+  }
+
+  /// 季 chip 文案：`s<N>` → 「第 N 季」；extras → 「PV·特典」（与合集详情页
+  /// `_groupLabel` 同一套 i18n）。
+  String _episodeSeasonLabel(String groupKey) {
+    final int? season = seasonNumberOfGroupKey(groupKey);
+    return season == null
+        ? t.collection_group_extras
+        : t.collection_group_season(n: season);
+  }
+
+  /// 剧集卡封面回退链的合集段（v68）：合集带字横图 → 无字背景；全缺 → null
+  /// （面板占位图标）。整组只解析一次，面板 N 张卡共享同一 provider。
+  ImageProvider? _playlistSeriesFallbackCover() {
+    for (final MediaImageKind kind in const <MediaImageKind>[
+      MediaImageKind.titleCard,
+      MediaImageKind.backdrop,
+    ]) {
+      for (final MediaImageRow row in _playlistCollectionImages) {
+        if (row.kind == kind.dbValue && row.path.isNotEmpty) {
+          return resolveMediaCoverImage(
+            kind: MediaKind.video,
+            localPath: row.path,
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  /// 剧集列表改为覆盖在**视频底部**的横向轨道：画面继续作为沉浸式背景，不把
+  /// 16:9 视频挤成窄栏。字幕跳转列表仍是 push-aside；两者沿用既有互斥状态。
+  ///
+  /// 隐藏态留在树里做 slide + fade，经 [FadingChromeGate] 保证不可见层不吃画面点击
+  /// **且不可聚焦**（BUG-1301：旧实现只有 [IgnorePointer]，挡不住焦点遍历——手柄
+  /// 浏览剧集卡片后关面板，焦点滞留在 opacity=0 的卡片 InkWell 上，焦点环在画面上
+  /// 画出一个空框）。× / Esc / 控制条按钮仍全部经 [_closeEpisodeList]，关闭副作用不分叉。
+  Widget _episodeOverlayPanel(bool visible) {
+    // M3E：剧集轨道与设置侧板同一层播放器 chrome——无色相中性深色渐变底 +
+    // 面板中性主题（季 chip、卡片文字读白前景，强调色仍是 app 主色）；Apple /
+    // 墨水屏照旧跟页面主题。
+    final bool neutral = videoM3ePanelNeutral(context);
+    final ColorScheme pageCs = _videoChromeColorScheme(context);
+    final ColorScheme cs = neutral ? videoM3ePanelScheme(pageCs) : pageCs;
+    // M3E 进出场：透明度走 effects 弹簧（不过冲），位移 + 轻微缩放走 spatial
+    // 弹簧（带一点回弹）；墨水屏 / 减弱动态效果下 token 时长归零，瞬时到位。
+    final FushiMotionScheme motion = context.fushiMotion;
+    return PositionedDirectional(
+      start: 0,
+      end: 0,
+      bottom: 0,
+      child: FadingChromeGate(
+        visible: visible,
+        duration: motion.effectsDefault.duration,
+        curve: motion.effectsDefault.curve,
+        child: AnimatedSlide(
+          offset: visible ? Offset.zero : const Offset(0, 0.14),
+          duration: motion.spatialDefault.duration,
+          curve: motion.spatialDefault.curve,
+          child: AnimatedScale(
+            scale: visible ? 1 : 0.97,
+            alignment: Alignment.bottomCenter,
+            duration: motion.spatialDefault.duration,
+            curve: motion.spatialDefault.curve,
+            child: _withSidePanelOpaqueCursor(
+              SafeArea(
+                top: false,
+                // 手柄重设计 P3：轨道打开即把焦点领进面板（关闭还给页面焦点），
+                // D-pad 才能选集——本面板常驻挂载靠 FadingChromeGate 显隐，认领
+                // 必须跟 visible 边沿走而非挂载。
+                child: PanelFocusScope(
+                  visible: visible,
+                  restoreFocus: () =>
+                      _focusOwnership.reclaim(FocusReclaimCause.overlayClosed),
+                  child: VideoM3ePanelTheme(
+                    child: VideoEpisodePanel(
+                      key: const ValueKey<String>('video-episode-panel'),
+                      episodes: _episodePanelEntries(),
+                      currentIndex: _currentEpisode,
+                      onTapEpisode: _handleEpisodeListTap,
+                      onClose: _closeEpisodeList,
+                      colorScheme: cs,
+                      title: t.video_episode_list,
+                      emptyHint: t.video_episode_list_empty,
+                      seasonLabelOf: _episodeSeasonLabel,
+                      fontSize: 14 * _videoUiScale,
+                      visible: visible,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // BUG-1301 note: 上面的 [FadingChromeGate] 同时承担旧 IgnorePointer + AnimatedOpacity
+  // 的职责（少一层嵌套），几何与动画时序不变。
+
+  /// 远端换集在途 OSD：居中「转圈 + 阶段文案 + 网络读取速度」，只在
+  /// [_remoteSwitchPhase] 非 null 时渲染，纯展示套 [IgnorePointer]（控制条照常可点，
+  /// 用户随时能再切别的集 / 退出）。窗口 / 全屏复用（挂在同一 controls Stack）。
+  Widget _buildRemoteSwitchOverlay() {
+    final ColorScheme cs = _videoChromeColorScheme(context);
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ValueListenableBuilder<_VideoLoadPhase?>(
+          valueListenable: _remoteSwitchPhase,
+          builder: (BuildContext _, _VideoLoadPhase? phase, __) {
+            if (phase == null) return const SizedBox.shrink();
+            final Color textColor = _osdTextColor(cs);
+            final double scale = _videoUiScale;
+            final ValueListenable<double?>? speed = _networkReadSpeedOf(
+              _controller,
+            );
+            return Center(
+              child: Container(
+                key: const ValueKey<String>('video-remote-switch-overlay'),
+                padding: EdgeInsets.symmetric(
+                  horizontal: 20 * scale,
+                  vertical: 16 * scale,
+                ),
+                decoration: BoxDecoration(
+                  color: _osdSurfaceColor(cs),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    SizedBox(
+                      width: 32 * scale,
+                      height: 32 * scale,
+                      child: FushiCircularProgressIndicator(color: textColor),
+                    ),
+                    SizedBox(height: 12 * scale),
+                    Text(
+                      _loadingPhaseLabel(phase),
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 14 * scale, color: textColor),
+                    ),
+                    if (speed != null)
+                      Padding(
+                        padding: EdgeInsets.only(top: 6 * scale),
+                        child: VideoReadSpeedLabel(
+                          readSpeed: speed,
+                          color: textColor.withValues(alpha: 0.8),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 自动连播倒计时 overlay（TODO-639）。一集播完且自动连播开关开着时，画面右下角弹出
+  /// 「N 秒后播放下一集」+「取消」可点按钮；点取消调 [_cancelAutoAdvanceCountdown] 停在
+  /// 本集。**不**套 [IgnorePointer]（取消按钮必须可点），与纯展示的 [_buildOsdOverlay]
+  /// 区分；非倒计时态渲染零尺寸、不拦截画面手势。窗口 / 全屏复用（挂在同一 controls
+  /// Stack，与 OSD 同源）。
+  Widget _buildAutoAdvanceOverlay() {
+    final ColorScheme cs = _videoChromeColorScheme(context);
+    // 倒计时卡底部避让从进度条真实几何推导（UI 巡检 PR-4）：与章节刻度层同源的
+    // [videoSeekBarTrackBand]（tickHeight 取轨道高 → band 顶缘 = 轨道上缘），卡片
+    // 底缘 = 轨道上缘 + 16×缩放 呼吸间距——此前固定 88 不吃 [_videoUiScale] 也不
+    // 吃系统 inset，缩放 >1 或手势导航高 inset 时压进进度条 / 按钮条。
+    final ({double bottom, double height}) band = videoSeekBarTrackBand(
+      trackCenter: _videoSeekBarTrackCenter,
+      tickHeight: _videoSeekBarTrackHeight * _controlsDensityScale,
+    );
+    final double countdownBottom =
+        band.bottom + band.height + 16 * _videoUiScale;
+    return Positioned(
+      right: 0,
+      bottom: 0,
+      child: SafeArea(
+        child: Padding(
+          padding: EdgeInsets.only(right: 16, bottom: countdownBottom),
+          child: ValueListenableBuilder<int?>(
+            valueListenable: _autoAdvanceCountdownNotifier,
+            builder: (BuildContext _, int? seconds, __) {
+              if (seconds == null) return const SizedBox.shrink();
+              return Material(
+                color: _osdSurfaceColor(cs),
+                borderRadius: BorderRadius.circular(8),
+                clipBehavior: Clip.antiAlias,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      FushiIcon(
+                        Icons.playlist_play_outlined,
+                        size: 18,
+                        color: _osdTextColor(cs),
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        t.video_auto_play_next_countdown(seconds: seconds),
+                        style: TextStyle(
+                          color: _osdTextColor(cs),
+                          fontSize: 14,
+                          height: 1.2,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FushiTextButton(
+                        onPressed: _cancelAutoAdvanceCountdown,
+                        style: TextButton.styleFrom(
+                          foregroundColor: _osdTextColor(cs),
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                        ),
+                        child: Text(t.video_auto_play_next_cancel),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,190 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import '../helpers/source_guard.dart';
+
+/// TODO-1079 / BUG-503 — app-external (Windows) global lookup popup "sometimes
+/// does not appear" root-cause guards (source scan).
+///
+/// The overlay is a real top-level WebView2 window. The flake was a timing /
+/// lifecycle-ownership problem, not a platform limit:
+///   A. the overlay WebView2 was created lazily on the first ShowAt and NEVER
+///      prewarmed, so the first hotkey raced a cold create chain (>450ms);
+///   B. reveal fell back to a BLIND 450ms timeout that could reveal a
+///      not-yet-loaded surface as a blank window;
+///   C. the host's lastBBoxKey de-dup could swallow a new lookup's first
+///      overlaySize (the reveal driver) when its bbox equalled the previous;
+///   D. native visible_/revealed_ and Dart _revealed drifted across lookups.
+///
+/// These guards lock the fix wiring at the strongest layer this harness can
+/// reach (source scan); the real WebView2 cold-start timing is a device/visual
+/// (Category-A) item verified on hardware by the integration owner.
+void main() {
+  String read(String p) => File(p).readAsStringSync();
+
+  group('A — overlay WebView2 is prewarmed off-screen (own ownership)', () {
+    test('Dart channel exposes prewarmWebView', () {
+      final String
+          ch = // spec 2026-07-10: channel 实现在 overlay_window_channel.dart（门面+实现拼接扫描）
+          read('lib/src/lookup/global_lookup_channel.dart') +
+              read('lib/src/lookup/overlay_window_channel.dart');
+      expect(
+        ch.contains("_invoke<void>('prewarmWebView'"),
+        isTrue,
+        reason: 'a dedicated prewarm channel method must exist',
+      );
+    });
+
+    test('每个通道调用都经注入 target 的唯一出口', () {
+      // 逐个方法手写 target 迟早漏一个，漏掉的那个会静默打到**另一个窗口**上
+      // （桌面浮窗 vs 游戏内离屏卡片）。出口只能有一个，裸 invokeMethod 只允许
+      // 出现在出口自身体内。
+      // 先掩码再数：那段 helper 的注释里正好逐字写着这个调用（它在解释为什么这里
+      // 必须是 _channel.invokeMethod 而不是 _invoke），裸计数会把注释一起算进来。
+      final String impl = maskComments(
+        read('lib/src/lookup/overlay_window_channel.dart'),
+      );
+      expect(
+        '_channel.invokeMethod'.allMatches(impl).length,
+        1,
+        reason: '除 _invoke 自身外不得裸调 _channel.invokeMethod',
+      );
+    });
+
+    test('controller triggers the prewarm from start()', () {
+      final String c = read('lib/src/lookup/global_lookup_controller.dart');
+      expect(c.contains('GlobalLookupChannel.prewarmWebView('), isTrue);
+      expect(
+        c.contains('_prewarmOverlay('),
+        isTrue,
+        reason: 'start() must kick the off-screen prewarm',
+      );
+    });
+
+    test('native window has a PrewarmWebView entry that navigates host.html',
+        () {
+      final String h = read('windows/runner/global_lookup_window.h');
+      expect(h.contains('void PrewarmWebView('), isTrue);
+      final String cpp = read('windows/runner/global_lookup_window.cpp');
+      expect(cpp.contains('void GlobalLookupWindow::PrewarmWebView('), isTrue);
+      // Prewarm builds the window + WebView2 (EnsureWebView navigates host.html)
+      // and shows it OFF-SCREEN without arming visible_/the dismiss hooks.
+      final int idx = cpp.indexOf('GlobalLookupWindow::PrewarmWebView(');
+      final int end = cpp.indexOf('\n}\n', idx);
+      final String body = cpp.substring(idx, end);
+      expect(body.contains('EnsureWebView()'), isTrue);
+      expect(body.contains('OffscreenX()'), isTrue);
+      expect(body.contains('visible_ = false'), isTrue);
+    });
+
+    test('the channel dispatches prewarmWebView natively', () {
+      final String fw = read('windows/runner/flutter_window.cpp');
+      expect(fw.contains('method == "prewarmWebView"'), isTrue);
+      expect(fw.contains('->PrewarmWebView('), isTrue);
+    });
+  });
+
+  group('B — reveal fallback is READY-DRIVEN, not a blind 450ms timeout', () {
+    late String c;
+    setUpAll(() {
+      c = read('lib/src/lookup/global_lookup_controller.dart');
+    });
+
+    test('a readiness query exists on the channel + native', () {
+      final String
+          ch = // spec 2026-07-10: channel 实现在 overlay_window_channel.dart（门面+实现拼接扫描）
+          read('lib/src/lookup/global_lookup_channel.dart') +
+              read('lib/src/lookup/overlay_window_channel.dart');
+      expect(ch.contains("_invoke<bool>('isWebViewReady')"), isTrue);
+      final String fw = read('windows/runner/flutter_window.cpp');
+      expect(fw.contains('method == "isWebViewReady"'), isTrue);
+      final String hpp = read('windows/runner/global_lookup_window.h');
+      expect(hpp.contains('bool IsWebViewReady()'), isTrue);
+    });
+
+    test('the safety reveal confirms readiness before revealing', () {
+      expect(c.contains('_scheduleReadyDrivenSafety('), isTrue);
+      expect(
+        c.contains('GlobalLookupChannel.isWebViewReady()'),
+        isTrue,
+        reason: 'the fallback must gate on isWebViewReady, not reveal blind',
+      );
+    });
+
+    test(
+      'galCard waits for versioned geometry before the bounded fallback',
+      () {
+        expect(
+          c.contains('final bool awaitingGalGeometry ='),
+          isTrue,
+          reason:
+              'game cards need overlaySize/captureReady, not readiness alone',
+        );
+        expect(c.contains("currentRoute.source == 'galCard'"), isTrue);
+        expect(
+          c.contains('(!awaitingGalGeometry && ready)'),
+          isTrue,
+          reason: 'WebView readiness must retain the desktop-only fast path',
+        );
+        expect(
+          c.contains('attempt >= _kReadySafetyMaxAttempts'),
+          isTrue,
+          reason: 'galCard must retain a bounded epoch-0 last resort',
+        );
+      },
+    );
+
+    test('the retired blind-timeout reveal is gone', () {
+      // The old path revealed unconditionally on a 450ms Timer regardless of
+      // readiness. That exact "SAFETY timeout" reveal must no longer exist.
+      expect(
+        c.contains("glog('reveal: SAFETY timeout"),
+        isFalse,
+        reason: 'the blind 450ms reveal must be replaced by the ready gate',
+      );
+    });
+  });
+
+  group('C — host bbox de-dup is reset per new lookup', () {
+    test('host resets lastBBoxKey when the root frame id changes', () {
+      final String js = read('assets/popup/global_lookup_host.js');
+      expect(
+        js.contains('lastRootId'),
+        isTrue,
+        reason: 'the host must track the root id to detect a fresh lookup',
+      );
+      // A changed root id clears the de-dup so the new card overlaySize fires.
+      expect(
+        js.contains('lastBBoxKey = ') && js.contains('rootId !== lastRootId'),
+        isTrue,
+      );
+    });
+  });
+
+  group('D — reveal state is reset from zero every lookup', () {
+    test('triggerSelectionLookup issues an unconditional hide() up front', () {
+      final String c = read('lib/src/lookup/global_lookup_controller.dart');
+      // 锚点只取前缀：这行日志后来带上了触发源标签（`FIRED (source=…)`，
+      // TODO-1066 手柄/鼠标侧键触发）。守卫要钉的是「开火 → hide → 抓选区」这个
+      // 顺序，不是那行日志的全文；用全等文本当锚点会让任何一次日志增补都变成假红。
+      final int fire = c.indexOf("glog('hotkey: FIRED");
+      final int capture = c.indexOf(
+        'SelectionCapture.captureForegroundSelection',
+      );
+      expect(fire, greaterThanOrEqualTo(0));
+      expect(capture, greaterThan(fire));
+      // The hide() reset must sit between the hotkey firing and selection
+      // capture, so native + Dart reveal state collapse to known-hidden first.
+      final String prelude = c.substring(fire, capture);
+      // TODO-1233 — the reset hide now passes notify:false (between-lookups
+      // reset, not a user dismissal → must not fire overlayHidden). The
+      // unconditional-reset INTENT the guard protects is unchanged.
+      expect(
+        prelude.contains('GlobalLookupChannel.hide(notify: false);'),
+        isTrue,
+        reason: 'each lookup must reset reveal state before showAt re-arms it',
+      );
+    });
+  });
+}

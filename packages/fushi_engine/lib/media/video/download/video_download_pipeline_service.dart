@@ -1,0 +1,4941 @@
+import 'dart:async';
+import 'dart:convert' show jsonEncode;
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:crypto/crypto.dart';
+import 'package:drift/drift.dart' show Value;
+import 'package:fushi_audio/fushi_audio_core.dart' show decodeTextBytes;
+import 'package:fushi_core/fushi_core.dart';
+import 'package:path/path.dart' as p;
+
+import 'package:fushi_engine/media/discovery/discovery_download_queue.dart'
+    show DiscoveryImportOutcome;
+import 'package:fushi_engine/media/discovery/discovery_models.dart'
+    show DiscoveryMediaKind;
+import 'package:fushi_engine/media/discovery/import/discovery_import_plan.dart'
+    show DiscoveryImportBlockedException;
+import 'package:fushi_engine/media/external_provider.dart';
+import 'package:fushi_engine/media/metadata/credential_redaction.dart';
+import 'package:fushi_engine/media/torrent/anime_download_config.dart';
+import 'package:fushi_engine/media/torrent/download_save_root.dart'
+    show sourceIncomingCategoryPath;
+import 'package:fushi_engine/media/torrent/magnet_utils.dart';
+import 'package:fushi_engine/media/torrent/nyaa_client.dart' show kNyaaTrackers;
+import 'package:fushi_engine/media/torrent/public_trackers.dart'
+    show kPublicTrackers;
+import 'package:fushi_engine/media/torrent/public_video_index_provider.dart'
+    show kApibayResourceProviderId, kKnabenResourceProviderId;
+import 'package:fushi_engine/media/torrent/torrent_add_coordinator.dart';
+import 'package:fushi_engine/media/torrent/torrent_backend.dart';
+import 'package:fushi_engine/media/torrent/torrent_metainfo.dart';
+import 'package:fushi_engine/media/torrent/video_resource_provider.dart';
+import 'package:fushi_engine/media/video/discovery/video_discovery_provider.dart';
+import 'package:fushi_engine/media/video/download/download_confirmed_identity.dart';
+import 'package:fushi_engine/media/video/download/video_download_backend_identity.dart';
+import 'package:fushi_engine/media/video/download/video_download_organizer.dart';
+import 'package:fushi_engine/media/video/download/video_media_reference_codec.dart';
+import 'package:fushi_engine/media/video/download/video_download_path_mapping.dart';
+import 'package:fushi_engine/media/video/download/video_download_subtitle_language.dart';
+import 'package:fushi_engine/media/video/download/video_resource_registry.dart';
+import 'package:fushi_engine/media/video/download/video_subtitle_registry.dart';
+import 'package:fushi_engine/media/video/external_video.dart'
+    show normalizeVideoPath;
+import 'package:fushi_engine/media/video/m3u8_playlist.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_models.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_provider.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_scrape_coordinator.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_work_planner.dart';
+import 'package:fushi_engine/media/video/subtitle/embedded_reference_subtitle_sync.dart';
+import 'package:fushi_engine/media/video/subtitle/subtitle_alignment_backup.dart';
+import 'package:fushi_engine/media/video/subtitle/subtitle_language_preference.dart';
+import 'package:fushi_engine/media/video/subtitle/subtitle_timing_check.dart';
+import 'package:fushi_engine/media/video/subtitle/video_subtitle_provider.dart';
+import 'package:fushi_engine/media/video/metadata/video_scrape_operation_gate.dart';
+import 'package:fushi_engine/media/video/scraper/cover_meta_store.dart';
+import 'package:fushi_engine/media/video/video_book_repository.dart';
+import 'package:fushi_engine/media/video/video_cover_extractor.dart';
+import 'package:fushi_engine/media/video/video_storage.dart';
+import 'package:fushi_engine/media/video/video_duration_probe.dart';
+import 'package:fushi_engine/media/video/video_filename_parser.dart';
+import 'package:fushi_engine/media/video/video_sidecar.dart'
+    show listSidecarSubtitles;
+import 'package:fushi_engine/updates/update_feed_kind.dart';
+import 'package:fushi_engine/updates/update_feed_port.dart';
+import 'package:fushi_engine/foundation/engine_log.dart';
+
+enum VideoDownloadSubtitlePolicy { none, bestEffort, required }
+
+/// 自动选字幕时最多真下几条候选来做时长校验（BUG-1697）。
+///
+/// 候选可能有几十条（多语言 × 多压制组），全下一遍既慢又是对来源站的滥用。
+/// 试完前 N 条还没有通过的，说明这个片子的自动匹配本来就不该硬猜，交给用户手选。
+const int kSubtitleVerifyMaxCandidates = 4;
+
+/// 已通过校验的候选 + 它那一次下载的字节（避免落盘前再下一遍）。
+class _VerifiedSubtitleBytes {
+  const _VerifiedSubtitleBytes({
+    required this.candidate,
+    required this.download,
+  });
+
+  final VideoSubtitleCandidate candidate;
+  final VideoSubtitleDownload download;
+}
+
+const String videoDownloadMissingBackendTaskError =
+    'torrent is not visible in the original backend';
+
+class VideoDownloadEnqueueRequest {
+  const VideoDownloadEnqueueRequest({
+    required this.media,
+    required this.resource,
+    required this.backendTarget,
+    required this.targetSourceId,
+    this.subtitlePolicy = VideoDownloadSubtitlePolicy.bestEffort,
+    this.priority = 0,
+    this.maxAttempts = 6,
+    this.coverUrl,
+  });
+
+  final VideoMediaReference media;
+  final VideoResourceCandidate resource;
+
+  /// 落点：后端实例 + 创建这一刻的投放分类（分类会被快照进任务行）。
+  final VideoDownloadBackendTarget backendTarget;
+  final int targetSourceId;
+  final VideoDownloadSubtitlePolicy subtitlePolicy;
+  final int priority;
+  final int maxAttempts;
+  final String? coverUrl;
+}
+
+/// 手动添加任务的 `resourceProvider` 值：这类任务没有发现身份，payload 来自
+/// 用户粘贴的磁力（`magnetUri` 列）或落盘的 .torrent 元数据文件。
+const String kManualVideoDownloadResourceProvider = 'manual';
+
+/// 手动「按域入库」任务的 organizationPolicy 前缀。完整值形如
+/// `discovery-novel`：organize 阶段只把文件解析成本机绝对路径（不重命名、不
+/// 进受管视频来源），import 阶段整包交给发现导入执行器按域入库。
+const String kManualDiscoveryPolicyPrefix = 'discovery-';
+
+/// 只下载、不自动入库的非视频任务策略。CoreAudio 单卷 m4b 没有正文/字幕，
+/// 下载完成后保留文件并正常结束任务，不能送进“正文 + 字幕 + 音频”的对齐导入器。
+const String kManualDownloadOnlyPolicyPrefix = 'download-only-';
+
+/// [kind] 域的手动任务 organizationPolicy 值。
+String manualDiscoveryOrganizationPolicy(DiscoveryMediaKind kind) =>
+    '$kManualDiscoveryPolicyPrefix${kind.name}';
+
+/// 从 organizationPolicy 还原发现域；非 `discovery-*` 策略返回 null。
+DiscoveryMediaKind? discoveryKindOfOrganizationPolicy(String policy) {
+  if (!policy.startsWith(kManualDiscoveryPolicyPrefix)) return null;
+  return DiscoveryMediaKind.values.asNameMap()[policy.substring(
+    kManualDiscoveryPolicyPrefix.length,
+  )];
+}
+
+String manualDownloadOnlyOrganizationPolicy(DiscoveryMediaKind kind) =>
+    '$kManualDownloadOnlyPolicyPrefix${kind.name}';
+
+DiscoveryMediaKind? downloadOnlyKindOfOrganizationPolicy(String policy) {
+  if (!policy.startsWith(kManualDownloadOnlyPolicyPrefix)) return null;
+  return DiscoveryMediaKind.values.asNameMap()[policy.substring(
+    kManualDownloadOnlyPolicyPrefix.length,
+  )];
+}
+
+/// 任务是否走「整理进受管视频来源」的流程（legacy 与按域入库/仅下载都不走）。
+bool videoDownloadJobUsesManagedSource(VideoDownloadJobRow job) =>
+    job.organizationPolicy != 'legacy' &&
+    discoveryKindOfOrganizationPolicy(job.organizationPolicy) == null &&
+    downloadOnlyKindOfOrganizationPolicy(job.organizationPolicy) == null;
+
+/// 目标来源失效时这条任务还能不能改绑到别的来源（BUG-2755）：受管任务、未完成、
+/// 文件还没最终落进来源（[kVideoDownloadSourceRebindableStages]）。
+bool videoDownloadJobTargetSourceRebindable(VideoDownloadJobRow job) =>
+    videoDownloadJobUsesManagedSource(job) &&
+    job.lifecycle != VideoDownloadJobLifecycle.completed &&
+    kVideoDownloadSourceRebindableStages.contains(job.stage);
+
+/// 受管视频来源此刻是否可用：存在、视频、本地、根目录可访问。与整理阶段的
+/// 校验同一判据，只是不抛异常。
+bool isUsableManagedVideoSource(MediaSourceRow? source) =>
+    source != null &&
+    source.mediaKind == 'video' &&
+    source.transport == 'local' &&
+    Directory(source.rootPath).existsSync();
+
+/// 手动添加任务（磁力链接 / .torrent 文件）。[magnetUri] 与 [metainfo] 恰好
+/// 传一个。[discoveryKind] 为 null 表示视频任务（走完整 organize/subtitle/
+/// import 视频流程，需要 [targetSourceId]）；非 null 表示按该域入库（书/漫画/
+/// 有声书/游戏，文件留在下载目录原地入库）。
+class VideoDownloadManualEnqueueRequest {
+  const VideoDownloadManualEnqueueRequest({
+    required this.title,
+    required this.backendTarget,
+    this.magnetUri,
+    this.metainfo,
+    this.selectedFileIndexes,
+    this.resourceTitle,
+    this.coverUrl,
+    this.metadataProvider,
+    this.externalId,
+    this.year,
+    this.discoveryKind,
+    this.importAfterDownload = true,
+    this.mediaKind = VideoMetadataMediaKind.movie,
+    this.targetSourceId,
+    this.subtitlePolicy = VideoDownloadSubtitlePolicy.none,
+    this.priority = 0,
+    this.maxAttempts = 6,
+  });
+
+  final String title;
+
+  /// 落点：后端实例 + 创建这一刻的投放分类（分类会被快照进任务行）。
+  final VideoDownloadBackendTarget backendTarget;
+  final String? magnetUri;
+  final InspectedTorrentMetainfo? metainfo;
+
+  /// null = 普通整颗 torrent；非空 = 只下载这些 metainfo file index。
+  /// 选择清单会在 add 之前写入 VideoDownloadJobFiles，作为崩溃恢复真相。
+  final Set<int>? selectedFileIndexes;
+  final String? resourceTitle;
+  final String? coverUrl;
+  final String? metadataProvider;
+  final String? externalId;
+
+  /// 作品年份（电影版本区分 / 合集命名 / 字幕搜索都用它）；null = 不知道。
+  final int? year;
+  final DiscoveryMediaKind? discoveryKind;
+
+  /// 非视频任务下载后是否交给发现导入器。false 时只完成下载任务。
+  final bool importAfterDownload;
+
+  /// 视频任务的组织形态：movie = 单文件；tv = 按季/集组织。
+  final VideoMetadataMediaKind mediaKind;
+  final int? targetSourceId;
+  final VideoDownloadSubtitlePolicy subtitlePolicy;
+  final int priority;
+  final int maxAttempts;
+}
+
+class VideoDownloadBackendBinding {
+  VideoDownloadBackendBinding({
+    required this.backend,
+    required this.identity,
+    VideoDownloadPathMapping? pathMapping,
+    Iterable<VideoDownloadPathMapping> pathMappings =
+        const <VideoDownloadPathMapping>[],
+  }) : pathMappings = List<VideoDownloadPathMapping>.unmodifiable(
+         <VideoDownloadPathMapping>[
+           if (pathMapping != null) pathMapping,
+           ...pathMappings,
+         ],
+       );
+
+  final TorrentBackend backend;
+  final VideoDownloadBackendIdentity identity;
+
+  /// Kept for source compatibility with callers that configure one mapping.
+  VideoDownloadPathMapping? get pathMapping => pathMappings.firstOrNull;
+  final List<VideoDownloadPathMapping> pathMappings;
+}
+
+/// 详情对话框拿不到**实时**数据时，究竟是为什么。
+///
+/// 这一层存在的理由：UI 侧原来只有 `backendOnline && backend == null` 一个
+/// 布尔量，于是把三种完全不同的状态折叠成同一句「该 torrent 已不在引擎中」。
+/// 其中最常见的一种根本不是异常——任务还排在队里等前面的下载让出槽位，
+/// 压根**还没被交给下载器**，却被报成「引擎里丢了」（用户报障：「明明只是
+/// 因为其他东西在下载」）。
+///
+/// 判据只有服务层拿得到（它持有 job 行，知道 stage 和有没有 backendTaskId），
+/// 所以由这里定性、UI 只负责渲染，杜绝 UI 二次猜测。
+enum VideoDownloadLiveDataAbsence {
+  /// 有实时数据，不缺。
+  none,
+
+  /// 还没交给下载器：任务仍在 `enqueue` 阶段（排队等槽位），或还没有拿到
+  /// 后端任务 id。**这是正常状态，不是故障**。
+  notHandedOff,
+
+  /// 交给过下载器，但现在引擎里找不到这个 hash——真丢了。
+  missingFromBackend,
+
+  /// 记录在案的那个后端此刻连不上（换机 / profile 变更 / 装包不全）。
+  backendOffline,
+}
+
+/// Details that remain useful even when the backend recorded by a durable job
+/// is no longer reachable. [backend] is only populated when that exact backend
+/// identity can be resolved; [snapshot] and [files] always have persisted
+/// fallbacks so opening the details dialog never depends on live infrastructure.
+class VideoDownloadJobDetails {
+  const VideoDownloadJobDetails({
+    required this.snapshot,
+    required this.files,
+    this.backend,
+    this.backendOnline = false,
+    this.liveDataAbsence = VideoDownloadLiveDataAbsence.none,
+  });
+
+  final TorrentBackend? backend;
+  final bool backendOnline;
+  final TorrentSnapshot snapshot;
+  final List<TorrentFileEntry> files;
+
+  /// 没有实时数据的原因；[VideoDownloadLiveDataAbsence.none] 表示有。
+  final VideoDownloadLiveDataAbsence liveDataAbsence;
+}
+
+/// 定性「为什么没有实时数据」。纯函数，便于直接单测三条分支。
+///
+/// 顺序是**有意**的：先问「该不该在引擎里」，再问「引擎答没答」。反过来问就
+/// 会把排队中的任务判成丢失——那正是本函数要消灭的误诊。
+VideoDownloadLiveDataAbsence resolveLiveDataAbsence({
+  required VideoDownloadJobRow job,
+  required String torrentId,
+  required bool hasLiveSnapshot,
+  required bool backendOnline,
+}) {
+  if (hasLiveSnapshot) return VideoDownloadLiveDataAbsence.none;
+  // 还没有后端任务 id，或仍停在入队阶段 = 还没轮到它进下载器。前面的任务占着
+  // 并发槽时这条最常见，它是正常排队，不是任何形式的故障。
+  if (torrentId.isEmpty || job.stage == VideoDownloadJobStage.enqueue) {
+    return VideoDownloadLiveDataAbsence.notHandedOff;
+  }
+  return backendOnline
+      ? VideoDownloadLiveDataAbsence.missingFromBackend
+      : VideoDownloadLiveDataAbsence.backendOffline;
+}
+
+/// Builds the durable half of task details without requiring a running
+/// pipeline service. This keeps completed/history rows inspectable even when
+/// startup deliberately disables downloads because their engine is missing.
+VideoDownloadJobDetails buildPersistedVideoDownloadJobDetails(
+  VideoDownloadJobRow job,
+  List<VideoDownloadJobFileRow> rows,
+) {
+  final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '').trim();
+  final double progress =
+      (job.lifecycle == VideoDownloadJobLifecycle.completed
+              ? 1.0
+              : job.stageProgress)
+          .clamp(0.0, 1.0)
+          .toDouble();
+  final List<TorrentFileEntry> files = <TorrentFileEntry>[
+    for (int index = 0; index < rows.length; index++)
+      TorrentFileEntry(
+        name: rows[index].currentRelativePath.trim().isNotEmpty
+            ? rows[index].currentRelativePath
+            : rows[index].originalRelativePath,
+        size: rows[index].sizeBytes ?? 0,
+        progress: _persistedFileIsComplete(rows[index].status) ? 1.0 : progress,
+        index: rows[index].backendFileIndex ?? index,
+      ),
+  ];
+  final int totalBytes = rows.fold<int>(
+    0,
+    (int total, VideoDownloadJobFileRow row) => total + (row.sizeBytes ?? 0),
+  );
+  final String savePath = job.observedSavePath?.trim() ?? '';
+  String contentPath = '';
+  for (final VideoDownloadJobFileRow row in rows) {
+    final String finalPath = row.finalAbsolutePath?.trim() ?? '';
+    if (finalPath.isNotEmpty) {
+      contentPath = finalPath;
+      break;
+    }
+  }
+  if (contentPath.isEmpty && savePath.isNotEmpty && rows.isNotEmpty) {
+    contentPath = p.join(savePath, rows.first.currentRelativePath);
+  }
+  return VideoDownloadJobDetails(
+    snapshot: TorrentSnapshot(
+      hash: torrentId,
+      name: job.resourceTitle?.trim().isNotEmpty == true
+          ? job.resourceTitle!.trim()
+          : job.title,
+      progress: progress,
+      state: _persistedTorrentState(job),
+      savePath: savePath,
+      contentPath: contentPath,
+      amountLeft: totalBytes > 0 ? (totalBytes * (1 - progress)).round() : -1,
+      totalSizeBytes: totalBytes > 0 ? totalBytes : -1,
+      downloadedBytes: totalBytes > 0 ? (totalBytes * progress).round() : 0,
+    ),
+    files: files,
+  );
+}
+
+bool _persistedFileIsComplete(String status) =>
+    status == VideoDownloadJobFileStatus.downloaded ||
+    status == VideoDownloadJobFileStatus.organized ||
+    status == VideoDownloadJobFileStatus.imported;
+
+String _persistedTorrentState(VideoDownloadJobRow job) {
+  if (job.lifecycle == VideoDownloadJobLifecycle.completed) return 'completed';
+  if (job.lifecycle == VideoDownloadJobLifecycle.cancelled) return 'pausedDL';
+  if (job.lifecycle == VideoDownloadJobLifecycle.failed ||
+      job.lifecycle == VideoDownloadJobLifecycle.needsAttention) {
+    return 'error';
+  }
+  if (job.stage == VideoDownloadJobStage.download) return 'downloading';
+  return job.stage;
+}
+
+/// Splits a backend-reported relative path into trusted path segments.
+///
+/// `TorrentFileEntry.name` is persisted verbatim, so this string is fully
+/// backend controlled. It must never reach [p.join] unchecked: join discards
+/// its root when the second argument is absolute (`/etc/passwd`, `C:\...`),
+/// and `..` segments walk out of the managed root. Either one would let a
+/// hostile or broken backend aim file deletion at arbitrary device paths.
+/// Returns null when the relative path cannot be trusted.
+List<String>? safeManagedRelativeSegments(String relativePath) {
+  final String portable = relativePath.replaceAll(r'\', '/').trim();
+  if (portable.isEmpty ||
+      portable.startsWith('/') ||
+      RegExp(r'^[A-Za-z]:').hasMatch(portable)) {
+    return null;
+  }
+  final List<String> segments = portable.split('/');
+  if (segments.any((String segment) => segment.isEmpty || segment == '..')) {
+    return null;
+  }
+  return segments;
+}
+
+/// Resolves [relativePath] under [root] and proves the result stays inside it.
+/// Returns null when the relative path is untrusted or escapes the root.
+String? resolveManagedPathWithinRoot({
+  required String root,
+  required String relativePath,
+}) {
+  final List<String>? segments = safeManagedRelativeSegments(relativePath);
+  if (segments == null) return null;
+  final String normalizedRoot = p.normalize(p.absolute(root));
+  final String resolved = p.normalize(
+    p.absolute(p.joinAll(<String>[normalizedRoot, ...segments])),
+  );
+  if (!p.isWithin(normalizedRoot, resolved)) return null;
+  return resolved;
+}
+
+/// Thrown when a delete request removed the durable job but could not remove
+/// every managed file: on Windows an open player or the download engine still
+/// holds a handle. The job row and the library rows of the files that really
+/// went away are already committed when this is thrown, so the surface never
+/// gets stuck in a half-deleted state; the caller only reports the remainder.
+class VideoDownloadJobFilesNotDeleted implements Exception {
+  const VideoDownloadJobFilesNotDeleted(this.paths);
+
+  final List<String> paths;
+
+  @override
+  String toString() =>
+      '${paths.length} downloaded file(s) could not be '
+      'deleted: ${paths.map(p.basename).join(', ')}';
+}
+
+/// 「下载时跳过特典」自动取消选择的文件行：`selected: false` + `kind: 'extra'`。
+///
+/// 整理阶段写 `kind: 'extra'` 的行都是选中的（只排布选中文件），手动选卷写的
+/// 行是 `kind: 'other'`，所以这两个条件合起来唯一标出自动跳过的特典。
+bool _isAutoSkippedExtraRow(VideoDownloadJobFileRow row) =>
+    !row.selected && row.kind == 'extra';
+
+/// 用户是否**亲手**选过文件（手动选卷 / 选单文件）。
+///
+/// 这决定任务是否共享一颗「用户只要其中一部分」的合集 torrent：重新投递要走
+/// 暂停添加 + 写优先级（只有 .torrent 元数据能做到），删除只能删选中的文件、
+/// 不能让后端连合集一起删。自动跳过的特典不算——那条任务仍是整颗 torrent 的
+/// 唯一主人：磁力照常重加、删除照常整颗连文件删，否则磁力任务一掉进重新投递
+/// 就永远卡在「需要 .torrent 元数据」，删除还会把特典残片留在盘上。
+///
+/// 「有没有被跳过的行」（整理排除、完成时的行状态）仍用 `!row.selected`，
+/// 那里两种来源的语义相同。
+bool _hasUserFileSelection(Iterable<VideoDownloadJobFileRow> rows) => rows.any(
+  (VideoDownloadJobFileRow row) =>
+      !row.selected && !_isAutoSkippedExtraRow(row),
+);
+
+/// Deletes the durable half of a job independently of the active pipeline.
+/// Only exact file/link paths recorded by this job are removed; directories
+/// are deliberately never deleted recursively, and a backend-reported relative
+/// path is only used when it provably resolves inside the observed save path.
+///
+/// Files are removed before their library rows, and a library row only goes
+/// away once its file is really gone: a file kept alive by an open handle
+/// stays playable instead of leaving an untracked orphan on disk. The durable
+/// job row is always removed, so a partial failure is reportable
+/// ([VideoDownloadJobFilesNotDeleted]) instead of leaving behind a job that
+/// repeats half of the deletion on every retry.
+Future<void> deletePersistedVideoDownloadJob({
+  required FushiDatabase database,
+  required VideoDownloadJobRow job,
+  required bool deleteFiles,
+}) async {
+  final List<String> undeleted = <String>[];
+  if (deleteFiles) {
+    final List<VideoDownloadJobFileRow> files = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final bool selective = _hasUserFileSelection(files);
+    final List<VideoDownloadJobSubtitleRow> subtitles = await database
+        .getVideoDownloadJobSubtitles(job.jobId);
+    final Set<String> managedPaths = <String>{
+      for (final VideoDownloadJobFileRow file in files)
+        if (!selective || file.selected)
+          if (file.finalAbsolutePath?.trim().isNotEmpty == true)
+            p.normalize(file.finalAbsolutePath!.trim()),
+      for (final VideoDownloadJobSubtitleRow subtitle in subtitles)
+        if (subtitle.finalPath?.trim().isNotEmpty == true)
+          p.normalize(subtitle.finalPath!.trim()),
+      for (final VideoDownloadJobSubtitleRow subtitle in subtitles)
+        if (subtitle.stagedPath?.trim().isNotEmpty == true)
+          p.normalize(subtitle.stagedPath!.trim()),
+    };
+    final String observedSavePath = job.observedSavePath?.trim() ?? '';
+    if (observedSavePath.isNotEmpty) {
+      for (final VideoDownloadJobFileRow file in files) {
+        if (selective && !file.selected) continue;
+        if (file.currentRelativePath.trim().isEmpty) continue;
+        final String? resolved = resolveManagedPathWithinRoot(
+          root: observedSavePath,
+          relativePath: file.currentRelativePath,
+        );
+        if (resolved == null) {
+          engineLog.log(
+            'VideoDownloadJobDelete',
+            'Refused to delete a backend-reported path that escapes the '
+                'observed save path: ${file.currentRelativePath}',
+          );
+          continue;
+        }
+        managedPaths.add(resolved);
+      }
+    }
+    final Set<String> removedPaths = <String>{};
+    for (final String path in managedPaths) {
+      try {
+        final FileSystemEntityType type = await FileSystemEntity.type(
+          path,
+          followLinks: false,
+        );
+        if (type == FileSystemEntityType.directory) continue;
+        if (type == FileSystemEntityType.file) {
+          await File(path).delete();
+        } else if (type == FileSystemEntityType.link) {
+          await Link(path).delete();
+        }
+        removedPaths.add(path);
+      } on Object catch (error, stack) {
+        undeleted.add(path);
+        engineLog.log(
+          'VideoDownloadJobDelete',
+          'Failed to delete $path: $error',
+          stack,
+        );
+      }
+    }
+    final Set<String> removedNormalized = removedPaths
+        .map(normalizeVideoPath)
+        .toSet();
+    final VideoBookRepository repository = VideoBookRepository(database);
+    final List<String> deletedBookUids = <String>[
+      for (final VideoBookRow book in await repository.listAll())
+        if (removedNormalized.contains(normalizeVideoPath(book.videoPath)))
+          book.bookUid,
+    ];
+    // 整个任务的入库行一次批量删（BUG-2949）：逐行调单条入口时，每集都要
+    // 各读一遍 media_images / video_books 全表、各开一个事务、各排一次封面互斥
+    // 锁——一季 24 集的种子就是 48 次全表扫描，删除按「集数 × 库大小」变慢。
+    if (deletedBookUids.isNotEmpty) {
+      await repository.deleteVideoBooksAndReclaimAssets(deletedBookUids);
+    }
+    database.notifyVideoLibraryChanged();
+  }
+  await database.deleteVideoDownloadJob(job.jobId);
+  if (undeleted.isNotEmpty) {
+    throw VideoDownloadJobFilesNotDeleted(List<String>.unmodifiable(undeleted));
+  }
+}
+
+/// 任务与库行之间没有 id 级外键，唯一纽带是
+/// `VideoDownloadJobFiles.finalAbsolutePath`。归一走 [platformPathKey]（绝对化 +
+/// Windows 折大小写），**不用** `normalizeVideoPath`——后者不折大小写，Windows 上
+/// `D:\x\a.mkv` 与 `d:\x\a.mkv` 会漏命中。
+List<VideoDownloadJobFileRow> _jobFilesMatching(
+  List<VideoDownloadJobFileRow> files,
+  Set<String> pathKeys,
+) => <VideoDownloadJobFileRow>[
+  for (final VideoDownloadJobFileRow file in files)
+    if ((file.finalAbsolutePath?.trim().isNotEmpty ?? false) &&
+        pathKeys.contains(platformPathKey(file.finalAbsolutePath!.trim())))
+      file,
+];
+
+/// 库侧「同时删除本地文件」**删磁盘之前**必须先跑这一步：把即将消失的
+/// [candidatePaths] 在下载后端标成不下载（[TorrentFilePriority.skip]）。
+///
+/// 顺序不能反。种子还在后端做种时，文件先消失、后端还按 normal 优先级期待它，
+/// 下一次校验就把整个种子停掉，同一种子里别的集跟着断。先 skip 再删，中间那一
+/// 瞬间后端本来就已经不再期待这个文件。
+///
+/// best-effort：后端离线 / 不支持文件优先级 / 种子已不在，都只记日志不阻塞删除
+/// ——但**不再静默**：以前 `on Object { return false; }` 把所有失败吃掉，用户和
+/// 日志两头都看不到「skip 没设上，一会儿种子要停」。
+Future<void> prepareVideoDownloadJobsForLocalDelete({
+  required FushiDatabase database,
+  required Iterable<String> candidatePaths,
+  VideoDownloadPipelineService? pipeline,
+}) async {
+  if (pipeline == null) return;
+  final Set<String> keys = <String>{
+    for (final String path in candidatePaths) platformPathKey(path),
+  };
+  if (keys.isEmpty) return;
+  for (final VideoDownloadJobRow job in await database.getVideoDownloadJobs()) {
+    final List<VideoDownloadJobFileRow> hit = _jobFilesMatching(
+      await database.getVideoDownloadJobFiles(job.jobId),
+      keys,
+    );
+    for (final VideoDownloadJobFileRow file in hit) {
+      if (file.backendFileIndex == null) continue;
+      await pipeline.skipBackendFile(job, file.backendFileIndex!);
+    }
+  }
+}
+
+/// 库侧删视频且用户勾了「同时删除本地文件」后，把已从磁盘消失的 [deletedPaths]
+/// 对账回下载任务——这是 [deletePersistedVideoDownloadJob]（任务侧删 → 联动删库行）
+/// 的反方向。
+///
+/// 命中的任务分两档，判据是**归属**而不是存在性检查：
+/// - **这个任务记录过的 kind=video 文件被本次删除全部覆盖**（且任务已终态）→ 任务
+///   已经没有任何视频产物，删任务行 + 删本任务显式记录过的其余文件（字幕/附件），
+///   并**只摘种子、不让下载引擎删数据**（`deleteBackendPayload: false`）：引擎删的
+///   是它自己记账的整个 save_path，范围远超本任务记录过的文件。
+/// - 否则（只删了部分集 / 有 video 行没记路径 / 任务还在跑）→ 任务保留，只把命中
+///   的文件行标 `skipped`，任务页不再把它当已入库文件展示。
+///
+/// 以前这里拿「其它集的 DB 路径 `File.exists()`」当判据：用户改名、移动、换盘符、
+/// qB 改保存路径，判据就翻成「别的视频都没了」，删一集连带整个种子在磁盘上还好好
+/// 的其它集一起被删；`finalAbsolutePath` 为空的行被 `continue` 当成「不存在」，是
+/// 同方向的第二个洞。归属判据只看这个任务自己记过什么，不问磁盘。
+///
+/// 全程 best-effort：任务对账失败只记 ErrorLog，视频与文件早已删掉，不回滚。
+Future<void> reconcileVideoDownloadJobsAfterLocalDelete({
+  required FushiDatabase database,
+  required Set<String> deletedPaths,
+  VideoDownloadPipelineService? pipeline,
+}) async {
+  if (deletedPaths.isEmpty) return;
+  final Set<String> deletedKeys = <String>{
+    for (final String path in deletedPaths) platformPathKey(path),
+  };
+  for (final VideoDownloadJobRow job in await database.getVideoDownloadJobs()) {
+    final List<VideoDownloadJobFileRow> files = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final List<VideoDownloadJobFileRow> hit = _jobFilesMatching(
+      files,
+      deletedKeys,
+    );
+    if (hit.isEmpty) continue;
+    final bool terminal =
+        job.lifecycle == VideoDownloadJobLifecycle.completed ||
+        job.lifecycle == VideoDownloadJobLifecycle.cancelled ||
+        job.lifecycle == VideoDownloadJobLifecycle.failed;
+    final Set<int> hitIds = <int>{for (final f in hit) f.id};
+    final List<VideoDownloadJobFileRow> videoRows = <VideoDownloadJobFileRow>[
+      for (final VideoDownloadJobFileRow file in files)
+        if (file.kind == 'video') file,
+    ];
+    // 「这个任务的视频产物全没了」= 它记过的每一条 video 行都在本次删除里。没记
+    // 路径的 video 行不算被覆盖——判不出它指向哪，就不能拿它当整删的依据。
+    final bool allVideoRowsDeleted =
+        videoRows.isNotEmpty &&
+        videoRows.every((VideoDownloadJobFileRow f) => hitIds.contains(f.id));
+    try {
+      if (terminal && allVideoRowsDeleted) {
+        if (pipeline != null) {
+          await pipeline.deleteJob(
+            job.jobId,
+            deleteFiles: true,
+            deleteBackendPayload: false,
+          );
+        } else {
+          await deletePersistedVideoDownloadJob(
+            database: database,
+            job: job,
+            deleteFiles: true,
+          );
+        }
+      } else {
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        for (final VideoDownloadJobFileRow file in hit) {
+          await database.updateVideoDownloadJobFile(
+            file.id,
+            VideoDownloadJobFilesCompanion(
+              status: const Value<String>(VideoDownloadJobFileStatus.skipped),
+              updatedAt: Value<int>(now),
+            ),
+          );
+        }
+      }
+    } on Object catch (error, stack) {
+      engineLog.log(
+        'VideoDownloadJobReconcile',
+        'Failed to reconcile job ${job.jobId} after local delete: $error',
+        stack,
+      );
+    }
+  }
+}
+
+typedef VideoDownloadBackendResolver =
+    Future<VideoDownloadBackendBinding?> Function(VideoDownloadJobRow job);
+
+/// 手动「按域入库」任务完成下载后的整包导入端口（AppModel 接线
+/// `DiscoveryImportExecutor.importPaths`；null = 本设备不支持该类任务）。
+typedef VideoDownloadDiscoveryImporter =
+    Future<DiscoveryImportOutcome> Function(
+      DiscoveryMediaKind kind,
+      List<String> absolutePaths,
+    );
+
+/// 已完成的受管任务，但目标来源已不存在（删来源后 FK 置空 / 指向已删行，
+/// BUG-2776）。它的种子存储仍在旧来源根下做种，不再归任何来源所有：文件被删
+/// 后引擎续传会在旧位置重建目录并重新下载。这类种子必须从引擎摘掉。
+bool videoDownloadJobIsOrphanedCompletedSeed(
+  VideoDownloadJobRow job, {
+  required Set<int> liveSourceIds,
+}) {
+  if (job.lifecycle != VideoDownloadJobLifecycle.completed ||
+      !videoDownloadJobUsesManagedSource(job)) {
+    return false;
+  }
+  final int? sourceId = job.targetSourceId;
+  return sourceId == null || !liveSourceIds.contains(sourceId);
+}
+
+/// Resume ids that remain owned by the v78 pipeline after legacy JSON files
+/// have been archived. New library jobs keep completed torrents alive so upload
+/// policy, seeding and task metrics continue across restarts. Legacy imports
+/// retain their historical terminal-state cleanup contract.
+///
+/// [liveSourceIds]：当前存在的来源 id。完成后来源已被删的受管任务不再保留
+/// （[videoDownloadJobIsOrphanedCompletedSeed]，BUG-2776）。
+Set<String> legacyEmbeddedTorrentResumeIds(
+  Iterable<VideoDownloadJobRow> jobs, {
+  required Set<int> liveSourceIds,
+}) {
+  final Set<String> ids = <String>{};
+  for (final VideoDownloadJobRow job in jobs) {
+    if (job.backendKind != 'embedded' ||
+        job.lifecycle == VideoDownloadJobLifecycle.cancelled ||
+        (job.organizationPolicy == 'legacy' &&
+            job.lifecycle == VideoDownloadJobLifecycle.completed) ||
+        videoDownloadJobIsOrphanedCompletedSeed(
+          job,
+          liveSourceIds: liveSourceIds,
+        )) {
+      continue;
+    }
+    for (final String? candidate in <String?>[
+      job.backendTaskId,
+      job.torrentHash,
+    ]) {
+      final String normalized = candidate?.trim().toLowerCase() ?? '';
+      if (normalized.isNotEmpty) ids.add(normalized);
+    }
+  }
+  return ids;
+}
+
+/// 从 Drift 真相源重建内置引擎的 resume keepIds（任务行 + 当前来源）。
+Future<Set<String>> loadEmbeddedTorrentResumeIds(FushiDatabase database) async {
+  final Set<int> liveSourceIds = <int>{
+    for (final MediaSourceRow source in await database.getAllMediaSources())
+      source.id,
+  };
+  return legacyEmbeddedTorrentResumeIds(
+    await database.getVideoDownloadJobs(),
+    liveSourceIds: liveSourceIds,
+  );
+}
+
+class VideoDownloadPipelineActionRequired implements Exception {
+  const VideoDownloadPipelineActionRequired(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// 刮削失败只因为资料源暂时不可用（网络 / 5xx / 限流）：刮削阶段唯一按退避
+/// 重试的失败，次数用完落 failed。
+class VideoDownloadScrapeProviderUnavailable implements Exception {
+  const VideoDownloadScrapeProviderUnavailable(this.message);
+
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// 要下载的文件已经被同一颗 torrent 的另一个未完成任务选中（例如同一卷点了
+/// 两次）。与别的「需要处理」区分开，调用方据此提示「已在队列」而不是「失败」。
+class VideoDownloadAlreadyQueued extends VideoDownloadPipelineActionRequired {
+  const VideoDownloadAlreadyQueued(super.message);
+}
+
+class VideoDownloadLeaseLost implements Exception {
+  const VideoDownloadLeaseLost();
+
+  @override
+  String toString() => 'video download worker lease was lost';
+}
+
+typedef VideoDownloadLeaseRenew = Future<bool> Function();
+
+/// Keeps a claimed database row alive while one external stage is running.
+///
+/// A renewal failure is deliberately treated as ownership loss, even when it
+/// was caused by a transient database error. Continuing an external side
+/// effect without a provable claim is less safe than letting the next worker
+/// reconcile the persisted stage.
+class VideoDownloadLeaseGuard {
+  VideoDownloadLeaseGuard({
+    required Duration leaseDuration,
+    required VideoDownloadLeaseRenew renew,
+  }) : _renew = renew,
+       _heartbeatInterval = Duration(
+         microseconds: leaseDuration.inMicroseconds ~/ 3 > 0
+             ? leaseDuration.inMicroseconds ~/ 3
+             : 1,
+       );
+
+  final VideoDownloadLeaseRenew _renew;
+  final Duration _heartbeatInterval;
+
+  Timer? _timer;
+  Future<void>? _activeRenewal;
+  bool _lost = false;
+  bool _released = false;
+  bool _stopped = false;
+
+  void start() {
+    if (_timer != null || _stopped || _released || _lost) return;
+    _timer = Timer.periodic(_heartbeatInterval, (_) => _scheduleRenewal());
+  }
+
+  void ensureHeld() {
+    if (_lost || _released) throw const VideoDownloadLeaseLost();
+  }
+
+  void markLost() {
+    if (_released || _stopped) return;
+    _lost = true;
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  /// Called only after a successful CAS that intentionally releases the row.
+  void markReleased() {
+    _released = true;
+    _timer?.cancel();
+    _timer = null;
+  }
+
+  Future<void> stop() async {
+    _stopped = true;
+    _timer?.cancel();
+    _timer = null;
+    await _activeRenewal;
+  }
+
+  void _scheduleRenewal() {
+    if (_stopped || _released || _lost || _activeRenewal != null) return;
+    late final Future<void> run;
+    run = _renewOnce().whenComplete(() {
+      if (identical(_activeRenewal, run)) _activeRenewal = null;
+    });
+    _activeRenewal = run;
+    unawaited(run);
+  }
+
+  Future<void> _renewOnce() async {
+    bool renewed = false;
+    try {
+      renewed = await _renew();
+    } on Object catch (error, stack) {
+      // 语义不变：续期异常照旧按「租约丢失」处理。但必须记账——BUG-2119 里一条
+      // 续期 UPDATE 拿到 SQLITE_BUSY 后就是在这里被静默吞掉的，那条挂起的写语句
+      // 随后毒化了整条数据库连接（每次 COMMIT 都抛「SQL statements in progress」），
+      // 错误日志里却看不到第一现场。
+      engineLog.log('VideoDownloadLeaseGuard.renew', error, stack);
+      renewed = false;
+    }
+    if (!renewed && !_released && !_stopped) markLost();
+  }
+}
+
+/// v78 持久任务执行器。每轮只推进一个阶段，阶段意图和文件级检查点先落 Drift，
+/// 再执行后端/网络/文件副作用；进程退出后下一次 claim 从持久 stage 继续。
+class VideoDownloadPipelineService {
+  VideoDownloadPipelineService({
+    required this.database,
+    required this.resourceRegistry,
+    required this.backendResolver,
+    required this.scrapeCoordinator,
+    this.onBackendTaskAdded,
+    this.subtitleRegistry,
+    this.subtitleAligner,
+    this.defaultContentLanguage,
+    this.subtitleLanguageResolver,
+    this.discoveryImporter,
+    this.onDownloadOnlyCompleted,
+    this.manualTorrentDirectory,
+    Iterable<String> preferredSubtitleLanguages = const <String>[],
+    String? workerId,
+    this.pollInterval = const Duration(seconds: 5),
+    this.leaseDuration = const Duration(minutes: 2),
+    this.updateFeed,
+    VideoCoverExtractor? coverExtractor,
+    this.videoCoversDirectory,
+    this.skipDownloadExtras,
+    this.defaultTargetSourceId,
+  }) : preferredSubtitleLanguages = List<String>.unmodifiable(
+         preferredSubtitleLanguages,
+       ),
+       workerId = workerId ?? 'video-${generateVideoDownloadInstallationId()}',
+       _coverExtractor = coverExtractor ?? extractVideoCover,
+       _videoRepository = VideoBookRepository(database);
+
+  final FushiDatabase database;
+  final VideoResourceRegistry resourceRegistry;
+  final VideoSubtitleRegistry? subtitleRegistry;
+
+  /// 装 sidecar 前按视频内嵌字幕轨对时间轴（见 embedded_reference_subtitle_sync.dart）；
+  /// null = 不对齐。算法是确定性的，所以续跑时按内容认领已落盘文件照样成立。
+  final AutomaticSubtitleAligner? subtitleAligner;
+
+  /// 用户在设置里**显式**选的字幕语言（`jimakuDefaultLanguage`）。非空即硬过滤
+  /// （进 `VideoSubtitleSearchRequest.languages`）——他自己说的。
+  final List<String> preferredSubtitleLanguages;
+
+  /// 设置·外观·排版里的默认内容语言。没有显式字幕语言、视频也没有可读语言时的
+  /// 最后一档；空/null = 不表态（**不猜**，见 subtitle_language_preference.dart）。
+  final String? defaultContentLanguage;
+
+  /// 按作品的字幕语言（见 video_download_subtitle_language.dart）。字幕阶段先问它：
+  /// 拿到语言码就当作用户对**这部作品**的显式选择（硬过滤 + 排序首选），压过
+  /// [preferredSubtitleLanguages]；null = 不表态，走原来的全局链。解析器抛异常
+  /// 与本阶段其它异常同等处理（任务按可重试 / needsAttention 落库），**不吞**：
+  /// 它读的是本进程内的偏好，抛了就是偏好层坏了，不能伪装成「没记过语言」。
+  final VideoDownloadSubtitleLanguageResolver? subtitleLanguageResolver;
+  final VideoDownloadBackendResolver backendResolver;
+  final VideoSourceScrapeCoordinator scrapeCoordinator;
+  final Future<void> Function(VideoDownloadJobRow job)? onBackendTaskAdded;
+
+  /// 见 [VideoDownloadDiscoveryImporter]。
+  final VideoDownloadDiscoveryImporter? discoveryImporter;
+
+  /// 「只下载」任务（`download-only-<域>` 策略，如 CoreAudio/TMW 合集单卷）完成
+  /// 之后调一次：参数是该任务落盘的已选文件绝对路径。这类任务不能改走
+  /// importAfterDownload（同包多卷的种子槽位接力挂在「只下载」上），宿主要在
+  /// 下完后做的事（有声书：排进转录后入库队列）从这里接。
+  ///
+  /// 此刻任务已经完成并落库，端口抛的异常只记日志、不回滚任务——下载本身是
+  /// 成功的，补救入口（任务面板的「配对」）仍在。
+  final Future<void> Function(DiscoveryMediaKind kind, List<String> paths)?
+      onDownloadOnlyCompleted;
+
+  /// 手动任务 .torrent 元数据的落盘目录（`<jobId>.torrent`）。null 时手动
+  /// 任务只接受磁力链接。
+  final Directory? manualTorrentDirectory;
+
+  /// 订阅新集提醒的配图抽取（默认 [extractVideoCover]，ffmpeg 抽帧）；测试注入。
+  final VideoCoverExtractor _coverExtractor;
+
+  /// 封面来源账本（`cover_meta.json`）所在目录；null = `VideoStorage.coversDir()`。
+  final Directory? videoCoversDirectory;
+  final String workerId;
+  final Duration pollInterval;
+  final Duration leaseDuration;
+
+  /// v101 更新提醒的投递口。可空：测试与不需要提醒的装配传 null，判据本身不因此
+  /// 走两条路径。
+  /// 更新提醒的投递端口（app 注入 UpdateFeedService；服务端可以不给）。
+  final UpdateFeedPublisher? updateFeed;
+
+  /// 全局偏好「下载时跳过特典」（PV / CM / 预告 / NCOP / NCED / 菜单 / 特典…）。
+  ///
+  /// 每轮观察下载时现读（用户中途改开关，对还没做过决定的任务立即生效）；
+  /// null = 永不跳过——服务端与既有测试不装配它，行为与加这个开关之前一致。
+  /// 只作用于 `library` 策略任务，且每条任务只决定一次（见
+  /// [_skipExtrasIfRequested]）。
+  final bool Function()? skipDownloadExtras;
+
+  /// 已判定「没有可跳的特典」的任务（无特典 / 全是特典）。种子文件列表拿到后
+  /// 就不会再变，判一次就够：不记下来的话开关打开期间每轮轮询都要再列一次
+  /// 文件（外接 qBittorrent 上是每 5 秒一次 HTTP）。刻意只放内存、不落全选的
+  /// 文件行——落行会把普通任务变成「有文件行」的形态，改变既有非选择性路径；
+  /// 进程重启后各任务重判一次，代价可以忽略。
+  final Set<String> _extrasDecidedJobIds = <String>{};
+
+  /// 本进程里已经把自动跳过的特典优先级写进后端的任务。后端任务是整颗重加的
+  /// （重新投递、进程重启后的首次观察），skip 优先级不会跟着回来，所以
+  /// 不在这个集合里的、带自动跳过特典行的任务，观察时要重写一次。
+  final Set<String> _extrasSkipAppliedJobIds = <String>{};
+
+  /// 当前默认的受管视频来源（app = 用户选的下载来源，没选取第一个可用的；服务端
+  /// = 它自己的下载来源）。任务目标来源被删后重试时用来重绑（BUG-2755）；null =
+  /// 装配方不提供，重试只能改绑到订阅的当前来源。
+  final Future<int?> Function()? defaultTargetSourceId;
+
+  final VideoBookRepository _videoRepository;
+  final VideoDownloadOrganizer _organizer = const VideoDownloadOrganizer();
+
+  Timer? _timer;
+  bool _running = false;
+  bool _disposed = false;
+  VideoDownloadLeaseGuard? _activeLease;
+  String? _activeJobId;
+
+  Future<String> enqueue(VideoDownloadEnqueueRequest request) async {
+    final MediaSourceRow? source = await database.getMediaSourceById(
+      request.targetSourceId,
+    );
+    _validateManagedSource(source);
+    if (request.maxAttempts <= 0) {
+      throw ArgumentError.value(request.maxAttempts, 'maxAttempts');
+    }
+    final String? revivedJobId = await _reviveOrphanedJobForRequest(request);
+    if (revivedJobId != null) return revivedJobId;
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final String jobId = generateVideoDownloadInstallationId();
+    await database.upsertVideoDownloadJob(
+      VideoDownloadJobsCompanion(
+        jobId: Value<String>(jobId),
+        resourceProvider: Value<String>(
+          persistedVideoResourceProviderId(request.resource),
+        ),
+        selectedResourceId: Value<String>(request.resource.remoteId),
+        resourceTitle: Value<String?>(request.resource.title),
+        torrentHash: Value<String?>(request.resource.infoHash?.toLowerCase()),
+        // 候选自带的持久磁链随任务落库（BUG-1784）：重启/重试直接用它物化
+        // payload，不再依赖回索引器重搜发布名——搜不回条目会把还活着的资源
+        // 误报成 notFound。
+        magnetUri: Value<String?>(_persistableMagnetOf(request.resource)),
+        metadataProvider: Value<String?>(request.media.providerId),
+        externalId: Value<String?>(request.media.mediaId),
+        mediaKind: Value<String>(request.media.mediaKind.name),
+        discoveryCategory: Value<String?>(request.media.discoveryCategory.name),
+        // v94（BUG-2003）：发现页完整身份随任务落库。原名/别名/全部外部 id 是
+        // subtitle 阶段与 scrape 阶段的输入，不能在入队这一刻降维成显示名。
+        identityJson: Value<String?>(encodeVideoMediaReference(request.media)),
+        title: Value<String>(request.media.title),
+        year: Value<int?>(request.media.year),
+        season: Value<int?>(request.media.season),
+        coverUrl: Value<String?>(request.coverUrl),
+        backendKind: Value<String>(request.backendTarget.kind),
+        backendProfileId: Value<String?>(request.backendTarget.profileId),
+        fingerprint: Value<String>(request.backendTarget.fingerprint),
+        category: Value<String?>(request.backendTarget.category),
+        targetSourceId: Value<int?>(request.targetSourceId),
+        organizationPolicy: const Value<String>('library'),
+        subtitlePolicy: Value<String>(request.subtitlePolicy.name),
+        lifecycle: const Value<String>(VideoDownloadJobLifecycle.active),
+        stage: const Value<String>(VideoDownloadJobStage.enqueue),
+        priority: Value<int>(request.priority),
+        maxAttempts: Value<int>(request.maxAttempts),
+        createdAt: Value<int>(now),
+        updatedAt: Value<int>(now),
+      ),
+    );
+    wake();
+    return jobId;
+  }
+
+  /// 同一 torrent 的旧任务停在 failed / needsAttention、目标来源又已失效时，
+  /// 把它改绑到本次请求的来源并按用户重试恢复，返回它的 jobId（BUG-2755）。
+  ///
+  /// `(fingerprint, torrent_hash)` 唯一：不这样做，新任务行一插就撞唯一索引，
+  /// 这一集改了来源也永远下不回来。旧任务的来源还可用、还在跑或文件已落进来源
+  /// 时返回 null，照常新建（撞索引的老行为不变）。
+  Future<String?> _reviveOrphanedJobForRequest(
+    VideoDownloadEnqueueRequest request,
+  ) async {
+    final String? hash = request.resource.infoHash?.trim().toLowerCase();
+    if (hash == null || hash.isEmpty) return null;
+    final VideoDownloadJobRow? existing = await database
+        .findVideoDownloadJobByFingerprintAndTorrentHash(
+          request.backendTarget.fingerprint,
+          hash,
+        );
+    if (existing == null || !await _isOrphanedFromSource(existing)) {
+      return null;
+    }
+    await database.updateVideoDownloadJob(
+      existing.jobId,
+      VideoDownloadJobsCompanion(
+        targetSourceId: Value<int?>(request.targetSourceId),
+        updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+      ),
+    );
+    await retryJob(existing.jobId);
+    return existing.jobId;
+  }
+
+  /// 任务停在 failed / needsAttention、文件还没落进来源、而目标来源已失效。
+  Future<bool> _isOrphanedFromSource(VideoDownloadJobRow job) async =>
+      videoDownloadJobTargetSourceRebindable(job) &&
+      (job.lifecycle == VideoDownloadJobLifecycle.failed ||
+          job.lifecycle == VideoDownloadJobLifecycle.needsAttention) &&
+      await _usableSourceId(job.targetSourceId) == null;
+
+  /// 手动添加任务：与搜索出的资源同走本管线（同任务列表、同优先级/重试/删除
+  /// 操作）。视频任务走完整 organize/subtitle/import 流程；[DiscoveryMediaKind]
+  /// 任务下载后整包交给 [discoveryImporter] 按域入库。没有发现身份，故完成后
+  /// 不进 scrape 阶段。
+  Future<String> enqueueManual(
+    VideoDownloadManualEnqueueRequest request,
+  ) async {
+    final String? magnet = request.magnetUri?.trim();
+    final InspectedTorrentMetainfo? metainfo = request.metainfo;
+    if ((magnet == null || magnet.isEmpty) == (metainfo == null)) {
+      throw ArgumentError(
+        'exactly one of magnetUri and metainfo must be provided',
+      );
+    }
+    final String? hash =
+        metainfo?.torrentId ?? parseMagnetInfoHash(magnet ?? '');
+    if (hash == null || hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The magnet link has no verifiable info hash',
+      );
+    }
+    final String title = request.title.trim();
+    if (title.isEmpty) {
+      throw ArgumentError.value(request.title, 'title');
+    }
+    if (request.maxAttempts <= 0) {
+      throw ArgumentError.value(request.maxAttempts, 'maxAttempts');
+    }
+    Set<int>? selectedFileIndexes = request.selectedFileIndexes;
+    if (selectedFileIndexes != null) {
+      if (metainfo == null || selectedFileIndexes.isEmpty) {
+        throw ArgumentError(
+          'selectedFileIndexes requires non-empty .torrent metainfo selection',
+        );
+      }
+      final Set<int> available = <int>{
+        for (final InspectedTorrentFile file in metainfo.files) file.index,
+      };
+      if (available.isEmpty || !available.containsAll(selectedFileIndexes)) {
+        throw ArgumentError.value(
+          selectedFileIndexes,
+          'selectedFileIndexes',
+          'selection contains an index absent from metainfo',
+        );
+      }
+      // 选中了全部文件 = 整颗 torrent：按普通任务建。否则落库的「选择」没有
+      // 一个跳过项，add 阶段 [_applyPersistedFileSelection] 会判它不完整而卡死。
+      if (selectedFileIndexes.containsAll(available)) {
+        selectedFileIndexes = null;
+      }
+    }
+    final DiscoveryMediaKind? discoveryKind = request.discoveryKind;
+    final bool video = discoveryKind == null;
+    if (video && !request.importAfterDownload) {
+      throw ArgumentError('video tasks cannot use download-only policy');
+    }
+    if (video) {
+      final MediaSourceRow? source = request.targetSourceId == null
+          ? null
+          : await database.getMediaSourceById(request.targetSourceId!);
+      _validateManagedSource(source);
+    } else if (request.importAfterDownload && discoveryImporter == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Importing this content kind is not supported on this device',
+      );
+    }
+    final VideoDownloadJobRow? duplicate = await database
+        .findVideoDownloadJobByFingerprintAndTorrentHash(
+          request.backendTarget.fingerprint,
+          hash.toLowerCase(),
+        );
+    // 同包多卷（CoreAudio/TMW：一颗合集 torrent、每卷一个只下载任务）：后一卷
+    // 不再被拒，而是建成独立任务、先不占 torrentHash 槽位，在 enqueue 阶段等
+    // 持有者完成时摘掉 torrent 再接手（见 [_enqueueTorrent]）。一颗 torrent 同时
+    // 仍只归一个任务管，后端里不会出现两个任务争同一个种子的优先级/删除权。
+    final bool waitsForPackHolder =
+        duplicate != null &&
+        !video &&
+        !request.importAfterDownload &&
+        _releasesPackSlot(duplicate);
+    if (duplicate != null && !waitsForPackHolder) {
+      throw VideoDownloadPipelineActionRequired(
+        'This torrent is already managed by job ${duplicate.jobId}; '
+        'remove that task before selecting another volume from the same pack',
+      );
+    }
+    await _rejectOverlappingPackSelection(
+      fingerprint: request.backendTarget.fingerprint,
+      torrentHash: hash.toLowerCase(),
+      selectedFileIndexes: selectedFileIndexes,
+    );
+    final String jobId = generateVideoDownloadInstallationId();
+    if (metainfo != null) {
+      final Directory? directory = manualTorrentDirectory;
+      if (directory == null) {
+        throw const VideoDownloadPipelineActionRequired(
+          'Torrent file storage is not configured on this device',
+        );
+      }
+      // 元数据字节先落盘再建任务行：任务在任何后续阶段重启后都能从
+      // `<jobId>.torrent` 重新物化 payload（对齐 magnet 走 magnetUri 列）。
+      await directory.create(recursive: true);
+      await File(
+        p.join(directory.path, '$jobId.torrent'),
+      ).writeAsBytes(metainfo.bytes, flush: true);
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    await database.transaction(() async {
+      await database.upsertVideoDownloadJob(
+        VideoDownloadJobsCompanion(
+          jobId: Value<String>(jobId),
+          resourceProvider: const Value<String>(
+            kManualVideoDownloadResourceProvider,
+          ),
+          selectedResourceId: Value<String>(hash),
+          resourceTitle: Value<String?>(
+            request.resourceTitle?.trim().isNotEmpty == true
+                ? request.resourceTitle!.trim()
+                : title,
+          ),
+          // 排在同包持有者后面的任务先不占槽位（唯一索引只约束非空值）；
+          // hash 仍在 selectedResourceId 里，轮到它时由 enqueue 阶段写入。
+          torrentHash: Value<String?>(
+            waitsForPackHolder ? null : hash.toLowerCase(),
+          ),
+          magnetUri: Value<String?>(magnet),
+          metadataProvider: Value<String?>(request.metadataProvider),
+          externalId: Value<String?>(request.externalId),
+          // mediaKind 的值域按 organizationPolicy 分治：视频任务放
+          // VideoMetadataMediaKind.name（organize/import 消费），discovery 任务放
+          // DiscoveryMediaKind.name（仅展示与 import 阶段消费，二者不交叉读）。
+          mediaKind: Value<String>(
+            video ? request.mediaKind.name : discoveryKind.name,
+          ),
+          discoveryCategory: const Value<String?>(null),
+          title: Value<String>(title),
+          year: Value<int?>(request.year),
+          coverUrl: Value<String?>(request.coverUrl),
+          backendKind: Value<String>(request.backendTarget.kind),
+          backendProfileId: Value<String?>(request.backendTarget.profileId),
+          fingerprint: Value<String>(request.backendTarget.fingerprint),
+          category: Value<String?>(request.backendTarget.category),
+          targetSourceId: Value<int?>(video ? request.targetSourceId : null),
+          organizationPolicy: Value<String>(
+            video
+                ? 'library'
+                : request.importAfterDownload
+                ? manualDiscoveryOrganizationPolicy(discoveryKind)
+                : manualDownloadOnlyOrganizationPolicy(discoveryKind),
+          ),
+          subtitlePolicy: Value<String>(
+            // 非视频内容没有字幕概念；强制 none 免得 subtitle 阶段空转。
+            (video ? request.subtitlePolicy : VideoDownloadSubtitlePolicy.none)
+                .name,
+          ),
+          lifecycle: const Value<String>(VideoDownloadJobLifecycle.active),
+          stage: const Value<String>(VideoDownloadJobStage.enqueue),
+          priority: Value<int>(request.priority),
+          maxAttempts: Value<int>(request.maxAttempts),
+          createdAt: Value<int>(now),
+          updatedAt: Value<int>(now),
+        ),
+      );
+      if (selectedFileIndexes != null) {
+        for (final InspectedTorrentFile file in metainfo!.files) {
+          final bool selected = selectedFileIndexes.contains(file.index);
+          await database.upsertVideoDownloadJobFile(
+            VideoDownloadJobFilesCompanion(
+              jobId: Value<String>(jobId),
+              backendFileIndex: Value<int?>(file.index),
+              originalRelativePath: Value<String>(file.path),
+              currentRelativePath: Value<String>(file.path),
+              kind: const Value<String>('other'),
+              sizeBytes: Value<int?>(file.length),
+              selected: Value<bool>(selected),
+              status: Value<String>(
+                selected
+                    ? VideoDownloadJobFileStatus.pending
+                    : VideoDownloadJobFileStatus.skipped,
+              ),
+              createdAt: Value<int>(now),
+              updatedAt: Value<int>(now),
+            ),
+          );
+        }
+      }
+    });
+    wake();
+    return jobId;
+  }
+
+  /// [holder] 会不会在完成时自己让出 torrent 槽位：只下载型手动任务完成时把
+  /// torrent 从后端摘掉并清空 `torrentHash`（见 [_resolveDiscoveryDownloadPaths]），
+  /// 同包后面排队的任务才等得到。已完成还占着槽位的任务永远不会让出。
+  static bool _releasesPackSlot(VideoDownloadJobRow holder) =>
+      holder.resourceProvider == kManualVideoDownloadResourceProvider &&
+      downloadOnlyKindOfOrganizationPolicy(holder.organizationPolicy) != null &&
+      holder.lifecycle != VideoDownloadJobLifecycle.completed;
+
+  /// 同一颗 torrent 的未完成手动任务里已经选过这些文件时拒绝再建：同一卷点两次
+  /// 只会排出两个重复下载同一文件的任务。整包任务（没有文件选择）与任何选择都
+  /// 重叠。
+  Future<void> _rejectOverlappingPackSelection({
+    required String fingerprint,
+    required String torrentHash,
+    required Set<int>? selectedFileIndexes,
+  }) async {
+    for (final VideoDownloadJobRow sibling
+        in await database.getVideoDownloadJobs()) {
+      if (sibling.fingerprint != fingerprint ||
+          sibling.resourceProvider != kManualVideoDownloadResourceProvider ||
+          sibling.lifecycle == VideoDownloadJobLifecycle.completed ||
+          (sibling.torrentHash ?? sibling.selectedResourceId).toLowerCase() !=
+              torrentHash) {
+        continue;
+      }
+      final List<VideoDownloadJobFileRow> rows = await database
+          .getVideoDownloadJobFiles(sibling.jobId);
+      final bool siblingSelective = _hasUserFileSelection(rows);
+      final bool overlaps =
+          selectedFileIndexes == null ||
+          !siblingSelective ||
+          rows.any(
+            (VideoDownloadJobFileRow row) =>
+                row.selected &&
+                row.backendFileIndex != null &&
+                selectedFileIndexes.contains(row.backendFileIndex),
+          );
+      if (overlaps) {
+        throw VideoDownloadAlreadyQueued(
+          'The selected files are already queued by job ${sibling.jobId}',
+        );
+      }
+    }
+  }
+
+  /// 把用户在独立字幕搜索中选中的候选附加到仍在执行的任务。这里只持久化来源
+  /// 身份，不保存 OpenSubtitles 临时 URL；真正到 subtitle 阶段会重新搜索同一
+  /// provider/remote id，再下载并原子安装。
+  Future<String> attachSubtitleSelection({
+    required String jobId,
+    required VideoSubtitleCandidate candidate,
+    int? season,
+    int? episode,
+  }) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected download job no longer exists',
+      );
+    }
+    if (!const <String>{
+          VideoDownloadJobStage.enqueue,
+          VideoDownloadJobStage.download,
+          VideoDownloadJobStage.organize,
+          VideoDownloadJobStage.subtitle,
+        }.contains(job.stage) ||
+        job.lifecycle == VideoDownloadJobLifecycle.completed ||
+        job.lifecycle == VideoDownloadJobLifecycle.cancelled ||
+        job.lifecycle == VideoDownloadJobLifecycle.failed) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Subtitles can only be attached before media import begins',
+      );
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    final String selectionKey = sha256.convert(<int>[
+      ...candidate.providerId.codeUnits,
+      0,
+      ...candidate.remoteId.codeUnits,
+      0,
+      ...'${season ?? ''}:${episode ?? ''}'.codeUnits,
+    ]).toString();
+    final String subtitleId = '$jobId:manual:$selectionKey';
+    await database.upsertVideoDownloadJobSubtitle(
+      VideoDownloadJobSubtitlesCompanion(
+        subtitleId: Value<String>(subtitleId),
+        jobId: Value<String>(jobId),
+        provider: Value<String>(candidate.providerId),
+        selectedSubtitleId: Value<String?>(candidate.remoteId),
+        language: Value<String?>(candidate.language),
+        season: Value<int?>(season ?? candidate.season),
+        episode: Value<int?>(episode ?? candidate.episode),
+        originalFileName: Value<String?>(candidate.fileName),
+        status: const Value<String>(VideoDownloadJobSubtitleStatus.pending),
+        error: const Value<String?>(null),
+        createdAt: Value<int>(now),
+        updatedAt: Value<int>(now),
+      ),
+    );
+    if (job.lifecycle == VideoDownloadJobLifecycle.needsAttention) {
+      await database.updateVideoDownloadJob(
+        jobId,
+        VideoDownloadJobsCompanion(
+          lifecycle: const Value<String>(VideoDownloadJobLifecycle.active),
+          claimedBy: const Value<String?>(null),
+          claimExpiresAt: const Value<int?>(null),
+          nextAttemptAt: Value<int?>(now),
+          lastError: const Value<String?>(null),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+    wake();
+    return subtitleId;
+  }
+
+  /// 用户显式调整排队优先级。数值越大越先被取走（DAO 侧 `priority DESC`）。
+  ///
+  /// 写完立刻 [wake]：优先级只在「下一次取任务」时才起作用，不唤醒的话用户会看到
+  /// 调了没反应，直到下一个轮询周期——那和没生效在观感上没区别。
+  Future<void> setJobPriority(String jobId, int priority) async {
+    await database.setVideoDownloadJobPriority(
+      jobId: jobId,
+      priority: priority,
+      nowAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    wake();
+  }
+
+  Future<void> retryJob(String jobId) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected download job no longer exists',
+      );
+    }
+    final bool rewindToEnqueue =
+        job.backendKind == QbConnectionConfig.backendEmbedded &&
+        job.stage == VideoDownloadJobStage.download &&
+        (job.lastError ?? '').contains(videoDownloadMissingBackendTaskError);
+    if (job.lifecycle == VideoDownloadJobLifecycle.failed ||
+        job.lifecycle == VideoDownloadJobLifecycle.needsAttention) {
+      await _rebindUnusableTargetSource(job);
+    }
+    final bool changed = await database.retryVideoDownloadJobByUser(
+      jobId: jobId,
+      nowAt: DateTime.now().millisecondsSinceEpoch,
+      rewindToEnqueue: rewindToEnqueue,
+    );
+    if (!changed) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Only failed or actionable download jobs can be retried',
+      );
+    }
+    wake();
+  }
+
+  /// 目标来源已被删 / 不可用的任务改绑到订阅的当前来源，没有订阅（或订阅的来源
+  /// 也不可用）时改绑到默认来源（BUG-2755）。否则重试只会在整理阶段再撞一次
+  /// 「managed video source no longer exists」。来源仍可用、或文件已落进来源的
+  /// 任务不动。
+  Future<void> _rebindUnusableTargetSource(VideoDownloadJobRow job) async {
+    if (!videoDownloadJobTargetSourceRebindable(job)) return;
+    if (await _usableSourceId(job.targetSourceId) != null) return;
+    final VideoDownloadSubscriptionRow? subscription = await database
+        .getVideoDownloadSubscriptionForJob(job.jobId);
+    int? replacement = await _usableSourceId(subscription?.targetSourceId);
+    final Future<int?> Function()? fallback = defaultTargetSourceId;
+    if (replacement == null && fallback != null) {
+      replacement = await _usableSourceId(await fallback());
+    }
+    if (replacement == null) return;
+    await database.updateVideoDownloadJob(
+      job.jobId,
+      VideoDownloadJobsCompanion(
+        targetSourceId: Value<int?>(replacement),
+        updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+      ),
+    );
+  }
+
+  Future<int?> _usableSourceId(int? sourceId) async {
+    if (sourceId == null) return null;
+    final MediaSourceRow? source = await database.getMediaSourceById(sourceId);
+    return isUsableManagedVideoSource(source) ? sourceId : null;
+  }
+
+  /// Resumes a user-paused durable job and its exact backend task.
+  ///
+  /// Embedded tasks whose fast-resume entry disappeared are rewound to the
+  /// enqueue stage so the original selected resource is recreated. Other
+  /// backends must still expose the recorded task; silently switching backend
+  /// instances would resume or create the wrong torrent.
+  Future<void> resumeJob(String jobId) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected download job no longer exists',
+      );
+    }
+    if (job.lifecycle != VideoDownloadJobLifecycle.cancelled) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Only paused download jobs can be resumed',
+      );
+    }
+
+    bool rewindToEnqueue = false;
+    final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+        .trim();
+    if (torrentId.isNotEmpty) {
+      final VideoDownloadBackendBinding? binding = await backendResolver(job);
+      _validateBackendBinding(job, binding);
+      final TorrentBackend backend = binding!.backend;
+      final List<TorrentSnapshot> snapshots = await backend.listTorrents(
+        category: job.category,
+      );
+      final bool backendTaskExists = snapshots.any(
+        (TorrentSnapshot snapshot) =>
+            snapshot.hash.toLowerCase() == torrentId.toLowerCase(),
+      );
+      if (backendTaskExists) {
+        if (backend is TorrentPauseBackend && backend.pauseControlAvailable) {
+          final bool resumed = await backend.resumeTorrent(torrentId);
+          if (!resumed) {
+            throw const VideoDownloadPipelineActionRequired(
+              'The original download backend could not resume this task',
+            );
+          }
+        }
+      } else if (job.backendKind == QbConnectionConfig.backendEmbedded &&
+          job.stage == VideoDownloadJobStage.download) {
+        rewindToEnqueue = true;
+      } else if (job.stage == VideoDownloadJobStage.download) {
+        throw const VideoDownloadPipelineActionRequired(
+          'The torrent is no longer available in the original backend',
+        );
+      }
+    } else if (job.backendKind == QbConnectionConfig.backendEmbedded &&
+        job.stage == VideoDownloadJobStage.download) {
+      rewindToEnqueue = true;
+    }
+
+    final bool changed = await database.resumeCancelledVideoDownloadJobByUser(
+      jobId: jobId,
+      nowAt: DateTime.now().millisecondsSinceEpoch,
+      rewindToEnqueue: rewindToEnqueue,
+    );
+    if (!changed) {
+      final VideoDownloadJobRow? current = await database.getVideoDownloadJob(
+        jobId,
+      );
+      if (current?.lifecycle == VideoDownloadJobLifecycle.active) return;
+      throw const VideoDownloadPipelineActionRequired(
+        'The download job changed while it was being resumed',
+      );
+    }
+    wake();
+  }
+
+  /// Cancels Fushi's durable workflow without deleting downloaded data.
+  /// When the original backend supports user pause, its exact task is paused
+  /// before the lifecycle CAS so cancellation never leaves an actively
+  /// downloading task behind merely because the UI stopped tracking it.
+  Future<void> cancelJob(String jobId) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected download job no longer exists',
+      );
+    }
+    if (job.lifecycle == VideoDownloadJobLifecycle.cancelled) return;
+    if (job.lifecycle == VideoDownloadJobLifecycle.completed) {
+      throw const VideoDownloadPipelineActionRequired(
+        'A completed download job cannot be cancelled',
+      );
+    }
+    final String? backendTaskId = job.backendTaskId?.trim();
+    if (backendTaskId?.isNotEmpty == true) {
+      final VideoDownloadBackendBinding? binding = await backendResolver(job);
+      _validateBackendBinding(job, binding);
+      final TorrentBackend backend = binding!.backend;
+      if (backend is TorrentPauseBackend && backend.pauseControlAvailable) {
+        final bool paused = await backend.pauseTorrent(backendTaskId!);
+        if (!paused) {
+          throw const VideoDownloadPipelineActionRequired(
+            'The original download backend could not pause this task',
+          );
+        }
+      }
+    }
+    final bool changed = await database.cancelVideoDownloadJobByUser(
+      jobId: jobId,
+      nowAt: DateTime.now().millisecondsSinceEpoch,
+    );
+    if (!changed) {
+      final VideoDownloadJobRow? current = await database.getVideoDownloadJob(
+        jobId,
+      );
+      if (current?.lifecycle == VideoDownloadJobLifecycle.cancelled) return;
+      throw const VideoDownloadPipelineActionRequired(
+        'The download job changed while it was being cancelled',
+      );
+    }
+  }
+
+  /// Returns the most useful existing path for Explorer/Finder integration.
+  /// Final organized files win; an in-progress task falls back to the backend
+  /// content path and then its observed save directory.
+  Future<String?> resolveJobLocation(String jobId) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) return null;
+    final files = await database.getVideoDownloadJobFiles(jobId);
+    final subtitles = await database.getVideoDownloadJobSubtitles(jobId);
+    final List<String?> candidates = <String?>[
+      for (final file in files) file.finalAbsolutePath,
+      for (final subtitle in subtitles) subtitle.finalPath,
+      for (final subtitle in subtitles) subtitle.stagedPath,
+    ];
+
+    try {
+      final TorrentSnapshot? snapshot = (await loadTaskSnapshots(
+        <VideoDownloadJobRow>[job],
+      ))[jobId];
+      candidates
+        ..add(snapshot?.contentPath)
+        ..add(snapshot?.savePath);
+    } on Object {
+      // The durable paths below still make the shortcut useful while the
+      // configured torrent backend is offline.
+    }
+
+    final String? savePath = job.observedSavePath?.trim();
+    if (savePath?.isNotEmpty == true) {
+      candidates.addAll(<String?>[
+        for (final file in files)
+          if (file.currentRelativePath.trim().isNotEmpty)
+            p.join(savePath!, file.currentRelativePath),
+        savePath,
+      ]);
+    }
+    for (final String? candidate in candidates) {
+      final String path = candidate?.trim() ?? '';
+      if (path.isEmpty) continue;
+      if (await FileSystemEntity.type(path, followLinks: false) !=
+          FileSystemEntityType.notFound) {
+        return p.normalize(path);
+      }
+    }
+    return null;
+  }
+
+  /// Loads details for a durable job. Live data is preferred when the exact
+  /// recorded backend is available; otherwise the database snapshot remains
+  /// viewable instead of blocking the entire dialog on backend startup.
+  Future<VideoDownloadJobDetails> loadJobDetails(String jobId) async {
+    final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected download job no longer exists',
+      );
+    }
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(jobId);
+    final VideoDownloadJobDetails persistedDetails =
+        buildPersistedVideoDownloadJobDetails(job, rows);
+    final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+        .trim();
+
+    TorrentBackend? backend;
+    bool backendOnline = false;
+    TorrentSnapshot? liveSnapshot;
+    List<TorrentFileEntry>? liveFiles;
+    if (torrentId.isNotEmpty) {
+      try {
+        final VideoDownloadBackendBinding? binding = await backendResolver(job);
+        _validateBackendBinding(job, binding);
+        backend = binding!.backend;
+        backendOnline = true;
+        final List<TorrentSnapshot> snapshots = await backend.listTorrents(
+          category: job.category,
+        );
+        for (final TorrentSnapshot snapshot in snapshots) {
+          if (snapshot.hash.toLowerCase() == torrentId.toLowerCase()) {
+            liveSnapshot = snapshot;
+            break;
+          }
+        }
+        final List<TorrentFileEntry> backendFiles = await backend.listFiles(
+          torrentId,
+        );
+        if (backendFiles.isNotEmpty) liveFiles = backendFiles;
+      } on Object {
+        // The exact original backend may be unavailable after an app upgrade,
+        // profile change or incomplete package install. Do not substitute the
+        // current global backend: it could be a different qBittorrent server.
+        backend = null;
+        backendOnline = false;
+      }
+    }
+
+    return VideoDownloadJobDetails(
+      backend: liveSnapshot == null ? null : backend,
+      backendOnline: backendOnline,
+      snapshot: liveSnapshot ?? persistedDetails.snapshot,
+      files: liveFiles ?? persistedDetails.files,
+      liveDataAbsence: resolveLiveDataAbsence(
+        job: job,
+        torrentId: torrentId,
+        hasLiveSnapshot: liveSnapshot != null,
+        backendOnline: backendOnline,
+      ),
+    );
+  }
+
+  /// 把 [job] 在后端的第 [fileIndex] 个文件标为不下载（[TorrentFilePriority.skip]）。
+  /// 库侧删这一集的本地文件**之前**调用（见
+  /// [prepareVideoDownloadJobsForLocalDelete]）：种子仍在后端时，缺失的文件若还是
+  /// normal 优先级，下一次校验就会让整个种子报错停掉。
+  ///
+  /// best-effort：后端离线 / 不支持文件优先级 / 种子已不在都返回 false，但**失败
+  /// 会记 ErrorLog**——静默返回 false 意味着「skip 没设上、一会儿种子要停」这件事
+  /// 在日志里也查不到。
+  Future<bool> skipBackendFile(VideoDownloadJobRow job, int fileIndex) async {
+    final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+        .trim();
+    if (torrentId.isEmpty) return false;
+    try {
+      final VideoDownloadBackendBinding? binding = await backendResolver(job);
+      _validateBackendBinding(job, binding);
+      final TorrentBackend backend = binding!.backend;
+      if (backend is! TorrentDetailBackend || !backend.detailAvailable) {
+        return false;
+      }
+      return await backend.setFilePriority(
+        torrentId,
+        fileIndex,
+        TorrentFilePriority.skip,
+      );
+    } on Object catch (error, stack) {
+      engineLog.log(
+        'VideoDownloadSkipBackendFile',
+        'Failed to skip file $fileIndex of job ${job.jobId}: $error',
+        stack,
+      );
+      return false;
+    }
+  }
+
+  /// 把已完成任务的种子从下载后端摘掉（只摘任务、**不删数据**），并清掉任务行上
+  /// 的种子身份（BUG-2776）。任务行与已整理的文件都保留。
+  ///
+  /// 已完成的受管任务整理后被 moveStorage 到来源根下继续做种；来源一换，这颗种子
+  /// 就钉在旧位置——用户删掉旧目录后，引擎续传会在原处重建并重新下载。
+  ///
+  /// 本方法摘所有来源已不存在的已完成受管任务
+  /// （[videoDownloadJobIsOrphanedCompletedSeed]）：删来源后、流水线启动时调用。
+  /// 后端离线 / 摘除失败的保持原样，下次再摘；内置引擎重启时 resume keepIds 按
+  /// 同一判据兜底。返回摘掉的任务数。
+  Future<int> releaseOrphanedCompletedSeeds() async {
+    final Set<int> liveSourceIds = <int>{
+      for (final MediaSourceRow source in await database.getAllMediaSources())
+        source.id,
+    };
+    return _releaseCompletedSeeds(
+      await database.getVideoDownloadJobs(),
+      (VideoDownloadJobRow job) => videoDownloadJobIsOrphanedCompletedSeed(
+        job,
+        liveSourceIds: liveSourceIds,
+      ),
+    );
+  }
+
+  /// 改订阅来源后，摘掉该订阅名下仍留在别的来源里的已完成集的种子（BUG-2776）。
+  /// 与 [releaseOrphanedCompletedSeeds] 同一摘除语义；订阅不存在或没有目标来源时
+  /// 什么都不做。
+  Future<int> releaseSubscriptionSeedsOutsideTarget(
+    String subscriptionId,
+  ) async {
+    final VideoDownloadSubscriptionRow? subscription = await database
+        .getVideoDownloadSubscription(subscriptionId);
+    final int? target = subscription?.targetSourceId;
+    if (target == null) return 0;
+    final List<VideoDownloadJobRow> jobs = <VideoDownloadJobRow>[];
+    for (final String jobId in await database.getVideoDownloadSubscriptionJobIds(
+      subscriptionId,
+    )) {
+      final VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+      if (job != null) jobs.add(job);
+    }
+    return _releaseCompletedSeeds(
+      jobs,
+      (VideoDownloadJobRow job) =>
+          job.lifecycle == VideoDownloadJobLifecycle.completed &&
+          videoDownloadJobUsesManagedSource(job) &&
+          job.targetSourceId != target,
+    );
+  }
+
+  Future<int> _releaseCompletedSeeds(
+    Iterable<VideoDownloadJobRow> jobs,
+    bool Function(VideoDownloadJobRow job) eligible,
+  ) async {
+    int released = 0;
+    for (final VideoDownloadJobRow job in jobs) {
+      if (!eligible(job)) continue;
+      final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+          .trim();
+      if (torrentId.isEmpty) continue;
+      try {
+        final VideoDownloadBackendBinding? binding = await backendResolver(job);
+        _validateBackendBinding(job, binding);
+        final TorrentBackend backend = binding!.backend;
+        if (backend is! TorrentRemovalBackend) continue;
+        if (!await backend.removeTorrent(torrentId, deleteFiles: false)) {
+          // 摘除返回 false 可能只是种子早已不在后端（被剪枝 / 用户在 qB 里删过）；
+          // 确认不在了同样算摘掉，否则保持原样下次再试。
+          final String id = torrentId.toLowerCase();
+          final List<TorrentSnapshot> present = await backend.listTorrents();
+          if (present.any(
+            (TorrentSnapshot snapshot) => snapshot.hash.toLowerCase() == id,
+          )) {
+            continue;
+          }
+        }
+      } on Object catch (error, stack) {
+        engineLog.log(
+          'VideoDownloadReleaseSeed',
+          'Failed to release completed seed of job ${job.jobId}: $error',
+          stack,
+        );
+        continue;
+      }
+      await database.updateVideoDownloadJob(
+        job.jobId,
+        VideoDownloadJobsCompanion(
+          backendTaskId: const Value<String?>(null),
+          torrentHash: const Value<String?>(null),
+          updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+        ),
+      );
+      released++;
+    }
+    return released;
+  }
+
+  /// Removes a durable task and, when requested, only the files that this task
+  /// explicitly recorded. Directories are never recursively removed here.
+  ///
+  /// [deleteFiles]：删本任务 DB 里显式记录过的文件（视频 / 字幕 / 附件）。
+  /// [deleteBackendPayload]：是否**同时**让下载引擎删掉它自己记账的整个种子数据
+  /// （`removeTorrent(deleteFiles: true)`）。两者分开的原因是范围不同：引擎删的是
+  /// 整个 save_path 下的全部内容，远超本任务记录过的文件。任务面板「删除任务 + 同
+  /// 时删除已下载文件」要的就是整份数据（默认 true）；库侧「我删了这一集的本地
+  /// 文件」对账过来时必须传 false，否则删一集会把磁盘上还好好的其它集一起带走。
+  /// [deleteFiles] 为 false 时本参数无意义（种子只摘不删数据）。
+  Future<void> deleteJob(
+    String jobId, {
+    required bool deleteFiles,
+    bool deleteBackendPayload = true,
+  }) async {
+    VideoDownloadJobRow? job = await database.getVideoDownloadJob(jobId);
+    if (job == null) return;
+    if (job.lifecycle != VideoDownloadJobLifecycle.completed &&
+        job.lifecycle != VideoDownloadJobLifecycle.cancelled) {
+      // Deletion is terminal: stop the durable workflow first, then remove the
+      // backend task below. Reusing cancelJob here would require a successful
+      // backend pause and make stale/missing torrents impossible to delete.
+      final bool stopped = await database.cancelVideoDownloadJobByUser(
+        jobId: jobId,
+        nowAt: DateTime.now().millisecondsSinceEpoch,
+      );
+      final VideoDownloadJobRow? current = await database.getVideoDownloadJob(
+        jobId,
+      );
+      if (current == null) return;
+      if (!stopped &&
+          current.lifecycle != VideoDownloadJobLifecycle.completed &&
+          current.lifecycle != VideoDownloadJobLifecycle.cancelled) {
+        throw const VideoDownloadPipelineActionRequired(
+          'The download job changed while it was being deleted',
+        );
+      }
+      job = current;
+    }
+    while (_activeJobId == jobId) {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+
+    final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+        .trim();
+    final List<VideoDownloadJobFileRow> persistedFiles = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final bool selective = _hasUserFileSelection(persistedFiles);
+    if (torrentId.isNotEmpty) {
+      try {
+        final VideoDownloadBackendBinding? binding = await backendResolver(job);
+        _validateBackendBinding(job, binding);
+        final TorrentBackend backend = binding!.backend;
+        if (backend is TorrentRemovalBackend) {
+          // 选择下载任务共用整颗合集 torrent。后端 deleteFiles 会删除合集下
+          // 全部文件；这里只移除后端任务，选中卷由下面的精确路径删除负责。
+          await backend.removeTorrent(
+            torrentId,
+            deleteFiles: deleteFiles && deleteBackendPayload && !selective,
+          );
+        }
+      } on Object {
+        // A stale/offline backend must not make a durable UI row impossible to
+        // remove. Exact known files are still handled below when requested.
+      }
+    }
+
+    // 手动 .torrent 任务的元数据文件随任务一起清（best-effort；文件极小，
+    // 删失败不阻塞任务行删除）。
+    final Directory? manualDirectory = manualTorrentDirectory;
+    if (manualDirectory != null &&
+        job.resourceProvider == kManualVideoDownloadResourceProvider) {
+      try {
+        final File metainfoFile = File(
+          p.join(manualDirectory.path, '${job.jobId}.torrent'),
+        );
+        if (await metainfoFile.exists()) await metainfoFile.delete();
+      } on Object {
+        // 忽略：孤儿 .torrent 文件无害。
+      }
+    }
+
+    try {
+      await deletePersistedVideoDownloadJob(
+        database: database,
+        job: job,
+        deleteFiles: deleteFiles,
+      );
+    } finally {
+      // The durable row is gone either way, including when files survived, so
+      // the scheduler must be kicked before the partial-failure report leaves.
+      wake();
+    }
+  }
+
+  /// 读取任务页所需的真实后端快照。
+  ///
+  /// 按后端身份与分类分组，每组只列一次 torrent；返回值以持久任务 id 为键。
+  /// 已完成但仍在做种的任务也会被观察，所以任务页能继续显示上传速度、节点与
+  /// 分享率。配置已切换或后端不可用的组安全降级为空，由 UI 显示未知值。
+  Future<Map<String, TorrentSnapshot>> loadTaskSnapshots(
+    Iterable<VideoDownloadJobRow> jobs,
+  ) async {
+    final Map<String, List<VideoDownloadJobRow>> groups =
+        <String, List<VideoDownloadJobRow>>{};
+    for (final VideoDownloadJobRow job in jobs) {
+      final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+          .trim()
+          .toLowerCase();
+      if (torrentId.isEmpty) continue;
+      final String key = <String?>[
+        job.backendKind,
+        job.backendProfileId,
+        job.fingerprint,
+        job.category,
+      ].map((String? value) => value ?? '').join('\u0000');
+      groups.putIfAbsent(key, () => <VideoDownloadJobRow>[]).add(job);
+    }
+
+    final Map<String, TorrentSnapshot> result = <String, TorrentSnapshot>{};
+    for (final List<VideoDownloadJobRow> group in groups.values) {
+      final VideoDownloadJobRow first = group.first;
+      try {
+        final VideoDownloadBackendBinding? binding = await backendResolver(
+          first,
+        );
+        _validateBackendBinding(first, binding);
+        final List<TorrentSnapshot> snapshots = await binding!.backend
+            .listTorrents(category: first.category);
+        final Map<String, TorrentSnapshot> byHash = <String, TorrentSnapshot>{
+          for (final TorrentSnapshot snapshot in snapshots)
+            snapshot.hash.toLowerCase(): snapshot,
+        };
+        for (final VideoDownloadJobRow job in group) {
+          final String torrentId = (job.backendTaskId ?? job.torrentHash ?? '')
+              .trim()
+              .toLowerCase();
+          final TorrentSnapshot? snapshot = byHash[torrentId];
+          if (snapshot != null) result[job.jobId] = snapshot;
+        }
+      } on Object {
+        // 指标是增强信息；后端暂不可读不能让持久任务列表一起消失。
+      }
+    }
+    return Map<String, TorrentSnapshot>.unmodifiable(result);
+  }
+
+  void start() {
+    if (_disposed || _timer != null) return;
+    wake();
+    _timer = Timer.periodic(pollInterval, (_) => wake());
+  }
+
+  void wake() {
+    if (_disposed || _running) return;
+    _running = true;
+    unawaited(_drain().whenComplete(() => _running = false));
+  }
+
+  /// 单轮 `_drain` 收尾的等待上界。`_disposed` 只让 `_drain` 的循环条件提前结束，
+  /// **当前那一个 `await _process(job)` 仍要跑完**——它做网络 + 文件 + Drift 工作，
+  /// 时长不可控。此前这里是裸 `while (_running)` 无界忙等，而 `dispose()` 挂在
+  /// `AppModel.closeDatabase()` → 退出路径上，等于让一个在飞的下载决定 app 什么时候
+  /// 能关掉（BUG-192 遗留的最后一个无界点）。放行不丢数据：job 状态机是租约式的，
+  /// 未完成的 claim 到期后由下次启动重新领取。
+  static const Duration stopDrainTimeout = Duration(milliseconds: 1500);
+
+  /// [drainTimeout] 为 null = **等到它自己收尾**（默认，也是历史行为）。
+  ///
+  /// 这个上界只能由**退出路径**传进来，绝不能变成 `stop()` 的全局语义。
+  /// `dispose()` 挂在 `AppModel.closeDatabase()` 上，而那条链的调用方不止退出：
+  /// 迁移导入（`migration_import_page.dart`）、备份导入与数据根整目录迁移都会
+  /// 先关库、紧接着在**文件层**合并/替换整个 DB 目录，`reloadVideoDownloadPipeline
+  /// Runtime` 还会关掉再立刻重启。
+  ///
+  /// 那些路径上放行意味着：`_disposeVideoDownloadPipelineRuntime` 会紧接着
+  /// `_videoDownloadBackend?.close()`，销毁一个在飞 `_process` 仍在引用的后端句柄；
+  /// `_database.close()` 之后租约续期定时器和 stage 写入继续打已关闭的 drift 连接
+  /// —— 正是 BUG-1505 的那 8 条「connection was closed」，而在迁移路径上那是**数据
+  /// 安全问题，不是噪声问题**。退出路径不同：进程马上就没了，放行只损失一次
+  /// checkpoint（租约式状态机下次启动重新领取）。
+  Future<void> stop({Duration? drainTimeout}) async {
+    _timer?.cancel();
+    _timer = null;
+    final Stopwatch waited = Stopwatch()..start();
+    while (_running) {
+      if (drainTimeout != null && waited.elapsed >= drainTimeout) {
+        fushiDebugPrint(
+          '[Fushi] video download pipeline stop timed out after '
+          '${waited.elapsedMilliseconds}ms; releasing',
+        );
+        return;
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+    }
+  }
+
+  Future<void> dispose({Duration? drainTimeout}) async {
+    _disposed = true;
+    await stop(drainTimeout: drainTimeout);
+  }
+
+  Future<void> _drain() async {
+    for (int processed = 0; processed < 8 && !_disposed; processed++) {
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      final VideoDownloadJobRow? job = await database.claimNextVideoDownloadJob(
+        workerId: workerId,
+        nowAt: now,
+        leaseDurationMs: leaseDuration.inMilliseconds,
+      );
+      if (job == null) return;
+      await _process(job);
+    }
+  }
+
+  Future<void> _process(VideoDownloadJobRow job) async {
+    final VideoDownloadLeaseGuard lease = VideoDownloadLeaseGuard(
+      leaseDuration: leaseDuration,
+      renew: () => database.renewVideoDownloadJobClaim(
+        jobId: job.jobId,
+        workerId: workerId,
+        nowAt: DateTime.now().millisecondsSinceEpoch,
+        leaseDurationMs: leaseDuration.inMilliseconds,
+      ),
+    );
+    _activeJobId = job.jobId;
+    _activeLease = lease;
+    lease.start();
+    try {
+      await _processWithLease(job);
+    } on VideoDownloadLeaseLost {
+      // Another worker (or a user lifecycle action) owns the row now. The
+      // persisted stage is the only safe place from which to continue.
+    } finally {
+      if (identical(_activeLease, lease)) _activeLease = null;
+      if (_activeJobId == job.jobId) _activeJobId = null;
+      await lease.stop();
+    }
+  }
+
+  Future<void> _processWithLease(VideoDownloadJobRow job) async {
+    try {
+      switch (job.stage) {
+        case VideoDownloadJobStage.enqueue:
+          await _enqueueTorrent(job);
+        case VideoDownloadJobStage.download:
+          await _observeDownload(job);
+        case VideoDownloadJobStage.organize:
+          await _organizeDownload(job);
+        case VideoDownloadJobStage.subtitle:
+          await _installSubtitles(job);
+        case VideoDownloadJobStage.import:
+          await _importMedia(job);
+        case VideoDownloadJobStage.scrape:
+          await _scrapeMedia(job);
+        default:
+          throw VideoDownloadPipelineActionRequired(
+            'Unknown download stage: ${job.stage}',
+          );
+      }
+    } on VideoDownloadPipelineActionRequired catch (error) {
+      await _markNeedsAttention(job, _safeError(error.message));
+    } on Object catch (error) {
+      _ensureLeaseHeld();
+      final bool retryable =
+          error is! ExternalProviderFailure || error.retryable;
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      // 刮削阶段只有「资料源暂时不可用」可重试；其余（映射不回来源、待确认…）
+      // 重试也不会变，交给人处理。
+      final bool scrapeNeedsHuman = job.stage == VideoDownloadJobStage.scrape &&
+          error is! VideoDownloadScrapeProviderUnavailable;
+      if (scrapeNeedsHuman || !retryable) {
+        await _markNeedsAttention(
+          job,
+          _safeError(error.toString()),
+          nowAt: now,
+        );
+        return;
+      }
+      if (error is VideoDownloadScrapeProviderUnavailable &&
+          job.attemptCount + 1 >= job.maxAttempts) {
+        // 资料源长时间不可用：文件早已入库，下载这件事做完了。刮削交给库内补刮
+        // ——它在作品没有规范身份时会用本任务确认过的身份去刮
+        // （`downloadConfirmedLookupsForWorks`），资料源恢复后自然补上。判成
+        // failed 只会留下一个误导的「出错」和一条永远不会自己好的任务。
+        fushiDebugPrint(
+          '[download-scrape] ${job.jobId}: metadata provider still '
+          'unavailable after ${job.maxAttempts} attempts; completing the '
+          'download and leaving the scrape to the library backfill: $error',
+        );
+        await _releaseLeaseWith(
+          () => database.completeVideoDownloadJob(
+            jobId: job.jobId,
+            workerId: workerId,
+            completedAt: now,
+          ),
+        );
+        return;
+      }
+      final int exponent = job.attemptCount.clamp(0, 6);
+      final int delaySeconds = 5 * (1 << exponent);
+      await _releaseLeaseWith(
+        () => database.retryVideoDownloadJob(
+          jobId: job.jobId,
+          workerId: workerId,
+          error: _safeError(error.toString()),
+          nowAt: now,
+          nextAttemptAt: now + Duration(seconds: delaySeconds).inMilliseconds,
+        ),
+      );
+    }
+  }
+
+  Future<VideoDownloadBackendBinding> _binding(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    final VideoDownloadBackendBinding? binding = await backendResolver(job);
+    _ensureLeaseHeld();
+    _validateBackendBinding(job, binding);
+    return binding!;
+  }
+
+  static void _validateBackendBinding(
+    VideoDownloadJobRow job,
+    VideoDownloadBackendBinding? binding,
+  ) {
+    if (binding == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The original download backend is not configured on this device',
+      );
+    }
+    final VideoDownloadBackendIdentity current = binding.identity;
+    // 只比后端**实例身份**。分类不参与：它是任务自己的投放位置（列
+    // `VideoDownloadJobs.category`），用户改设置里的分类、或升级后默认分类
+    // 漂移，都不代表换了一台下载器；下游全部用 `job.category` 去后端定位这个
+    // 任务自己的种子，旧种子本来也还在旧分类下（BUG-1879）。
+    if (current.kind != job.backendKind ||
+        current.profileId != job.backendProfileId ||
+        current.fingerprint != job.fingerprint) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend instance or profile no longer matches this job',
+      );
+    }
+  }
+
+  Future<void> _enqueueTorrent(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    final VideoDownloadBackendBinding binding = await _binding(job);
+    final String category = job.category ?? '';
+    if (category.isEmpty || !await binding.backend.prepareCategory(category)) {
+      throw StateError('download category is unavailable');
+    }
+    _ensureLeaseHeld();
+    final TorrentAddPayload payload = await _resolvePayload(job);
+    _ensureLeaseHeld();
+    final String? hash = (payload.torrentId ?? job.torrentHash)?.toLowerCase();
+    if (hash == null || hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected torrent has no verifiable info hash',
+      );
+    }
+    final VideoDownloadJobRow? duplicate = await database
+        .findVideoDownloadJobByFingerprintAndTorrentHash(job.fingerprint, hash);
+    // 先判孤儿接管（BUG-2755）：持有者停在 failed / needsAttention 且目标来源已
+    // 失效时永远不会让出槽位，同包排队等它只会卡死。
+    if (duplicate != null &&
+        duplicate.jobId != job.jobId &&
+        !await _supersedeOrphanedDuplicate(duplicate, job)) {
+      if (_releasesPackSlot(job) && _releasesPackSlot(duplicate)) {
+        // 同包的上一卷还没下完：排队等它完成让出 torrent，不算失败、不耗重试
+        // 预算。持有者被暂停/出错时也继续等——用户恢复、重试或删掉它之后这里
+        // 自动接手。
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        await _releaseLeaseWith(
+          () => database.releaseVideoDownloadJobClaim(
+            jobId: job.jobId,
+            workerId: workerId,
+            nowAt: now,
+            nextAttemptAt: now + pollInterval.inMilliseconds,
+          ),
+        );
+        return;
+      }
+      throw VideoDownloadPipelineActionRequired(
+        'This torrent is already managed by job ${duplicate.jobId}',
+      );
+    }
+    _ensureLeaseHeld();
+    // BUG-2755：受管任务直接下载进目标来源的暂存目录，不再先落全局下载根。
+    final String? savePath = await _incomingSavePath(job, binding, category);
+    _ensureLeaseHeld();
+    // Persist the exact hash before the enqueue side effect.
+    await database.updateVideoDownloadJob(
+      job.jobId,
+      VideoDownloadJobsCompanion(torrentHash: Value<String?>(hash)),
+    );
+    _ensureLeaseHeld();
+    final List<VideoDownloadJobFileRow> persistedFiles = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    _ensureLeaseHeld();
+    if (_hasUserFileSelection(persistedFiles)) {
+      await _addSelectedTorrentPaused(
+        job: job,
+        backend: binding.backend,
+        payload: payload,
+        category: category,
+        savePath: savePath,
+        torrentId: hash,
+      );
+    } else {
+      final bool added = await TorrentAddCoordinator(
+        binding.backend,
+      ).add(payload, category: category, savePath: savePath);
+      _ensureLeaseHeld();
+      if (!added) {
+        final List<TorrentSnapshot> current = await binding.backend
+            .listTorrents(category: category);
+        _ensureLeaseHeld();
+        if (!current.any(
+          (TorrentSnapshot value) => value.hash.toLowerCase() == hash,
+        )) {
+          throw StateError('download backend rejected the torrent');
+        }
+      }
+      // 整颗重新投递会让后端丢掉此前写的特典 skip 优先级：下一轮观察重新写。
+      _extrasSkipAppliedJobIds.remove(job.jobId);
+    }
+    final Future<void> Function(VideoDownloadJobRow job)? checkpoint =
+        onBackendTaskAdded;
+    if (checkpoint != null) {
+      await checkpoint(job);
+      _ensureLeaseHeld();
+    }
+    await _advance(
+      job,
+      VideoDownloadJobStage.download,
+      backendTaskId: hash,
+      torrentHash: hash,
+      // Re-entering the download stage is regained ground, not progress: a job
+      // that keeps losing its backend task would otherwise refund its retry
+      // budget on every lap of enqueue -> download -> rewind and never fail.
+      // The budget is still reset by the next real advance (download ->
+      // organize) and by an explicit user retry.
+      resetAttempts: false,
+    );
+  }
+
+  /// 同 hash 的旧任务停在 failed / needsAttention、目标来源又已失效时，让 [job]
+  /// 接管它（BUG-2755）。否则同一集改了来源重新入队会被它永远拦成「already
+  /// managed」。旧任务的来源还在、还在跑、或文件已落进来源时不接管。
+  Future<bool> _supersedeOrphanedDuplicate(
+    VideoDownloadJobRow duplicate,
+    VideoDownloadJobRow job,
+  ) async {
+    if (!await _isOrphanedFromSource(duplicate)) return false;
+
+    _ensureLeaseHeld();
+    final bool superseded = await database.supersedeVideoDownloadJob(
+      supersededJobId: duplicate.jobId,
+      byJobId: job.jobId,
+    );
+    if (superseded) {
+      engineLog.logDiagnostic(
+        'VideoDownloadPipeline',
+        'job ${job.jobId} took over torrent of job ${duplicate.jobId} '
+            'whose target source no longer exists',
+      );
+    }
+    return superseded;
+  }
+
+  /// 受管任务在下载器里的落点：`<来源根>/.fushi-incoming/<category>`，经路径映射
+  /// 换成后端视角（BUG-2755）。非受管任务、没有来源、来源不可用、或来源不在任何
+  /// 映射里时返回 null，后端回退到自己的分类默认目录（全局下载根）。
+  ///
+  /// 没配映射 = 下载器与本机同盘同视角（与整理阶段 [_effectivePathMappings] 的
+  /// identity 假设一致），直接用本机路径。
+  Future<String?> _incomingSavePath(
+    VideoDownloadJobRow job,
+    VideoDownloadBackendBinding binding,
+    String category,
+  ) async {
+    if (!videoDownloadJobUsesManagedSource(job)) return null;
+    final int? sourceId = job.targetSourceId;
+    if (sourceId == null) return null;
+    final MediaSourceRow? source = await database.getMediaSourceById(sourceId);
+    if (!isUsableManagedVideoSource(source)) return null;
+    final String local = p.normalize(
+      p.absolute(sourceIncomingCategoryPath(source!.rootPath, category)),
+    );
+    if (binding.pathMappings.isEmpty) return local;
+    return _mappingForLocalPath(
+      binding.pathMappings,
+      local,
+    )?.localToRemote(local);
+  }
+
+  /// 选择下载必须在产生任何网络副作用前确认能力，并拒绝接管后端中已有的同
+  /// hash 任务。后端以暂停态添加后才写优先级；失败时任务最多残留为暂停态，
+  /// 不会静默开始整包下载。
+  Future<void> _addSelectedTorrentPaused({
+    required VideoDownloadJobRow job,
+    required TorrentBackend backend,
+    required TorrentAddPayload payload,
+    required String category,
+    required String? savePath,
+    required String torrentId,
+  }) async {
+    if (payload is! TorrentMetainfoPayload ||
+        backend is! TorrentPausedMetainfoBackend ||
+        backend is! TorrentDetailBackend ||
+        backend is! TorrentPauseBackend ||
+        !(backend as TorrentDetailBackend).detailAvailable ||
+        !(backend as TorrentPauseBackend).pauseControlAvailable) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The download backend cannot safely apply a single-file selection',
+      );
+    }
+    final TorrentPausedMetainfoBackend pausedBackend = backend;
+    final TorrentDetailBackend detailBackend = backend as TorrentDetailBackend;
+    final TorrentPauseBackend pauseBackend = backend as TorrentPauseBackend;
+    final List<TorrentSnapshot> existing = await backend.listTorrents();
+    _ensureLeaseHeld();
+    if (existing.any(
+      (TorrentSnapshot value) => value.hash.toLowerCase() == torrentId,
+    )) {
+      throw const VideoDownloadPipelineActionRequired(
+        'This torrent already exists in the download backend; '
+        'it will not be taken over or have its file priorities changed',
+      );
+    }
+    final bool added = await pausedBackend.addTorrentMetainfoPaused(
+      payload,
+      category: category,
+      savePath: savePath,
+    );
+
+    _ensureLeaseHeld();
+    if (!added) {
+      throw StateError('download backend rejected the paused torrent');
+    }
+    try {
+      await _applyPersistedFileSelection(
+        job: job,
+        backend: backend,
+        detail: detailBackend,
+        pause: pauseBackend,
+        torrentId: torrentId,
+      );
+    } on Object {
+      if (backend is TorrentRemovalBackend) {
+        await (backend as TorrentRemovalBackend).removeTorrent(
+          torrentId,
+          deleteFiles: false,
+        );
+        _ensureLeaseHeld();
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _applyPersistedFileSelection({
+    required VideoDownloadJobRow job,
+    required TorrentBackend backend,
+    required TorrentDetailBackend detail,
+    required TorrentPauseBackend pause,
+    required String torrentId,
+  }) async {
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    _ensureLeaseHeld();
+    final List<int> skipped = <int>[
+      for (final VideoDownloadJobFileRow row in rows)
+        if (!row.selected && row.backendFileIndex != null)
+          row.backendFileIndex!,
+    ];
+    final List<int> selected = <int>[
+      for (final VideoDownloadJobFileRow row in rows)
+        if (row.selected && row.backendFileIndex != null) row.backendFileIndex!,
+    ];
+    if (selected.isEmpty || skipped.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The persisted torrent file selection is incomplete',
+      );
+    }
+    if (!await _setFilePriorities(
+      backend,
+      detail,
+      torrentId,
+      skipped,
+      TorrentFilePriority.skip,
+    )) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend rejected skipped torrent files',
+      );
+    }
+    _ensureLeaseHeld();
+    if (!await _setFilePriorities(
+      backend,
+      detail,
+      torrentId,
+      selected,
+      TorrentFilePriority.normal,
+    )) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend rejected selected torrent files',
+      );
+    }
+    _ensureLeaseHeld();
+    final List<TorrentFilePriority>? priorities = await detail.filePriorities(
+      torrentId,
+    );
+    _ensureLeaseHeld();
+    if (priorities == null ||
+        skipped.any(
+          (int index) =>
+              index >= priorities.length ||
+              priorities[index] != TorrentFilePriority.skip,
+        ) ||
+        selected.any(
+          (int index) =>
+              index >= priorities.length ||
+              priorities[index] == TorrentFilePriority.skip,
+        )) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend did not confirm the requested torrent file selection',
+      );
+    }
+    if (!await pause.resumeTorrent(torrentId)) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The selected torrent could not be resumed',
+      );
+    }
+  }
+
+  Future<bool> _setFilePriorities(
+    TorrentBackend backend,
+    TorrentDetailBackend detail,
+    String torrentId,
+    List<int> indexes,
+    TorrentFilePriority priority,
+  ) async {
+    if (indexes.isEmpty) return true;
+    if (backend is TorrentBulkFilePriorityBackend) {
+      return backend.setFilePriorities(torrentId, indexes, priority);
+    }
+    for (final int index in indexes) {
+      if (!await detail.setFilePriority(torrentId, index, priority)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<TorrentAddPayload> _resolvePayload(VideoDownloadJobRow job) async {
+    final String? magnet = job.magnetUri;
+    if (magnet != null && magnet.isNotEmpty) {
+      return TorrentMagnetPayload(
+        magnetUri: magnet,
+        torrentId: parseMagnetInfoHash(magnet) ?? job.torrentHash,
+      );
+    }
+    // 手动 .torrent 任务：payload 从入队时落盘的元数据文件重新物化（带
+    // 期望 hash 复核，文件被换掉会显式失败而不是下错种子）。
+    if (job.resourceProvider == kManualVideoDownloadResourceProvider) {
+      return _resolveManualMetainfoPayload(job);
+    }
+    // 公共索引器（nyaa/apibay/knaben）的 payload 就是「info hash + 该索引器的
+    // 固定 tracker 集」拼出来的磁链——那是任务行里**已有数据的纯函数**，压根
+    // 不需要网络（BUG-1866）。此前它只是重搜失败后的兜底，正常路径先拿完整
+    // 发布名回索引器全文搜：nyaa 对
+    // `[Airota&VCB-Studio] Gekijouban … BDRip [MOVIE]` 这种串必然搜不中，于是
+    // 每次重启/重试都要先把一个还活着的资源误报成 notFound、再被兜底捞回来。
+    // 把纯函数摆到联网之前，这条误报就没有产生的余地了。
+    //
+    // 与联网重搜的差别只在 tracker 与 `dn` 编码，info hash 一定相同：nyaa 与
+    // apibay 联网走的也是同一份常量 tracker（`NyaaTorrent.magnet` /
+    // `buildPublicVideoIndexMagnet`），完全等价；**Knaben 例外**——它的 API 直接
+    // 给 `magnetUrl`，联网时原样透传，离线路径统一换成
+    // `kPublicTrackers`，可能丢掉 knaben 自带的少量 tracker。公共
+    // tracker + DHT 足以补齐，用一条必然发生的 notFound 误报换它不划算。
+    // 真正必须重搜的只剩私有 Torznab：它的 .torrent 走临时凭据 URL，不落库。
+    final TorrentMagnetPayload? offline = _publicIndexerMagnetPayload(job);
+    if (offline != null) {
+      await _persistResolvedMagnet(job, offline.magnetUri);
+      return offline;
+    }
+    final TorrentAddPayload payload = await resourceRegistry.resolveSelection(
+      selection: VideoResourceSelection(
+        providerId: job.resourceProvider,
+        remoteId: job.selectedResourceId,
+        title: job.resourceTitle ?? job.title,
+      ),
+      request: VideoResourceSearchRequest(
+        media: _mediaReference(job),
+        query: job.resourceTitle ?? job.title,
+        season: job.season,
+      ),
+    );
+    // 重搜成功解析出的磁链写回任务行：下次重启/重试不再吃索引器可用性。
+    if (payload is TorrentMagnetPayload) {
+      await _persistResolvedMagnet(job, payload.magnetUri);
+    }
+    return payload;
+  }
+
+  /// 公共索引器任务的离线磁链：`magnet:?xt=urn:btih:<hash>` + 该索引器的固定
+  /// tracker 集。私有 Torznab（DHT 关闭、需 .torrent 凭据）返回 null，由调用方
+  /// 回索引器重搜，保持原失败语义。
+  ///
+  /// 只认 40 位 v1 hash：BT v2 的 64 位 hash 要走 `urn:btmh:`，拿它拼 `btih`
+  /// 只会得到一个谁也认不出的磁链，宁可退回重搜。
+  TorrentMagnetPayload? _publicIndexerMagnetPayload(VideoDownloadJobRow job) {
+    final String provider = job.resourceProvider;
+    bool isProvider(String id) => provider == id || provider.startsWith('$id:');
+    final List<String>? trackers = isProvider('nyaa')
+        ? kNyaaTrackers
+        : isProvider(kApibayResourceProviderId) ||
+              isProvider(kKnabenResourceProviderId)
+        ? kPublicTrackers
+        : null;
+    if (trackers == null) return null;
+    final String hash = (job.torrentHash ?? job.selectedResourceId)
+        .toLowerCase();
+    if (!RegExp(r'^[0-9a-f]{40}$').hasMatch(hash)) return null;
+    final StringBuffer magnet = StringBuffer('magnet:?xt=urn:btih:$hash');
+    final String name = (job.resourceTitle ?? job.title).trim();
+    if (name.isNotEmpty) {
+      magnet.write('&dn=${Uri.encodeQueryComponent(name)}');
+    }
+    for (final String tracker in trackers) {
+      magnet.write('&tr=${Uri.encodeQueryComponent(tracker)}');
+    }
+    return TorrentMagnetPayload(magnetUri: magnet.toString(), torrentId: hash);
+  }
+
+  Future<void> _persistResolvedMagnet(
+    VideoDownloadJobRow job,
+    String magnetUri,
+  ) async {
+    if (!magnetUri.startsWith('magnet:')) return;
+    await database.updateVideoDownloadJob(
+      job.jobId,
+      VideoDownloadJobsCompanion(magnetUri: Value<String?>(magnetUri)),
+    );
+  }
+
+  /// 入队时可落库的候选磁链（DB CHECK 约束要求 `magnet:` 前缀）。
+  static String? _persistableMagnetOf(VideoResourceCandidate resource) {
+    final String? magnet = resource.magnetUri?.trim();
+    if (magnet == null || !magnet.startsWith('magnet:')) return null;
+    return magnet;
+  }
+
+  /// 读取 `<manualTorrentDirectory>/<jobId>.torrent` 并复核 info hash。
+  Future<TorrentAddPayload> _resolveManualMetainfoPayload(
+    VideoDownloadJobRow job,
+  ) async {
+    final Directory? directory = manualTorrentDirectory;
+    if (directory == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Torrent file storage is not configured on this device',
+      );
+    }
+    final File file = File(p.join(directory.path, '${job.jobId}.torrent'));
+    if (!await file.exists()) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The torrent file recorded for this task is no longer available',
+      );
+    }
+    try {
+      return inspectTorrentMetainfo(
+        await file.readAsBytes(),
+        // 排队等同包持有者的任务还没写 torrentHash，身份在 selectedResourceId。
+        expectedInfoHash: job.torrentHash ?? job.selectedResourceId,
+      ).toPayload(fileName: p.basename(file.path));
+    } on TorrentMetainfoException catch (error) {
+      throw VideoDownloadPipelineActionRequired(error.message);
+    }
+  }
+
+  Future<void> _observeDownload(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    final VideoDownloadBackendBinding binding = await _binding(job);
+    final String hash = job.backendTaskId ?? job.torrentHash ?? '';
+    if (hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend torrent id is missing',
+      );
+    }
+    final List<TorrentSnapshot> snapshots = await binding.backend.listTorrents(
+      category: job.category,
+    );
+    _ensureLeaseHeld();
+    TorrentSnapshot? snapshot;
+    for (final TorrentSnapshot value in snapshots) {
+      if (value.hash.toLowerCase() == hash.toLowerCase()) {
+        snapshot = value;
+        break;
+      }
+    }
+    if (snapshot == null) {
+      if (job.backendKind == QbConnectionConfig.backendEmbedded) {
+        // The embedded engine can legitimately lose a task whose fast-resume
+        // snapshot did not survive an unclean exit, so re-adding it is worth a
+        // try. It consumes retry budget: a task that can never be held (full
+        // disk, invalid torrent, a snapshot that never persists) must reach a
+        // terminal state instead of re-enqueueing itself forever while the UI
+        // shows an eternally "active" job.
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        await _releaseLeaseWith(
+          () => database.rewindVideoDownloadJobToEnqueue(
+            jobId: job.jobId,
+            workerId: workerId,
+            error: videoDownloadMissingBackendTaskError,
+            nowAt: now,
+            nextAttemptAt: now + pollInterval.inMilliseconds,
+          ),
+        );
+        return;
+      }
+      throw StateError(videoDownloadMissingBackendTaskError);
+    }
+    if (snapshot.isFailure) {
+      throw VideoDownloadPipelineActionRequired(
+        'The download backend reported ${snapshot.state}',
+      );
+    }
+    if (!snapshot.isComplete) {
+      final int now = DateTime.now().millisecondsSinceEpoch;
+      _ensureLeaseHeld();
+      await database.updateVideoDownloadJob(
+        job.jobId,
+        VideoDownloadJobsCompanion(
+          stageProgress: Value<double>(snapshot.progress.clamp(0, 1)),
+          observedSavePath: Value<String?>(snapshot.savePath),
+          updatedAt: Value<int>(now),
+        ),
+      );
+      await _skipExtrasIfRequested(job, binding.backend, hash);
+      _ensureLeaseHeld();
+      await _releaseLeaseWith(
+        () => database.releaseVideoDownloadJobClaim(
+          jobId: job.jobId,
+          workerId: workerId,
+          nowAt: now,
+          nextAttemptAt: now + pollInterval.inMilliseconds,
+        ),
+      );
+      return;
+    }
+    final List<TorrentFileEntry> files = await binding.backend.listFiles(hash);
+    _ensureLeaseHeld();
+    if (files.isEmpty) throw StateError('download has no visible files');
+    await _ensureDownloadedFileRows(job, files);
+    await _advance(
+      job,
+      VideoDownloadJobStage.organize,
+      observedSavePath: snapshot.savePath,
+    );
+  }
+
+  /// 「下载时跳过特典」：下载途中把特典文件的优先级设成 skip，并把整份文件
+  /// 选择落成文件行（特典 `selected: false` + `kind: 'extra'`）。完成判定、
+  /// [_ensureDownloadedFileRows]、整理排除都按「有被跳过的行」处理它；重新
+  /// 投递与删除则仍当整颗 torrent（见 [_hasUserFileSelection]）。
+  ///
+  /// 只决定一次：任务一旦有文件行（手动选择、或上一轮已决定）就不再重判，
+  /// 用户中途关掉开关也不会把已跳过的特典再拉回来——已决定跳过的，后端任务
+  /// 被整颗重加后还会重写 skip 优先级（[_reapplyExtrasSkip]）。磁力还没拿到
+  /// 元数据（文件列表为空）时本轮什么都不做，下一轮再判。
+  ///
+  /// 判据用整理器同一份（[isVideoDownloadExtraFile]）：特典目录里的非视频文件
+  /// （扫图、CD 音轨）同样跳过，整理器反正也只会把它们当附件。永远留至少
+  /// 一个正片视频——整个种子都是特典时（用户就是来下 SP 盘的）原样全下。
+  Future<void> _skipExtrasIfRequested(
+    VideoDownloadJobRow job,
+    TorrentBackend backend,
+    String hash,
+  ) async {
+    // 没装配开关（服务端 / 既有测试）= 这个进程从不产生自动跳过的特典行。
+    final bool Function()? toggle = skipDownloadExtras;
+    if (toggle == null) return;
+    if (job.organizationPolicy != 'library') return;
+    if (_extrasDecidedJobIds.contains(job.jobId) ||
+        _extrasSkipAppliedJobIds.contains(job.jobId)) {
+      return;
+    }
+    if (backend is! TorrentDetailBackend || !backend.detailAvailable) return;
+    _ensureLeaseHeld();
+    final List<VideoDownloadJobFileRow> existing = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    _ensureLeaseHeld();
+    if (existing.isNotEmpty) {
+      await _reapplyExtrasSkip(job, backend, hash, existing);
+      return;
+    }
+    if (!toggle()) return;
+    final List<TorrentFileEntry> files = await backend.listFiles(hash);
+    _ensureLeaseHeld();
+    if (files.isEmpty) return;
+    final String? sharedRoot = videoDownloadSharedRoot(files);
+    final Set<int> extras = <int>{
+      for (final TorrentFileEntry file in files)
+        if (isVideoDownloadExtraFile(file.name, sharedRoot: sharedRoot))
+          file.index,
+    };
+    final bool keepsMainVideo = files.any(
+      (TorrentFileEntry file) =>
+          !extras.contains(file.index) && isVideoDownloadVideoFile(file.name),
+    );
+    if (extras.isEmpty || !keepsMainVideo) {
+      // 文件列表非空 = 元数据已知，这个结论不会再变。
+      _extrasDecidedJobIds.add(job.jobId);
+      return;
+    }
+    if (!await _setFilePriorities(
+      backend,
+      backend,
+      hash,
+      extras.toList()..sort(),
+      TorrentFilePriority.skip,
+    )) {
+      // 不落文件行：下一轮仍是「未决定」，会再试一次；任务本身照常下载。
+      engineLog.log(
+        'VideoDownloadPipeline',
+        'Backend rejected skipping ${extras.length} extras files '
+            'of job ${job.jobId}; will retry on the next poll',
+      );
+      return;
+    }
+    _ensureLeaseHeld();
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    await database.transaction(() async {
+      for (final TorrentFileEntry file in files) {
+        final bool selected = !extras.contains(file.index);
+        await database.upsertVideoDownloadJobFile(
+          VideoDownloadJobFilesCompanion(
+            jobId: Value<String>(job.jobId),
+            backendFileIndex: Value<int?>(file.index),
+            originalRelativePath: Value<String>(file.name),
+            currentRelativePath: Value<String>(file.name),
+            // 'extra' 把「自动跳过的特典」与用户亲手取消选择的文件区分开，
+            // 见 [_isAutoSkippedExtraRow]。
+            kind: Value<String>(selected ? 'other' : 'extra'),
+            sizeBytes: Value<int?>(file.size),
+            selected: Value<bool>(selected),
+            status: Value<String>(
+              selected
+                  ? VideoDownloadJobFileStatus.downloading
+                  : VideoDownloadJobFileStatus.skipped,
+            ),
+            createdAt: Value<int>(now),
+            updatedAt: Value<int>(now),
+          ),
+        );
+      }
+    });
+    _extrasSkipAppliedJobIds.add(job.jobId);
+  }
+
+  /// 已决定跳过特典的任务，在本进程里还没把 skip 优先级写进**当前**后端任务
+  /// 时补写一次（重新投递 / 进程重启后后端任务是整颗重加的）。没有自动跳过行
+  /// 的任务（用户手动选择的任务）不归这里管，判一次就记为已决定。
+  Future<void> _reapplyExtrasSkip(
+    VideoDownloadJobRow job,
+    TorrentDetailBackend backend,
+    String hash,
+    List<VideoDownloadJobFileRow> rows,
+  ) async {
+    final List<int> skipped = <int>[
+      for (final VideoDownloadJobFileRow row in rows)
+        if (_isAutoSkippedExtraRow(row) && row.backendFileIndex != null)
+          row.backendFileIndex!,
+    ]..sort();
+    if (skipped.isEmpty) {
+      _extrasDecidedJobIds.add(job.jobId);
+      return;
+    }
+    // 磁力重加后要等元数据到了才有文件可设优先级。
+    final List<TorrentFileEntry> files = await backend.listFiles(hash);
+    _ensureLeaseHeld();
+    if (files.isEmpty) return;
+    if (!await _setFilePriorities(
+      backend,
+      backend,
+      hash,
+      skipped,
+      TorrentFilePriority.skip,
+    )) {
+      engineLog.log(
+        'VideoDownloadPipeline',
+        'Backend rejected re-applying skip to ${skipped.length} extras files '
+            'of job ${job.jobId}; will retry on the next poll',
+      );
+      return;
+    }
+    _ensureLeaseHeld();
+    _extrasSkipAppliedJobIds.add(job.jobId);
+  }
+
+  Future<void> _ensureDownloadedFileRows(
+    VideoDownloadJobRow job,
+    List<TorrentFileEntry> files,
+  ) async {
+    _ensureLeaseHeld();
+    final List<VideoDownloadJobFileRow> existing = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final Map<int, VideoDownloadJobFileRow> byIndex =
+        <int, VideoDownloadJobFileRow>{
+          for (final VideoDownloadJobFileRow row in existing)
+            if (row.backendFileIndex != null) row.backendFileIndex!: row,
+        };
+    final bool selective = existing.any(
+      (VideoDownloadJobFileRow row) => !row.selected,
+    );
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final TorrentFileEntry file in files) {
+      _ensureLeaseHeld();
+      final VideoDownloadJobFileRow? row = byIndex[file.index];
+      if (row != null) {
+        await database.updateVideoDownloadJobFile(
+          row.id,
+          VideoDownloadJobFilesCompanion(
+            currentRelativePath: Value<String>(file.name),
+            sizeBytes: Value<int?>(file.size),
+            status: Value<String>(
+              row.selected
+                  ? VideoDownloadJobFileStatus.downloaded
+                  : VideoDownloadJobFileStatus.skipped,
+            ),
+            updatedAt: Value<int>(now),
+          ),
+        );
+        continue;
+      }
+      await database.upsertVideoDownloadJobFile(
+        VideoDownloadJobFilesCompanion(
+          jobId: Value<String>(job.jobId),
+          backendFileIndex: Value<int?>(file.index),
+          originalRelativePath: Value<String>(file.name),
+          currentRelativePath: Value<String>(file.name),
+          kind: const Value<String>('other'),
+          sizeBytes: Value<int?>(file.size),
+          selected: Value<bool>(!selective),
+          status: Value<String>(
+            selective
+                ? VideoDownloadJobFileStatus.skipped
+                : VideoDownloadJobFileStatus.downloaded,
+          ),
+          createdAt: Value<int>(now),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+  }
+
+  Future<void> _organizeDownload(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    if (job.organizationPolicy == 'legacy') {
+      await _reconcileLegacyDownload(job);
+      return;
+    }
+    if (discoveryKindOfOrganizationPolicy(job.organizationPolicy) != null) {
+      await _resolveDiscoveryDownloadPaths(job);
+      return;
+    }
+    if (downloadOnlyKindOfOrganizationPolicy(job.organizationPolicy) != null) {
+      await _resolveDiscoveryDownloadPaths(job);
+      return;
+    }
+    final MediaSourceRow source = await _managedSource(job);
+    final VideoDownloadBackendBinding binding = await _binding(job);
+    final String hash = job.backendTaskId ?? job.torrentHash ?? '';
+    if (hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired('Torrent id is missing');
+    }
+    List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    if (await _organizedFilesExist(rows)) {
+      await _markFilesOrganized(rows);
+      await _advanceToSubtitle(job, rows);
+      return;
+    }
+    final List<VideoDownloadPathMapping> mappings = _effectivePathMappings(
+      binding,
+      observedSavePath: job.observedSavePath,
+      sourceRoot: source.rootPath,
+    );
+    await _validateObservedSavePath(job, mappings);
+    final VideoDownloadPathMapping mapping =
+        _mappingForLocalPath(mappings, source.rootPath) ??
+        (throw const VideoDownloadPipelineActionRequired(
+          'The managed video source is outside every backend path mapping',
+        ));
+    final VideoOrganizationRequest request = VideoOrganizationRequest(
+      torrentId: hash,
+      title: job.title,
+      year: job.year,
+      kind: job.mediaKind == VideoMetadataMediaKind.movie.name
+          ? VideoOrganizationKind.movie
+          : VideoOrganizationKind.episodic,
+      defaultSeasonNumber: job.season ?? 1,
+      sourceRoot: source.rootPath,
+      pathMapping: mapping,
+    );
+    // 选择性任务（手动选文件 / 跳过特典）里没选的文件没下完或根本没下：
+    // 不排布、不改名、不入库，否则半截文件会被当成已整理的正片或特典。
+    final Set<int> skippedIndexes = <int>{
+      for (final VideoDownloadJobFileRow row in rows)
+        if (!row.selected && row.backendFileIndex != null)
+          row.backendFileIndex!,
+    };
+    final List<TorrentFileEntry> backendFiles =
+        (await binding.backend.listFiles(hash))
+            .where(
+              (TorrentFileEntry file) => !skippedIndexes.contains(file.index),
+            )
+            .toList(growable: false);
+    _ensureLeaseHeld();
+    final VideoOrganizationPlan planned;
+    try {
+      planned = _organizer.plan(request, backendFiles);
+    } on FormatException catch (error) {
+      throw VideoDownloadPipelineActionRequired(error.message.toString());
+    }
+    // 整理器把「电影身份 + 多集合集包」改判成了剧集（BUG-2760）：任务本身也
+    // 必须跟着变成剧集，否则导入仍按电影逐文件建条目、字幕只配主片。先落任务
+    // 形态、再落文件计划——崩溃重放时两者不会一新一旧。
+    if (planned.kind == VideoOrganizationKind.episodic &&
+        request.kind == VideoOrganizationKind.movie) {
+      job = await _reclassifyMovieJobAsEpisodic(job);
+    }
+    await _persistOrganizationIntent(job, planned, backendFiles);
+    _ensureLeaseHeld();
+    final VideoOrganizationResult result = await _organizer.organize(
+      backend: binding.backend,
+      request: request,
+      excludedFileIndexes: skippedIndexes,
+      onFileCommitted: (VideoOrganizationFilePlan file) async {
+        _ensureLeaseHeld();
+        final VideoDownloadJobFileRow? row = await _jobFileByIndex(
+          job.jobId,
+          file.backendFileIndex,
+        );
+        if (row == null) return;
+        await database.updateVideoDownloadJobFile(
+          row.id,
+          VideoDownloadJobFilesCompanion(
+            currentRelativePath: Value<String>(file.targetRelativePath),
+            targetRelativePath: Value<String?>(file.targetRelativePath),
+            finalAbsolutePath: Value<String?>(file.finalLocalPath),
+            season: Value<int?>(file.seasonNumber),
+            episode: Value<int?>(file.episodeNumber),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+      },
+    );
+    _ensureLeaseHeld();
+    if (!result.ok) {
+      throw VideoDownloadPipelineActionRequired(
+        result.error ?? 'Backend organization failed',
+      );
+    }
+    rows = await database.getVideoDownloadJobFiles(job.jobId);
+    await _markFilesOrganized(rows);
+    await _advanceToSubtitle(job, rows);
+  }
+
+  /// 手动「按域入库」任务的 organize：不重命名、不搬进受管视频来源，只把后端
+  /// 报告的文件解析成本机绝对路径并核对存在性/体积，随后直接跳到 import 阶段
+  /// （这类内容没有字幕概念，subtitle 阶段整段不进）。
+  Future<void> _resolveDiscoveryDownloadPaths(VideoDownloadJobRow job) async {
+    final VideoDownloadBackendBinding binding = await _binding(job);
+    final String hash = job.backendTaskId ?? job.torrentHash ?? '';
+    if (hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired('Torrent id is missing');
+    }
+    final List<VideoDownloadPathMapping> mappings = _effectivePathMappings(
+      binding,
+      observedSavePath: job.observedSavePath,
+    );
+    final ({VideoDownloadPathMapping mapping, String localPath}) saveRoot =
+        await _validateObservedSavePath(job, mappings);
+    final List<TorrentFileEntry> backendFiles = await binding.backend.listFiles(
+      hash,
+    );
+    _ensureLeaseHeld();
+    if (backendFiles.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The download has no visible files',
+      );
+    }
+    await _ensureDownloadedFileRows(job, backendFiles);
+    final Map<int, TorrentFileEntry> byIndex = <int, TorrentFileEntry>{
+      for (final TorrentFileEntry file in backendFiles) file.index: file,
+    };
+    final List<VideoDownloadJobFileRow> selectedRows =
+        (await database.getVideoDownloadJobFiles(job.jobId))
+            .where((VideoDownloadJobFileRow row) => row.selected)
+            .toList(growable: false);
+    if (selectedRows.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The download task has no selected files',
+      );
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final VideoDownloadJobFileRow row in selectedRows) {
+      _ensureLeaseHeld();
+      final TorrentFileEntry? backendFile = row.backendFileIndex == null
+          ? null
+          : byIndex[row.backendFileIndex!];
+      if (backendFile == null) {
+        throw VideoDownloadPipelineActionRequired(
+          'A selected torrent file is missing from the backend: '
+          '${row.currentRelativePath}',
+        );
+      }
+      final String? absolutePath = _resolveBackendFileLocalPath(
+        remoteSavePath: job.observedSavePath!,
+        relativePath: backendFile.name,
+        mapping: saveRoot.mapping,
+        localSaveRoot: saveRoot.localPath,
+      );
+      if (absolutePath == null) {
+        throw VideoDownloadPipelineActionRequired(
+          'A downloaded file is outside the observed save path: '
+          '${backendFile.name}',
+        );
+      }
+      final File localFile = File(absolutePath);
+      if (!await localFile.exists()) {
+        throw VideoDownloadPipelineActionRequired(
+          'A downloaded file is not accessible on this device: '
+          '${backendFile.name}',
+        );
+      }
+      if (backendFile.size > 0 &&
+          await localFile.length() != backendFile.size) {
+        throw VideoDownloadPipelineActionRequired(
+          'A downloaded file size does not match: ${backendFile.name}',
+        );
+      }
+      await database.updateVideoDownloadJobFile(
+        row.id,
+        VideoDownloadJobFilesCompanion(
+          currentRelativePath: Value<String>(backendFile.name),
+          finalAbsolutePath: Value<String?>(absolutePath),
+          sizeBytes: Value<int?>(backendFile.size),
+          status: const Value<String>(VideoDownloadJobFileStatus.organized),
+          error: const Value<String?>(null),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+    if (downloadOnlyKindOfOrganizationPolicy(job.organizationPolicy) != null) {
+      final TorrentBackend backend = binding.backend;
+      if (backend is! TorrentRemovalBackend ||
+          !await backend.removeTorrent(hash, deleteFiles: false)) {
+        throw const VideoDownloadPipelineActionRequired(
+          'The completed pack could not be detached from the download backend',
+        );
+      }
+      _ensureLeaseHeld();
+      // 释放物理 torrent 所有权与唯一索引槽位；下载文件和历史任务仍保留，
+      // 用户随后可以从同一 TMW Part 再挑另一本。
+      await database.updateVideoDownloadJob(
+        job.jobId,
+        const VideoDownloadJobsCompanion(
+          backendTaskId: Value<String?>(null),
+          torrentHash: Value<String?>(null),
+        ),
+      );
+      _ensureLeaseHeld();
+      await _releaseLeaseWith(
+        () => database.completeVideoDownloadJob(
+          jobId: job.jobId,
+          workerId: workerId,
+          completedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+      await _notifyDownloadOnlyCompleted(job);
+      return;
+    }
+    await _advance(job, VideoDownloadJobStage.import);
+  }
+
+  /// Reconciles a pre-v78 plan against its original backend location. Legacy
+  /// plans deliberately never rename files or move torrent storage: the old
+  /// JSON workflow imported in-place and could be seeding from arbitrary
+  /// paths outside a managed source.
+  Future<void> _reconcileLegacyDownload(VideoDownloadJobRow job) async {
+    final VideoDownloadBackendBinding binding = await _binding(job);
+    final String hash = job.backendTaskId ?? job.torrentHash ?? '';
+    if (hash.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired('Torrent id is missing');
+    }
+    final List<VideoDownloadPathMapping> mappings = _effectivePathMappings(
+      binding,
+      observedSavePath: job.observedSavePath,
+    );
+    final ({VideoDownloadPathMapping mapping, String localPath}) saveRoot =
+        await _validateObservedSavePath(job, mappings);
+    final List<TorrentFileEntry> backendFiles = await binding.backend.listFiles(
+      hash,
+    );
+    _ensureLeaseHeld();
+    if (backendFiles.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The legacy torrent has no visible files',
+      );
+    }
+    await _ensureDownloadedFileRows(job, backendFiles);
+    final Map<int, TorrentFileEntry> byIndex = <int, TorrentFileEntry>{
+      for (final TorrentFileEntry file in backendFiles) file.index: file,
+    };
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    int videoCount = 0;
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final VideoDownloadJobFileRow row in rows) {
+      _ensureLeaseHeld();
+      final TorrentFileEntry? backendFile = row.backendFileIndex == null
+          ? null
+          : byIndex[row.backendFileIndex!];
+      if (backendFile == null) continue;
+      final String? absolutePath = _resolveBackendFileLocalPath(
+        remoteSavePath: job.observedSavePath!,
+        relativePath: backendFile.name,
+        mapping: saveRoot.mapping,
+        localSaveRoot: saveRoot.localPath,
+      );
+      if (absolutePath == null) {
+        throw VideoDownloadPipelineActionRequired(
+          'Legacy backend file is outside the observed save path: '
+          '${backendFile.name}',
+        );
+      }
+      final File localFile = File(absolutePath);
+      if (!await localFile.exists()) {
+        throw VideoDownloadPipelineActionRequired(
+          'Legacy backend file is not accessible on this device: '
+          '${backendFile.name}',
+        );
+      }
+      if (backendFile.size > 0 &&
+          await localFile.length() != backendFile.size) {
+        throw VideoDownloadPipelineActionRequired(
+          'Legacy backend file size does not match: ${backendFile.name}',
+        );
+      }
+      final bool isVideo = _isVideoFile(backendFile.name);
+      final VideoNameInfo parsed = parseVideoFilename(
+        p.basename(backendFile.name),
+      );
+      await database.updateVideoDownloadJobFile(
+        row.id,
+        VideoDownloadJobFilesCompanion(
+          currentRelativePath: Value<String>(backendFile.name),
+          finalAbsolutePath: Value<String?>(absolutePath),
+          kind: Value<String>(isVideo ? 'video' : 'other'),
+          season: Value<int?>(parsed.season),
+          episode: Value<int?>(parsed.episode),
+          sizeBytes: Value<int?>(backendFile.size),
+          status: Value<String>(
+            isVideo
+                ? VideoDownloadJobFileStatus.organized
+                : VideoDownloadJobFileStatus.skipped,
+          ),
+          error: const Value<String?>(null),
+          updatedAt: Value<int>(now),
+        ),
+      );
+      if (isVideo) videoCount++;
+    }
+    if (videoCount == 0) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The legacy torrent has no supported video files',
+      );
+    }
+    await _advance(job, VideoDownloadJobStage.subtitle);
+  }
+
+  /// 把电影任务改成剧集任务（BUG-2760，整理器判定种子是多集合集包）。
+  ///
+  /// 身份快照里的 TMDB / IMDb id 属于**电影**命名空间，不能拿去当剧集身份；
+  /// 这里不改写快照，而是由 [_mediaReference] 在「快照 kind ≠ 任务 kind」时丢弃
+  /// 这些 id（刮削改走媒体库自动识别）。旧行没有快照时先按改判前的形态补写一份，
+  /// 让这条判据对它同样成立。
+  Future<VideoDownloadJobRow> _reclassifyMovieJobAsEpisodic(
+    VideoDownloadJobRow job,
+  ) async {
+    _ensureLeaseHeld();
+    fushiDebugPrint(
+      '[download-organize] ${job.jobId}: movie job holds a multi-episode '
+      'pack, reclassifying as tv',
+    );
+    await database.updateVideoDownloadJob(
+      job.jobId,
+      VideoDownloadJobsCompanion(
+        mediaKind: Value<String>(VideoMetadataMediaKind.tv.name),
+        discoveryCategory:
+            job.discoveryCategory == VideoDiscoveryCategory.movie.name
+            ? Value<String?>(VideoDiscoveryCategory.tv.name)
+            : const Value<String?>.absent(),
+        identityJson: job.identityJson == null
+            ? Value<String?>(encodeVideoMediaReference(_mediaReference(job)))
+            : const Value<String?>.absent(),
+        updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+      ),
+    );
+    _ensureLeaseHeld();
+    return await database.getVideoDownloadJob(job.jobId) ?? job;
+  }
+
+  Future<void> _persistOrganizationIntent(
+    VideoDownloadJobRow job,
+    VideoOrganizationPlan plan,
+    List<TorrentFileEntry> backendFiles,
+  ) async {
+    _ensureLeaseHeld();
+    final Map<int, TorrentFileEntry> files = <int, TorrentFileEntry>{
+      for (final TorrentFileEntry file in backendFiles) file.index: file,
+    };
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final VideoOrganizationFilePlan file in plan.files) {
+      _ensureLeaseHeld();
+      final VideoDownloadJobFileRow? row = await _jobFileByIndex(
+        job.jobId,
+        file.backendFileIndex,
+      );
+      if (row == null) continue;
+      await database.updateVideoDownloadJobFile(
+        row.id,
+        VideoDownloadJobFilesCompanion(
+          targetRelativePath: Value<String?>(file.targetRelativePath),
+          finalAbsolutePath: Value<String?>(file.finalLocalPath),
+          kind: Value<String>(
+            file.targetRelativePath.contains('/Extras/') ? 'extra' : 'video',
+          ),
+          season: Value<int?>(file.seasonNumber),
+          episode: Value<int?>(file.episodeNumber),
+          sizeBytes: Value<int?>(files[file.backendFileIndex]?.size),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+  }
+
+  Future<void> _advanceToSubtitle(
+    VideoDownloadJobRow job,
+    List<VideoDownloadJobFileRow> rows,
+  ) async {
+    String? root;
+    for (final VideoDownloadJobFileRow row in rows) {
+      final String? relative = row.targetRelativePath;
+      if (relative != null && relative.contains('/')) {
+        root = relative.substring(0, relative.indexOf('/'));
+        break;
+      }
+    }
+    await _advance(
+      job,
+      VideoDownloadJobStage.subtitle,
+      targetRelativeRoot: root,
+    );
+  }
+
+  Future<bool> _organizedFilesExist(List<VideoDownloadJobFileRow> rows) async {
+    final List<VideoDownloadJobFileRow> planned = rows
+        .where(
+          (VideoDownloadJobFileRow row) =>
+              row.finalAbsolutePath != null && row.targetRelativePath != null,
+        )
+        .toList();
+    if (planned.isEmpty) return false;
+    for (final VideoDownloadJobFileRow row in planned) {
+      final File file = File(row.finalAbsolutePath!);
+      if (!await file.exists()) return false;
+      if (row.sizeBytes != null && await file.length() != row.sizeBytes) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Future<void> _markFilesOrganized(List<VideoDownloadJobFileRow> rows) async {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final VideoDownloadJobFileRow row in rows) {
+      _ensureLeaseHeld();
+      if (row.finalAbsolutePath == null) continue;
+      await database.updateVideoDownloadJobFile(
+        row.id,
+        VideoDownloadJobFilesCompanion(
+          status: const Value<String>(VideoDownloadJobFileStatus.organized),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+  }
+
+  Future<void> _installSubtitles(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    if (job.organizationPolicy == 'legacy') {
+      await _installLegacyStagedSubtitles(job);
+      return;
+    }
+    final VideoDownloadSubtitlePolicy policy =
+        VideoDownloadSubtitlePolicy.values.asNameMap()[job.subtitlePolicy] ??
+        VideoDownloadSubtitlePolicy.bestEffort;
+    if (policy == VideoDownloadSubtitlePolicy.none) {
+      await _advance(job, VideoDownloadJobStage.import);
+      return;
+    }
+    if (subtitleRegistry == null) {
+      if (policy == VideoDownloadSubtitlePolicy.required) {
+        throw const VideoDownloadPipelineActionRequired(
+          'Required subtitles are not configured on this device',
+        );
+      }
+      await _advance(job, VideoDownloadJobStage.import);
+      return;
+    }
+    // 按作品的字幕语言一次性解析：整条任务的所有分集共用同一个答案。
+    final String? perWorkLanguage = await _resolvePerWorkSubtitleLanguage(job);
+    _ensureLeaseHeld();
+    // 按作品的语言只提名次、不收窄搜索面：它来自字幕工作台的筛选记忆
+    // （`jimaku_pref_langs`，选择即写），那是「列出来给我看」的 UI 筛选器，不是
+    // 「这部番只下这个语言」的下载策略。塞进 `languages:`（provider 侧是服务端硬
+    // 过滤参数）会让该语言没字幕的任务一条都下不到、policy=required 时直接变
+    // needsAttention，而用户从没表达过这个意思，也没有任何入口能撤销（选「全部」
+    // 刻意不写、偏好层没有 remove）。排序首选由下面的 `explicitLanguage` 负责。
+    final List<String> searchLanguages;
+    if (preferredSubtitleLanguages.isEmpty) {
+      // 全局「不限」：保持不限。
+      searchLanguages = const <String>[];
+    } else if (perWorkLanguage == null) {
+      searchLanguages = preferredSubtitleLanguages;
+    } else {
+      searchLanguages = <String>[
+        perWorkLanguage,
+        ...preferredSubtitleLanguages.where(
+          (String language) => language != perWorkLanguage,
+        ),
+      ];
+    }
+    final List<VideoDownloadJobFileRow> files =
+        (await database.getVideoDownloadJobFiles(job.jobId))
+            .where(
+              (VideoDownloadJobFileRow row) =>
+                  row.kind == 'video' && row.finalAbsolutePath != null,
+            )
+            .toList();
+    // 多部电影一个种子（BUG-2007）：job 携带的身份只描述用户确认的那一部
+    // （= 主片，最大文件，与组织器抬正片同判据）。并列正片拿 job 标题去搜
+    // 只会装上主片的字幕，这里直接跳过——等它们刮出各自规范身份后由刮削后
+    // 字幕补齐链路（VideoSubtitleBackfillService）接手。
+    final VideoDownloadJobFileRow? movieMain =
+        job.mediaKind == VideoMetadataMediaKind.movie.name
+        ? _mainMovieRow(files)
+        : null;
+    bool anyInstalled = false;
+    for (final VideoDownloadJobFileRow file in files) {
+      if (movieMain != null && file.id != movieMain.id) continue;
+      final List<VideoDownloadJobSubtitleRow> existing = await database
+          .getVideoDownloadJobSubtitles(job.jobId);
+      final VideoDownloadJobSubtitleRow? prior = existing
+          .where(
+            (VideoDownloadJobSubtitleRow row) =>
+                row.jobFileId == file.id &&
+                row.status == VideoDownloadJobSubtitleStatus.placed,
+          )
+          .firstOrNull;
+      if (prior?.status == VideoDownloadJobSubtitleStatus.placed &&
+          prior?.finalPath != null &&
+          await File(prior!.finalPath!).exists()) {
+        anyInstalled = true;
+        continue;
+      }
+      final VideoDownloadJobSubtitleRow? resolving = existing
+          .where(
+            (VideoDownloadJobSubtitleRow row) =>
+                row.jobFileId == file.id &&
+                row.selectedSubtitleId != null &&
+                row.status == VideoDownloadJobSubtitleStatus.resolving,
+          )
+          .firstOrNull;
+      final VideoDownloadJobSubtitleRow? manual = existing
+          .where(
+            (VideoDownloadJobSubtitleRow row) =>
+                row.jobFileId == null &&
+                row.selectedSubtitleId != null &&
+                row.status == VideoDownloadJobSubtitleStatus.pending &&
+                (row.season == null || row.season == file.season) &&
+                (row.episode == null || row.episode == file.episode),
+          )
+          .firstOrNull;
+      // A resolving row is the durable choice made before the previous
+      // download/write side effect. Re-resolve that exact provider item after
+      // a restart instead of choosing a possibly different first result.
+      final VideoDownloadJobSubtitleRow? persistedSelection =
+          manual ?? resolving;
+      final String subtitleId =
+          persistedSelection?.subtitleId ?? '${job.jobId}:${file.id}';
+      try {
+        final File video = File(file.finalAbsolutePath!);
+        final ProviderBatchResult<VideoSubtitleCandidate> result =
+            await subtitleRegistry!.search(
+              VideoSubtitleSearchRequest(
+                media: _mediaReference(
+                  job,
+                ).copyWithEpisode(season: file.season, episode: file.episode),
+                season: file.season,
+                episode: file.episode,
+                languages: searchLanguages,
+                fingerprint: LocalVideoFingerprint(
+                  fileSize: await video.length(),
+                  fileName: p.basename(video.path),
+                  openSubtitlesMovieHash: await computeOpenSubtitlesMovieHash(
+                    video.path,
+                  ),
+                ),
+              ),
+            );
+        _ensureLeaseHeld();
+        if (result.items.isEmpty) {
+          final String message = result.failures.isEmpty
+              ? 'No matching subtitle was found'
+              : result.failures.first.message;
+          await _recordUnavailableSubtitle(job, file, subtitleId, message);
+          if (policy == VideoDownloadSubtitlePolicy.required) {
+            throw VideoDownloadPipelineActionRequired(message);
+          }
+          continue;
+        }
+        VideoSubtitleCandidate? candidate;
+        if (persistedSelection != null) {
+          for (final VideoSubtitleCandidate value in result.items) {
+            if (value.providerId == persistedSelection.provider &&
+                value.remoteId == persistedSelection.selectedSubtitleId) {
+              candidate = value;
+              break;
+            }
+          }
+          if (candidate == null) {
+            final String message = result.failures.isEmpty
+                ? 'The selected subtitle is no longer available'
+                : result.failures.first.message;
+            await _recordUnavailableSubtitle(
+              job,
+              file,
+              subtitleId,
+              message,
+              existingSelection: persistedSelection,
+            );
+            throw VideoDownloadPipelineActionRequired(message);
+          }
+        }
+        // 自动选片时**先验证再采用**：下载候选字节，用时长/内容判据核一遍，不过
+        // 就换下一个候选（BUG-1697）。旧实现直接 `result.items.first`，排序只按
+        // provider 优先级与下载量，从不看内容——把整季合并文件装到某一集上是无声
+        // 通过的。手动选中的候选（persistedSelection）不参与筛选：用户的显式选择
+        // 优先于任何启发式。
+        _VerifiedSubtitleBytes? verified;
+        if (candidate == null) {
+          final ({_VerifiedSubtitleBytes? picked, String? reason}) selection =
+              await _selectVerifiedSubtitle(
+                candidates: result.items,
+                videoPath: video.path,
+                explicitLanguage: perWorkLanguage,
+              );
+          verified = selection.picked;
+          if (verified == null) {
+            // 原因要说清是「都没通过校验」还是「一条都没下下来」——两者对用户是
+            // 不同的动作（改条目 vs 查网络）。
+            final String message =
+                selection.reason ??
+                'No subtitle candidate could be verified against this video';
+            await _recordUnavailableSubtitle(job, file, subtitleId, message);
+            if (policy == VideoDownloadSubtitlePolicy.required) {
+              throw VideoDownloadPipelineActionRequired(message);
+            }
+            continue;
+          }
+          candidate = verified.candidate;
+        }
+        final String extension = _safeSubtitleExtension(candidate.fileName);
+        final String language = candidate.language.trim().isEmpty
+            ? 'und'
+            : candidate.language.trim().toLowerCase();
+        final String initialTarget = p.join(
+          p.dirname(video.path),
+          '${p.basenameWithoutExtension(video.path)}.$language$extension',
+        );
+        final int now = DateTime.now().millisecondsSinceEpoch;
+        final String initialTempPath = '$initialTarget.${job.jobId}.fushi.tmp';
+        // Persist the selected remote identity before downloading its temporary
+        // payload. OpenSubtitles/Jimaku URLs themselves are never persisted.
+        await database.upsertVideoDownloadJobSubtitle(
+          VideoDownloadJobSubtitlesCompanion(
+            subtitleId: Value<String>(subtitleId),
+            jobId: Value<String>(job.jobId),
+            jobFileId: Value<int?>(file.id),
+            provider: Value<String>(candidate.providerId),
+            selectedSubtitleId: Value<String?>(candidate.remoteId),
+            language: Value<String?>(language),
+            season: Value<int?>(file.season),
+            episode: Value<int?>(file.episode),
+            originalFileName: Value<String?>(candidate.fileName),
+            stagedPath: Value<String?>(initialTempPath),
+            finalPath: Value<String?>(initialTarget),
+            status: const Value<String>(
+              VideoDownloadJobSubtitleStatus.resolving,
+            ),
+            createdAt: Value<int>(persistedSelection?.createdAt ?? now),
+            updatedAt: Value<int>(now),
+          ),
+        );
+        // 自动路径已经在校验时下过一次字节，直接复用——校验不该让每条字幕多下
+        // 一遍。手动/续跑路径没验过，这里才真去下。
+        final VideoSubtitleDownload download =
+            verified?.download ?? await subtitleRegistry!.download(candidate);
+        _ensureLeaseHeld();
+        // 打包源（SubDL 的 zip）的候选名只是下载前的猜测 `<release>.srt`，真实扩展名
+        // 要解包后才知道：sidecar 扩展名以 `download.fileName` 为准（空才回退候选名），
+        // 否则 ASS/VTT 会被装成 `.srt`——时轴校验按内容解析、拦不住这个。
+        final String resolvedFileName = download.fileName.trim().isEmpty
+            ? candidate.fileName
+            : download.fileName;
+        final String resolvedExtension = _safeSubtitleExtension(
+          resolvedFileName,
+        );
+        final String resolvedInitialTarget = resolvedExtension == extension
+            ? initialTarget
+            : p.join(
+                p.dirname(video.path),
+                '${p.basenameWithoutExtension(video.path)}'
+                '.$language$resolvedExtension',
+              );
+        final Uint8List subtitleBytes = await _sidecarBytes(
+          download.bytes,
+          videoPath: video.path,
+          initialTarget: resolvedInitialTarget,
+        );
+        _ensureLeaseHeld();
+        final String selectedTarget = await _selectSidecarTarget(
+          bytes: subtitleBytes,
+          initialTarget: resolvedInitialTarget,
+        );
+        final String tempPath = '$selectedTarget.${job.jobId}.fushi.tmp';
+        // The exact conflict-free destination is another durable intent. If
+        // the process exits after rename but before `placed`, the next run
+        // downloads the same selected item, verifies content at this path and
+        // adopts it without creating a second sidecar.
+        await database.updateVideoDownloadJobSubtitle(
+          subtitleId,
+          VideoDownloadJobSubtitlesCompanion(
+            originalFileName: Value<String?>(resolvedFileName),
+            stagedPath: Value<String?>(tempPath),
+            finalPath: Value<String?>(selectedTarget),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+        _ensureLeaseHeld();
+        final String installed = await _installSidecarAtTargetAtomically(
+          bytes: subtitleBytes,
+          target: selectedTarget,
+          tempPath: tempPath,
+        );
+        _ensureLeaseHeld();
+        await database.updateVideoDownloadJobSubtitle(
+          subtitleId,
+          VideoDownloadJobSubtitlesCompanion(
+            stagedPath: const Value<String?>(null),
+            finalPath: Value<String?>(installed),
+            status: const Value<String>(VideoDownloadJobSubtitleStatus.placed),
+            error: const Value<String?>(null),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+        anyInstalled = true;
+      } on VideoDownloadPipelineActionRequired {
+        rethrow;
+      } on Object catch (error) {
+        await _recordUnavailableSubtitle(
+          job,
+          file,
+          subtitleId,
+          _safeError(error.toString()),
+          existingSelection: persistedSelection,
+        );
+        if (policy == VideoDownloadSubtitlePolicy.required) rethrow;
+      }
+    }
+    if (policy == VideoDownloadSubtitlePolicy.required && !anyInstalled) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Required subtitles could not be installed',
+      );
+    }
+    await _advance(job, VideoDownloadJobStage.import);
+  }
+
+  /// 问 [subtitleLanguageResolver] 这部作品要什么字幕语言。null = 没接解析器 /
+  /// 它不表态。异常原样冒泡，由阶段执行器统一按可重试 / needsAttention 处理。
+  Future<String?> _resolvePerWorkSubtitleLanguage(
+    VideoDownloadJobRow job,
+  ) async {
+    final VideoDownloadSubtitleLanguageResolver? resolver =
+        subtitleLanguageResolver;
+    if (resolver == null) return null;
+    final String? code = await resolver(
+      VideoDownloadSubtitleLanguageQuery(
+        jobId: job.jobId,
+        title: job.title,
+        year: job.year,
+        metadataProvider: job.metadataProvider,
+        externalId: job.externalId,
+      ),
+    );
+    final String normalized = code?.trim() ?? '';
+    return normalized.isEmpty ? null : normalized;
+  }
+
+  /// 依次下载 [candidates] 并做时长/内容校验，返回**第一个通过**的候选及其字节。
+  ///
+  /// 为什么要真下下来才能判：判据看的是字幕内容本身（最后一句结束在哪），搜索
+  /// 结果里只有文件名和体积。体积判不了——同样 40KB 的 ass 可能是一集也可能是
+  /// 整季。
+  ///
+  /// [kSubtitleVerifyMaxCandidates] 是硬上界：候选可能有几十条（多语言 × 多压制
+  /// 组），全下一遍既慢又是对来源站的滥用。试完前 N 条还没通过就放弃，让用户
+  /// 手动选——那时候自动匹配本来也不该硬猜。
+  ///
+  /// 探不到视频时长（缺 ffprobe / 超时）时判据退化成只做内容自检，**绝不因为
+  /// 探测失败就拒收**。
+  Future<({_VerifiedSubtitleBytes? picked, String? reason})>
+  _selectVerifiedSubtitle({
+    required List<VideoSubtitleCandidate> candidates,
+    required String videoPath,
+    String? explicitLanguage,
+  }) async {
+    if (candidates.isEmpty) {
+      return (picked: null, reason: 'No subtitle candidate was returned');
+    }
+    // 一次 ffprobe 拿两件事实：时长（校验用）+ 音轨语言（选语言用）。
+    final VideoProbeFacts facts = await probeVideoFacts(videoPath);
+    _ensureLeaseHeld();
+    final KnownVideoDuration? known = facts.durationMs == null
+        ? null
+        : KnownVideoDuration.probed(facts.durationMs!);
+    // 默认取**视频自己的语言**：按作品的解析器 / 设置里显式选过就用那个，否则用
+    // 音轨自报的语言。这里是**排序**不是过滤——只有英文字幕的日语番仍然配得上，
+    // 只是排在后面。
+    final String? preferredLanguage = resolveSubtitleDownloadLanguage(
+      explicitSubtitlePreference:
+          explicitLanguage ?? preferredSubtitleLanguages.firstOrNull,
+      contentMetadataLanguage: facts.primaryAudioLanguage,
+      globalDefaultContentLanguage: defaultContentLanguage,
+    );
+    final List<VideoSubtitleCandidate> ordered = rankByPreferredLanguage(
+      candidates,
+      preferredLanguage,
+      (VideoSubtitleCandidate c) => c.language,
+    );
+    String? lastRejection;
+    String? lastDownloadError;
+    final int limit = ordered.length < kSubtitleVerifyMaxCandidates
+        ? ordered.length
+        : kSubtitleVerifyMaxCandidates;
+    for (int i = 0; i < limit; i++) {
+      final VideoSubtitleCandidate candidate = ordered[i];
+      final VideoSubtitleDownload download;
+      try {
+        download = await subtitleRegistry!.download(candidate);
+      } on Object catch (error) {
+        // 单条下载失败不该中断整轮筛选——下一条可能好好的。
+        lastDownloadError = _safeError(error.toString());
+        fushiDebugPrint(
+          '[subtitle] candidate download failed '
+          '(${candidate.providerId}:${candidate.remoteId}): $error',
+        );
+        continue;
+      }
+      _ensureLeaseHeld();
+      final SubtitleTimingCheck check = checkSubtitleTiming(
+        summarizeSubtitleTiming(await decodeTextBytes(download.bytes)),
+        video: known,
+      );
+      if (!check.rejected) {
+        return (
+          picked: _VerifiedSubtitleBytes(
+            candidate: candidate,
+            download: download,
+          ),
+          reason: null,
+        );
+      }
+      lastRejection = check.detail;
+      fushiDebugPrint(
+        '[subtitle] rejected candidate '
+        '"${candidate.fileName}": ${check.detail}',
+      );
+    }
+    // 一条都没通过就不退而求其次：硬装一个只会让用户以为自动匹配好了，而错字幕
+    // 比没字幕更难发现。原因分两类回给调用方——「都没通过校验」要改条目，
+    // 「一条都没下下来」要查网络。
+    if (lastRejection != null) {
+      return (
+        picked: null,
+        reason: 'No subtitle candidate matched this video ($lastRejection)',
+      );
+    }
+    return (
+      picked: null,
+      reason: lastDownloadError == null
+          ? 'No subtitle candidate could be downloaded'
+          : 'Subtitle download failed: $lastDownloadError',
+    );
+  }
+
+  /// Copies old JSON-plan subtitle staging files without consuming them.
+  /// This mirrors the pre-v78 workflow: a video that already has any sidecar
+  /// is left untouched, because that sidecar may have been placed or edited by
+  /// the user outside Fushi.
+  Future<void> _installLegacyStagedSubtitles(VideoDownloadJobRow job) async {
+    final VideoDownloadSubtitlePolicy policy =
+        VideoDownloadSubtitlePolicy.values.asNameMap()[job.subtitlePolicy] ??
+        VideoDownloadSubtitlePolicy.bestEffort;
+    if (policy == VideoDownloadSubtitlePolicy.none) {
+      await _advance(job, VideoDownloadJobStage.import);
+      return;
+    }
+    final List<VideoDownloadJobFileRow> videos =
+        (await database.getVideoDownloadJobFiles(job.jobId))
+            .where(
+              (VideoDownloadJobFileRow row) =>
+                  row.kind == 'video' && row.finalAbsolutePath != null,
+            )
+            .toList()
+          ..sort(_compareJobFiles);
+    final List<VideoDownloadJobSubtitleRow> subtitles = await database
+        .getVideoDownloadJobSubtitles(job.jobId);
+    bool installed = false;
+    for (final VideoDownloadJobSubtitleRow subtitle in subtitles) {
+      _ensureLeaseHeld();
+      if (subtitle.status == VideoDownloadJobSubtitleStatus.placed &&
+          subtitle.finalPath != null &&
+          await File(subtitle.finalPath!).exists()) {
+        installed = true;
+        continue;
+      }
+      if (subtitle.status == VideoDownloadJobSubtitleStatus.skipped) continue;
+      final VideoDownloadJobFileRow? video = _matchLegacySubtitleVideo(
+        subtitle,
+        videos,
+      );
+      final String? stagedPath = subtitle.stagedPath;
+      if (video == null || stagedPath == null || stagedPath.trim().isEmpty) {
+        await _markLegacySubtitleUnavailable(
+          subtitle,
+          video,
+          'Legacy subtitle could not be paired to a video file',
+        );
+        if (policy == VideoDownloadSubtitlePolicy.required) {
+          throw const VideoDownloadPipelineActionRequired(
+            'A required legacy subtitle could not be paired to a video file',
+          );
+        }
+        continue;
+      }
+      final File staged = File(stagedPath);
+      if (!await staged.exists()) {
+        await _markLegacySubtitleUnavailable(
+          subtitle,
+          video,
+          'Legacy subtitle staging file is no longer accessible',
+        );
+        if (policy == VideoDownloadSubtitlePolicy.required) {
+          throw const VideoDownloadPipelineActionRequired(
+            'A required legacy subtitle staging file is unavailable',
+          );
+        }
+        continue;
+      }
+      final String videoPath = video.finalAbsolutePath!;
+      final String? existingSidecar = await _firstSidecarPath(videoPath);
+      if (existingSidecar != null) {
+        final bool sameContent = await _filesHaveSameContent(
+          staged,
+          File(existingSidecar),
+        );
+        await database.updateVideoDownloadJobSubtitle(
+          subtitle.subtitleId,
+          VideoDownloadJobSubtitlesCompanion(
+            jobFileId: Value<int?>(video.id),
+            finalPath: Value<String?>(sameContent ? existingSidecar : null),
+            status: Value<String>(
+              sameContent
+                  ? VideoDownloadJobSubtitleStatus.placed
+                  : VideoDownloadJobSubtitleStatus.skipped,
+            ),
+            error: Value<String?>(
+              sameContent
+                  ? null
+                  : 'A sidecar already exists; the legacy staging file was kept',
+            ),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+        if (sameContent) installed = true;
+        continue;
+      }
+      final String extension = _safeSubtitleExtension(
+        subtitle.originalFileName ?? stagedPath,
+      );
+      final String language = subtitle.language?.trim() ?? '';
+      final String languageSegment = language.isEmpty ? '' : '.$language';
+      final String targetPath = p.join(
+        p.dirname(videoPath),
+        '${p.basenameWithoutExtension(videoPath)}$languageSegment$extension',
+      );
+      final File target = File(targetPath);
+      if (await target.exists()) {
+        await database.updateVideoDownloadJobSubtitle(
+          subtitle.subtitleId,
+          VideoDownloadJobSubtitlesCompanion(
+            jobFileId: Value<int?>(video.id),
+            status: const Value<String>(VideoDownloadJobSubtitleStatus.skipped),
+            error: const Value<String?>(
+              'The subtitle target already exists; nothing was overwritten',
+            ),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+        continue;
+      }
+      final String tempPath = '$targetPath.${job.jobId}.legacy-copy.tmp';
+      final File temp = File(tempPath);
+      if (await temp.exists()) await temp.delete();
+      await target.parent.create(recursive: true);
+      await staged.copy(temp.path);
+      _ensureLeaseHeld();
+      if (await target.exists()) {
+        await temp.delete();
+        await database.updateVideoDownloadJobSubtitle(
+          subtitle.subtitleId,
+          VideoDownloadJobSubtitlesCompanion(
+            jobFileId: Value<int?>(video.id),
+            status: const Value<String>(VideoDownloadJobSubtitleStatus.skipped),
+            error: const Value<String?>(
+              'The subtitle target changed while copying; nothing was overwritten',
+            ),
+            updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+        continue;
+      }
+      await temp.rename(target.path);
+      await database.updateVideoDownloadJobSubtitle(
+        subtitle.subtitleId,
+        VideoDownloadJobSubtitlesCompanion(
+          jobFileId: Value<int?>(video.id),
+          finalPath: Value<String?>(target.path),
+          status: const Value<String>(VideoDownloadJobSubtitleStatus.placed),
+          error: const Value<String?>(null),
+          updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+        ),
+      );
+      installed = true;
+    }
+    if (policy == VideoDownloadSubtitlePolicy.required && !installed) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Required legacy subtitles could not be installed',
+      );
+    }
+    await _advance(job, VideoDownloadJobStage.import);
+  }
+
+  Future<void> _markLegacySubtitleUnavailable(
+    VideoDownloadJobSubtitleRow subtitle,
+    VideoDownloadJobFileRow? video,
+    String error,
+  ) => database.updateVideoDownloadJobSubtitle(
+    subtitle.subtitleId,
+    VideoDownloadJobSubtitlesCompanion(
+      jobFileId: Value<int?>(video?.id),
+      status: const Value<String>(VideoDownloadJobSubtitleStatus.unavailable),
+      error: Value<String?>(error),
+      updatedAt: Value<int>(DateTime.now().millisecondsSinceEpoch),
+    ),
+  );
+
+  static VideoDownloadJobFileRow? _matchLegacySubtitleVideo(
+    VideoDownloadJobSubtitleRow subtitle,
+    List<VideoDownloadJobFileRow> videos,
+  ) {
+    if (subtitle.jobFileId != null) {
+      for (final VideoDownloadJobFileRow video in videos) {
+        if (video.id == subtitle.jobFileId) return video;
+      }
+    }
+    if (subtitle.episode != null) {
+      for (final VideoDownloadJobFileRow video in videos) {
+        if (video.episode == subtitle.episode &&
+            (subtitle.season == null || video.season == subtitle.season)) {
+          return video;
+        }
+      }
+    }
+    if (videos.length == 1 &&
+        (subtitle.episode == null || videos.single.episode == null)) {
+      return videos.single;
+    }
+    return null;
+  }
+
+  static Future<String?> _firstSidecarPath(String videoPath) async {
+    final Directory directory = Directory(p.dirname(videoPath));
+    if (!await directory.exists()) return null;
+    final List<String> names = <String>[];
+    await for (final FileSystemEntity entity in directory.list(
+      followLinks: false,
+    )) {
+      if (entity is File) names.add(p.basename(entity.path));
+    }
+    final List<String> sidecars = listSidecarSubtitles(
+      p.basenameWithoutExtension(videoPath),
+      names,
+    );
+    return sidecars.isEmpty ? null : p.join(directory.path, sidecars.first);
+  }
+
+  static Future<bool> _filesHaveSameContent(File left, File right) async {
+    if (!await left.exists() || !await right.exists()) return false;
+    if (await left.length() != await right.length()) return false;
+    return sha256.convert(await left.readAsBytes()) ==
+        sha256.convert(await right.readAsBytes());
+  }
+
+  Future<void> _recordUnavailableSubtitle(
+    VideoDownloadJobRow job,
+    VideoDownloadJobFileRow file,
+    String subtitleId,
+    String error, {
+    VideoDownloadJobSubtitleRow? existingSelection,
+  }) async {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    if (existingSelection != null) {
+      await database.updateVideoDownloadJobSubtitle(
+        subtitleId,
+        VideoDownloadJobSubtitlesCompanion(
+          jobFileId: Value<int?>(file.id),
+          status: const Value<String>(
+            VideoDownloadJobSubtitleStatus.unavailable,
+          ),
+          error: Value<String?>(_safeError(error)),
+          updatedAt: Value<int>(now),
+        ),
+      );
+      return;
+    }
+    await database.upsertVideoDownloadJobSubtitle(
+      VideoDownloadJobSubtitlesCompanion(
+        subtitleId: Value<String>(subtitleId),
+        jobId: Value<String>(job.jobId),
+        jobFileId: Value<int?>(file.id),
+        provider: const Value<String>('auto'),
+        season: Value<int?>(file.season),
+        episode: Value<int?>(file.episode),
+        status: const Value<String>(VideoDownloadJobSubtitleStatus.unavailable),
+        error: Value<String?>(_safeError(error)),
+        createdAt: Value<int>(now),
+        updatedAt: Value<int>(now),
+      ),
+    );
+  }
+
+  /// sidecar 的候选落点：原名，再 `<stem>.fushiN<ext>`（N = 1..99）。
+  Iterable<String> _sidecarTargetCandidates(String initialTarget) sync* {
+    yield initialTarget;
+    final String extension = p.extension(initialTarget);
+    final String stem = p.basenameWithoutExtension(initialTarget);
+    for (int suffix = 1; suffix < 100; suffix++) {
+      yield p.join(p.dirname(initialTarget), '$stem.fushi$suffix$extension');
+    }
+  }
+
+  Future<String> _selectSidecarTarget({
+    required List<int> bytes,
+    required String initialTarget,
+  }) async {
+    final Digest incoming = sha256.convert(bytes);
+    for (final String target in _sidecarTargetCandidates(initialTarget)) {
+      final File existing = File(target);
+      if (!await existing.exists()) return target;
+      if (sha256.convert(await existing.readAsBytes()) == incoming) {
+        return target;
+      }
+    }
+    throw const VideoDownloadPipelineActionRequired(
+      'No conflict-free subtitle target is available',
+    );
+  }
+
+  /// 要装的 sidecar 字节。没装对齐器 = 下载原样。装了则先认领上一轮写下的那份：
+  /// 内容等于原稿，或能经对齐备份反查到原稿——续跑的产物只取决于首跑落盘，而对齐
+  /// 本身还取决于开关与这一轮抽轨成败；重新对齐一旦结果不同，按内容认领的哈希就
+  /// 对不上，会在视频旁多写一份 `.fushiN`。
+  Future<Uint8List> _sidecarBytes(
+    Uint8List raw, {
+    required String videoPath,
+    required String initialTarget,
+  }) async {
+    final AutomaticSubtitleAligner? aligner = subtitleAligner;
+    if (aligner == null) return raw;
+    final Digest rawDigest = sha256.convert(raw);
+    for (final String target in _sidecarTargetCandidates(initialTarget)) {
+      final File existing = File(target);
+      if (!await existing.exists()) break;
+      final Uint8List content = await existing.readAsBytes();
+      if (sha256.convert(content) == rawDigest) return raw;
+      final Uint8List? original = await findSubtitleAlignmentOriginal(content);
+      if (original != null && sha256.convert(original) == rawDigest) {
+        return content;
+      }
+    }
+    return aligner(raw, videoPath);
+  }
+
+  Future<String> _installSidecarAtTargetAtomically({
+    required List<int> bytes,
+    required String target,
+    required String tempPath,
+  }) async {
+    final File existing = File(target);
+    if (await existing.exists()) {
+      if (sha256.convert(await existing.readAsBytes()) ==
+          sha256.convert(bytes)) {
+        return target;
+      }
+      throw const VideoDownloadPipelineActionRequired(
+        'Subtitle target changed while installing; nothing was overwritten',
+      );
+    }
+    final File temp = File(tempPath);
+    if (await temp.exists()) await temp.delete();
+    await temp.writeAsBytes(bytes, flush: true);
+    if (await File(target).exists()) {
+      await temp.delete();
+      throw const VideoDownloadPipelineActionRequired(
+        'Subtitle target changed while installing; nothing was overwritten',
+      );
+    }
+    await temp.rename(target);
+    return target;
+  }
+
+  Future<void> _importMedia(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    final DiscoveryMediaKind? discoveryKind = discoveryKindOfOrganizationPolicy(
+      job.organizationPolicy,
+    );
+    if (discoveryKind != null) {
+      await _importDiscoveryMedia(job, discoveryKind);
+      return;
+    }
+    final bool legacy = job.organizationPolicy == 'legacy';
+    final MediaSourceRow? source = legacy ? null : await _managedSource(job);
+    final List<VideoDownloadJobFileRow> files =
+        (await database.getVideoDownloadJobFiles(job.jobId))
+            .where(
+              (VideoDownloadJobFileRow row) =>
+                  row.kind == 'video' && row.finalAbsolutePath != null,
+            )
+            .toList()
+          ..sort(_compareJobFiles);
+    if (files.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'No organized video files are available for import',
+      );
+    }
+    final Map<int, String> bookUidByFileId = <int, String>{};
+    int? collectionId;
+    if (job.mediaKind == VideoMetadataMediaKind.tv.name) {
+      final List<PlaylistEntry> entries = files
+          .map(
+            (VideoDownloadJobFileRow file) => PlaylistEntry(
+              title: _episodeTitle(job.title, file),
+              path: file.finalAbsolutePath!,
+              positionMs: 0,
+            ),
+          )
+          .toList();
+      final SplitPlaylistImportResult result = await _videoRepository
+          .importSplitPlaylist(
+            collectionName: videoDownloadCollectionName(
+              title: job.title,
+              year: job.year,
+              legacy: legacy,
+            ),
+            entries: entries,
+            sourceId: source?.id,
+            reuseExistingPaths: true,
+          );
+      _ensureLeaseHeld();
+      collectionId = result.collectionId;
+      await _videoRepository.reorderDownloadedCollectionEpisodes(collectionId);
+      _ensureLeaseHeld();
+      for (int index = 0; index < files.length; index++) {
+        bookUidByFileId[files[index].id] = result.episodeUids[index];
+      }
+      if (result.createdEpisodeUids.isNotEmpty) {
+        await _videoRepository.recordVideoImportActivity(
+          bookUid: result.createdEpisodeUids.first,
+          title: job.title,
+        );
+        await _publishSubscriptionEpisodeUpdates(
+          job: job,
+          collectionId: collectionId,
+          files: files,
+          result: result,
+        );
+      }
+    } else {
+      // 多部电影一个种子（BUG-2007）：organize 已把够体量的并列正片保成
+      // `kind: 'video'`，这里逐部入库。主片（最大文件，与组织器抬正片同判据）
+      // 沿用 job.title；并列正片的标题见 [_standaloneMovieTitles]。
+      final VideoDownloadJobFileRow? movieMain = _mainMovieRow(files);
+      final Map<int, String> siblingTitles = _standaloneMovieTitles(
+        files,
+        mainFileId: movieMain?.id,
+        mainTitle: job.title,
+      );
+      final List<VideoBookRow> existing = await database.allVideoBooks();
+      final Set<String> taken = existing
+          .map((VideoBookRow row) => row.bookUid)
+          .toSet();
+      String? firstCreatedUid;
+      for (final VideoDownloadJobFileRow file in files) {
+        VideoBookRow? book;
+        final String normalized = normalizeVideoPath(file.finalAbsolutePath!);
+        for (final VideoBookRow row in existing) {
+          if (normalizeVideoPath(row.videoPath) == normalized) {
+            book = row;
+            break;
+          }
+        }
+        if (book == null) {
+          final String uid = coreUniqueVideoBookUid(
+            coreSingleVideoBookUid(file.finalAbsolutePath!),
+            taken,
+          );
+          taken.add(uid);
+          await _videoRepository.saveVideoBook(
+            VideoBooksCompanion(
+              bookUid: Value<String>(uid),
+              title: Value<String>(
+                file.id == movieMain?.id
+                    ? job.title
+                    : siblingTitles[file.id] ?? job.title,
+              ),
+              videoPath: Value<String>(file.finalAbsolutePath!),
+              embeddedSubtitleTrack: const Value<int?>(0),
+              importedAt: Value<int?>(DateTime.now().millisecondsSinceEpoch),
+            ),
+            sourceId: source?.id,
+          );
+          _ensureLeaseHeld();
+          book = await database.getVideoBookByBookUid(uid);
+          firstCreatedUid ??= book?.bookUid;
+        } else if (!legacy && book.sourceId == null) {
+          await _videoRepository.assignSourceIfNull(book.bookUid, source!.id);
+        }
+        if (book == null) throw StateError('video import did not create a row');
+        bookUidByFileId[file.id] = book.bookUid;
+      }
+      if (firstCreatedUid != null) {
+        await _videoRepository.recordVideoImportActivity(
+          bookUid: firstCreatedUid,
+          title: job.title,
+        );
+      }
+    }
+    final List<VideoDownloadJobSubtitleRow> subtitles = await database
+        .getVideoDownloadJobSubtitles(job.jobId);
+    for (final VideoDownloadJobSubtitleRow subtitle in subtitles) {
+      final String? uid = subtitle.jobFileId == null
+          ? null
+          : bookUidByFileId[subtitle.jobFileId!];
+      if (uid != null &&
+          subtitle.status == VideoDownloadJobSubtitleStatus.placed &&
+          subtitle.finalPath != null) {
+        await _videoRepository.updateSubtitleSource(uid, subtitle.finalPath);
+      }
+    }
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final VideoDownloadJobFileRow file in files) {
+      await database.updateVideoDownloadJobFile(
+        file.id,
+        VideoDownloadJobFilesCompanion(
+          status: const Value<String>(VideoDownloadJobFileStatus.imported),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+    if (collectionId != null) {
+      await database.updateVideoDownloadJob(
+        job.jobId,
+        VideoDownloadJobsCompanion(
+          collectionId: Value<int?>(collectionId),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+    database.notifyVideoLibraryChanged();
+    // 已确认的 MAL/TMDB 身份直接刮削；无身份作品留给媒体库自动识别或人工确认。
+    if (legacy || _confirmedMetadataLookup(job) == null) {
+      await _releaseLeaseWith(
+        () => database.completeVideoDownloadJob(
+          jobId: job.jobId,
+          workerId: workerId,
+          completedAt: now,
+        ),
+      );
+      return;
+    }
+    await _advance(job, VideoDownloadJobStage.scrape, nowAt: now);
+  }
+
+  /// 从持久化发现身份恢复 MAL/TMDB lookup（手动任务另认显式 AniDB），保留旧行
+  /// 读取兼容。与库内补刮同一判据 [videoDownloadJobConfirmedLookup]。
+  VideoMetadataLookup? _confirmedMetadataLookup(VideoDownloadJobRow job) =>
+      videoDownloadJobConfirmedLookup(job);
+
+  Future<void> _notifyDownloadOnlyCompleted(VideoDownloadJobRow job) async {
+    final Future<void> Function(DiscoveryMediaKind, List<String>)? hook =
+        onDownloadOnlyCompleted;
+    final DiscoveryMediaKind? kind =
+        downloadOnlyKindOfOrganizationPolicy(job.organizationPolicy);
+    if (hook == null || kind == null) return;
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final List<String> paths = <String>[
+      for (final VideoDownloadJobFileRow row in rows)
+        if (row.selected && (row.finalAbsolutePath?.trim().isNotEmpty ?? false))
+          row.finalAbsolutePath!,
+    ];
+    if (paths.isEmpty) return;
+    try {
+      await hook(kind, paths);
+    } catch (error, stack) {
+      engineLog.log(
+        'VideoDownloadPipelineService.onDownloadOnlyCompleted(${job.jobId})',
+        error,
+        stack,
+      );
+    }
+  }
+
+  /// 手动「按域入库」任务的 import：整包绝对路径交给 [discoveryImporter]
+  /// （分类 → 需要时解压 → 各域既有导入原语），成功即完成任务。
+  Future<void> _importDiscoveryMedia(
+    VideoDownloadJobRow job,
+    DiscoveryMediaKind kind,
+  ) async {
+    final VideoDownloadDiscoveryImporter? importer = discoveryImporter;
+    if (importer == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'Importing this content kind is not supported on this device',
+      );
+    }
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final List<String> paths = <String>[
+      for (final VideoDownloadJobFileRow row in rows)
+        if (row.selected && (row.finalAbsolutePath?.trim().isNotEmpty ?? false))
+          row.finalAbsolutePath!,
+    ];
+    if (paths.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'No downloaded files are available for import',
+      );
+    }
+    _ensureLeaseHeld();
+    final DiscoveryImportOutcome outcome;
+    try {
+      outcome = await importer(kind, paths);
+    } on DiscoveryImportBlockedException catch (error) {
+      // 分类不出/解压失败是内容问题，不是可重试的环境问题。
+      throw VideoDownloadPipelineActionRequired(error.toString());
+    }
+    _ensureLeaseHeld();
+    fushiDebugPrint(
+      '[manual-download] imported ${outcome.importedCount} item(s) '
+      'as ${kind.name}${outcome.summary == null ? '' : ': ${outcome.summary}'}',
+    );
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    // importedCount == 0（库里已有同一本）也算完成：文件就位、库里可见，用户
+    // 无事可做。真正的失败在上面以异常表达。
+    for (final VideoDownloadJobFileRow row in rows) {
+      if (!row.selected || row.finalAbsolutePath == null) continue;
+      await database.updateVideoDownloadJobFile(
+        row.id,
+        VideoDownloadJobFilesCompanion(
+          status: const Value<String>(VideoDownloadJobFileStatus.imported),
+          updatedAt: Value<int>(now),
+        ),
+      );
+    }
+    await _releaseLeaseWith(
+      () => database.completeVideoDownloadJob(
+        jobId: job.jobId,
+        workerId: workerId,
+        completedAt: now,
+      ),
+    );
+  }
+
+  Future<void> _scrapeMedia(VideoDownloadJobRow job) async {
+    _ensureLeaseHeld();
+    final MediaSourceRow source = await _managedSource(job);
+    final VideoMetadataLookup? lookup = _confirmedMetadataLookup(job);
+    final VideoMetadataMediaKind? mediaKind = VideoMetadataMediaKind.values
+        .asNameMap()[job.mediaKind];
+    if (lookup == null || mediaKind == null) {
+      // 防御分支：import 阶段的闸已保证只有带 MAL/TMDB 身份的任务进到这里。
+      // 万一（旧行重试/竞态）没有身份，按同一判据正常完成而不是卡死。
+      await _releaseLeaseWith(
+        () => database.completeVideoDownloadJob(
+          jobId: job.jobId,
+          workerId: workerId,
+          completedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+      return;
+    }
+    // 「按文件夹」来源只整理不刮削（来源设置里就是这么说的，计划器对它恒空）：
+    // 文件已就位、库里可见，任务按完成收口，而不是报一条看不懂的映射失败。
+    if (source.videoGroupingMode == 'folder') {
+      fushiDebugPrint(
+        '[download-scrape] ${job.jobId}: managed source ${source.id} groups '
+        'by folder, skipping metadata scrape',
+      );
+      await _releaseLeaseWith(
+        () => database.completeVideoDownloadJob(
+          jobId: job.jobId,
+          workerId: workerId,
+          completedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+      return;
+    }
+    final List<VideoDownloadJobFileRow> rows = await database
+        .getVideoDownloadJobFiles(job.jobId);
+    final Set<String> importedPaths = rows
+        .where((VideoDownloadJobFileRow row) => row.kind == 'video')
+        .map((VideoDownloadJobFileRow row) => row.finalAbsolutePath)
+        .whereType<String>()
+        .map(normalizeVideoPath)
+        .toSet();
+    // 导入的文件物理上就在托管来源根目录里，库里的行必须归这个来源——扫描器
+    // 抢先按别的（重叠的）来源建了行、或旧行挂在已删来源上时，计划器按
+    // `source_id` 过滤会看不到它们，整条任务就落成「映射不回来源」。
+    final List<String> unindexed = <String>[];
+    for (final String importedPath in importedPaths) {
+      final VideoBookRow? book = await _videoRepository.findByVideoPath(
+        importedPath,
+      );
+      if (book == null) {
+        unindexed.add(importedPath);
+        continue;
+      }
+      if (book.sourceId != source.id) {
+        fushiDebugPrint(
+          '[download-scrape] ${job.jobId}: ${book.bookUid} was indexed under '
+          'source ${book.sourceId}, reassigning to managed source '
+          '${source.id}',
+        );
+        await database.assignVideoBookSource(book.bookUid, source.id);
+      }
+    }
+    _ensureLeaseHeld();
+    if (unindexed.isNotEmpty) {
+      throw VideoDownloadPipelineActionRequired(
+        'Imported media is missing from the video library: '
+        '${unindexed.join(', ')}',
+      );
+    }
+    final List<VideoSourceScrapeWork> works = await VideoSourceWorkPlanner(
+      database,
+    ).plan(source);
+    _ensureLeaseHeld();
+    final List<VideoSourceScrapeWork> pathMatches = downloadJobPathMatches(
+      rows,
+      works,
+    );
+    // 与库内补刮 / 整源刮削同一个「任务 → 作品」判据（download_confirmed_identity）。
+    final VideoSourceScrapeWork? work = downloadJobWork(job, rows, works);
+    if (work == null) {
+      // 把「为什么」说出来：是计划器压根没看到这些文件（附件分类 / 归属），还是
+      // 看到了却分在多个作品里且没有一个是本任务的合集。
+      final String detail = pathMatches.isEmpty
+          ? 'none of ${importedPaths.length} imported file(s) belong to a '
+                'scrapable work of source ${source.id} '
+                '(${works.length} work(s) planned)'
+          : '${importedPaths.length} imported file(s) spread over '
+                '${pathMatches.length} works '
+                '(${pathMatches.map((VideoSourceScrapeWork value) => value.stableKey).join(', ')}), '
+                'none is collection ${job.collectionId}';
+      throw VideoDownloadPipelineActionRequired(
+        'Imported media could not be mapped exactly back to its managed '
+        'source: $detail',
+      );
+    }
+    final report = await scrapeCoordinator.scrapeImportedWork(
+      work,
+      lookup: lookup,
+    );
+    _ensureLeaseHeld();
+    database.notifyVideoLibraryChanged();
+    if (report.failedOnlyBecauseProviderUnavailable) {
+      // 资料源临时连不上（Jikan 504 之类）：文件已在库，身份已确认，过一会儿原样
+      // 再刮就行——走任务的退避重试，不停在「需要处理」。
+      throw VideoDownloadScrapeProviderUnavailable(report.errors.first.message);
+    }
+    if (report.cancelled ||
+        report.failedWorks > 0 ||
+        report.pendingConfirmations > 0 ||
+        report.succeededWorks == 0) {
+      final String message = report.errors.isNotEmpty
+          ? report.errors.first.message
+          : report.warnings.isNotEmpty
+          ? report.warnings.first.message
+          : 'Exact metadata scrape did not complete';
+      throw VideoDownloadPipelineActionRequired(message);
+    }
+    await _releaseLeaseWith(
+      () => database.completeVideoDownloadJob(
+        jobId: job.jobId,
+        workerId: workerId,
+        completedAt: DateTime.now().millisecondsSinceEpoch,
+      ),
+    );
+  }
+
+  Future<void> _advance(
+    VideoDownloadJobRow job,
+    String stage, {
+    int? nowAt,
+    String? backendTaskId,
+    String? torrentHash,
+    String? observedSavePath,
+    String? targetRelativeRoot,
+    bool resetAttempts = true,
+  }) => _releaseLeaseWith(
+    () => database.advanceVideoDownloadJobStage(
+      jobId: job.jobId,
+      workerId: workerId,
+      stage: stage,
+      nowAt: nowAt ?? DateTime.now().millisecondsSinceEpoch,
+      progress: 0,
+      backendTaskId: backendTaskId,
+      torrentHash: torrentHash,
+      observedSavePath: observedSavePath,
+      targetRelativeRoot: targetRelativeRoot,
+      resetAttempts: resetAttempts,
+    ),
+  );
+
+  Future<void> _markNeedsAttention(
+    VideoDownloadJobRow job,
+    String error, {
+    int? nowAt,
+  }) => _releaseLeaseWith(
+    () => database.markVideoDownloadJobNeedsAttention(
+      jobId: job.jobId,
+      workerId: workerId,
+      error: error,
+      nowAt: nowAt ?? DateTime.now().millisecondsSinceEpoch,
+    ),
+  );
+
+  Future<void> _releaseLeaseWith(Future<bool> Function() transition) async {
+    final VideoDownloadLeaseGuard? lease = _activeLease;
+    if (lease == null) throw const VideoDownloadLeaseLost();
+    lease.ensureHeld();
+    final bool changed = await transition();
+    if (!changed) {
+      lease.markLost();
+      throw const VideoDownloadLeaseLost();
+    }
+    lease.markReleased();
+  }
+
+  void _ensureLeaseHeld() {
+    final VideoDownloadLeaseGuard? lease = _activeLease;
+    if (lease == null) throw const VideoDownloadLeaseLost();
+    lease.ensureHeld();
+  }
+
+  Future<MediaSourceRow> _managedSource(VideoDownloadJobRow job) async {
+    final int? sourceId = job.targetSourceId;
+    if (sourceId == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The managed video source no longer exists',
+      );
+    }
+    final MediaSourceRow? source = await database.getMediaSourceById(sourceId);
+    _validateManagedSource(source);
+    return source!;
+  }
+
+  List<VideoDownloadPathMapping> _effectivePathMappings(
+    VideoDownloadBackendBinding binding, {
+    String? observedSavePath,
+    String? sourceRoot,
+  }) {
+    if (binding.pathMappings.isNotEmpty) return binding.pathMappings;
+    final List<VideoDownloadPathMapping> identities =
+        <VideoDownloadPathMapping>[];
+    final Set<String> anchors = <String>{};
+    void addAccessibleIdentity(String? path) {
+      if (path == null || path.trim().isEmpty) return;
+      final Directory directory = Directory(path);
+      if (!directory.existsSync()) return;
+      final String absolute = p.normalize(p.absolute(path));
+      final String anchor = p.rootPrefix(absolute);
+      final String root = anchor.isEmpty ? absolute : anchor;
+      final String key = Platform.isWindows ? root.toLowerCase() : root;
+      if (anchors.add(key)) {
+        identities.add(VideoDownloadPathMapping.identity(root));
+      }
+    }
+
+    // No explicit map means "same machine" only. Using the filesystem anchor
+    // (drive root or `/`) lets a local backend move from a download directory
+    // into a sibling managed source; anchoring at the source itself would
+    // incorrectly reject the observed download path.
+    addAccessibleIdentity(observedSavePath);
+    addAccessibleIdentity(sourceRoot);
+    return List<VideoDownloadPathMapping>.unmodifiable(identities);
+  }
+
+  Future<({VideoDownloadPathMapping mapping, String localPath})>
+  _validateObservedSavePath(
+    VideoDownloadJobRow job,
+    List<VideoDownloadPathMapping> mappings,
+  ) async {
+    final String? observed = job.observedSavePath?.trim();
+    if (observed == null || observed.isEmpty) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The download backend did not report its save path',
+      );
+    }
+    final VideoDownloadPathMapping? mapping = _mappingForRemotePath(
+      mappings,
+      observed,
+    );
+    if (mapping == null) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The backend save path cannot be mapped to this device',
+      );
+    }
+    final String? localPath = mapping.remoteToLocal(observed);
+    if (localPath == null || !await Directory(localPath).exists()) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The mapped backend save path is not accessible on this device',
+      );
+    }
+    return (mapping: mapping, localPath: p.normalize(p.absolute(localPath)));
+  }
+
+  static VideoDownloadPathMapping? _mappingForRemotePath(
+    Iterable<VideoDownloadPathMapping> mappings,
+    String remotePath,
+  ) {
+    VideoDownloadPathMapping? selected;
+    for (final VideoDownloadPathMapping mapping in mappings) {
+      if (mapping.remoteToLocal(remotePath) == null) continue;
+      if (selected == null ||
+          mapping.remoteRoot.length > selected.remoteRoot.length) {
+        selected = mapping;
+      }
+    }
+    return selected;
+  }
+
+  static VideoDownloadPathMapping? _mappingForLocalPath(
+    Iterable<VideoDownloadPathMapping> mappings,
+    String localPath,
+  ) {
+    VideoDownloadPathMapping? selected;
+    for (final VideoDownloadPathMapping mapping in mappings) {
+      if (mapping.localToRemote(localPath) == null) continue;
+      if (selected == null ||
+          mapping.localRoot.length > selected.localRoot.length) {
+        selected = mapping;
+      }
+    }
+    return selected;
+  }
+
+  static String? _resolveBackendFileLocalPath({
+    required String remoteSavePath,
+    required String relativePath,
+    required VideoDownloadPathMapping mapping,
+    required String localSaveRoot,
+  }) {
+    final List<String>? segments = safeManagedRelativeSegments(relativePath);
+    if (segments == null) return null;
+    final String remote = <String>[
+      remoteSavePath.replaceAll('\\', '/').replaceFirst(RegExp(r'/+$'), ''),
+      ...segments,
+    ].join('/');
+    final String? local = mapping.remoteToLocal(remote);
+    if (local == null) return null;
+    final String normalizedRoot = p.normalize(p.absolute(localSaveRoot));
+    final String normalizedLocal = p.normalize(p.absolute(local));
+    if (normalizedLocal != normalizedRoot &&
+        !p.isWithin(normalizedRoot, normalizedLocal)) {
+      return null;
+    }
+    return normalizedLocal;
+  }
+
+  static bool _isVideoFile(String path) =>
+      kVideoExtensions.contains(p.extension(path).toLowerCase());
+
+  static void _validateManagedSource(MediaSourceRow? source) {
+    if (source == null ||
+        source.mediaKind != 'video' ||
+        source.transport != 'local') {
+      throw const VideoDownloadPipelineActionRequired(
+        'A local managed video source is required',
+      );
+    }
+    final Directory root = Directory(source.rootPath);
+    if (!root.existsSync()) {
+      throw const VideoDownloadPipelineActionRequired(
+        'The managed video source path is not accessible on this device',
+      );
+    }
+  }
+
+  VideoMediaReference _mediaReference(VideoDownloadJobRow job) =>
+      videoDownloadJobMediaReference(job);
+
+  Future<VideoDownloadJobFileRow?> _jobFileByIndex(
+    String jobId,
+    int index,
+  ) async {
+    for (final VideoDownloadJobFileRow row
+        in await database.getVideoDownloadJobFiles(jobId)) {
+      if (row.backendFileIndex == index) return row;
+    }
+    return null;
+  }
+
+  /// movie 形态 job 的主片行：最大 `sizeBytes`（与组织器抬正片的判据一致；
+  /// 平手取列表里先出现的行）。旧行没记体积时按 0 参与比较。
+  static VideoDownloadJobFileRow? _mainMovieRow(
+    List<VideoDownloadJobFileRow> files,
+  ) =>
+      mainMovieDownloadFile(files);
+
+  /// 并列正片的入库标题（BUG-2007）：优先文件名解析出的标题（剥字幕组/分辨率
+  /// 噪音）；解析为空、与主片标题相同或与其他并列正片撞名时退回整理后文件名。
+  /// 有损解析（前編/後編 会归约成同名）只用来选展示标题，绝不承担唯一性——
+  /// 唯一性由 bookUid 与磁盘路径保证。
+  static Map<int, String> _standaloneMovieTitles(
+    List<VideoDownloadJobFileRow> files, {
+    required int? mainFileId,
+    required String mainTitle,
+  }) {
+    final Map<int, String> raw = <int, String>{};
+    final Map<int, String> parsed = <int, String>{};
+    final Map<String, int> hits = <String, int>{};
+    for (final VideoDownloadJobFileRow file in files) {
+      if (file.id == mainFileId || file.finalAbsolutePath == null) continue;
+      final String stem = p.basenameWithoutExtension(file.finalAbsolutePath!);
+      final String series = parseVideoFilename(stem).series.trim();
+      raw[file.id] = stem;
+      parsed[file.id] = series;
+      hits[series] = (hits[series] ?? 0) + 1;
+    }
+    return <int, String>{
+      for (final int id in raw.keys)
+        id:
+            parsed[id]!.isEmpty ||
+                parsed[id] == mainTitle ||
+                hits[parsed[id]]! > 1
+            ? raw[id]!
+            : parsed[id]!,
+    };
+  }
+
+  static int _compareJobFiles(
+    VideoDownloadJobFileRow a,
+    VideoDownloadJobFileRow b,
+  ) {
+    final int bySeason = (a.season ?? 0).compareTo(b.season ?? 0);
+    if (bySeason != 0) return bySeason;
+    final int byEpisode = (a.episode ?? 0).compareTo(b.episode ?? 0);
+    if (byEpisode != 0) return byEpisode;
+    return a.id.compareTo(b.id);
+  }
+
+  /// 订阅下载入库后投递「番剧更新」提醒（v101）。
+  ///
+  /// 三个刻意的判据：
+  /// * 挂在 **`createdEpisodeUids`** 上而不是「下载完成」——那份判据由
+  ///   `importSplitPlaylist` 在事务内按归一路径算出，调用方自己重扫会把崩溃重放
+  ///   误判成新增（BUG-1417 的形状）；
+  /// * 只提醒**订阅**拉起来的任务，手动下载不提醒（用户自己刚点的）；
+  /// * 挂在**入库之后**，所以提醒出现时那一集已经能点开就播。
+  ///
+  /// 提醒带三样东西：该集抽帧（[_episodeNotificationImage]，顺手就是这集的书架
+  /// 封面）、资源发布时刻（订阅条目 `publishedAt`）、发布信息（字幕组 / 分辨率，
+  /// 从资源标题里认）。通知按作品分组（`notificationGroup`）：一部番一格。
+  Future<void> _publishSubscriptionEpisodeUpdates({
+    required VideoDownloadJobRow job,
+    required int collectionId,
+    required List<VideoDownloadJobFileRow> files,
+    required SplitPlaylistImportResult result,
+  }) async {
+    final UpdateFeedPublisher? feed = updateFeed;
+    if (feed == null) return;
+    final VideoDownloadSubscriptionItemRow? item = await database
+        .videoDownloadSubscriptionItemForJob(job.jobId);
+    if (item == null) return;
+    final String? release = subscriptionReleaseLabel(job.resourceTitle);
+    final List<UpdateFeedDraft> drafts = <UpdateFeedDraft>[];
+    for (final String uid in result.createdEpisodeUids) {
+      final int index = result.episodeUids.indexOf(uid);
+      final VideoDownloadJobFileRow? file = index >= 0 && index < files.length
+          ? files[index]
+          : null;
+      final String? imagePath = await _episodeNotificationImage(
+        bookUid: uid,
+        videoPath: file?.finalAbsolutePath,
+        collectionId: collectionId,
+      );
+      final String subtitle = <String>[
+        if (file != null) _episodeLabel(file),
+        if (release != null) release,
+      ].join(' · ');
+      drafts.add(
+        UpdateFeedDraft(
+          kind: UpdateFeedKind.videoEpisode,
+          targetKey: videoEpisodeTargetKey(
+            collectionId: collectionId,
+            episodeKey: uid,
+          ),
+          title: job.title,
+          subtitle: subtitle.isEmpty ? null : subtitle,
+          detailJson: jsonEncode(<String, Object?>{
+            'collectionId': collectionId,
+            'bookUid': uid,
+            if (imagePath != null) 'imagePath': imagePath,
+            if (item.publishedAt != null) 'publishedAt': item.publishedAt,
+          }),
+          imagePath: imagePath,
+          publishedAt: item.publishedAt,
+          notificationGroup: 'collection:$collectionId',
+        ),
+      );
+    }
+    await feed.publishBatch(UpdateFeedKind.videoEpisode, drafts);
+  }
+
+  /// 新集提醒的配图：该集抽帧，并把它落成这集的书架封面（来源账本记
+  /// autoFrame，与库内导入 / 书架回填同一套准入）；抽不到（无 ffmpeg、空洞文件）
+  /// 退作品封面；都没有就纯文字。**best-effort**：任何失败只记日志，不能让
+  /// 「已入库、已能播」的事实因为一张图发不出提醒。
+  Future<String?> _episodeNotificationImage({
+    required String bookUid,
+    required String? videoPath,
+    required int collectionId,
+  }) async {
+    String? frame;
+    // 与库内导入 / host 回填同一套门：维护动作（刮削清理）持锁期间不写封面，
+    // 这轮就退作品海报。
+    final VideoScrapeOperationLease? lease = videoPath == null
+        ? null
+        : VideoScrapeOperationGate.tryEnterOperation();
+    if (lease != null) {
+      try {
+        frame = await VideoCoverMutationGate.runExclusive(() async {
+          final CoverMetaStore store = CoverMetaStore(
+            videoCoversDirectory ?? await VideoStorage.coversDir(),
+          );
+          if (!await store.allowsAutoFrameWrite(bookUid)) {
+            return (await database.getVideoBookByBookUid(bookUid))?.coverPath;
+          }
+          final String? cover = await _coverExtractor(
+            videoPath: videoPath!,
+            bookUid: bookUid,
+          );
+          if (cover == null || cover.isEmpty) return null;
+          await database.updateVideoBookCover(bookUid, cover);
+          if (!await store.markAutoFrameAfterWrite(bookUid)) {
+            engineLog.log(
+              'videoDownload.episodeCover.provenanceConflict',
+              StateError('封面来源在自动抽帧期间发生变化: $bookUid'),
+              StackTrace.current,
+            );
+          }
+          return cover;
+        });
+      } catch (error, stack) {
+        engineLog.log('videoDownload.episodeCover', error, stack);
+      } finally {
+        lease.release();
+      }
+    }
+    if (frame != null && frame.isNotEmpty) return frame;
+    final MediaCollectionRow? collection = await database
+        .getMediaCollectionById(collectionId);
+    final String? poster = collection?.coverPath;
+    return poster == null || poster.isEmpty ? null : poster;
+  }
+
+  /// 从资源标题里认发布信息：`[SubsPlease] Show - 02 (1080p) [ABCD].mkv` →
+  /// `1080p · SubsPlease`。认不出任何一样返回 null——不硬凑。分辨率取第一个
+  /// `NNNNp` / `4K`；字幕组取开头第一个方括号（惯例位置），纯 hash 串不算。
+  static String? subscriptionReleaseLabel(String? resourceTitle) {
+    if (resourceTitle == null) return null;
+    final RegExpMatch? resolution = RegExp(
+      r'\b(\d{3,4}p|4K)\b',
+      caseSensitive: false,
+    ).firstMatch(resourceTitle);
+    final RegExpMatch? group = RegExp(
+      r'^\s*\[([^\]]{1,40})\]',
+    ).firstMatch(resourceTitle);
+    final String? groupName = group?.group(1)?.trim();
+    final String? resolutionLabel = resolution?.group(1);
+    // 首方括号是 hash 串（`[A1B2C3D4]`）或就是分辨率本身（`[1080p][Group]`）都
+    // 不算字幕组——后者会把「1080p · 1080p」写进副标题。
+    final bool groupIsNoise =
+        groupName == null ||
+        groupName.isEmpty ||
+        RegExp(r'^[0-9A-Fa-f]{6,}$').hasMatch(groupName) ||
+        groupName.toLowerCase() == resolutionLabel?.toLowerCase();
+    final List<String> parts = <String>[
+      if (resolutionLabel != null) resolutionLabel,
+      if (!groupIsNoise) groupName,
+    ];
+    return parts.isEmpty ? null : parts.join(' · ');
+  }
+
+  static String _episodeTitle(String title, VideoDownloadJobFileRow file) =>
+      '$title - ${_episodeLabel(file)}';
+
+  /// 不带作品名的集标签（`S01E03`）。更新提醒的副标题用它——那里作品名已经在
+  /// 主标题上了，再拼一遍只会把通知栏的一行挤没。
+  static String _episodeLabel(VideoDownloadJobFileRow file) {
+    final String season = (file.season ?? 1).toString().padLeft(2, '0');
+    final String episode = (file.episode ?? 0).toString().padLeft(2, '0');
+    return 'S${season}E$episode';
+  }
+
+  static String _safeSubtitleExtension(String fileName) {
+    final String extension = p.extension(fileName).toLowerCase();
+    return const <String>{
+          '.srt',
+          '.ass',
+          '.ssa',
+          '.vtt',
+          '.sub',
+        }.contains(extension)
+        ? extension
+        : '.srt';
+  }
+
+  static String _safeError(String value) {
+    final String redacted = redactCredentialsInText(
+      value,
+    ).replaceAll(RegExp(r'[\r\n]+'), ' ').trim();
+    if (redacted.length <= 600) return redacted;
+    return '${redacted.substring(0, 600)}…';
+  }
+}
+
+extension on VideoMediaReference {
+  VideoMediaReference copyWithEpisode({int? season, int? episode}) =>
+      VideoMediaReference(
+        providerId: providerId,
+        mediaId: mediaId,
+        mediaKind: mediaKind,
+        discoveryCategory: discoveryCategory,
+        title: title,
+        originalTitle: originalTitle,
+        aliases: aliases,
+        year: year,
+        season: season ?? this.season,
+        episode: episode ?? this.episode,
+        anidbId: anidbId,
+        tmdbId: tmdbId,
+        imdbId: imdbId,
+        tvdbId: tvdbId,
+        anilistId: anilistId,
+        bangumiId: bangumiId,
+        externalIds: externalIds,
+      );
+}

@@ -1,0 +1,1602 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:crypto/crypto.dart';
+import 'package:drift/drift.dart';
+import 'package:flutter/foundation.dart';
+import 'package:path/path.dart' as p;
+
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_cover_cache.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_download_counts.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_extension_store_client.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_extension_updates.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_runtime_factory.dart';
+import 'package:fushi/src/startup/exit_flush_registry.dart';
+
+/// 扩展仓库**不内置**（2026-10-09 用户口径：「扩展仓库内置仓库全部不内置」）。
+///
+/// 新安装时仓库列表为空，空态引导用户自己添加信任的仓库。早先版本首次启动会
+/// 替用户落一行默认仓库（漫画 keiyoushi、视频 yuzono/anime-repo），并置位偏好
+/// `mihon_default_store_seeded` / `mihon_default_anime_store_seeded`；那些行是
+/// 普通仓库记录，升级后原样保留（已装扩展照常检查更新），用户可以自己删。两个
+/// 偏好键只是历史残留，不再读写（持久化名冻结，不做清理迁移）。
+class MihonManager extends ChangeNotifier {
+  MihonManager({
+    required this.database,
+    required this.rootDirectory,
+    required this.runtime,
+    MihonExtensionStoreClient? storeClient,
+    MihonDownloadCountsClient? downloadCountsClient,
+    this.fetchDownloadCounts = false,
+    this.kind = MihonMediaKind.manga,
+    this.ownsRuntime = true,
+    Duration coverCacheMaxAge = const Duration(
+      days: kMangaCoverCacheDefaultMaxAgeDays,
+    ),
+  }) : _storeClient = storeClient ?? MihonExtensionStoreClient(),
+       _downloadCountsClient =
+           downloadCountsClient ?? MihonDownloadCountsClient() {
+    coverCache = MihonCoverCache(
+      Directory(p.join(rootDirectory.path, 'cache', 'covers')),
+      maxAge: coverCacheMaxAge,
+    );
+    if (ownsRuntime && MihonRuntimeFactory.usesDesktopSidecar) {
+      _exitShutdown = ExitFlushRegistry.instance.register(
+        shutdownRuntimeForExit,
+      );
+    }
+  }
+
+  final FushiDatabase database;
+  final Directory rootDirectory;
+  final MihonRuntime runtime;
+
+  /// 本 manager 管的是哪个生态的扩展（漫画 / 视频）。
+  ///
+  /// 三张扩展表按 `media_kind` 分片（v107），[reload] 只读本生态的行；安装门只收
+  /// 本生态的 APK（[MihonExtensionInspection.kind] 不符即 `WRONG_MEDIA_KIND`）；
+  /// 仓库同样按生态各一份。运行时可以共用——同一个
+  /// sidecar / 原生宿主两种扩展都认，见 [ownsRuntime]。
+  final MihonMediaKind kind;
+
+  /// 是否由本 manager 负责 [runtime] 的生命周期（退出时关 sidecar、dispose）。
+  ///
+  /// 真实 app 里漫画与视频两个 manager **共用一个** runtime 实例（桌面端一个
+  /// sidecar JVM 512 MiB，两个太贵；Android 原生宿主本来就是单例），生命周期由
+  /// 持有它的 `AppModel` 统一管，两个 manager 都传 false。单测构造一个 manager
+  /// 配一个 fake runtime 时保持默认 true，语义不变。
+  final bool ownsRuntime;
+  late final MihonCoverCache coverCache;
+  final MihonExtensionStoreClient _storeClient;
+
+  /// 是否在目录刷新后去 GitHub 拉扩展的公开下载量（见 [MihonDownloadCounts]）。
+  ///
+  /// 默认 **false**，只有真实 app 启动那一处传 true：这是一次 5 MB 量级的外网
+  /// 请求，挂在构造函数的默认值上会让每个构造 manager 的单测都去打 `api.github.com`（既慢又把测试绑在外网和 60 次/小时的
+  /// 未认证配额上）。
+  final bool fetchDownloadCounts;
+
+  final MihonDownloadCountsClient _downloadCountsClient;
+
+  /// 上一次拉到的下载量，跨刷新复用：安装流程会重建 [available]（见
+  /// [_resolveInstallTarget]），那条路径**不发**这次请求，靠这份缓存把计数续上，
+  /// 否则装完一个扩展整列表的下载量会集体消失、排序当场乱掉。
+  MihonDownloadCounts _downloadCounts = MihonDownloadCounts.empty;
+
+  List<MangaExtensionStoreRow> stores = const <MangaExtensionStoreRow>[];
+  List<MangaExtensionRow> installed = const <MangaExtensionRow>[];
+  List<MangaOnlineSourceRow> sources = const <MangaOnlineSourceRow>[];
+  List<MihonAvailableExtension> available = const <MihonAvailableExtension>[];
+  bool loading = false;
+  String? error;
+  bool _disposed = false;
+  Future<void>? _initialising;
+  Future<void>? _runtimeShutdown;
+  ExitFlushCallback? _exitShutdown;
+  final Set<String> _extensionActionPackages = <String>{};
+  String? _activePreviewPackage;
+
+  bool isExtensionActionBusy(String packageName) =>
+      _extensionActionPackages.contains(packageName);
+
+  /// Claims a package for the complete user-facing preview/install flow.
+  /// This survives page rebuilds and navigation while a dialog is open.
+  bool tryBeginExtensionAction(String packageName) {
+    if (!_extensionActionPackages.add(packageName)) return false;
+    _notify();
+    return true;
+  }
+
+  void endExtensionAction(String packageName) {
+    if (_extensionActionPackages.remove(packageName)) _notify();
+  }
+
+  /// Desktop window close ends in a process-level fast exit, so ordinary
+  /// ChangeNotifier/widget disposal is not guaranteed to run. Register this
+  /// bounded callback with the app exit barrier to stop the exact retained
+  /// sidecar process before the Flutter process terminates.
+  Future<void> shutdownRuntimeForExit() => _runtimeShutdown ??= ownsRuntime
+      ? runtime.dispose()
+      : Future<void>.value();
+
+  Future<void> initialise() {
+    final Future<void>? current = _initialising;
+    if (current != null) return current;
+    final Future<void> future = _initialise();
+    _initialising = future;
+    return future;
+  }
+
+  Future<void> _initialise() async {
+    loading = true;
+    _notify();
+    try {
+      await rootDirectory.create(recursive: true);
+      await Directory(
+        p.join(rootDirectory.path, 'extensions'),
+      ).create(recursive: true);
+      await Directory(
+        p.join(rootDirectory.path, 'tmp'),
+      ).create(recursive: true);
+      await reload();
+      // 必须在 reload 之后：判断孤儿要拿 installed 跟标记里的包名比对。
+      await _recoverAbandonedPreview();
+      await _clearStagedApks();
+      await _refreshStores();
+    } catch (exception) {
+      error = '$exception';
+      rethrow;
+    } finally {
+      loading = false;
+      _notify();
+    }
+  }
+
+  int _nextStoreSortOrder() => stores.isEmpty
+      ? 0
+      : stores
+                .map((MangaExtensionStoreRow row) => row.sortOrder)
+                .reduce((int a, int b) => a > b ? a : b) +
+            1;
+
+  Future<void> reload() async {
+    final String mediaKind = kind.dbValue;
+    stores = await database.getMangaExtensionStores(mediaKind: mediaKind);
+    installed = await database.getMangaExtensions(mediaKind: mediaKind);
+    sources = await database.getMangaOnlineSources(mediaKind: mediaKind);
+    _notify();
+  }
+
+  Future<void> addStore(String url, {bool allowInsecure = false}) async {
+    await _guarded(() async {
+      final MihonStoreFetchResult fetched = await _storeClient.fetchStore(
+        url,
+        allowInsecure: allowInsecure,
+      );
+      final MihonStore store = fetched.store!;
+      final List<MihonAvailableExtension> extensions = await _storeClient
+          .fetchExtensions(store, allowInsecure: allowInsecure);
+      final int sortOrder = _nextStoreSortOrder();
+      await database.upsertMangaExtensionStore(
+        MangaExtensionStoresCompanion.insert(
+          indexUrl: store.indexUrl,
+          mediaKind: Value(kind.dbValue),
+          name: store.name,
+          format: store.format.name,
+          badgeLabel: Value(store.badgeLabel),
+          signingKey: Value(store.signingKey),
+          contactJson: Value(jsonEncode(store.contact)),
+          extensionListUrl: Value(store.extensionListUrl),
+          sortOrder: Value(sortOrder),
+          etag: Value(fetched.etag),
+          lastModified: Value(fetched.lastModified),
+          lastSyncAt: Value(DateTime.now().millisecondsSinceEpoch),
+        ),
+      );
+      available = <MihonAvailableExtension>[
+        ...available.where(
+          (MihonAvailableExtension item) => item.storeUrl != store.indexUrl,
+        ),
+        ...await _withDownloadCounts(extensions),
+      ];
+      await reload();
+    });
+  }
+
+  Future<void> refreshStores() async {
+    await _guarded(_refreshStores);
+  }
+
+  Future<void> _refreshStores() async {
+    final List<MihonAvailableExtension> next = <MihonAvailableExtension>[];
+    final List<MangaExtensionStoreRow> rows = List<MangaExtensionStoreRow>.of(
+      stores,
+    );
+    for (final MangaExtensionStoreRow row in rows) {
+      if (!row.enabled) continue;
+      final List<MihonAvailableExtension> cachedExtensions = available
+          .where(
+            (MihonAvailableExtension item) => item.storeUrl == row.indexUrl,
+          )
+          .toList(growable: false);
+      try {
+        final bool insecure = Uri.parse(row.indexUrl).scheme == 'http';
+        // Current JSON/protobuf repositories embed the complete catalogue in
+        // the index response. After a process restart that catalogue is not in
+        // memory, so a conditional 304 would leave the page permanently empty.
+        // Only validate an embedded index when its parsed catalogue is still
+        // reusable; repositories with an external list can always re-fetch it.
+        final bool hasReusableCatalogue =
+            row.extensionListUrl != null || cachedExtensions.isNotEmpty;
+        final MihonStoreFetchResult fetched = await _storeClient.fetchStore(
+          row.indexUrl,
+          etag: hasReusableCatalogue ? row.etag : null,
+          lastModified: hasReusableCatalogue ? row.lastModified : null,
+          allowInsecure: insecure,
+        );
+        final MihonStore store = fetched.notModified
+            ? _storeFromRow(row)
+            : fetched.store!;
+        // A current protobuf/JSON store can embed its complete extension
+        // list. A 304 response intentionally has no body, so reconstructing
+        // the store from the DB cannot reconstruct that list. Retain the
+        // already parsed list in that case; external/legacy indexes can
+        // still be fetched independently from extensionListUrl.
+        // BUG-2641：入口地址可能被解析到另一个身份（legacy `index.min.json` 跟到同目录
+        // `repo.json`，默认视频仓库 yuzono 就是这样）。过去这里按解析后的地址落库、
+        // 却不删种子行，于是主键不同的两行指向同一仓库，之后每次刷新各拉一遍，
+        // 扩展列表整份翻倍。解析后的身份已有自己的**启用**行：这行只是别名，删掉
+        // 即可，目录由那一行自己拉；否则把这一行原子地迁到解析后的地址（同
+        // [editStoreUrl]）——包括解析后那行被停用的情况：用户在翻倍期间很可能停用了
+        // 其中一行来去重，若停的恰是 repo.json 那行，只删别名会让整个默认仓库从列表
+        // 消失；迁移则用本行（启用中）的启用位与排序覆盖它。
+        final bool aliased = store.indexUrl != row.indexUrl;
+        if (aliased &&
+            rows.any(
+              (MangaExtensionStoreRow other) =>
+                  other.indexUrl == store.indexUrl && other.enabled,
+            )) {
+          await database.deleteMangaExtensionStore(row.indexUrl);
+          continue;
+        }
+        final List<MihonAvailableExtension> extensions =
+            fetched.notModified && store.extensionListUrl == null
+            ? cachedExtensions
+            : await _storeClient.fetchExtensions(
+                store,
+                allowInsecure: insecure,
+              );
+        next.addAll(extensions);
+        await database.transaction(() async {
+          if (aliased) {
+            await database.deleteMangaExtensionStore(row.indexUrl);
+          }
+          await database.upsertMangaExtensionStore(
+            MangaExtensionStoresCompanion.insert(
+              indexUrl: store.indexUrl,
+              mediaKind: Value(kind.dbValue),
+              name: store.name,
+              format: store.format.name,
+              badgeLabel: Value(store.badgeLabel),
+              signingKey: Value(store.signingKey),
+              contactJson: Value(jsonEncode(store.contact)),
+              extensionListUrl: Value(store.extensionListUrl),
+              enabled: Value(row.enabled),
+              sortOrder: Value(row.sortOrder),
+              etag: Value(fetched.etag ?? row.etag),
+              lastModified: Value(fetched.lastModified ?? row.lastModified),
+              lastSyncAt: Value(DateTime.now().millisecondsSinceEpoch),
+              lastError: const Value(null),
+            ),
+          );
+        });
+      } catch (exception) {
+        // A manual refresh must not blank an already visible catalogue merely
+        // because this request failed. Cold start has no in-memory catalogue,
+        // but installed extensions still come from the database via reload().
+        next.addAll(cachedExtensions);
+        await database.upsertMangaExtensionStore(
+          MangaExtensionStoresCompanion.insert(
+            indexUrl: row.indexUrl,
+            mediaKind: Value(kind.dbValue),
+            name: row.name,
+            format: row.format,
+            badgeLabel: Value(row.badgeLabel),
+            signingKey: Value(row.signingKey),
+            contactJson: Value(row.contactJson),
+            extensionListUrl: Value(row.extensionListUrl),
+            enabled: Value(row.enabled),
+            sortOrder: Value(row.sortOrder),
+            etag: Value(row.etag),
+            lastModified: Value(row.lastModified),
+            lastSyncAt: Value(row.lastSyncAt),
+            lastError: Value('$exception'),
+          ),
+        );
+      }
+    }
+    available = await _withDownloadCounts(next);
+    await reload();
+  }
+
+  /// 改仓库地址。
+  ///
+  /// `indexUrl` 是 `MangaExtensionStores` 的主键（表注释：仓库入口 URL 同时是
+  /// 稳定身份），所以数据层没有「改地址」这个动作，只能删旧行 + 插新行。
+  /// 之前 UI 索性不提供入口，用户只能删了重加——而在 [BUG-1804] 修好之前
+  /// 重加那条路本身是堵死的，于是「删掉官方仓库 → 加了个坏的 → 想改回来」
+  /// 变成死局（BUG-1806）。
+  ///
+  /// 顺序上**先把新地址完整拉通再动数据库**：拉不通就抛异常，旧行原封不动。
+  /// 反过来先删再拉，一旦新地址有问题，用户会同时失去旧仓库和新仓库。
+  Future<void> editStoreUrl(
+    String oldIndexUrl,
+    String newIndexUrl, {
+    bool allowInsecure = false,
+  }) async {
+    await _guarded(() async {
+      final MangaExtensionStoreRow? existing = stores
+          .where((MangaExtensionStoreRow row) => row.indexUrl == oldIndexUrl)
+          .firstOrNull;
+      if (existing == null) {
+        throw const MihonRuntimeException(
+          'STORE_MISSING',
+          'The extension store is no longer configured',
+        );
+      }
+      final MihonStoreFetchResult fetched = await _storeClient.fetchStore(
+        newIndexUrl,
+        allowInsecure: allowInsecure,
+      );
+      final MihonStore store = fetched.store!;
+      // 索引可能把我们重定向到另一个入口地址（legacy 分支跟随 index_v2），
+      // 落库的身份必须是解析后的那个，不是用户输入的那个。
+      if (store.indexUrl != oldIndexUrl &&
+          stores.any(
+            (MangaExtensionStoreRow row) => row.indexUrl == store.indexUrl,
+          )) {
+        throw const MihonRuntimeException(
+          'STORE_DUPLICATE',
+          'Another extension store already uses this URL',
+        );
+      }
+      final List<MihonAvailableExtension> extensions = await _storeClient
+          .fetchExtensions(store, allowInsecure: allowInsecure);
+      // 删旧行 + 插新行必须原子。两个独立 await 之间只要出事（第二步抛异常、
+      // 进程被杀、设备断电），用户的仓库行就**彻底消失**——比改地址失败严重得多，
+      // 而且正是 BUG-1806 那个死局的成因（仓库没了又加不回来）。
+      await database.transaction(() async {
+        await database.deleteMangaExtensionStore(oldIndexUrl);
+        await database.upsertMangaExtensionStore(
+          MangaExtensionStoresCompanion.insert(
+            indexUrl: store.indexUrl,
+            mediaKind: Value(kind.dbValue),
+            name: store.name,
+            format: store.format.name,
+            badgeLabel: Value(store.badgeLabel),
+            signingKey: Value(store.signingKey),
+            contactJson: Value(jsonEncode(store.contact)),
+            extensionListUrl: Value(store.extensionListUrl),
+            // 改的是地址，不是这一行的其他状态——启用位和排序必须跟着走，
+            // 否则「改个地址」会顺手把仓库关掉或者甩到列表末尾。
+            enabled: Value(existing.enabled),
+            sortOrder: Value(existing.sortOrder),
+            etag: Value(fetched.etag),
+            lastModified: Value(fetched.lastModified),
+            lastSyncAt: Value(DateTime.now().millisecondsSinceEpoch),
+          ),
+        );
+      });
+      available = <MihonAvailableExtension>[
+        ...available.where(
+          (MihonAvailableExtension item) =>
+              item.storeUrl != oldIndexUrl && item.storeUrl != store.indexUrl,
+        ),
+        ...await _withDownloadCounts(extensions),
+      ];
+      await reload();
+    });
+  }
+
+  Future<void> removeStore(String indexUrl) async {
+    await database.deleteMangaExtensionStore(indexUrl);
+    available = available
+        .where((MihonAvailableExtension item) => item.storeUrl != indexUrl)
+        .toList(growable: false);
+    await reload();
+  }
+
+  Future<MihonInstallProposal> prepareStoreInstall(
+    MihonAvailableExtension extension,
+  ) async {
+    final MangaExtensionStoreRow? store = stores
+        .where(
+          (MangaExtensionStoreRow row) => row.indexUrl == extension.storeUrl,
+        )
+        .firstOrNull;
+    if (store == null) {
+      throw const MihonRuntimeException(
+        'STORE_MISSING',
+        'The extension store is no longer configured',
+      );
+    }
+    // 明文放行的授权必须来自**用户当初确认过的那个仓库地址**，绝不能来自 APK
+    // 直链自己的 scheme —— 后者等于「因为你是 http，所以允许你走 http」，把
+    // `_validatedUri` 的 HTTPS 策略自我否决掉：一个 https 仓库可以在索引里塞一条
+    // http 直链，用户看不到任何提示就被中间人换掉安装包。仓库地址在 addStore 时
+    // 已经过 `_confirmInsecureUrl` 明示同意，继承它才是正确的信任传递。
+    final bool insecure = Uri.parse(store.indexUrl).scheme == 'http';
+    final MihonAvailableExtension target = await _resolveInstallTarget(
+      store,
+      extension,
+      allowInsecure: insecure,
+    );
+    final Uint8List bytes = await _storeClient.downloadApk(
+      target.apkUrl,
+      allowInsecure: insecure,
+    );
+    return _prepareInstallBytes(
+      bytes,
+      expected: target,
+      expectedSigningKey: store.signingKey,
+    );
+  }
+
+  /// 安装前**重新解析一次仓库索引**，拿当次索引里的直链去下载。
+  ///
+  /// [available] 是远端索引的**内存快照**，只在进程冷启动的 [_refreshStores]
+  /// 里刷一次（没有任何缓存表，重启即丢）。而快照里的 `apkUrl` 指向的是**短寿命
+  /// 资源**：keiyoushi 把 APK 挂在 GitHub release 上，只保留最近 7 个 release，
+  /// 旧 tag 连同资产一起被删（2026-08-18 实测：当时保留的 7 个 release 全部产于
+  /// 08-16，即保留窗口只有两天）。手机上进程在后台活了几天再点安装，快照里的
+  /// **每一条**直链都指向已删除的 tag——用户看到的就是 `STORE_HTTP_404`。
+  ///
+  /// 同一份快照还会让版本号漂移变成 `METADATA_MISMATCH`（下载到的 APK 比快照新，
+  /// 被当成「与仓库元数据不符」拒掉）。两个症状同一个根因：**下载时刻的真相源
+  /// 是索引，不是几天前的快照**。所以这里不是「404 了再重试一次」的补丁，而是把安装
+  /// 的输入从快照换成当次索引。
+  ///
+  /// 刷不到索引就直接失败，不回退到快照：下一步本来就要联网下 APK，「索引拿不到
+  /// 却假装能装」只会把同一个 404 推到下一步，还多一条分支。
+  Future<MihonAvailableExtension> _resolveInstallTarget(
+    MangaExtensionStoreRow store,
+    MihonAvailableExtension snapshot, {
+    required bool allowInsecure,
+  }) async {
+    final List<MihonAvailableExtension> extensions =
+        await _resolveStoreCatalogue(store, allowInsecure: allowInsecure);
+    return _requireListed(extensions, snapshot.packageName);
+  }
+
+  /// 重新解析一个仓库的索引并让 [available] 跟上，返回当次索引里的完整目录。
+  ///
+  /// 从 [_resolveInstallTarget] 里拆出来，是为了让 [installMany] 能**每个仓库只
+  /// 解析一次**：keiyoushi 的 `index.pb` 内嵌 1400+ 条扩展，逐个装时每条都重新下载
+  /// 并解析一遍整份索引，装一百个就是一百次全量解析（还有一百次整表 `_notify`）。
+  Future<List<MihonAvailableExtension>> _resolveStoreCatalogue(
+    MangaExtensionStoreRow store, {
+    required bool allowInsecure,
+  }) async {
+    final MihonStoreFetchResult fetched = await _storeClient.fetchStore(
+      store.indexUrl,
+      allowInsecure: allowInsecure,
+    );
+    final MihonStore resolved = fetched.store!;
+    final List<MihonAvailableExtension> extensions = await _storeClient
+        .fetchExtensions(resolved, allowInsecure: allowInsecure);
+    // 索引都重新拉了，顺手让目录跟上：卡片上的版本号不该跟马上要装的东西对不上。
+    // `index_v2` 会让最终 indexUrl 与库里那行不同，两个地址的旧条目都要清。
+    available = <MihonAvailableExtension>[
+      ...available.where(
+        (MihonAvailableExtension item) =>
+            item.storeUrl != store.indexUrl &&
+            item.storeUrl != resolved.indexUrl,
+      ),
+      // 安装路径只用缓存续计数，不再打一次 GitHub API：批量安装时这里跑 N 次。
+      ...await _withDownloadCounts(extensions, allowFetch: false),
+    ];
+    _notify();
+    return extensions;
+  }
+
+  MihonAvailableExtension _requireListed(
+    List<MihonAvailableExtension> extensions,
+    String packageName,
+  ) {
+    final MihonAvailableExtension? target = extensions
+        .where(
+          (MihonAvailableExtension item) => item.packageName == packageName,
+        )
+        .firstOrNull;
+    if (target == null) {
+      throw const MihonRuntimeException(
+        'EXTENSION_GONE',
+        'The extension is no longer listed in its repository',
+      );
+    }
+    return target;
+  }
+
+  Future<MihonInstallProposal> prepareLocalInstall(String apkPath) async {
+    final File file = File(apkPath);
+    final int length = await file.length();
+    if (length > mihonExtensionApkMaxBytes) {
+      throw const MihonRuntimeException(
+        'DOWNLOAD_TOO_LARGE',
+        'Extension APK exceeds the 100 MiB limit',
+      );
+    }
+    return _prepareInstallBytes(await file.readAsBytes());
+  }
+
+  Future<MihonInstallProposal> _prepareInstallBytes(
+    Uint8List bytes, {
+    MihonAvailableExtension? expected,
+    String? expectedSigningKey,
+  }) async {
+    final String sha = sha256.convert(bytes).toString();
+    final File temp = File(
+      p.join(rootDirectory.path, 'tmp', 'extension-$sha.apk.part'),
+    );
+    await temp.writeAsBytes(bytes, flush: true);
+    try {
+      final MihonExtensionInspection inspection = await runtime
+          .inspectExtension(temp.path);
+      // 生态门先于版本门：一个 Aniyomi APK 装进漫画 manager（或反过来）不是
+      // 「版本不对」，是根本不属于这里——两个生态的 lib 版本号空间也不同
+      // （漫画 1.4/1.6，视频 14），先判生态才能给出对的原因。
+      if (inspection.kind != kind) {
+        throw MihonRuntimeException(
+          'WRONG_MEDIA_KIND',
+          'Extension is a ${inspection.kind.dbValue} extension; '
+              'this list only installs ${kind.dbValue} extensions',
+        );
+      }
+      if (!kind.supportedLibVersions.contains(inspection.libVersion)) {
+        throw MihonRuntimeException(
+          'UNSUPPORTED_LIB',
+          'Extension lib ${inspection.libVersion} is not supported',
+        );
+      }
+      // 身份门：「我拿到的 APK 是不是我点的那一个」。三个字段都是两侧同义量，
+      // 全等才放行。
+      //
+      // BUG-1996 曾把 versionCode 从判据里拿掉，理由是「索引 69 / APK 104069 不同
+      // 尺度」——**那个前提经实测证伪**：keiyoushi 的索引与 APK 由 gradle 的同一个
+      // `androidVersionCodeProvider` 产出，直连 `repo/index.pb` 实测 SamuraiScan
+      // field5 = 104069、Manga Mura = 104005，与各自 APK 的 android:versionCode
+      // 逐字相同。判据因此原样保留，并补上 versionName（严格更强，不是放宽）。
+      //
+      // 用户报的「扩展装不上」根因**仍未定位**（见 BUG-1996）。所以这里改的是可
+      // 诊断性：把两侧实际值写进异常，下一份报告才有得看——原来是一句常量。
+      //
+      // 真实性不由本门负责：APK 是不是仓库签的由下面 SIGNATURE_MISMATCH 对
+      // `signingKey` 保证，是不是与已装版本同一签名由 SIGNATURE_CHANGED 保证。
+      if (expected != null) {
+        if (inspection.packageName != expected.packageName ||
+            inspection.apkVersionCode != expected.extensionVersionCode ||
+            inspection.versionName != expected.versionName) {
+          throw MihonRuntimeException(
+            'METADATA_MISMATCH',
+            'Downloaded APK does not match the extension store metadata '
+                '(store: ${expected.packageName} '
+                'v${expected.extensionVersionCode}/${expected.versionName}; '
+                'apk: ${inspection.packageName} '
+                'v${inspection.apkVersionCode}/${inspection.versionName})',
+          );
+        }
+      }
+      final String expectedSigner = _normalizeFingerprint(
+        expectedSigningKey ?? '',
+      );
+      final String actualSigner = _normalizeFingerprint(
+        inspection.signerSha256,
+      );
+      if (expectedSigner.isNotEmpty && expectedSigner != actualSigner) {
+        throw const MihonRuntimeException(
+          'SIGNATURE_MISMATCH',
+          'APK signer does not match the extension store signing key',
+        );
+      }
+      final MangaExtensionRow? current = await database.getMangaExtension(
+        inspection.packageName,
+      );
+      if (current != null) {
+        // 两侧同为 APK 尺度（DB 列存的就是 `apkVersionCode`），自洽，BUG-1996 不动它。
+        if (inspection.apkVersionCode < current.versionCode) {
+          throw const MihonRuntimeException(
+            'DOWNGRADE_REJECTED',
+            'Extension downgrade is not allowed',
+          );
+        }
+        if (_normalizeFingerprint(current.signerSha256) != actualSigner) {
+          throw const MihonRuntimeException(
+            'SIGNATURE_CHANGED',
+            'Extension update signer does not match the installed version',
+          );
+        }
+      }
+      final bool trusted = await database.isMangaSignerTrusted(actualSigner);
+      return MihonInstallProposal(
+        tempPath: temp.path,
+        apkSha256: sha,
+        inspection: inspection,
+        expected: expected,
+        current: current,
+        signerTrusted: trusted,
+      );
+    } catch (_) {
+      if (await temp.exists()) await temp.delete();
+      rethrow;
+    }
+  }
+
+  Future<void> commitInstall(
+    MihonInstallProposal proposal, {
+    required bool trustSigner,
+    bool invalidateRuntime = true,
+  }) async {
+    final String signer = _normalizeFingerprint(
+      proposal.inspection.signerSha256,
+    );
+    if (!proposal.signerTrusted && !trustSigner) {
+      throw const MihonRuntimeException(
+        'SIGNER_NOT_TRUSTED',
+        'The extension signer has not been trusted',
+      );
+    }
+    await _guarded(() async {
+      if (!proposal.signerTrusted) {
+        await database.trustMangaSigner(
+          MangaTrustedSignersCompanion.insert(
+            fingerprint: signer,
+            label: proposal.inspection.name,
+            origin: proposal.expected?.storeUrl ?? 'local',
+            trustedAt: DateTime.now().millisecondsSinceEpoch,
+          ),
+        );
+      }
+      final String packageName = proposal.inspection.packageName;
+      final File target = File(
+        p.join(rootDirectory.path, 'extensions', '$packageName.apk'),
+      );
+      final File backup = File('${target.path}.previous');
+      final bool desktop = MihonRuntimeFactory.usesDesktopSidecar;
+      if (desktop) {
+        if (await backup.exists()) await backup.delete();
+        if (await target.exists()) await target.rename(backup.path);
+        try {
+          await File(proposal.tempPath).rename(target.path);
+        } on FileSystemException {
+          await File(proposal.tempPath).copy(target.path);
+          await File(proposal.tempPath).delete();
+        }
+      }
+      String runtimePath = desktop
+          ? target.path
+          : await runtime.installPrivateExtension(proposal.tempPath);
+      try {
+        final MihonExtensionRef extension = MihonExtensionRef(
+          packageName: packageName,
+          apkPath: runtimePath,
+        );
+        final List<MihonSource> loaded = await _listSources(extension);
+        if (loaded.isEmpty) {
+          throw MihonRuntimeException(
+            'NO_SOURCES',
+            'Extension did not expose any ${kind.dbValue} sources',
+          );
+        }
+        final String storedPath = p.join(
+          'extensions',
+          '$packageName.${desktop ? 'apk' : 'ext'}',
+        );
+        await database.upsertMangaExtension(
+          MangaExtensionsCompanion.insert(
+            packageName: packageName,
+            storeUrl: Value(proposal.expected?.storeUrl),
+            name: proposal.inspection.name,
+            // 列名冻结，语义 = APK 尺度（见 [MihonExtensionInspection.apkVersionCode]）。
+            versionCode: proposal.inspection.apkVersionCode,
+            versionName: proposal.inspection.versionName,
+            libVersion: proposal.inspection.libVersion,
+            language:
+                proposal.expected?.language ??
+                loaded
+                    .map((MihonSource item) => item.language)
+                    .toSet()
+                    .join(','),
+            contentWarning: Value(proposal.expected?.contentWarning ?? 0),
+            apkPath: storedPath,
+            apkSha256: proposal.apkSha256,
+            signerSha256: signer,
+            installedAt: DateTime.now().millisecondsSinceEpoch,
+            mediaKind: Value(kind.dbValue),
+          ),
+        );
+        await database.replaceMangaOnlineSources(
+          packageName,
+          loaded.map(
+            (MihonSource source) => MangaOnlineSourcesCompanion.insert(
+              extensionPackage: packageName,
+              sourceId: source.id,
+              name: source.name,
+              language: source.language,
+              baseUrl: Value(source.baseUrl),
+              mediaKind: Value(kind.dbValue),
+            ),
+          ),
+        );
+        if (await backup.exists()) await backup.delete();
+        if (await File(proposal.tempPath).exists()) {
+          await File(proposal.tempPath).delete();
+        }
+      } catch (_) {
+        if (desktop) {
+          if (await target.exists()) await target.delete();
+          if (await backup.exists()) await backup.rename(target.path);
+        }
+        rethrow;
+      }
+      // 批量安装把整批的失效攒到最后一次（[installMany]）：桌面端每次失效都要
+      // 重启 Java sidecar，逐个装等于重启 N 次。
+      if (invalidateRuntime) await runtime.invalidateExtension(packageName);
+      await reload();
+    });
+  }
+
+  /// 批量安装一批可安装扩展。
+  ///
+  /// 两种模式，由 [upgrade] 选：
+  /// - **首装**（默认）：只装没装过的，已经装了的直接跳过，不做「顺手升级」——批量
+  ///   的意义是铺满一个语言的可用源，不是替用户决定升级。
+  /// - **升级**（[upgrade] = true，扩展页「一键更新」，BUG-2481）：只处理已装且仓库
+  ///   里版本更高的（[hasMihonExtensionUpdate]，与角标同一判据），没装的 / 已是最新
+  ///   的跳过。签名换了的那条在 [_prepareInstallBytes] 以 `SIGNATURE_CHANGED`
+  ///   落进 `failed`（与已装版本签名不符，这道门不看 `trustSigner`），让用户回到
+  ///   单条流程看着指纹确认——一键更新 / 后台自动更新都不能顺手接受新签名。
+  ///
+  /// 两种模式都把整批的运行时失效攒到最后一次（见
+  /// [MihonRuntime.invalidateExtensions]）：桌面 sidecar 每次失效都要重启，逐个
+  /// 装等于重启 N 次。升级期间旧版本继续被加载着，直到最后那一次重启统一换新。
+  ///
+  /// **每个仓库只解析一次索引**（[_resolveStoreCatalogue]），而不是像单条安装那样
+  /// 每个扩展重拉一遍：装一百个就是一百次全量索引下载 + 解析。
+  ///
+  /// 单条失败不中断整批：网络抖动、上游删了某个 release、签名换了——这些都只该
+  /// 让那一条进 `failed`，而不是让已经排队的另外九十九条一起作废。
+  Future<MihonBulkInstallReport> installMany(
+    List<MihonAvailableExtension> targets, {
+    required bool trustSigner,
+    bool upgrade = false,
+    void Function(int done, int total, MihonAvailableExtension current)?
+    onProgress,
+    bool Function()? isCancelled,
+  }) async {
+    final List<String> installedPackages = <String>[];
+    final List<String> skippedPackages = <String>[];
+    final Map<String, String> failedPackages = <String, String>{};
+    final Map<String, String> failureCodes = <String, String>{};
+    final Map<String, MangaExtensionRow> installedByPackage =
+        <String, MangaExtensionRow>{
+          for (final MangaExtensionRow row in installed) row.packageName: row,
+        };
+    final Set<String> alreadyInstalled = installedByPackage.keys.toSet();
+    // 升级模式的「该不该动这一条」：没装 → 跳；仓库里不比已装新 → 跳。
+    bool shouldSkip(MihonAvailableExtension target) => upgrade
+        ? !hasMihonExtensionUpdate(
+            available: target,
+            installed: installedByPackage[target.packageName],
+          )
+        : alreadyInstalled.contains(target.packageName);
+    final Map<String, List<MihonAvailableExtension>> byStore =
+        <String, List<MihonAvailableExtension>>{};
+    for (final MihonAvailableExtension target in targets) {
+      byStore
+          .putIfAbsent(target.storeUrl, () => <MihonAvailableExtension>[])
+          .add(target);
+    }
+    final int total = targets.length;
+    int done = 0;
+    bool cancelled() => isCancelled?.call() ?? false;
+    try {
+      for (final MapEntry<String, List<MihonAvailableExtension>> entry
+          in byStore.entries) {
+        if (cancelled()) break;
+        final MangaExtensionStoreRow? store = stores
+            .where((MangaExtensionStoreRow row) => row.indexUrl == entry.key)
+            .firstOrNull;
+        if (store == null) {
+          for (final MihonAvailableExtension target in entry.value) {
+            failedPackages[target.packageName] = 'STORE_MISSING';
+            done++;
+          }
+          continue;
+        }
+        final bool insecure = Uri.parse(store.indexUrl).scheme == 'http';
+        List<MihonAvailableExtension> catalogue;
+        try {
+          catalogue = await _resolveStoreCatalogue(
+            store,
+            allowInsecure: insecure,
+          );
+        } catch (exception) {
+          // 索引拉不下来，这个仓库的每一条都装不了——但别的仓库还能继续。
+          for (final MihonAvailableExtension target in entry.value) {
+            failedPackages[target.packageName] = '$exception';
+            done++;
+          }
+          continue;
+        }
+        for (final MihonAvailableExtension target in entry.value) {
+          if (cancelled()) break;
+          onProgress?.call(done, total, target);
+          done++;
+          if (shouldSkip(target)) {
+            skippedPackages.add(target.packageName);
+            continue;
+          }
+          if (!tryBeginExtensionAction(target.packageName)) {
+            // 用户正在单独装同一个，让那条流程去装。
+            skippedPackages.add(target.packageName);
+            continue;
+          }
+          MihonInstallProposal? proposal;
+          try {
+            final MihonAvailableExtension resolved = _requireListed(
+              catalogue,
+              target.packageName,
+            );
+            final Uint8List bytes = await _storeClient.downloadApk(
+              resolved.apkUrl,
+              allowInsecure: insecure,
+            );
+            proposal = await _prepareInstallBytes(
+              bytes,
+              expected: resolved,
+              expectedSigningKey: store.signingKey,
+            );
+            await commitInstall(
+              proposal,
+              trustSigner: trustSigner,
+              invalidateRuntime: false,
+            );
+            installedPackages.add(target.packageName);
+            alreadyInstalled.add(target.packageName);
+          } catch (exception) {
+            failedPackages[target.packageName] = '$exception';
+            if (exception is MihonRuntimeException) {
+              failureCodes[target.packageName] = exception.code;
+            }
+            // 失败的提案连着一份 tmp/*.apk.part，当场删掉而不是等下次启动兜底：
+            // 一百条里失败十条就是十份最大 100 MiB 的残骸。
+            if (proposal != null) {
+              try {
+                await discardProposal(proposal);
+              } catch (_) {
+                // 删不掉只是留个残骸，[_clearStagedApks] 下次启动会清。
+              }
+            }
+          } finally {
+            endExtensionAction(target.packageName);
+          }
+        }
+      }
+    } finally {
+      if (installedPackages.isNotEmpty) {
+        await runtime.invalidateExtensions(installedPackages);
+        await reload();
+      }
+      // 逐条的失败已经进了报告，别让 [commitInstall] 的 _guarded 留下的最后一条
+      // 错误在页面顶部当成「整批失败」显示。
+      error = null;
+      _notify();
+    }
+    return MihonBulkInstallReport(
+      installed: List<String>.unmodifiable(installedPackages),
+      skipped: List<String>.unmodifiable(skippedPackages),
+      failed: Map<String, String>.unmodifiable(failedPackages),
+      failureCodes: Map<String, String>.unmodifiable(failureCodes),
+    );
+  }
+
+  /// 丢弃一个没有走到 [commitInstall] 的安装提案。
+  ///
+  /// [prepareStoreInstall] / [prepareLocalInstall] 成功后 APK 已经落在 `tmp/`，
+  /// 用户在签名确认框点取消时那份文件就没人认领了（最大 100 MiB）。
+  /// [_clearStagedApks] 会在下次启动兜底，但当场删掉才是对的。
+  Future<void> discardProposal(MihonInstallProposal proposal) async {
+    final File temp = File(proposal.tempPath);
+    if (await temp.exists()) await temp.delete();
+  }
+
+  /// 开一次「装之前先看看这个源有什么漫画」的试用预览。
+  ///
+  /// Mihon 扩展是**代码**不是配置——站点怎么解析、封面在哪、翻页规则全在 APK 里，
+  /// 所以预览内容必然要真跑它的代码。预览与安装的差别因此不在「有没有执行」，
+  /// 而在**有没有在库里留下痕迹**：
+  /// - 不写 `manga_extensions` / `manga_online_sources`，所以它不进已安装列表、
+  ///   不出现在「浏览」视图、不参与任何续读；
+  /// - 不把签名指纹写进受信任表（只有 [commitInstall] 才写）；
+  /// - 放弃时把落地的文件删干净。
+  ///
+  /// 平台差异只在「代码从哪加载」：桌面 sidecar 直接吃任意路径的 APK 字节，
+  /// staged 的临时文件就能跑；Android 的 `invoke` 只认 `filesDir/exts/<pkg>.ext`
+  /// （Dart 传过去的 `apkPath` 在那条路径上是死字段），所以必须先
+  /// [MihonRuntime.installPrivateExtension] 把文件放进私有目录——**那一步只是文件
+  /// 落地，不构成本类意义上的「安装」**。
+  ///
+  /// 只对**未安装**的扩展开放：Android 的 native install 会覆盖 `exts/` 里同包名
+  /// 的文件，对已装扩展做预览等于拿未经确认的版本顶掉用户正在用的那份。已装的
+  /// 扩展本来就能从「浏览」进去看，不需要预览。
+  Future<MihonPreviewSession> beginPreview(
+    MihonInstallProposal proposal,
+  ) async {
+    if (proposal.current != null) {
+      throw const MihonRuntimeException(
+        'PREVIEW_ALREADY_INSTALLED',
+        'Preview is only available for extensions that are not installed',
+      );
+    }
+    final String packageName = proposal.inspection.packageName;
+    if (_activePreviewPackage != null) {
+      throw const MihonRuntimeException(
+        'PREVIEW_IN_PROGRESS',
+        'Another extension preview is already active',
+      );
+    }
+    _activePreviewPackage = packageName;
+    late final MihonPreviewSession session;
+    try {
+      await _guarded(() async {
+        // 标记先于文件落地写：崩溃留下的孤儿只能靠它认出来（见 _recoverAbandonedPreview）。
+        await _writePreviewMarker(packageName);
+        try {
+          final String runtimePath = Platform.isAndroid
+              ? await runtime.installPrivateExtension(proposal.tempPath)
+              : proposal.tempPath;
+          final MihonExtensionRef extension = MihonExtensionRef(
+            packageName: packageName,
+            apkPath: runtimePath,
+          );
+          final List<MihonSource> loaded = await _listSources(extension);
+          if (loaded.isEmpty) {
+            throw MihonRuntimeException(
+              'NO_SOURCES',
+              'Extension did not expose any ${kind.dbValue} sources',
+            );
+          }
+          session = MihonPreviewSession(
+            proposal: proposal,
+            extension: extension,
+            sources: loaded,
+          );
+        } catch (_) {
+          await _discardPreview(packageName, tempPath: proposal.tempPath);
+          rethrow;
+        }
+      });
+    } catch (_) {
+      _activePreviewPackage = null;
+      rethrow;
+    }
+    return session;
+  }
+
+  /// 结束预览。
+  ///
+  /// [keep] 为 true 表示用户看完决定装：落地的文件留给 [commitInstall] 复用
+  /// （Android 上它已经在 `exts/` 里，桌面上 temp 文件还等着被 rename 过去），
+  /// 这里只清运行时的已加载缓存，让安装后重新加载到同一份文件。
+  /// 为 false 则把预览留下的一切删干净。
+  Future<void> endPreview(
+    MihonPreviewSession session, {
+    required bool keep,
+  }) async {
+    final String packageName = session.proposal.inspection.packageName;
+    try {
+      if (keep) {
+        await runtime.invalidateExtension(packageName);
+        await _clearPreviewMarker();
+        return;
+      }
+      await _guarded(
+        () => _discardPreview(packageName, tempPath: session.proposal.tempPath),
+      );
+    } finally {
+      if (_activePreviewPackage == packageName) {
+        _activePreviewPackage = null;
+      }
+    }
+  }
+
+  Future<void> _discardPreview(
+    String packageName, {
+    required String tempPath,
+  }) async {
+    await runtime.invalidateExtension(packageName);
+    if (Platform.isAndroid) {
+      await runtime.uninstallPrivateExtension(packageName);
+    }
+    final File temp = File(tempPath);
+    if (await temp.exists()) await temp.delete();
+    await _clearPreviewMarker();
+  }
+
+  File get _previewMarker =>
+      File(p.join(rootDirectory.path, 'tmp', 'preview-pending'));
+
+  Future<void> _writePreviewMarker(String packageName) async {
+    await _previewMarker.parent.create(recursive: true);
+    await _previewMarker.writeAsString(packageName, flush: true);
+  }
+
+  Future<void> _clearPreviewMarker() async {
+    if (await _previewMarker.exists()) await _previewMarker.delete();
+  }
+
+  /// 预览期间进程被杀，会在 Android 私有目录里留下一个没有任何 DB 记录的孤儿
+  /// 扩展文件。它不会出现在任何列表里（列表读 DB），但会占空间，而且下次预览同
+  /// 一个包时 native 的 install 会走「升级」分支去比对签名版本号，行为不可预期。
+  ///
+  /// 桌面端不需要动 runtime：那边预览用的是 `tmp/*.apk.part`，由 [_clearStagedApks]
+  /// 统一清理，没有任何东西被放进常驻目录。
+  Future<void> _recoverAbandonedPreview() async {
+    if (!await _previewMarker.exists()) return;
+    try {
+      final String packageName = (await _previewMarker.readAsString()).trim();
+      final bool reallyInstalled = installed.any(
+        (MangaExtensionRow row) => row.packageName == packageName,
+      );
+      if (Platform.isAndroid && packageName.isNotEmpty && !reallyInstalled) {
+        await runtime.invalidateExtension(packageName);
+        await runtime.uninstallPrivateExtension(packageName);
+      }
+    } on Object {
+      // 清不掉不能挡住整个扩展子系统启动：孤儿文件只占空间，不影响正确性。
+    }
+    await _clearPreviewMarker();
+  }
+
+  /// 清掉上次进程留下的半成品 APK。
+  ///
+  /// `tmp/extension-<sha>.apk.part` 是 [_prepareInstallBytes] 的落脚点，正常路径
+  /// 上一定会被 [commitInstall] rename 掉或被失败分支删掉，只有进程在中途被杀才
+  /// 会留下。它们没有任何长期意义，且每个最大 100 MiB。
+  Future<void> _clearStagedApks() async {
+    final Directory tmp = Directory(p.join(rootDirectory.path, 'tmp'));
+    if (!await tmp.exists()) return;
+    try {
+      await for (final FileSystemEntity entity in tmp.list()) {
+        if (entity is File && entity.path.endsWith('.apk.part')) {
+          await entity.delete();
+        }
+      }
+    } on Object {
+      // 同上：清理是尽力而为，不能让它挡住启动。
+    }
+  }
+
+  Future<void> uninstallExtension(
+    MangaExtensionRow extension, {
+    bool clearData = false,
+  }) async {
+    await _guarded(() async {
+      await runtime.uninstallPrivateExtension(extension.packageName);
+      if (MihonRuntimeFactory.usesDesktopSidecar) {
+        final File file = File(resolveApkPath(extension));
+        if (await file.exists()) await file.delete();
+      }
+      if (clearData) {
+        for (final MangaOnlineSourceRow source in sources.where(
+          (MangaOnlineSourceRow row) =>
+              row.extensionPackage == extension.packageName,
+        )) {
+          await database.clearMangaSourcePreferences(
+            source.extensionPackage,
+            source.sourceId,
+          );
+        }
+      }
+      await database.deleteMangaExtension(extension.packageName);
+      await runtime.invalidateExtension(extension.packageName);
+      await reload();
+    });
+  }
+
+  Future<void> setExtensionEnabled(
+    MangaExtensionRow extension,
+    bool enabled,
+  ) async {
+    await database.setMangaExtensionEnabled(extension.packageName, enabled);
+    await reload();
+  }
+
+  Future<void> updateSourceSettings(
+    MangaOnlineSourceRow source, {
+    bool? enabled,
+    bool? pinned,
+    int? sortOrder,
+  }) async {
+    await database.updateMangaOnlineSourceSettings(
+      extensionPackage: source.extensionPackage,
+      sourceId: source.sourceId,
+      enabled: enabled,
+      pinned: pinned,
+      sortOrder: sortOrder,
+    );
+    await reload();
+  }
+
+  /// 「按下载量排序」（BUG-2481）：把已登记的源按其扩展 APK 的公开下载次数重排
+  /// 一次，写穿 `sort_order`；之后用户仍可用上下箭头微调。
+  ///
+  /// 计数来自仓库目录快照（[available] 的 `downloadCount`，同一包在多仓库里取
+  /// 最大）；快照为空（还没刷过仓库 / 断网）时返回 false，什么都不改。
+  Future<bool> sortSourcesByDownloads() async {
+    final Map<String, int> counts = mihonDownloadCountsByPackage(available);
+    if (counts.isEmpty) return false;
+    final List<MangaOnlineSourceRow> ordered = sortMangaSourcesByDownloads(
+      sources,
+      counts,
+    );
+    // 与拖拽重排同一条串行写入路径：不会与在飞的拖拽互相覆盖。
+    await reorderSources(ordered);
+    return true;
+  }
+
+  /// 拖拽重排（「来源」列表组内拖拽 / 菜单上移下移）：按 [ordered] 的先后把
+  /// `sort_order` 重写成 0..n-1，一次 reload。调用方传完整列表（置顶组在前、
+  /// 其余组在后，组内即用户排出的顺序），与 `pinned desc, sort_order` 的查询序
+  /// 一致；与**当前存储**相同的行不写。
+  ///
+  /// HBK-AUDIT-016：连续重排（A0/B1 拖成 BA，保存未完再拖回 AB）曾经并发执行、
+  /// 并按调用方手里旧行的 `sortOrder` 判「没变」——第二次全部跳过写入，库里
+  /// 停在 BA。现在所有排序意图串行提交，且只提交**最后一次**意图（中间被覆盖的
+  /// 不再写）；比较基准是写入前现读的存储顺序，不是调用方快照。返回的 Future
+  /// 在本次意图（或覆盖它的更新意图）落库并 reload 之后完成。
+  Future<void> reorderSources(List<MangaOnlineSourceRow> ordered) {
+    _queuedReorder = List<MangaOnlineSourceRow>.of(ordered);
+    return _reorderWorker ??= _drainReorders();
+  }
+
+  /// 最近一次尚未落库的排序意图；新意图直接覆盖旧意图。
+  List<MangaOnlineSourceRow>? _queuedReorder;
+
+  /// 正在串行落库的 worker；空闲时为 null。
+  Future<void>? _reorderWorker;
+
+  Future<void> _drainReorders() async {
+    Object? lastError;
+    StackTrace? lastStack;
+    try {
+      while (true) {
+        final List<MangaOnlineSourceRow>? next = _queuedReorder;
+        if (next == null) break;
+        _queuedReorder = null;
+        try {
+          await _writeSourceOrder(next);
+          // 后来的意图成功落库，先前被它覆盖的失败不再有意义。
+          lastError = null;
+          lastStack = null;
+        } on Object catch (error, stack) {
+          lastError = error;
+          lastStack = stack;
+        }
+      }
+    } finally {
+      // 与「队列已空」的判定同步执行：之后到来的意图会起新 worker。
+      _reorderWorker = null;
+    }
+    if (lastError != null) {
+      Error.throwWithStackTrace(lastError, lastStack ?? StackTrace.current);
+    }
+  }
+
+  /// 一次排序意图 = 一个 Drift 事务（HBK-AUDIT-031）：中途任何一行写失败整体
+  /// 回滚，库里不会留下前几行已改、后几行未改的半截顺序（重复 sortOrder）。
+  /// 无论成败都 reload，让显示快照与存储一致。
+  Future<void> _writeSourceOrder(List<MangaOnlineSourceRow> ordered) async {
+    try {
+      await database.transaction(() async {
+        final Map<(String, String), int> stored = <(String, String), int>{
+          for (final MangaOnlineSourceRow row
+              in await database.getMangaOnlineSources(mediaKind: kind.dbValue))
+            (row.extensionPackage, row.sourceId): row.sortOrder,
+        };
+        for (int index = 0; index < ordered.length; index++) {
+          final MangaOnlineSourceRow row = ordered[index];
+          if (stored[(row.extensionPackage, row.sourceId)] == index) {
+            continue;
+          }
+          await database.updateMangaOnlineSourceSettings(
+            extensionPackage: row.extensionPackage,
+            sourceId: row.sourceId,
+            sortOrder: index,
+          );
+        }
+      });
+    } finally {
+      await reload();
+    }
+  }
+
+  Future<List<MihonPreference>> getPreferences(
+    MangaOnlineSourceRow source,
+  ) async {
+    final MangaExtensionRow extension = installed.firstWhere(
+      (MangaExtensionRow row) => row.packageName == source.extensionPackage,
+    );
+    final List<MihonPreference> persisted = await _readPersistedPreferences(
+      source,
+    );
+    return switch (kind) {
+      MihonMediaKind.manga => runtime.getPreferences(
+        extensionRef(extension),
+        sourceModel(source),
+        persisted: persisted,
+      ),
+      MihonMediaKind.anime => animeRuntime.getAnimePreferences(
+        extensionRef(extension),
+        sourceModel(source),
+        persisted: persisted,
+      ),
+    };
+  }
+
+  Future<List<MihonPreference>> setPreference(
+    MangaOnlineSourceRow source,
+    MihonPreference preference,
+  ) async {
+    final MangaExtensionRow extension = installed.firstWhere(
+      (MangaExtensionRow row) => row.packageName == source.extensionPackage,
+    );
+    final List<MihonPreference> persisted = await _readPersistedPreferences(
+      source,
+    );
+    final List<MihonPreference> updated = await switch (kind) {
+      MihonMediaKind.manga => runtime.setPreference(
+        extensionRef(extension),
+        sourceModel(source),
+        preference,
+        persisted: persisted,
+      ),
+      MihonMediaKind.anime => animeRuntime.setAnimePreference(
+        extensionRef(extension),
+        sourceModel(source),
+        preference,
+        persisted: persisted,
+      ),
+    };
+    for (final MihonPreference item in updated) {
+      await database.upsertMangaSourcePreference(
+        MangaSourcePreferencesCompanion.insert(
+          extensionPackage: source.extensionPackage,
+          sourceId: source.sourceId,
+          preferenceKey: item.key,
+          preferenceType: item.kind.name,
+          valueJson: item.encodeValue(),
+          updatedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+    }
+    return updated;
+  }
+
+  Future<void> clearSourceData(MangaOnlineSourceRow source) async {
+    final MangaExtensionRow extension = installed.firstWhere(
+      (MangaExtensionRow row) => row.packageName == source.extensionPackage,
+    );
+    await runtime.clearSourceData(extensionRef(extension), sourceModel(source));
+    await database.clearMangaSourcePreferences(
+      source.extensionPackage,
+      source.sourceId,
+    );
+  }
+
+  /// 视频生态需要 [AnimeMihonRuntime] 能力；生产的两个运行时都经
+  /// `MihonBridgeRuntime` 具备，缺的只可能是测试 fake 或未来的新宿主。
+  AnimeMihonRuntime get animeRuntime {
+    final Object candidate = runtime;
+    if (candidate is AnimeMihonRuntime) return candidate;
+    throw const MihonRuntimeException(
+      'ANIME_UNSUPPORTED',
+      'This Mihon runtime cannot host Aniyomi extensions',
+    );
+  }
+
+  Future<List<MihonSource>> _listSources(MihonExtensionRef extension) =>
+      switch (kind) {
+        MihonMediaKind.manga => runtime.listSources(extension),
+        MihonMediaKind.anime => animeRuntime.listAnimeSources(extension),
+      };
+
+  Future<MihonSourceContext> contextForSource(
+    MangaOnlineSourceRow source,
+  ) async {
+    final MangaExtensionRow extension = installed.firstWhere(
+      (MangaExtensionRow row) =>
+          row.packageName == source.extensionPackage && row.enabled,
+      orElse: () => throw const MihonRuntimeException(
+        'EXTENSION_DISABLED',
+        'The manga source extension is not installed or is disabled',
+      ),
+    );
+    return MihonSourceContext(
+      extension: extensionRef(extension),
+      source: sourceModel(source),
+      preferences: await _readPersistedPreferences(source),
+    );
+  }
+
+  MihonExtensionRef extensionRef(MangaExtensionRow extension) =>
+      MihonExtensionRef(
+        packageName: extension.packageName,
+        apkPath: resolveApkPath(extension),
+      );
+
+  MihonSource sourceModel(MangaOnlineSourceRow source) => MihonSource(
+    extensionPackage: source.extensionPackage,
+    id: source.sourceId,
+    name: source.name,
+    language: source.language,
+    baseUrl: source.baseUrl,
+  );
+
+  String resolveApkPath(MangaExtensionRow extension) {
+    if (Platform.isAndroid) return extension.apkPath;
+    return p.normalize(p.join(rootDirectory.path, extension.apkPath));
+  }
+
+  Future<List<MihonPreference>> _readPersistedPreferences(
+    MangaOnlineSourceRow source,
+  ) async {
+    final List<MangaSourcePreferenceRow> rows = await database
+        .getMangaSourcePreferences(source.extensionPackage, source.sourceId);
+    return rows
+        .map((MangaSourcePreferenceRow row) {
+          final MihonPreferenceKind kind = MihonPreferenceKind.values
+              .firstWhere(
+                (MihonPreferenceKind value) => value.name == row.preferenceType,
+                orElse: () => MihonPreferenceKind.unsupported,
+              );
+          return MihonPreference(
+            key: row.preferenceKey,
+            kind: kind,
+            title: row.preferenceKey,
+            value: jsonDecode(row.valueJson),
+          );
+        })
+        .toList(growable: false);
+  }
+
+  /// 给一批可安装扩展附上公开下载量。
+  ///
+  /// [allowFetch] = false 时只用缓存（安装流程重建目录那条路径），不发网络：那条
+  /// 路径每装一个扩展都会跑一次，挂上外网请求等于批量安装 N 个就打 N 次 GitHub API。
+  ///
+  /// 抓取失败在 client 内部已降级成空计数，这里不会抛——目录刷新不该因为热度数据
+  /// 拿不到而失败。
+  Future<List<MihonAvailableExtension>> _withDownloadCounts(
+    List<MihonAvailableExtension> extensions, {
+    bool allowFetch = true,
+  }) async {
+    if (extensions.isEmpty) return extensions;
+    final bool missing = extensions.any(
+      (MihonAvailableExtension item) =>
+          _downloadCounts.lookup(item.apkUrl) == null,
+    );
+    if (fetchDownloadCounts && allowFetch && missing) {
+      final MihonDownloadCounts fetched = await _downloadCountsClient.fetch(
+        extensions.map((MihonAvailableExtension item) => item.apkUrl),
+      );
+      // 只留当前目录用得上的键：扩展升级后旧版本的 apkUrl 永远不会再被查到，
+      // 无限 merge 下去等于按刷新次数线性涨内存。
+      final Set<String> live = extensions
+          .map((MihonAvailableExtension item) => item.apkUrl)
+          .toSet();
+      final Map<String, int> kept = <String, int>{
+        for (final MapEntry<String, int> entry
+            in _downloadCounts.merge(fetched).byApkUrl.entries)
+          if (live.contains(entry.key)) entry.key: entry.value,
+      };
+      _downloadCounts = MihonDownloadCounts(kept);
+    }
+    if (_downloadCounts.isEmpty) return extensions;
+    return <MihonAvailableExtension>[
+      for (final MihonAvailableExtension item in extensions)
+        item.withDownloadCount(_downloadCounts.lookup(item.apkUrl)),
+    ];
+  }
+
+  MihonStore _storeFromRow(MangaExtensionStoreRow row) => MihonStore(
+    indexUrl: row.indexUrl,
+    name: row.name,
+    badgeLabel: row.badgeLabel ?? row.name,
+    signingKey: row.signingKey ?? '',
+    contact: row.contactJson == null
+        ? const <String, String?>{}
+        : (jsonDecode(row.contactJson!) as Map<Object?, Object?>)
+              .map<String, String?>(
+                (Object? key, Object? value) => MapEntry<String, String?>(
+                  key.toString(),
+                  value?.toString(),
+                ),
+              ),
+    format: MihonStoreFormat.values.firstWhere(
+      (MihonStoreFormat value) => value.name == row.format,
+      orElse: () => MihonStoreFormat.currentJson,
+    ),
+    extensionListUrl: row.extensionListUrl,
+  );
+
+  Future<void> _guarded(Future<void> Function() action) async {
+    loading = true;
+    error = null;
+    _notify();
+    try {
+      await action();
+    } catch (exception) {
+      error = '$exception';
+      rethrow;
+    } finally {
+      loading = false;
+      _notify();
+    }
+  }
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    if (_disposed) return;
+    _disposed = true;
+    final ExitFlushCallback? exitShutdown = _exitShutdown;
+    _exitShutdown = null;
+    if (exitShutdown != null) {
+      ExitFlushRegistry.instance.unregister(exitShutdown);
+    }
+    _storeClient.close();
+    unawaited(shutdownRuntimeForExit());
+    super.dispose();
+  }
+
+  static String _normalizeFingerprint(String value) =>
+      value.replaceAll(RegExp('[^0-9a-fA-F]'), '').toLowerCase();
+}
+
+@immutable
+class MihonInstallProposal {
+  const MihonInstallProposal({
+    required this.tempPath,
+    required this.apkSha256,
+    required this.inspection,
+    required this.expected,
+    required this.current,
+    required this.signerTrusted,
+  });
+
+  final String tempPath;
+  final String apkSha256;
+  final MihonExtensionInspection inspection;
+  final MihonAvailableExtension? expected;
+  final MangaExtensionRow? current;
+  final bool signerTrusted;
+}
+
+/// 一次进行中的扩展试用预览。
+///
+/// 持有 staged（已落地但未登记入库）的扩展引用和它暴露出来的源列表。生命周期由
+/// [MihonManager.beginPreview] / [MihonManager.endPreview] 成对管理——**不要**自己
+/// 拿 [extension] 去调 [MihonManager.commitInstall] 之外的写库路径，那会绕过
+/// 「预览不留痕迹」的不变量。
+@immutable
+class MihonPreviewSession {
+  const MihonPreviewSession({
+    required this.proposal,
+    required this.extension,
+    required this.sources,
+  });
+
+  final MihonInstallProposal proposal;
+  final MihonExtensionRef extension;
+  final List<MihonSource> sources;
+
+  /// 把预览里的某个源包装成浏览页能直接吃的上下文。
+  ///
+  /// 偏好恒为空：源偏好落在 `manga_source_preferences` 表且以
+  /// `(extensionPackage, sourceId)` 为键，而预览的扩展根本没进库——读它只会拿到
+  /// 空表，写它则会留下指向不存在扩展的孤儿行。预览就用扩展的内置默认值。
+  MihonSourceContext contextFor(MihonSource source) => MihonSourceContext(
+    extension: extension,
+    source: source,
+    preferences: const <MihonPreference>[],
+  );
+}
+
+@immutable
+class MihonSourceContext {
+  const MihonSourceContext({
+    required this.extension,
+    required this.source,
+    required this.preferences,
+  });
+
+  final MihonExtensionRef extension;
+  final MihonSource source;
+  final List<MihonPreference> preferences;
+}
+
+/// [MihonManager.installMany] 的结果。三档互斥，加起来等于请求安装的条数
+/// （被取消时会少——取消点之后的那些一条都没试过，不该算进任何一档）。
+@immutable
+class MihonBulkInstallReport {
+  const MihonBulkInstallReport({
+    required this.installed,
+    required this.skipped,
+    required this.failed,
+    this.failureCodes = const <String, String>{},
+  });
+
+  /// 这一轮真正装上的包名。
+  final List<String> installed;
+
+  /// 跳过的包名：已经装过，或正被另一条流程装着。
+  final List<String> skipped;
+
+  /// 包名 → 失败原因。逐条独立，不影响同批其它扩展。
+  final Map<String, String> failed;
+
+  /// 包名 → 失败的 [MihonRuntimeException.code]（只有运行时异常有码；网络错误等
+  /// 不在这里）。给后台自动更新判「换了签名」这类需要用户亲自处理的失败，不靠
+  /// 解析 [failed] 里的人读文本。
+  final Map<String, String> failureCodes;
+
+  int get attempted => installed.length + skipped.length + failed.length;
+}
+
+/// 目录快照里每个扩展包的公开下载次数（同一包在多个仓库都有时取最大）；没有
+/// 计数的包不出现在结果里。
+Map<String, int> mihonDownloadCountsByPackage(
+  Iterable<MihonAvailableExtension> available,
+) {
+  final Map<String, int> counts = <String, int>{};
+  for (final MihonAvailableExtension extension in available) {
+    final int? count = extension.downloadCount;
+    if (count == null) continue;
+    final int? existing = counts[extension.packageName];
+    if (existing == null || count > existing) {
+      counts[extension.packageName] = count;
+    }
+  }
+  return counts;
+}
+
+/// 源按其扩展下载量降序；没有计数的排最后；同分按原 `sortOrder` 保持稳定。
+///
+/// 纯函数，与页面解耦：「排完是什么顺序」必须能直接断言，否则这类一次性重排
+/// 写错方向（升序 / null 排前）只有用户点了才发现。
+List<MangaOnlineSourceRow> sortMangaSourcesByDownloads(
+  List<MangaOnlineSourceRow> sources,
+  Map<String, int> countsByPackage,
+) {
+  final List<MangaOnlineSourceRow> ordered = List<MangaOnlineSourceRow>.of(
+    sources,
+  );
+  ordered.sort((MangaOnlineSourceRow a, MangaOnlineSourceRow b) {
+    final int? left = countsByPackage[a.extensionPackage];
+    final int? right = countsByPackage[b.extensionPackage];
+    if (left != right) {
+      if (left == null) return 1;
+      if (right == null) return -1;
+      return right.compareTo(left);
+    }
+    return a.sortOrder.compareTo(b.sortOrder);
+  });
+  return ordered;
+}

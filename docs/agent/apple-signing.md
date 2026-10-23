@@ -1,0 +1,347 @@
+# Apple 签名与 TestFlight
+
+Hibiki 的 iOS / macOS 发布签名怎么配、怎么轮换、坏了怎么查。
+构建通道与版本号规则见 [build.md](build.md)；这里只讲 Apple 那一侧。
+
+## 两条互不相干的链路
+
+| | iOS | macOS |
+|---|---|---|
+| 分发方式 | TestFlight / App Store | Developer ID（商店之外直接下载） |
+| 证书 | `Apple Distribution` | `Developer ID Application` |
+| 描述文件 | `IOS_APP_STORE` 类型，绑 `app.fushi.reader` | 不需要 |
+| 后处理 | 上传 App Store Connect 审核处理 | `notarytool` 公证 + `stapler` 装订 |
+| 沙盒 | 不涉及 | **刻意不进 Mac App Store** |
+
+macOS 不上架的原因不是懒：`macos/Runner/Release.entitlements` 已经刻意移除
+`com.apple.security.app-sandbox`，因为应用内自动更新要替换 `/Applications/fushi.app`，
+沙盒容器写不了那里（决策见 `docs/specs/2026-06-04-all-platform-auto-update-design.md` §5）。
+Mac App Store 强制沙盒，两者不能兼得。Developer ID + 公证是「不上架但不被
+Gatekeeper 拦」的正解。
+
+**不要**为了「统一」把 macOS 也塞进 TestFlight —— 那等于把自动更新废掉。
+
+## Bundle ID 现状（2026-08-06 改名 Fushi）
+
+| 平台 | bundle ID / application ID | 备注 |
+|---|---|---|
+| iOS | `app.fushi.reader` | App Store / TestFlight 用；旧 `app.hibiki.reader` 已废弃 |
+| macOS | `app.fushi.reader` | 原 `com.example.hibiki` |
+| Android | `app.fushi.reader` | 新包身份（`android/app/build.gradle` 的 `namespace`/`applicationId` 是唯一真相源）；老包 `app.hibiki.reader` 只作为过渡桥包与迁移探测目标存活 |
+| Linux | `app.fushi.reader` | `linux/CMakeLists.txt` 的 `APPLICATION_ID`（原 `com.example.hibiki`） |
+
+**macOS 换包名是有代价且已被明确接受的决定。** Flutter 的
+`getApplicationSupportDirectory()` 在 macOS 上返回
+`~/Library/Application Support/<bundleId>`，Hibiki 的整个 Drift 数据库（书库、阅读
+进度、统计）就落在那里，偏好落 `~/Library/Preferences/<bundleId>.plist`。换包名之后
+旧目录**还在磁盘上但 app 不再读它**，现有 mac 用户升级即等同全新安装。用户已在知情
+下选择「不做迁移」。将来若要补迁移，落点是 `lib/src/storage/data_root_migrator.dart`
+旁边新加一条「平台 support 根变更」的一次性搬迁，而不是改 `AppPaths` 的解析逻辑。
+
+**Android 换包名同样是有代价且已被明确接受的决定。** 改 `applicationId` 在 Android 上
+等于全新应用：老包 `app.hibiki.reader` 的私有数据目录不共享，Play/侧载更新链路也断。
+方案是**桥包迁移**而不是「不改」——老包出一版带导出器的过渡版，新包 `app.fushi.reader`
+带导入器（`lib/src/migration/`，旧包身份收口在常量 `kHibikiPackageName`），完整决策与
+阶段见 [docs/plans/2026-08-06-rename-fushi-migration.md](../plans/2026-08-06-rename-fushi-migration.md)。
+MethodChannel 前缀已同批切到 `app.fushi.reader/*`（Dart 真相源
+`fushi/lib/src/utils/misc/channel_constants.dart` 的 `FushiChannels._prefix`，Java 侧
+`app.fushi.reader.constants.ChannelNames` 必须同步）。
+
+## 仓库 Secrets 清单
+
+`.github/workflows/release-desktop.yml` 的 `macos` / `ios` job 读这些。
+**每一项都是可选的**：缺任何一项，对应链路整段跳过，未签名 IPA / ad-hoc zip 照常
+发布。fork 和无开发者账号的状态下发布链路完全不受影响。
+
+| Secret | 内容 | 用在哪 |
+|---|---|---|
+| `APPLE_TEAM_ID` | 10 位 Team ID | iOS + macOS |
+| `APPSTORE_API_KEY_ID` | App Store Connect API Key ID | 上传 TestFlight、公证 |
+| `APPSTORE_API_ISSUER_ID` | Issuer ID（UUID，整个团队一个） | 同上 |
+| `APPSTORE_API_PRIVATE_KEY` | `.p8` 私钥全文（PEM 文本，含 BEGIN/END 行） | 同上 |
+| `IOS_DIST_CERT_P12_BASE64` | Apple Distribution 证书 + 私钥的 p12，base64 单行 | iOS |
+| `IOS_DIST_CERT_P12_PASSWORD` | 上面 p12 的导出口令 | iOS |
+| `IOS_PROVISIONING_PROFILE_BASE64` | App Store 描述文件，base64 单行 | iOS |
+| `MACOS_DEVELOPER_ID_P12_BASE64` | Developer ID Application 证书 + 私钥的 p12 | macOS |
+| `MACOS_DEVELOPER_ID_P12_PASSWORD` | 上面 p12 的导出口令 | macOS |
+
+写入/ 轮换统一走 `tool/apple_signing_secrets.sh`，它会先把材料自洽性验一遍再写：
+
+```bash
+tool/apple_signing_secrets.sh \
+  --team-id 8N35BLYGL5 \
+  --asc-key-id <KEYID> --asc-issuer-id <UUID> \
+  --asc-key ~/.appstoreconnect/private_keys/AuthKey_<KEYID>.p8 \
+  --ios-cert ~/.hibiki-apple-signing/ios_distribution.p12 \
+  --ios-cert-password-file ~/.hibiki-apple-signing/ios_distribution.p12.password \
+  --ios-profile ~/.hibiki-apple-signing/hibiki_appstore.mobileprovision
+```
+
+加 `--verify-only` 只验不写。它挡掉的正是那些「CI 跑到 codesign 才炸、报错还毫无
+指向性」的错误：p12 里装的是 Development 证书、描述文件绑的是另一张证书、描述文件
+是 ad-hoc 类型、bundle id 对不上、证书 30 天内到期。
+
+## 首次配置
+
+### 1. App Store Connect API Key
+
+appstoreconnect.apple.com → 用户和访问 → 集成 → App Store Connect API → 团队密钥 →
+新建，角色 **App Manager**。下载的 `.p8` **只能下一次**，丢了只能作废重建。
+页面顶部的 Issuer ID 一并记下。
+
+### 2. 证书、Bundle ID、描述文件
+
+除 Developer ID 外全部可以用 API 建（不用碰 Keychain Access 的 CSR 流程）：
+
+```bash
+# 私钥留在本地，只把 CSR 发给 Apple
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout ios_distribution.key -out ios_distribution.csr \
+  -subj "/CN=Hibiki iOS Distribution/O=Hibiki/C=US"
+```
+
+然后 `POST /v1/certificates`（`certificateType: DISTRIBUTION`）→
+`POST /v1/bundleIds`（`app.fushi.reader`，platform `IOS`）→
+`POST /v1/profiles`（`profileType: IOS_APP_STORE`，关联上面两者）。
+返回的证书 subject 里的 `OU=` 就是 Team ID。
+
+把证书和私钥打成 p12 时**要把 WWDR 中间证书一起打进去**，证书链自足，不依赖
+runner 钥匙串里预装了什么：
+
+```bash
+curl -fsSL -o AppleWWDRCAG3.cer https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer
+openssl x509 -inform DER -in AppleWWDRCAG3.cer -out AppleWWDRCAG3.pem
+openssl pkcs12 -export -inkey ios_distribution.key -in ios_distribution.pem \
+  -certfile AppleWWDRCAG3.pem -passout "pass:$P12_PASS" -out ios_distribution.p12
+```
+
+**Developer ID 证书是例外**：Apple 限定只有「账号持有人」能创建，API key 一律
+403 `This operation can only be performed by the Account Holder.`。必须去
+developer.apple.com/account/resources/certificates → **+** → **Developer ID
+Application** → 上传本地生成的 CSR → 下载 `.cer`，再和本地私钥合成 p12。
+
+### 3. App Store Connect 的 App 记录
+
+**API 建不了**（`The resource 'apps' does not allow 'CREATE'`）。必须在
+appstoreconnect.apple.com →「我的 App」→ **+** 手动建，Bundle ID 选
+`app.fushi.reader`。没有这条记录，`altool --upload-app` 会以
+"No suitable application records were found" 失败。
+
+## 发一版 TestFlight
+
+Actions → **Build Desktop and Apple Release Artifacts** → Run workflow：
+
+- `channel` = `beta`（或 `formal`）
+- `upload_testflight` = true（默认）
+
+手动 dispatch：beta / formal 直接上传；debug 只在 `testflight_only=true` 时上传（手动重发
+一个普通 debug 不会顺手传）。
+
+### debug 包约每三次上一次 TestFlight
+
+push 触发的 debug 通道（`develop` / `main` push）**约每三次传一次**：发布序列（= 构建号 =
+commit 计数，`tool/release_sequence.sh`）能被 3 整除的那次 push，ios job 在未签名 IPA 之外
+再做一趟签名构建 + `altool` 上传（2026-09-16 用户拍板「发三次调试版触发一次 TestFlight」）。
+不每次都传，是因为 push 一天 5~13 次，全传会让 App Store Connect 的处理排队压后真正想发的
+beta、TestFlight 列表被 debug 构建淹掉（每个挂 90 天）、每条 push 再多一趟 15 分钟签名构建。
+用发布序列而不是 run 号：本仓不变式是 run 号永远不当序列（`tool/check_release_policy.ps1`
+整个禁用 `GITHUB_RUN_NUMBER` / `github.run_number`），而且这样从 TestFlight 的构建号就能看出
+哪次是自动传的。每次 push 涨的 commit 数不固定，所以是「约」每三次；哪次会传，看 ios job
+「Resolve Apple signing mode」那一行 `debug push, build N ...` 的日志。
+
+debug 包在 TestFlight 里的短版本与 beta 相同（Apple 只收三段），靠构建号和 app 内
+`FUSHI_BUILD_VERSION`（`2.x.y-debug.<seq>`）区分。构建号是 commit 计数 + 地板、沿 develop
+单调，debug / beta / formal 共用一条序列。所以从**比 develop 头更旧的 commit** 手动发 beta
+时，构建号会比已传的 debug 小、altool 拒收——beta 一律从 develop 头发。
+
+缺任一 Apple 密钥时 push 门直接关闭（fork 照常绿）；`testflight_only=true` 的 dispatch 缺密钥
+则红，不允许「绿着跳过」。想在两次自动上传之间手动补传一份 debug：Run workflow →
+`channel=debug` + `testflight_only=true`（只跑 ios job 的签名 + 上传，其余全跳）。
+
+（09-14 ~ 09-16 曾有过定时通道 `testflight-debug.yml`：每 8 小时用 `tool/asc_latest_build_number.sh`
+查一次 App Store Connect、有新提交才 dispatch。改为按次数后已连同脚本一起撤掉；别把它加
+回来，两条节律并存会重复上传。守卫 `apple_signing_workflow_guard_test.dart` 钉着「不得回潮」。）
+
+上传后 App Store Connect 处理通常 5–30 分钟，之后才出现在测试员列表里。
+
+### GitHub Release 资产不受影响
+
+Release 里挂的 `fushi-<版本>-ios.ipa` **仍然是未签名包**，走的还是原来的
+`flutter build ios --release --no-codesign` + 手工打 Payload。老用户用 AltStore /
+Sideloadly 自签侧载的就是它，换成 App Store 签名包会直接打断他们。TestFlight 用的是
+另外一次签名构建（手动 beta/formal，或每第三次 debug push），产物不进 Release 资产。
+
+代价是这种 run 下 iOS 会构建两次。可以接受：手动 beta/formal 本来就不频繁，debug 也只有
+三分之一的 push 多这一趟。
+
+## 实现要点（改之前先读）
+
+### iOS 签名设置为什么写进 `ios/Flutter/Release.xcconfig`
+
+`Runner.xcodeproj` 在 **project 级**钉了
+`CODE_SIGN_IDENTITY[sdk=iphoneos*] = "iPhone Developer"`，CI 钥匙串里没有这张证书。
+Xcode 的优先级是「命令行 > target 设置 > **target 的 xcconfig** > project 设置」，
+而 `Flutter/Release.xcconfig` 正是 Runner **target** 的 base configuration，
+所以往它追加就能压过 project 级的钉死值。
+
+两个坑：
+
+1. **带条件的赋值只能被同样带条件的赋值压过**。只写 `CODE_SIGN_IDENTITY = ...`
+   压不住 `CODE_SIGN_IDENTITY[sdk=iphoneos*]`，两种写法都要写。
+2. **不要用 `xcodebuild` 命令行传签名设置**。命令行优先级最高，但会同时作用到
+   CocoaPods 的 pod target 上；Hibiki 的 Podfile 用了 `use_frameworks!`，pod
+   target 也要签名，会撞出 "Provisioning profile doesn't match target"。
+   xcconfig 只作用于 Runner 工程，Pods 工程有自己的 xcconfig。
+
+验证方式（不需要完整构建）：
+
+```bash
+cd fushi/ios
+xcodebuild -project Runner.xcodeproj -target Runner -configuration Release \
+  -sdk iphoneos -showBuildSettings \
+  | grep -E "CODE_SIGN_IDENTITY|CODE_SIGN_STYLE|DEVELOPMENT_TEAM|PROVISIONING_PROFILE_SPECIFIER"
+```
+
+追加 xcconfig 后这里必须显示 `Apple Distribution` / `Manual` / 你的 Team ID /
+描述文件名，显示 `iPhone Developer` 就说明覆盖没生效。
+
+### macOS 是构建后重签，不是构建时签
+
+`flutter build macos` 出的是 ad-hoc 签名的 app，workflow 之后做一遍完整重签。
+三条硬性约束：
+
+**1. 必须排在 Mihon / ffmpeg 打包步骤之后。** 那两步往 bundle 里塞可执行文件并用
+`codesign --force --deep --sign -` 重签整个 app —— 签在它们前面的 Developer ID
+签名会被那个 ad-hoc 签名整个盖掉，而且盖得静悄悄，直到公证被拒才发现。
+
+**2. 签名面是「每一个 Mach-O」，不是「每一个 dylib」。** `Contents/MacOS/` 下的
+`ffmpeg` / `ffprobe`、`Contents/Resources/mihon_bridge/` 里的 JVM 可执行体都算，
+而它们**都没有扩展名** —— 所以按 `file | grep Mach-O` 判定，不能按后缀。按路径深度
+倒序签，内层先签（codesign 会把内层签名封进外层，顺序反了外层立刻失效）；
+`find -type f` 同时排除符号链接，jlink 镜像和 framework 里的符号链接不能签。
+
+**3. `--options runtime` + `--timestamp` 一个都不能少**，这是公证的前提。特别注意
+`macos/Runner.xcodeproj` 里 hoshidicts 的构建脚本用的是 `codesign --timestamp=none`
+的 ad-hoc 签名 —— 重签这一步正是用来覆盖它的。
+
+### 没有 Developer ID 时：ad-hoc 包必须钉指定要求（BUG-2772）
+
+现状更新（2026-10-10）：两个 secret 已于 2026-10-09 16:15 UTC 写入，macOS 各通道改走
+Developer ID 路径；但首批写入的口令与 p12 不一致（口令文件结尾带裸 `\r`，p12 用带 `\r`
+的口令加密，`gh secret set` 写入时去掉了 `\r`），「Import Developer ID certificate」报
+`SecKeychainItemImport: The user name or passphrase you entered is not correct`，macOS 资产
+整包缺席、调试版清单只剩 Android/Windows/iOS。`tool/apple_signing_secrets.sh` 现在按 gh
+同口径去掉口令结尾的 `\r\n` 再校验，这类不一致会在本地校验阶段直接报「口令错误」。
+**口令文件只写一行、不要带 `\r`；p12 用同一份去掉 `\r` 的口令重新导出。**
+
+以下为写入 secret 之前的历史说明：仓库没有 `MACOS_DEVELOPER_ID_P12_BASE64` /
+`MACOS_DEVELOPER_ID_P12_PASSWORD` 时，macOS 包**所有通道**（debug / beta / formal）都走 ad-hoc
+路径——签名判据不看通道，补齐这两个 secret（证书只能账号持有人在网页端建）后各通道自动改走
+Developer ID + 公证，workflow 不用再改。在那之前，手动下载用的 `-macos-arm64.dmg` 里随包放
+`打开说明 How to open.txt`（Gatekeeper「仍要打开」/ `xattr -dr com.apple.quarantine`）。
+
+ad-hoc 签名默认的指定要求是 `cdhash H"…"`，每次构建都变。TCC（辅助功能等隐私授权）
+存的就是授权那一刻的指定要求，所以不钉的话**每次应用内更新都要重新授权**（全局查词
+读前台选区靠辅助功能）。workflow 的「Pin stable designated requirement for ad-hoc
+macOS app」在所有 bundle 改动之后、只在 ad-hoc 路径上，只重签外层（**不带 `--deep`**，
+否则 identifier 要求会盖到内层 Mach-O 上、`--verify --strict` 失败）并嵌入
+`designated => identifier "app.fushi.reader"`。它之后不许再出现 `--deep --sign -`
+整包重签（守卫 `fushi/test/build/macos_adhoc_designated_requirement_guard_test.dart`）。
+改 macOS bundle id 等于让所有用户重新授权一次。Developer ID 路径不需要这一步：默认
+要求锚在 Team ID 上，本就跨构建稳定。
+
+### 捆绑 JVM 的额外 entitlement
+
+`Contents/Resources/mihon_bridge` 是一个 Temurin JDK 21 的 jlink 镜像
+（`tool/mihon/build_desktop_runtime.sh`）。HotSpot 在强化运行时下需要 JIT、
+可写可执行内存，还要能加载镜像里那堆库，所以这些可执行体单独用一份 entitlements 签：
+
+```
+com.apple.security.cs.allow-jit
+com.apple.security.cs.allow-unsigned-executable-memory
+com.apple.security.cs.disable-library-validation
+```
+
+**只给 JVM，不给主 app**。主 app 是 AOT 编译的 Flutter，不需要其中任何一项，
+给了纯属白白扩大攻击面。JVM 是独立进程、有自己的签名和 entitlements，
+这样切分不会削弱主 app 的强化运行时。
+
+### `ITSAppUsesNonExemptEncryption`
+
+`ios/Runner/Info.plist` 里写了 `false`。不写的话每个 TestFlight 构建都会卡在
+「缺少出口合规信息」，要去网页上手动答问卷才能分发，CI 自动发布就没意义了。
+`false` 的依据是 Hibiki 只用系统 HTTPS/TLS，没有自研或专有加密算法。
+**将来如果引入自研加密（比如端到端加密的互联同步），必须回头改这个值并补交年度
+自分类报告。**
+
+## APNs 推送密钥（反馈回复推送）
+
+开发者在反馈处理台回复 / 改状态后，排行榜 Worker（`services/leaderboard/src/feedback_push.js`）
+给反馈人的 iOS 设备发 APNs 推送，App 没运行也能收到，点开直达那条反馈。Android 不接 FCM
+（国内无 GMS），继续用后台检查；桌面不变。**两侧缺配置都安全空转**：Worker 缺 secret 时
+不发送、不报错（每个 isolate 记一行日志），App 拿不到推送令牌时不登记，提醒照旧走本机后台检查。
+
+### 1. Apple Developer 侧
+
+1. developer.apple.com/account/resources/identifiers → `app.fushi.reader` → Capabilities 勾
+   **Push Notifications** → Save。
+2. **重新生成 App Store 描述文件**（勾了 capability 之后旧描述文件里没有 `aps-environment`）：
+   Profiles → 原来那份 `IOS_APP_STORE` 描述文件 → Edit → Save → 下载，然后照「仓库 Secrets
+   清单」重写 `IOS_PROVISIONING_PROFILE_BASE64`（`tool/apple_signing_secrets.sh`）。
+   `release-desktop.yml` 解出描述文件时发现它带 `aps-environment`，才往 `Release.xcconfig` 追加
+   `CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements`（值取描述文件里的，App Store 描述文件
+   是 `production`）；不带就照旧不接入——**描述文件没开 Push 却签进 aps-environment，codesign
+   会直接失败**，所以这一步不能写死在工程里。
+3. Keys → **+** → 勾 **Apple Push Notifications service (APNs)** → 下载 `AuthKey_<KEYID>.p8`
+   （**只能下一次**，丢了只能作废重建）。记下 Key ID 与 Team ID（10 位）。一把 Auth Key
+   对团队下所有 App、sandbox 与 production 都有效，不像旧的 .p12 推送证书一年一换。
+
+### 2. Worker secrets
+
+```bash
+cd services/leaderboard
+W="node node_modules/wrangler/bin/wrangler.js"
+$W secret put APNS_KEY_P8    --config wrangler.toml   # 粘贴 .p8 全文（含 BEGIN/END 行）
+$W secret put APNS_KEY_ID    --config wrangler.toml   # Key ID
+$W secret put APNS_TEAM_ID   --config wrangler.toml   # Team ID
+$W secret put APNS_BUNDLE_ID --config wrangler.toml   # app.fushi.reader
+$W secret put APNS_ENV       --config wrangler.toml   # production（见下）
+```
+
+部署前先应用迁移 `0010_feedback_push_tokens.sql`（Actions 部署勾 `apply_migrations`）。
+
+### sandbox 与 production
+
+| | sandbox（`api.sandbox.push.apple.com`） | production（`api.push.apple.com`） |
+|---|---|---|
+| 哪些包的令牌 | Xcode 直接装的 Debug 包（`aps-environment = development`） | TestFlight 与 App Store 包（`production`） |
+| `APNS_ENV` | `sandbox` | `production` |
+
+两套环境的令牌互不通用：令牌发错环境 APNs 回 `400 BadDeviceToken`，Worker 会把它当失效令牌删掉。
+线上 Worker 只服务 TestFlight / App Store 包，所以设 `production`。本地真机调推送：在自己机器上
+（别提交）给 Runner 加 `CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements`（Debug 的
+`FUSHI_APS_ENVIRONMENT` 默认 `development`），并临时把一个测试 Worker 的 `APNS_ENV` 设成 `sandbox`。
+
+GitHub Release 里的未签名 ipa（AltStore / Sideloadly 侧载）没有推送能力，照旧走后台检查。
+
+## 排障
+
+| 症状 | 原因 |
+|---|---|
+| `No suitable application records were found` | App Store Connect 里没建 App 记录，或 bundle id 对不上 |
+| `The bundle version must be higher than the previously uploaded version` | 构建号回退了。构建号 = `git rev-list --count HEAD`，检查是不是在旧提交上发布 |
+| `Missing export compliance` 卡住构建 | `ITSAppUsesNonExemptEncryption` 没生效，确认它在 `Info.plist` 顶层 dict 里 |
+| `codesign` 卡住不返回 | 忘了 `security set-key-partition-list`，无人值守 runner 上会等一个永远不来的 UI 授权 |
+| 签名过了但 App Store 校验拒收 | p12 的证书不在描述文件的 `DeveloperCertificates` 里。跑 `tool/apple_signing_secrets.sh --verify-only` 会直接报出来 |
+| 公证失败但看不出原因 | `xcrun notarytool log <submission-id> --key ... --key-id ... --issuer ...` 会逐个列出被拒的二进制 |
+| 公证后 app 启动即崩 | 强化运行时的库校验。先确认 `Contents/Frameworks` 下每个 dylib 都被同一 Team ID 签过；确实需要加载外部未签名库时才考虑 `com.apple.security.cs.disable-library-validation` |
+| `Developer ID` 证书创建 403 | 只有账号持有人能建，API key 不行。走网页端 |
+
+## 轮换
+
+- **分发证书 / Developer ID 证书**：一年到期。到期前重新走「首次配置」第 2 步，
+  再跑一遍 `tool/apple_signing_secrets.sh`。**旧证书不要急着撤销** —— 撤销
+  Developer ID 会让已经发出去的 macOS 包失效。
+- **描述文件**：跟着证书一起换（描述文件绑定证书）。
+- **API Key**：泄露或人员变动时在 App Store Connect 作废重建，然后重写
+  `APPSTORE_API_*` 三个 secret。

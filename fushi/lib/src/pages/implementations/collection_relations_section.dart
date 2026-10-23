@@ -1,0 +1,359 @@
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/net/app_http_image.dart';
+import 'package:material_ui/material_ui.dart';
+
+import 'package:fushi/src/media/collections/collection_relation.dart';
+import 'package:fushi/src/media/media_cover_source.dart';
+import 'package:fushi/src/media/video/cover_ui/portrait_cover_image.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+/// 合集详情页「相关作品」横滚区（TODO-2484 UI）。
+///
+/// 数据来自 `collection_relations`。当前生产关系由本地拆季写入；历史外部源关系仍可
+/// 读取和绑定。无任何关系边时整块不渲染。
+///
+/// 卡片 = 2:3 封面（coverPath 本地优先 → coverUrl 网络回落 → 占位图标）+
+/// 关系类型徽标 + 两行标题。点击分两路：
+/// - targetCollectionId 非空（已绑定本地合集）→ [onOpenCollection] 跳详情；
+/// - 空（历史未绑定边）→ 小菜单「去下载」（[onDownload]，预填标题开下载对话框）/
+///   「绑定到已有合集」（列本地合集选择后写 bindCollectionRelationTarget）。
+class CollectionRelationsSection extends StatefulWidget {
+  const CollectionRelationsSection({
+    required this.database,
+    required this.collectionId,
+    required this.onOpenCollection,
+    required this.onDownload,
+    super.key,
+  });
+
+  final FushiDatabase database;
+  final int collectionId;
+
+  /// 打开已绑定的本地合集详情（调用方持导航上下文）。
+  final void Function(int targetCollectionId) onOpenCollection;
+
+  /// 「去下载」：以关系边标题预填打开下载对话框。
+  ///
+  /// null = 本平台/本配置没有下载中心（模块关掉，或 iOS 按 App Store 合规不提供），
+  /// 此时小菜单里不出这一项——留着就是一个点了会推进不存在流程的按钮。
+  final void Function(CollectionRelationRow relation)? onDownload;
+
+  @override
+  State<CollectionRelationsSection> createState() =>
+      _CollectionRelationsSectionState();
+}
+
+class _CollectionRelationsSectionState
+    extends State<CollectionRelationsSection> {
+  static const double _cardWidth = 132;
+  static const double _coverHeight = _cardWidth * 3 / 2;
+  static const double _textHeight = 48;
+  static const double _gap = 12;
+
+  final ScrollController _controller = ScrollController();
+
+  /// 关系边查询。**必须持久化在 State 里，不能写在 build 里现取**（BUG-2010）：
+  /// 写在 build 里 = 每次重建都对库多发一次查询，而重建源不受本页控制——app 一
+  /// 拉到前台就走 `AppLifecycleState.resumed` → 重取系统调色板 → 通知主题 →
+  /// 全树重建。
+  ///
+  /// 注意本区**不会**因此闪：builder 只读 `snap.data`，而 FutureBuilder 换
+  /// future 时走的是 `_snapshot.inState(ConnectionState.none)`——data 会保留，
+  /// 只有像 `VideoWorkDetailPage` 那样判 `connectionState` 的才会退回加载态。
+  /// 这里省下的是白查库，不是闪。future 的身份只由 collectionId 决定。
+  late Future<List<CollectionRelationRow>> _relationsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _relationsFuture = widget.database.getCollectionRelations(
+      widget.collectionId,
+    );
+  }
+
+  @override
+  void didUpdateWidget(covariant CollectionRelationsSection oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.collectionId != widget.collectionId ||
+        oldWidget.database != widget.database) {
+      _relationsFuture = widget.database.getCollectionRelations(
+        widget.collectionId,
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  String _relationLabel(String wire) {
+    switch (CollectionRelationType.fromWire(wire)) {
+      case CollectionRelationType.prequel:
+        return t.collection_relation_prequel;
+      case CollectionRelationType.sequel:
+        return t.collection_relation_sequel;
+      case CollectionRelationType.sideStory:
+        return t.collection_relation_side_story;
+      case CollectionRelationType.movie:
+        return t.collection_relation_movie;
+      case CollectionRelationType.spinOff:
+        return t.collection_relation_spin_off;
+      case CollectionRelationType.other:
+        return t.collection_relation_other;
+    }
+  }
+
+  /// 未绑定边的点击菜单：去下载 / 绑定到已有合集。坐标经 Overlay
+  /// globalToLocal 消掉 FushiAppUiScale 缩放（BUG-781 同族纪律）。
+  Future<void> _showUnboundMenu(
+    CollectionRelationRow relation,
+    Offset globalPosition,
+  ) async {
+    final RenderObject? overlay =
+        Overlay.of(context).context.findRenderObject();
+    if (overlay is! RenderBox) return;
+    final Offset anchor = overlay.globalToLocal(globalPosition);
+    final _RelationMenuAction? action = await showFushiMenu<_RelationMenuAction>(
+      context: context,
+      position: RelativeRect.fromRect(
+        Rect.fromPoints(anchor, anchor),
+        Offset.zero & overlay.size,
+      ),
+      items: <PopupMenuEntry<_RelationMenuAction>>[
+        if (widget.onDownload != null)
+          PopupMenuItem<_RelationMenuAction>(
+            value: _RelationMenuAction.download,
+            child: Row(
+              children: <Widget>[
+                const FushiIcon(Icons.download_outlined, size: 20),
+                const SizedBox(width: 12),
+                Text(t.collection_relation_download),
+              ],
+            ),
+          ),
+        PopupMenuItem<_RelationMenuAction>(
+          value: _RelationMenuAction.bind,
+          child: Row(
+            children: <Widget>[
+              const FushiIcon(Icons.link, size: 20),
+              const SizedBox(width: 12),
+              Text(t.collection_relation_bind),
+            ],
+          ),
+        ),
+      ],
+    );
+    if (!mounted) return;
+    switch (action) {
+      case _RelationMenuAction.download:
+        widget.onDownload?.call(relation);
+      case _RelationMenuAction.bind:
+        await _bindToExisting(relation);
+      case null:
+        break;
+    }
+  }
+
+  /// 「绑定到已有合集」：列全部本地合集（排除本合集自身）→ 选中即写
+  /// bindCollectionRelationTarget 并刷新区块。
+  Future<void> _bindToExisting(CollectionRelationRow relation) async {
+    final List<MediaCollectionRow> all =
+        await widget.database.getAllMediaCollections();
+    final List<MediaCollectionRow> candidates = <MediaCollectionRow>[
+      for (final MediaCollectionRow c in all)
+        if (c.id != widget.collectionId) c,
+    ];
+    if (!mounted) return;
+    final MediaCollectionRow? chosen = await showAppDialog<MediaCollectionRow>(
+      context: context,
+      builder: (BuildContext context) => FushiSimpleDialog(
+        title: Text(t.collection_relation_bind),
+        children: <Widget>[
+          for (final MediaCollectionRow c in candidates)
+            FushiSimpleDialogOption(
+              onPressed: () => Navigator.of(context).pop(c),
+              child: Text(c.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+            ),
+        ],
+      ),
+    );
+    if (chosen == null || !mounted) return;
+    await widget.database.bindCollectionRelationTarget(relation.id, chosen.id);
+    if (!mounted) return;
+    FushiToast.show(
+      msg: t.collection_relation_bound(name: chosen.name),
+      severity: ToastSeverity.success,
+    );
+    // 重取即刷新：future 的身份变化本身就是「该重建」的信号，不再需要一个只为
+    // 翻 key 而存在的计数器。
+    setState(() {
+      _relationsFuture = widget.database.getCollectionRelations(
+        widget.collectionId,
+      );
+    });
+  }
+
+  Widget _buildCard(
+    BuildContext context,
+    CollectionRelationRow relation,
+  ) {
+    // 封面三级回落：coverPath 本地文件 → coverUrl 网络（AppHttpImage 是刮削
+    // 候选封面的既有口径，见 scrape_cover_preview.dart）→ 占位图标。
+    final ImageProvider? localCover = resolveMediaCoverImage(
+      kind: MediaKind.video,
+      localPath: relation.coverPath,
+    );
+    final String? coverUrl = relation.coverUrl;
+    final Widget coverWidget;
+    if (localCover != null) {
+      coverWidget = PortraitCoverImage(
+        image: localCover,
+        errorBuilder: (BuildContext _) => _coverPlaceholder(context),
+      );
+    } else if (coverUrl != null && coverUrl.isNotEmpty) {
+      coverWidget = Image(
+        image: AppHttpImage(coverUrl),
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => _coverPlaceholder(context),
+      );
+    } else {
+      coverWidget = _coverPlaceholder(context);
+    }
+    final bool bound = relation.targetCollectionId != null;
+    return SizedBox(
+      width: _cardWidth,
+      child: GestureDetector(
+        // 未绑定边需要触发点坐标定位菜单，InkWell onTap 拿不到，统一走 onTapUp。
+        onTapUp: (TapUpDetails details) {
+          final int? target = relation.targetCollectionId;
+          if (target != null) {
+            widget.onOpenCollection(target);
+            return;
+          }
+          _showUnboundMenu(relation, details.globalPosition);
+        },
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            ClipRRect(
+              borderRadius: FushiBorderRadius.card,
+              child: SizedBox(
+                width: _cardWidth,
+                height: _coverHeight,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: <Widget>[
+                    coverWidget,
+                    PositionedDirectional(
+                      top: 6,
+                      start: 6,
+                      // 关系类型徽标压在封面图上，走共享封面角标胶囊
+                      // （CoverBadge 的纯文字形态）——此前这里是第四份手抄的
+                      // 「深色 scrim + 圆角胶囊 + 白色小字」，正是 CoverBadge
+                      // 要收口的那一类。
+                      child: CoverBadge(
+                        label: _relationLabel(relation.relationType),
+                      ),
+                    ),
+                    if (bound)
+                      PositionedDirectional(
+                        bottom: 6,
+                        end: 6,
+                        child: FushiIcon(
+                          Icons.link,
+                          size: 16,
+                          color: Colors.white.withValues(alpha: 0.9),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 6),
+            SizedBox(
+              height: _textHeight - 6,
+              child: Text(
+                relation.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                    ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 无封面占位走三库页共用的 [ShelfCoverPlaceholder]（底色/描边/图标色全部
+  /// 取自设计令牌，`tokens.surfaces.overlay` 即原先直读的最高阶容器面色）。
+  Widget _coverPlaceholder(BuildContext context) => ShelfCoverPlaceholder(
+        icon: Icons.movie_outlined,
+        iconSize: 28,
+        backgroundColor: FushiDesignTokens.of(context).surfaces.overlay,
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return FutureBuilder<List<CollectionRelationRow>>(
+      future: _relationsFuture,
+      builder: (
+        BuildContext context,
+        AsyncSnapshot<List<CollectionRelationRow>> snap,
+      ) {
+        final List<CollectionRelationRow> relations =
+            snap.data ?? const <CollectionRelationRow>[];
+        // 无关系边（未刮削/源无关联）整块不渲染，不占位。
+        if (relations.isEmpty) return const SizedBox.shrink();
+        return Padding(
+          key: const ValueKey<String>('collection-relations-section'),
+          padding: EdgeInsets.only(top: tokens.spacing.section),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Padding(
+                padding: EdgeInsets.symmetric(horizontal: tokens.spacing.page),
+                child: Text(
+                  t.collection_related_title,
+                  style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+              ),
+              SizedBox(height: tokens.spacing.rowVertical),
+              SizedBox(
+                height: _coverHeight + _textHeight,
+                // 鼠标拖动横滚（home_video 横滚行同款）。**裸滚轮刻意不横滚**：
+                // 本区嵌在合集详情页的纵向滚动里，投轴会把整页滚动吃掉
+                // （BUG-1536）；Shift + 滚轮的横滚由 Flutter 内建翻轴提供，
+                // 行为守卫见 test/pages/collection_relations_section_test.dart。
+                child: HorizontalDragScrollable(
+                  child: ListView.separated(
+                    controller: _controller,
+                    scrollDirection: Axis.horizontal,
+                    physics: desktopAwareScrollPhysics(),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: tokens.spacing.page,
+                    ),
+                    itemCount: relations.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: _gap),
+                    itemBuilder: (BuildContext context, int index) =>
+                        _buildCard(context, relations[index]),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+enum _RelationMenuAction { download, bind }

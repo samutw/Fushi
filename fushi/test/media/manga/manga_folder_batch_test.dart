@@ -1,0 +1,399 @@
+/// BUG-1649：在漫画框选一个**装着整卷文件的文件夹**（一卷一个 `.epub`/`.cbz`）。
+///
+/// 修复前目录只有「一卷页图目录」一种解释，这种文件夹会被 `enumerateMangaPages`
+/// 扫出 0 张图，报 `Manga image folder has no pages`——那句话描述的是判定结果，
+/// 不是用户做错了什么。这里钉死新的目录形态判定与逐卷导入的编排契约。
+library;
+
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:archive/archive.dart';
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/epub/epub_storage.dart';
+import 'package:fushi/src/media/import/import_carrier.dart';
+import 'package:fushi/src/media/manga/import/manga_folder_batch.dart';
+import 'package:fushi/src/media/manga/manga_module.dart';
+import 'package:fushi/src/utils/misc/error_log_service.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Directory root;
+  late Directory app;
+  late FushiDatabase db;
+
+  setUp(() {
+    root = Directory.systemTemp.createTempSync('manga_batch_');
+    app = Directory.systemTemp.createTempSync('manga_batch_app_');
+    EpubStorage.debugBaseDirectoryOverride = app.path;
+    db = FushiDatabase.forTesting(NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+    EpubStorage.debugBaseDirectoryOverride = null;
+    if (root.existsSync()) root.deleteSync(recursive: true);
+    if (app.existsSync()) app.deleteSync(recursive: true);
+  });
+
+  group('目录形态判定（生产实参）', () {
+    test('装着整卷文件的目录 → mangaBatchFolder，而不是「没有页」的页图目录', () {
+      _writeCbz(root, 'vol1.cbz');
+      _writeCbz(root, 'vol2.cbz');
+
+      expect(MangaModule.directoryHasPageImages(root.path), isFalse);
+      expect(MangaModule.directoryCarrierFileCount(root.path), 2);
+      expect(_classifyWithRealPredicates(root.path),
+          ImportCarrier.mangaBatchFolder);
+    });
+
+    test('页图目录仍是 mangaFolder（修复不得改动既有路径）', () {
+      File(p.join(root.path, '001.png')).writeAsBytesSync(_pngBytes());
+
+      expect(MangaModule.directoryHasPageImages(root.path), isTrue);
+      expect(_classifyWithRealPredicates(root.path), ImportCarrier.mangaFolder);
+    });
+
+    test('页图与整卷文件同时在场 → 页图这条解释优先', () {
+      File(p.join(root.path, '001.png')).writeAsBytesSync(_pngBytes());
+      _writeCbz(root, 'vol1.cbz');
+
+      expect(_classifyWithRealPredicates(root.path), ImportCarrier.mangaFolder);
+    });
+
+    // BUG-2785：mokuro 标准产物「卷.mokuro + 同名页图子目录」。页图判据递归进子目录
+    // 抢先认成页图目录，OCR 静默丢失。真文件系统判据下钉死新的优先级。
+    test('卷.mokuro + 同名页图子目录 → mangaMokuro，且能换出那个 .mokuro 文件', () {
+      File(p.join(root.path, 'vol1.mokuro')).writeAsStringSync('{}');
+      Directory(p.join(root.path, 'vol1')).createSync();
+      File(p.join(root.path, 'vol1', '001.png')).writeAsBytesSync(_pngBytes());
+
+      expect(MangaModule.directoryHasPageImages(root.path), isTrue,
+          reason: '前提：页图判据会递归看到子目录里的图（这正是抢先误判的来源）');
+      expect(MangaModule.directoryMokuroFileCount(root.path), 1);
+      expect(_classifyWithRealPredicates(root.path), ImportCarrier.mangaMokuro);
+      expect(MangaModule.directorySingleMokuroPath(root.path),
+          p.join(root.path, 'vol1.mokuro'));
+    });
+
+    test('两个 .mokuro → mangaBatchFolder；换不出单个文件', () {
+      for (final String vol in <String>['vol1', 'vol2']) {
+        File(p.join(root.path, '$vol.mokuro')).writeAsStringSync('{}');
+        Directory(p.join(root.path, vol)).createSync();
+        File(p.join(root.path, vol, '001.png')).writeAsBytesSync(_pngBytes());
+      }
+
+      expect(_classifyWithRealPredicates(root.path),
+          ImportCarrier.mangaBatchFolder);
+      expect(MangaModule.directorySingleMokuroPath(root.path), isNull);
+    });
+  });
+
+  group('候选枚举', () {
+    test('只认整卷扩展名，且只看直接子层', () {
+      _writeCbz(root, 'vol2.cbz');
+      _writeCbz(root, 'vol10.cbz');
+      _writeCbz(root, 'vol1.cbz');
+      File(p.join(root.path, 'notes.txt')).writeAsStringSync('not a volume');
+      final Directory nested = Directory(p.join(root.path, 'nested'))
+        ..createSync();
+      _writeCbz(nested, 'vol99.cbz');
+
+      final List<String> names = mangaCarrierFilesIn(root)
+          .map((File f) => p.basename(f.path))
+          .toList();
+      // 自然序：vol2 在 vol10 之前（字典序会把 vol10 排前面，那会打乱卷号）。
+      expect(names, <String>['vol1.cbz', 'vol2.cbz', 'vol10.cbz']);
+    });
+
+    test('候选集与文件选择器白名单同源（不得各抄一份）', () {
+      for (final String ext in kMangaCarrierFileExtensions) {
+        final File file = File(p.join(root.path, 'v$ext'))
+          ..writeAsBytesSync(<int>[0]);
+        expect(
+          mangaCarrierFilesIn(root).map((File f) => f.path),
+          contains(file.path),
+          reason: '$ext 在白名单里就必须能被批量捡起来',
+        );
+        file.deleteSync();
+      }
+    });
+  });
+
+  group('逐卷导入', () {
+    test('每卷各成一本，标题取各自文件名', () async {
+      _writeCbz(root, '銀河英雄伝説 01.cbz');
+      _writeCbz(root, '銀河英雄伝説 02.cbz');
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.importedCount, 2);
+      expect(report.failedCount, 0);
+      final List<EpubBookRow> books = await db.getAllEpubBooks();
+      expect(
+        books.map((EpubBookRow b) => b.title).toList()..sort(),
+        <String>['銀河英雄伝説 01', '銀河英雄伝説 02'],
+      );
+      expect(
+        books.every((EpubBookRow b) =>
+            BookFormat.parseOrEpub(b.format) == BookFormat.manga),
+        isTrue,
+      );
+    });
+
+    test('一卷坏包不中断整批：其余卷照样进库', () async {
+      _writeCbz(root, 'vol1.cbz');
+      File(p.join(root.path, 'vol2.cbz'))
+          .writeAsBytesSync(<int>[0x00, 0x01, 0x02, 0x03]); // 不是 zip
+      _writeCbz(root, 'vol3.cbz');
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.importedCount, 2, reason: '坏的那一卷不该把另外两卷一起废掉');
+      expect(report.failedCount, 1);
+      expect(
+        report.volumes
+            .firstWhere((MangaBatchVolumeResult v) =>
+                v.status == MangaBatchVolumeStatus.failed)
+            .name,
+        'vol2.cbz',
+      );
+      expect((await db.getAllEpubBooks()).length, 2);
+    });
+
+    test('自带插图的 Yomitan 词典 zip 被如实计为「不是漫画」，不落库', () async {
+      _writeCbz(root, 'vol1.cbz');
+      _writeYomitanDictZip(root, 'dict.zip');
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.importedCount, 1);
+      expect(report.notMangaCount, 1);
+      expect((await db.getAllEpubBooks()).length, 1,
+          reason: '词典包被导成一本只有插图的垃圾「漫画」是糟蹋用户数据');
+    });
+
+    test('重跑同一个文件夹是幂等的：已在库的卷计入跳过而不是复制一份', () async {
+      _writeCbz(root, 'vol1.cbz');
+
+      final MangaBatchImportReport first =
+          await importMangaBatchFolder(db: db, path: root.path);
+      expect(first.importedCount, 1);
+
+      final MangaBatchImportReport second =
+          await importMangaBatchFolder(db: db, path: root.path);
+      expect(second.importedCount, 0);
+      expect(second.duplicateCount, 1);
+      expect((await db.getAllEpubBooks()).length, 1,
+          reason: '批量路径用 skip 策略，不得留下 `vol1 (2)`');
+    });
+
+    test('一卷都没进来时报告 isEmpty（调用方据此报失败而不是「成功 0 卷」）', () async {
+      _writeYomitanDictZip(root, 'dict.zip');
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.importedCount, 0);
+      expect(report.isEmpty, isTrue);
+    });
+
+    test('进度按卷回报，末次等于总卷数', () async {
+      _writeCbz(root, 'vol1.cbz');
+      _writeCbz(root, 'vol2.cbz');
+      final List<(int, int)> progress = <(int, int)>[];
+
+      await importMangaBatchFolder(
+        db: db,
+        path: root.path,
+        onVolumeProgress: (int done, int total) => progress.add((done, total)),
+      );
+
+      expect(progress.first, (0, 2));
+      expect(progress.last, (2, 2));
+    });
+  });
+
+  // 用户实报：多选拖入漫画只导进来一本。拖 N 卷进来必须与「选一个装着 N 卷的文件夹」
+  // 得到同一种结果。
+  group('多选路径逐卷导入（importMangaBatchPaths）', () {
+    test('同时拖入的每一卷各成一本，标题取各自文件名', () async {
+      _writeCbz(root, '01.cbz');
+      _writeCbz(root, '02.cbz');
+      _writeCbz(root, '03.cbz');
+
+      final MangaBatchImportReport report = await importMangaBatchPaths(
+        db: db,
+        paths: <String>[
+          p.join(root.path, '01.cbz'),
+          p.join(root.path, '02.cbz'),
+          p.join(root.path, '03.cbz'),
+        ],
+      );
+
+      expect(report.importedCount, 3);
+      expect(
+        (await db.getAllEpubBooks()).map((EpubBookRow b) => b.title).toList()
+          ..sort(),
+        <String>['01', '02', '03'],
+      );
+    });
+
+    test('页图目录与整卷文件混拖：目录按一卷导入，目录名里的点不当扩展名', () async {
+      final Directory pages = Directory(p.join(root.path, '第01巻.v2'))
+        ..createSync();
+      File(p.join(pages.path, '001.png')).writeAsBytesSync(_pngBytes());
+      _writeCbz(root, '02.cbz');
+
+      final MangaBatchImportReport report = await importMangaBatchPaths(
+        db: db,
+        paths: <String>[pages.path, p.join(root.path, '02.cbz')],
+      );
+
+      expect(report.importedCount, 2, reason: '${report.volumes}');
+      expect(
+        (await db.getAllEpubBooks()).map((EpubBookRow b) => b.title).toList()
+          ..sort(),
+        <String>['02', '第01巻.v2'],
+      );
+    });
+
+    test('拖入装着整卷文件的目录 = 展开成其中每一卷；同一卷重复给只导一次', () async {
+      final Directory series = Directory(p.join(root.path, 'series'))
+        ..createSync();
+      _writeCbz(series, 'a.cbz');
+      _writeCbz(series, 'b.cbz');
+
+      final MangaBatchImportReport report = await importMangaBatchPaths(
+        db: db,
+        paths: <String>[series.path, p.join(series.path, 'a.cbz')],
+      );
+
+      expect(report.volumes.length, 2, reason: '重复路径不得成为第三卷');
+      expect(report.importedCount, 2);
+    });
+
+    test('混进来的词典 zip 计为「不是漫画」，其余照样进库', () async {
+      _writeCbz(root, 'vol1.cbz');
+      _writeYomitanDictZip(root, 'dict.zip');
+
+      final MangaBatchImportReport report = await importMangaBatchPaths(
+        db: db,
+        paths: <String>[
+          p.join(root.path, 'vol1.cbz'),
+          p.join(root.path, 'dict.zip'),
+        ],
+      );
+
+      expect(report.importedCount, 1);
+      expect(report.notMangaCount, 1);
+    });
+  });
+
+  group('逐卷失败必须落进错误日志', () {
+    // 批量路径把每卷异常收进报告、只给调用方一句「成功 N / 失败 M」的汇总，于是
+    // ImportFlowMixin.runImport 那道 ErrorLogService 永远拿不到真正的原因，用户
+    // 事后翻错误日志页是空的。落盘因此必须在**吞掉异常的这一层**。
+    test('坏卷的真实原因写进 ErrorLogService，而不是只 debugPrint', () async {
+      final int before = ErrorLogService.instance.entries.length;
+
+      // 一卷好的 + 一卷坏的：坏卷是页图在任何布局下都找不到的 .mokuro——正是用户
+      // 撞上的那种失败，只不过这里让它发生在批量路径里。
+      _writeCbz(root, 'good.cbz');
+      File(p.join(root.path, 'broken.mokuro'))
+          .writeAsStringSync(jsonEncode(<String, Object?>{
+        'version': '0.2.0',
+        'title': 'Broken',
+        'pages': <Object?>[
+          <String, Object?>{
+            'img_width': 800,
+            'img_height': 1200,
+            'img_path': 'nowhere.jpg',
+            'blocks': <Object?>[],
+          },
+        ],
+      }));
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.failedCount, 1, reason: '坏卷必须计入失败');
+      final List<ErrorLogEntry> added =
+          ErrorLogService.instance.entries.skip(before).toList();
+      expect(
+        added.where((ErrorLogEntry e) => e.source == 'MangaBatchImport.volume'),
+        isNotEmpty,
+        reason: '坏卷的原因必须以 MangaBatchImport.volume 落进错误日志',
+      );
+      expect(
+        added
+            .where((ErrorLogEntry e) => e.source == 'MangaBatchImport.volume')
+            .map((ErrorLogEntry e) => e.error)
+            .join('\n'),
+        contains('broken.mokuro'),
+        reason: '日志必须指名道姓说是哪一卷，否则 20 卷里的失败无从定位',
+      );
+    });
+
+    test('全成功时不往错误日志塞噪声', () async {
+      final int before = ErrorLogService.instance.entries.length;
+      _writeCbz(root, 'ok1.cbz');
+      _writeCbz(root, 'ok2.cbz');
+
+      final MangaBatchImportReport report =
+          await importMangaBatchFolder(db: db, path: root.path);
+
+      expect(report.failedCount, 0);
+      expect(
+        ErrorLogService.instance.entries
+            .skip(before)
+            .where((ErrorLogEntry e) => e.source == 'MangaBatchImport.volume'),
+        isEmpty,
+      );
+    });
+  });
+}
+
+ImportCarrier _classifyWithRealPredicates(String path) => classifyImportCarrier(
+      path,
+      isDirectory: (String pth) => Directory(pth).existsSync(),
+      isImageArchive: MangaModule.isImageArchive,
+      directoryHasPageImages: MangaModule.directoryHasPageImages,
+      directoryCarrierFileCount: MangaModule.directoryCarrierFileCount,
+      directoryMokuroFileCount: MangaModule.directoryMokuroFileCount,
+    );
+
+Uint8List _pngBytes() =>
+    Uint8List.fromList(img.encodePng(img.Image(width: 20, height: 40)));
+
+void _writeCbz(Directory dir, String name) {
+  final Uint8List png = _pngBytes();
+  final Archive archive = Archive()
+    ..addFile(ArchiveFile('001.png', png.length, png));
+  File(p.join(dir.path, name))
+      .writeAsBytesSync(ZipEncoder().encode(archive) ?? <int>[]);
+}
+
+/// 词典包与图片包同形，唯一的结构指纹是 `index.json` + `*_bank_*.json`；这里连
+/// 插图一起放，正是「只看有没有图片」会误判的那种包。
+void _writeYomitanDictZip(Directory dir, String name) {
+  final Uint8List png = _pngBytes();
+  final List<int> index =
+      utf8.encode('{"title":"Test Dict","format":3,"revision":"1"}');
+  final List<int> bank = utf8.encode('[]');
+  final Archive archive = Archive()
+    ..addFile(ArchiveFile('index.json', index.length, index))
+    ..addFile(ArchiveFile('term_bank_1.json', bank.length, bank))
+    ..addFile(ArchiveFile('illustration.png', png.length, png));
+  File(p.join(dir.path, name))
+      .writeAsBytesSync(ZipEncoder().encode(archive) ?? <int>[]);
+}

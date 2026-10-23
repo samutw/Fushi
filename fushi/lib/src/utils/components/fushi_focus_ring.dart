@@ -1,0 +1,512 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/rendering.dart';
+import 'package:fushi/src/focus/focus_geometry.dart';
+import 'package:fushi/src/focus/fushi_focus_controller.dart';
+import 'package:fushi/src/focus/fushi_focus_scroll.dart';
+import 'package:fushi/src/utils/app_ui_scale.dart';
+import 'package:fushi/src/utils/adaptive/adaptive_platform.dart';
+import 'package:fushi/src/utils/components/glass/fushi_apple_palette.dart';
+
+/// App-level overlay that paints a high-contrast ring around the widget that
+/// currently holds primary focus — but ONLY in keyboard/gamepad highlight mode
+/// ([FocusHighlightMode.traditional]). In touch mode it draws nothing. This is
+/// a single app-wide observability aid for gamepad navigation and automated
+/// screenshots; it does not require per-widget changes.
+///
+/// Because it is the single app-wide observer of focus, it also keeps the
+/// focused control visible: when focus lands off-screen (window resize,
+/// autofocus, programmatic/gamepad focus) it scrolls the nearest scrollable so
+/// the control — and therefore the ring — is brought into view ("把视角转过去").
+/// A deliberate manual scroll that leaves focus behind is NOT yanked back; the
+/// ring simply tracks the control to its new (possibly off-screen) position.
+class FushiFocusRing extends StatefulWidget {
+  const FushiFocusRing({super.key, this.enabled = true, required this.child});
+
+  final Widget child;
+
+  /// False = 焦点环禁用但保持挂载（不绘制、不做几何计算）。与
+  /// [FushiFocusRoot.enabled] 同步门控：实验开关切换只改行为不改树结构，
+  /// child 的 Element 全保留（见 main.dart `_wrapFocusNavigation`）。
+  final bool enabled;
+
+  @override
+  State<FushiFocusRing> createState() => _FushiFocusRingState();
+}
+
+class _FushiFocusRingState extends State<FushiFocusRing>
+    with WidgetsBindingObserver {
+  final FocusManager _fm = FocusManager.instance;
+  final GlobalKey _stackKey = GlobalKey(debugLabel: 'fushi-focus-ring-stack');
+
+  // Cached focus rectangle in this ring Stack's LOCAL coordinate space,
+  // recomputed in a post-frame callback only. NEVER
+  // read render geometry during build: the focused node's element can be
+  // *inactive* mid-build (e.g. a route swap at startup), and findRenderObject()
+  // asserts on inactive elements ("Cannot get renderObject of inactive
+  // element"). On desktop the keyboard highlight mode is on from launch, so
+  // that path runs immediately — which is why this only ever crashed there.
+  Rect? _rect;
+  bool _recomputeScheduled = false;
+  bool _ensureVisibleScheduled = false;
+
+  // BUG-1300：环显示期间的逐帧几何跟踪臂标记（见 [_armFrameTracker]）。
+  bool _frameTrackerArmed = false;
+
+  // The node we last scrolled into view. Distinguishes a real primary-focus
+  // change (worth scrolling to) from the many other FocusManager notifications
+  // and from a manual scroll (which must never trigger a scroll-back).
+  FocusNode? _lastFocused;
+
+  // The in-app UI scale (exposed by FushiAppUiScale via _AppUiScaleScope) seen
+  // at the last didChangeDependencies. Used to tell a geometry-changing scale
+  // reflow (must reveal + recompute) apart from a theme-only dependency change
+  // (must only recompute the ring, never scroll).
+  double? _lastUiScale;
+
+  @override
+  void initState() {
+    super.initState();
+    _fm.addListener(_onFocusManagerChange);
+    _fm.addHighlightModeListener(_onHighlight);
+    WidgetsBinding.instance.addObserver(this);
+    _lastFocused = _fm.primaryFocus;
+    _scheduleRecompute();
+  }
+
+  @override
+  void dispose() {
+    _fm.removeListener(_onFocusManagerChange);
+    _fm.removeHighlightModeListener(_onHighlight);
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  // Fires on ANY inherited dependency read in build() changing — that is both
+  // the in-app UI scale (FushiAppUiScale exposes it via _AppUiScaleScope,
+  // read below) AND the theme (Theme.of in build()). We must distinguish them:
+  //
+  //  - A scale change reflows the whole subtree, moving the focused control,
+  //    without any window-metrics/focus/scroll/highlight change — invisible to
+  //    every other recompute trigger here, so the ring would stay pinned to the
+  //    control's old position ("焦点不跟着动"). Treat it like a resize: reveal
+  //    the control and recompute the ring geometry.
+  //  - A theme change does NOT move geometry. Calling _scheduleEnsureVisible()
+  //    for it would yank a focused control the user deliberately scrolled out of
+  //    view back to center, breaking this widget's "manual scroll is not pulled
+  //    back" contract (see the class doc). So a theme-only change must ONLY
+  //    recompute (cheap, no scroll; also refreshes the ring colour).
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // Depend on the actual in-app UI scale. FushiAppUiScale exposes it via an
+    // InheritedWidget (_AppUiScaleScope); a scale change always notifies this
+    // dependent — unlike the old MediaQuery.textScaler aspect, which the
+    // Transform-based scale no longer touches (changing scale only moves the
+    // size aspect, never reaching a textScaler-aspect dependent). A scale reflow
+    // moves the focused control without any window-metrics/focus/scroll/highlight
+    // change, so detect it here and reveal the control. Removing this read
+    // silently brings back the original "焦点不跟着动" bug.
+    final double uiScale = FushiAppUiScale.of(context);
+    final bool scaleChanged = _lastUiScale != null && uiScale != _lastUiScale;
+    _lastUiScale = uiScale;
+    if (scaleChanged) _scheduleEnsureVisible();
+    _scheduleRecompute();
+  }
+
+  @override
+  void didUpdateWidget(FushiFocusRing oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enabled && !widget.enabled) {
+      // 关闭时立刻收掉残留的环（不等下一次焦点事件）。
+      setState(() => _rect = null);
+    } else if (!oldWidget.enabled && widget.enabled) {
+      _scheduleRecompute();
+    }
+  }
+
+  void _onHighlight(FocusHighlightMode _) => _scheduleRecompute();
+
+  void _onFocusManagerChange() {
+    final FocusNode? current = _fm.primaryFocus;
+    if (!identical(current, _lastFocused)) {
+      _lastFocused = current;
+      // Focus moved: bring it on-screen if a non-traversal path left it hidden.
+      _scheduleEnsureVisible();
+    }
+    _scheduleRecompute();
+  }
+
+  // Window resize / inset change can reflow the focused control off-screen
+  // without any focus change. Bring it back and refresh the ring geometry.
+  // _ensureVisibleIfHidden is gated on traditional (keyboard/gamepad) highlight
+  // mode, so a soft-keyboard inset change on touch devices is a no-op here; it
+  // only scrolls when a hardware keyboard/gamepad is actually driving focus.
+  @override
+  void didChangeMetrics() {
+    _scheduleEnsureVisible();
+    _scheduleRecompute();
+  }
+
+  void _scheduleRecompute() {
+    if (!widget.enabled) return;
+    if (_recomputeScheduled || !mounted) return;
+    _recomputeScheduled = true;
+    // By post-frame time the element tree is finalized: every element is either
+    // active (safe to query) or unmounted/defunct (caught by ctx.mounted).
+    // Inactive elements no longer exist, so the geometry read cannot assert.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        _recomputeScheduled = false;
+        return;
+      }
+      final Rect? next = _computeFocusRect();
+      if (next != _rect) {
+        setState(() => _rect = next);
+      }
+      // Clear at the end so the "scheduled" window spans the whole read, not
+      // just up to entry — independent of when focus changes are delivered.
+      _recomputeScheduled = false;
+      _armFrameTracker();
+    });
+  }
+
+  /// BUG-1300 根因修复：键盘/手柄高亮模式期间**逐帧**跟踪焦点控件几何。
+  ///
+  /// 旧实现按「事件枚举」重算矩形（焦点变化 / 滚动通知 / 窗口尺寸 / UI 缩放 /
+  /// 主题），但布局位移本身没有事件——首页 dashboard 异步数据（热力图 / 各区块）
+  /// 加载后整页 reflow，焦点控件被推走，环钉死在旧矩形上悬空（用户截图：环横跨
+  /// 两个区块之间的空白）。此前的 UI-scale 特例（didChangeDependencies 读
+  /// FushiAppUiScale）正是同一类病灶的单点补丁；本跟踪器把「矩形 = 焦点控件的
+  /// 实时几何」变成持续成立的导出状态，一并吸收滚动/缩放/任意 reflow。
+  ///
+  /// 成本：post-frame 回调**不催帧**——没有帧渲染时回调只是挂起（零开销）；有帧
+  /// 渲染（滚动 / 动画 / 数据加载重建）时每帧一次 `localToGlobal`（微秒级）。矩形
+  /// 无变化不 setState、不产生新帧，天然收敛。离开 traditional 模式即停臂（环不
+  /// 显示无需跟踪），回到该模式由 [_onHighlight] → [_scheduleRecompute] 重新起臂。
+  void _armFrameTracker() {
+    if (_frameTrackerArmed || !mounted) return;
+    if (!widget.enabled ||
+        _fm.highlightMode != FocusHighlightMode.traditional) {
+      return;
+    }
+    _frameTrackerArmed = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _frameTrackerArmed = false;
+      if (!mounted ||
+          !widget.enabled ||
+          _fm.highlightMode != FocusHighlightMode.traditional) {
+        return; // 事件路径（_onHighlight / didUpdateWidget）负责后续重新起臂。
+      }
+      final Rect? next = _computeFocusRect();
+      if (next != _rect) {
+        setState(() => _rect = next);
+      }
+      _armFrameTracker();
+    });
+  }
+
+  void _scheduleEnsureVisible() {
+    // Only keyboard/gamepad mode follows focus; skip the wasted post-frame in
+    // touch mode. Dedupe so a burst of focus/resize notifications schedules at
+    // most one scroll check per frame.
+    if (_ensureVisibleScheduled ||
+        _fm.highlightMode != FocusHighlightMode.traditional) {
+      return;
+    }
+    _ensureVisibleScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _ensureVisibleScheduled = false;
+      if (!mounted) return;
+      _ensureVisibleIfHidden();
+    });
+  }
+
+  // Scroll the focused control into view ONLY when it is not already fully
+  // visible inside its nearest scrollable. Skipping the already-visible case
+  // avoids a second, differently-aligned scroll on ordinary Tab traversal
+  // (which Flutter already reveals) while still covering the off-screen paths
+  // (resize, autofocus, programmatic/gamepad focus).
+  /// 焦点控件的**视觉几何** context：受管控件用登记的渲染锚点，其余回退原生
+  /// context。绘制（[_computeFocusRect]）与 reveal（[_ensureVisibleIfHidden]）
+  /// 必须共用这一份——两处各算一遍迟早漂移。
+  ///
+  /// **不缓存**：`_FushiFocusScope.controller` 随实验开关在 null↔controller 之间
+  /// 翻转，而 `listen: false` 走 `getInheritedWidgetOfExactType`、**不建立
+  /// inherited 依赖**，`didChangeDependencies` 不会因此重跑。缓存下来就会永远停在
+  /// 冷启动第一帧读到的 null——`main.dart` 的 `runApp()` 在 `initialise()` 之前
+  /// 执行（为了先给用户看加载页而不是白屏），那一帧偏好还没加载完，
+  /// `experimentalFocusNavigationEnabled` 恒读默认 false。于是冷启动（偏好已开）、
+  /// 运行时翻开关、以及全部集成测试（`focus_driver` 就是「app 起来后再翻开关」）
+  /// 三条路径全废，修复整场会话静默失效。
+  ///
+  /// 就地解析的代价是每次一次哈希查表；两个调用点都在 post-frame，读取合法。
+  /// **绝不要改成 `listen: true`**：`_FushiFocusScope` 是 `InheritedNotifier`，
+  /// 那会让本层在每次焦点变化时整层重建。
+  BuildContext? _focusGeometryContext() {
+    if (!mounted) return null;
+    final FocusNode? primary = _fm.primaryFocus;
+    if (primary == null) return null;
+    final FushiFocusController? controller =
+        FushiFocusRoot.maybeControllerOf(context, listen: false);
+    return controller?.geometryContextFor(primary) ?? primary.context;
+  }
+
+  void _ensureVisibleIfHidden() {
+    if (_fm.highlightMode != FocusHighlightMode.traditional) return;
+    final BuildContext? ctx = _focusGeometryContext();
+    if (ctx == null || !ctx.mounted) return;
+    FushiFocusScroll.ensureVisibleIfHidden(ctx);
+  }
+
+  Rect? _computeFocusRect() {
+    if (_fm.highlightMode != FocusHighlightMode.traditional) return null;
+    // Registered controls expose a render anchor around their whole visual
+    // surface. FocusNode.context can instead point at a framework-internal,
+    // inset child of composite inputs (SearchBar/TextFormField), which made the
+    // global ring frame the wrong rectangle across discovery and settings.
+    final BuildContext? ctx = _focusGeometryContext();
+    if (ctx == null) return null;
+    // ON-SCREEN (view-coord) rect of the focused control: globalRectOfBox maps
+    // both corners through localToGlobal so the rect carries the SCALED size.
+    // `topLeft & size` would pair a scaled position with an unscaled size, and
+    // build() (which divides by the live scale) would then shrink the ring on
+    // zoom-in instead of growing it with the control. See focus_geometry.dart.
+    final Rect? rect = globalRectOfContext(ctx);
+    if (rect == null) return null;
+    _updateTargetShape(ctx);
+    // Don't ring a (near) full-screen focusable: the ring would sit at/beyond the
+    // window edge — clipped, and occluded by any overlaid chrome (e.g. a reader
+    // bottom bar). Such a node draws its own inset focus indicator instead.
+    final views = WidgetsBinding.instance.platformDispatcher.views;
+    if (views.isNotEmpty) {
+      final view = views.first;
+      final double sw = view.physicalSize.width / view.devicePixelRatio;
+      final double sh = view.physicalSize.height / view.devicePixelRatio;
+      if (rect.width >= sw * 0.92 && rect.height >= sh * 0.92) return null;
+    }
+
+    // BUG-1963: the ring Stack is not guaranteed to start at the view origin.
+    // The Windows custom title bar wraps the scaled app and places this Stack
+    // below its caption row. Treating [rect]'s global coordinates as local ones
+    // therefore added the title-bar height a second time and drew the ring one
+    // row below the focused subtitle-toolbar button. Convert both corners into
+    // the actual Stack coordinate space; this also preserves any transform
+    // between the view and the Stack instead of assuming scale is the only one.
+    final BuildContext? stackContext = _stackKey.currentContext;
+    if (stackContext == null || !stackContext.mounted) return null;
+    final RenderObject? stackObject = stackContext.findRenderObject();
+    if (stackObject is! RenderBox ||
+        !stackObject.hasSize ||
+        !stackObject.attached) {
+      return null;
+    }
+    return Rect.fromPoints(
+      stackObject.globalToLocal(rect.topLeft),
+      stackObject.globalToLocal(rect.bottomRight),
+    );
+  }
+
+  /// 焦点控件自身的外形（只换算一次：同一节点、同一尺寸时沿用缓存，逐帧跟踪
+  /// 不重复遍历渲染树）。null = 探不到形状，回退通用圆角。
+  _FocusTargetShape? _targetShape;
+  RenderObject? _targetShapeOwner;
+  Size? _targetShapeSize;
+
+  void _updateTargetShape(BuildContext ctx) {
+    final RenderObject? ro = ctx.findRenderObject();
+    if (ro is! RenderBox || !ro.hasSize) {
+      _targetShape = null;
+      _targetShapeOwner = null;
+      _targetShapeSize = null;
+      return;
+    }
+    if (identical(ro, _targetShapeOwner) && ro.size == _targetShapeSize) {
+      return;
+    }
+    _targetShapeOwner = ro;
+    _targetShapeSize = ro.size;
+    _targetShape = _probeTargetShape(ro);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 环色：MD3 主色、Apple 强调色（单色主题下就是黑 / 白）。
+    final Color color = isGlassDesign(context)
+        ? appleColorsOf(context).accent
+        : Theme.of(context).colorScheme.primary;
+    // _rect is already expressed in this Stack's local coordinate system. The
+    // Stack sits inside FushiAppUiScale, so inflate by 2 / scale to retain a
+    // constant 2px visual gap after the outer transform magnifies it.
+    final double scale = FushiAppUiScale.of(context);
+    final double gap = 2 / scale;
+    final Rect? localRect = widget.enabled ? _rect : null;
+    // 环的定位矩形 = 控件外框外扩 2px 间隙；2px 线描在矩形外侧
+    // （strokeAlignOutside），于是线与控件轮廓之间恰好空出 2px。
+    final Rect? ringRect = localRect?.inflate(gap);
+    return Stack(
+      key: _stackKey,
+      children: <Widget>[
+        // 滚动 / 动画 / 数据加载 reflow 期间环不滞后：traditional 模式下
+        // [_armFrameTracker] 逐帧跟踪焦点控件几何（BUG-1300），旧的
+        // ScrollNotification 监听特例已被它吸收（滚动帧就是帧）。
+        widget.child,
+        if (ringRect != null)
+          Positioned.fromRect(
+            rect: ringRect,
+            child: IgnorePointer(
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  // 圆角取控件自身外形再加上间隙，与控件轮廓等距（胶囊仍是
+                  // 胶囊、圆钮仍是圆）。
+                  borderRadius: _ringRadius(_targetShape, ringRect.size, gap),
+                  border: Border.all(
+                    color: color,
+                    width: _kRingWidth / scale,
+                    strokeAlign: BorderSide.strokeAlignOutside,
+                  ),
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+/// 焦点环线宽（逻辑像素，MD3 焦点指示器 2dp）。
+const double _kRingWidth = 2;
+
+/// 探不到控件形状时的通用圆角（控件外沿口径）。
+const double _kFallbackRadius = 8;
+
+/// 焦点控件的外形，统一成两类：圆、四角半径（胶囊 = 足够大的半径）。
+sealed class _FocusTargetShape {
+  const _FocusTargetShape();
+}
+
+class _CircleShape extends _FocusTargetShape {
+  const _CircleShape();
+}
+
+class _RadiiShape extends _FocusTargetShape {
+  const _RadiiShape(this.radius);
+  final BorderRadius radius;
+}
+
+/// 在焦点控件的渲染子树里找「与控件同尺寸」的形状载体：Material 的
+/// [RenderPhysicalShape] / [RenderPhysicalModel]、装饰盒、圆角 / 椭圆裁剪。
+/// 只认尺寸与控件外框相差 ≤4px 的节点——内部小图标的圆底不能代表整个控件。
+/// 广度优先、最多看 [_kShapeProbeBudget] 个节点，逐帧跟踪下也是常数开销。
+_FocusTargetShape? _probeTargetShape(RenderBox root) {
+  final Size target = root.size;
+  bool sameSize(RenderObject node) =>
+      node is RenderBox &&
+      node.hasSize &&
+      (node.size.width - target.width).abs() <= 4 &&
+      (node.size.height - target.height).abs() <= 4;
+
+  final List<RenderObject> queue = <RenderObject>[root];
+  int visited = 0;
+  while (queue.isNotEmpty && visited < _kShapeProbeBudget) {
+    final RenderObject node = queue.removeAt(0);
+    visited++;
+    if (sameSize(node)) {
+      final _FocusTargetShape? shape = _shapeOfRenderObject(node);
+      if (shape != null) return shape;
+    }
+    node.visitChildren((RenderObject child) {
+      // 子树里比控件小一圈以上的节点不再往下找（已经进了内容层）。
+      if (child is RenderBox &&
+          child.hasSize &&
+          (child.size.width < target.width - 4 ||
+              child.size.height < target.height - 4)) {
+        return;
+      }
+      queue.add(child);
+    });
+  }
+  return null;
+}
+
+const int _kShapeProbeBudget = 48;
+
+_FocusTargetShape? _shapeOfRenderObject(RenderObject node) {
+  if (node is RenderPhysicalShape) {
+    final CustomClipper<Path>? clipper = node.clipper;
+    if (clipper is ShapeBorderClipper) return _fromShapeBorder(clipper.shape);
+    return null;
+  }
+  if (node is RenderPhysicalModel) {
+    if (node.shape == BoxShape.circle) return const _CircleShape();
+    final BorderRadius? radius = node.borderRadius?.resolve(TextDirection.ltr);
+    return radius == null ? null : _RadiiShape(radius);
+  }
+  if (node is RenderClipOval) return const _CircleShape();
+  if (node is RenderClipRRect) {
+    return _RadiiShape(node.borderRadius.resolve(TextDirection.ltr));
+  }
+  if (node is RenderClipPath) {
+    final CustomClipper<Path>? clipper = node.clipper;
+    if (clipper is ShapeBorderClipper) return _fromShapeBorder(clipper.shape);
+    return null;
+  }
+  if (node is RenderDecoratedBox) {
+    final Decoration decoration = node.decoration;
+    if (decoration is ShapeDecoration) {
+      return _fromShapeBorder(decoration.shape);
+    }
+    if (decoration is BoxDecoration) {
+      if (decoration.shape == BoxShape.circle) return const _CircleShape();
+      final BorderRadius? radius =
+          decoration.borderRadius?.resolve(TextDirection.ltr);
+      return radius == null ? null : _RadiiShape(radius);
+    }
+  }
+  return null;
+}
+
+_FocusTargetShape? _fromShapeBorder(ShapeBorder shape) {
+  if (shape is CircleBorder) return const _CircleShape();
+  if (shape is StadiumBorder) return const _RadiiShape(_kStadiumRadius);
+  if (shape is RoundedRectangleBorder) {
+    return _RadiiShape(shape.borderRadius.resolve(TextDirection.ltr));
+  }
+  if (shape is ContinuousRectangleBorder) {
+    // 连续曲率边的视觉圆角约为标称值的一半。
+    final BorderRadius r = shape.borderRadius.resolve(TextDirection.ltr);
+    return _RadiiShape(r * 0.5);
+  }
+  if (shape is RoundedSuperellipseBorder) {
+    return _RadiiShape(shape.borderRadius.resolve(TextDirection.ltr));
+  }
+  return null;
+}
+
+/// 「足够大」的圆角：画到任何矩形上都是胶囊（按短边一半截断）。
+const BorderRadius _kStadiumRadius = BorderRadius.all(Radius.circular(9999));
+
+/// 环（定位矩形 = 控件外框外扩 [gap]）的圆角：控件外形的每个角放大 [gap]，
+/// 环与控件轮廓等距；圆形控件取半个短边（正方形即正圆，非正方形退成胶囊）；
+/// 探不到形状时用通用圆角。线描在外侧，外沿圆角由绘制自然再放大一个线宽。
+BorderRadius _ringRadius(_FocusTargetShape? target, Size ringSize, double gap) {
+  final double cap = ringSize.shortestSide / 2;
+  switch (target) {
+    case _CircleShape():
+      return BorderRadius.all(Radius.circular(cap));
+    case _RadiiShape(:final BorderRadius radius):
+      Radius grow(Radius r) => r.x <= 0 && r.y <= 0
+          ? Radius.zero
+          : Radius.elliptical(
+              (r.x + gap).clamp(0.0, cap),
+              (r.y + gap).clamp(0.0, cap),
+            );
+      return BorderRadius.only(
+        topLeft: grow(radius.topLeft),
+        topRight: grow(radius.topRight),
+        bottomLeft: grow(radius.bottomLeft),
+        bottomRight: grow(radius.bottomRight),
+      );
+    case null:
+      return BorderRadius.all(Radius.circular(_kFallbackRadius + gap));
+  }
+}

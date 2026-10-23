@@ -1,0 +1,47 @@
+## BUG-366 · 有声书正文逐句高亮完全不显示（JS 归一化未折叠 + 缺观测日志）
+- **报告**：2026-06-21（用户：坚持没修好·mode 无关）
+- **真实性**：✅ 真 bug（hypothesis C 真回归，根因见下）+ 加观测日志解定位僵局
+- **[x] ① 已修复** — JS `foldNormalize` 值折叠与 Dart 匹配坐标系对齐
+  - 提交：（见 git log，分支 todo-630-highlight-observability）
+  - 根因 `file:line`：
+    - `packages/hibiki_audio/lib/src/matching/epub_srt_matcher.dart:151,198,492`（`_buildIndex` + 各 cue 用 `AudioTextNormalizer.normalize/appendNormalized` 做**值折叠**：片假名→平假名 / 大小写折叠 / 全角→ASCII / 半角片假名→全角片假名）→ 匹配时算出的 `normCharStart/End`（hint）与 `idx.normText` 都在**折叠坐标系**。
+    - `hibiki/lib/src/reader/reader_pagination_scripts.dart` 运行期 JS：`normalizeText`（约 :514-516，正则白名单**只剥不折**）+ `buildSasayakiNormIndex`（`full` 用 `isMatchableChar` 只剥不折）+ `collectSasayakiCueRanges` 的 `full.indexOf(needle)`（BUG-060 实时文本重定位）。
+    - 分叉：commit `cf990a444`（全角转换 + 预归一化 cue）/ `b524c8102`（片假名→平假名）给 Dart 加了值折叠，提交说明称"JS 镜像不必改（只判 keepability，offset 计数一致）"，但**漏了** BUG-060 之后 JS 在运行期对 `cue.text` 做 `full.indexOf(needle)` 实时文本比较——折叠类书（SRT 片假名/全角 vs EPUB 平假名/半角）的 needle（未折叠）在 full（未折叠）里 `indexOf` 落空 → 回落 `hint`（折叠坐标系的偏移，与未折叠的 `map` 又错位）→ 高亮看似"完全不显示/错位"。
+  - 修复：JS 新增 `foldCodePoint`（与 `AudioTextNormalizer` 值转换严格同口径，半角片假名→全角片假名查表、片假名→平假名、大小写、全角→ASCII，全部单 BMP 码元→单 BMP 码元 1:1，不改 `buildSasayakiNormIndex` 逐码元 map 粒度）+ `foldNormalize`（剥 + 折叠）；`buildSasayakiNormIndex` 的 `full` 改折叠入串（`reader_pagination_scripts.dart`，`foldCodePoint` 约 :616 / `foldNormalize` 约 :626 / `full` 折叠 :742 / needle :788）；needle 从 `normalizeText(cue.text)` 改 `foldNormalize(cue.text)`。不回退 BUG-060（仍 needle 在实时 DOM 就近重定位）/061/110/123/125（折叠只动文本比较口径，不动 ::highlight ruby 渲染 / seek / 选区）。
+  - 同时加观测日志（无侵入，经 reader 页 `onConsoleMessage`→`debugPrint('[WebView] ...')`→DebugLogService 落盘），前缀 `[sasayaki-hl]`：
+    - `applySasayakiCues`：`payloadCues=N`（payload 是否带 cue）+ 一次性 `diag cssHighlightsSupported=<bool> sasayakiBg="<--hoshi-sasayaki-background-color>"`（CSS highlights 支持与否 / 背景色透明或缺失也会"看不见"）。
+    - `collectSasayakiCueRanges`：`cues=N fullLen=N emptyRanges=N firstNeedleLen=N`（全空 = 路径/折叠未命中；部分空 = 个别 cue 未命中）。
+    - `highlightSasayakiCue`：`ranges=N ruby=N`（0+0 → `RETURN_NULL_no_segments`，即不高亮）。
+- **[x] ② 已加自动化测试** — `hibiki/test/reader/sasayaki_cue_mapping_drift_test.dart`
+  - 纯逻辑红→绿：新增 `ReaderPaginationScripts.foldNormalizeForTesting`（逐字镜像 JS 剥+折叠算法的 Dart 影子）。
+    - `foldNormalize parity with AudioTextNormalizer`：片假名/全角字母数字/半角片假名/混合标点 emoji/星平面汉字（代理对不折叠）各断言 `foldNormalizeForTesting(x) == AudioTextNormalizer.normalize(x)`。
+    - `folding-class cue relocation`：平假名 DOM 全文 + 片假名 cue，折叠后 needle 命中真实位置（5）；并保留**证伪**用例（未折叠 needle 在平假名全文里 `indexOf` 落空回落 hint=0，即修复前症状）。
+  - 源码守卫：JS 必须定义 `foldCodePoint`/`foldNormalize`、needle 经 `foldNormalize(cue.text`、full 经 `foldCodePoint(text.codePointAt(i))`；观测日志 `[sasayaki-hl]` 三节点（applySasayakiCues payloadCues + diag 背景色变量 / collectRanges emptyRanges / highlightCue ranges + RETURN_NULL）都在（防回归删）。
+  - 同步更新既有 BUG-060 守卫断言（needle 由 `this.normalizeText(cue.text` 改 `this.foldNormalize(cue.text`，意图不变：needle 来自 cue 原文靠 DOM 自校正）。
+- **备注**：
+  - 本任务修了 hypothesis C（真回归）+ 加了定位日志。**"完全消失"的最终根因（hypothesis A：用户书是 SRT 走不同路径 / payload 根本没带 cue）仍需用户真机日志确认**。
+  - 真机取证指引：用户播放有声书时看日志里 `[sasayaki-hl]` 行：
+    - 无 `applySasayakiCues payloadCues=` 或 `payloadCues=0` → payload 空（hypothesis A：SRT 字幕书未生成 sasayaki cue / 走非 sasayaki 高亮路径）。
+    - `diag cssHighlightsSupported=false` → 平台不支持 CSS Highlights（hypothesis B，走 wrapper 回退路径）。
+    - `diag sasayakiBg=""` 或透明色 → 背景色变量缺失/透明（hypothesis D：即使 range 命中也看不见）。
+    - `collectRanges emptyRanges == cues`（全空）→ 折叠/路径仍未命中（hypothesis E）；部分空 → 个别 cue。
+    - `highlightCue ranges=0 ruby=0 RETURN_NULL_no_segments` → 该 cue 没拿到 range（apply 阶段没收到该 id 的 segment）。
+  - 验证：`flutter analyze` 0 issues；`flutter test test/reader/ test/media/audiobook/ -j 1` 947 通过 0 失败（并行跑时 `audiobook_session_test.dart` 偶发 isolate loading flake，单跑 8/8 绿，与本改动无关）。
+
+## 复发与真根因修正（2026-06-21 第二轮，用户：有声书仍完全没高亮，mode 无关）
+
+- **上次 JS 折叠修复未命中真根因**：只改了 `collectSasayakiCueRanges` 的值折叠（sasayaki 链路**下游**）。但用户的书走 `_srtBookUid` 分支，`mining.part.dart:283` 直接 `return null`，`applySasayakiCues` **从不被调用** → 改的那段 JS 在这条路径上**一次都跑不到** → 对用户的书无效（与横竖排无关，正合用户判断）。
+- **真根因（hypothesis A 坐实）= 路径分叉，纯 SRT 书两端都绕开 sasayaki 系统**：
+  - setup 期：`mining.part.dart` `_prepareSasayakiCuesJson` 在 `_srtBookUid != null` 时直接 `return null` → `applySasayakiCues` 永不被调用 → `cueRangesMap` 空。
+  - 播放期：SRT cue 的 `textFragmentId = '[data-cue-id="<idx>"]'`（`srt_parser.dart:148`，非 `sasayaki://` 格式）→ `audiobook_bridge.dart:335` `SasayakiMatchCodec.tryDecode` 返 null → `highlight` 走普通 `__hoshiHighlight`（`:344`）而非 `__hoshiHighlightSasayakiCueById` → 永不激活 `::highlight(hoshi-sasayaki)`。
+  - **现有 JS `[sasayaki-hl]` 三处日志全在 `applySasayakiCues` 内部，SRT 路径下永不触发 = 致命盲区**（用户日志里看不到任何 sasayaki 行，恰是 SRT 路径指纹，但无日志能区分「没调 apply」vs「apply 调了 payload=0」）。
+- **本轮只加 Dart 端诊断日志（`[sasayaki-hl]`，零行为变化）补盲区**：
+  - `mining.part.dart` 三处早返回：`path=SRT` / `path=NONE` / `path=AUDIOBOOK`（无 sasayaki）/ `path=AUDIOBOOK-SASAYAKI payloadLen=N`。
+  - `audiobook_bridge.dart` 播放期：`highlight raw=... frag=NULL->__hoshiHighlight / sasayaki`；`applySasayakiCues ... EMPTY payload`。
+  - 守卫 `hibiki/test/reader/diagnostic_logging_guard_test.dart`。
+- **真机取证指引**：播放有声书看日志：
+  - 出现 `[sasayaki-hl] prepareCues path=SRT ... SKIPPED` → 坐实用户书是纯 SRT 路径，sasayaki 从未启用。
+  - `highlight ... frag=NULL->__hoshiHighlight` 反复刷 → 坐实播放期走普通高亮路径。
+  - `path=AUDIOBOOK-SASAYAKI payloadLen=0` → 当前章无命中 cue（匹配问题，非路径问题）。
+- **根本修法（待真机日志定书类型后实施）**：若坐实是纯 SRT 书，需让 SRT 字幕书也走逐句高亮——要么导入时给 SRT cue 也算 sasayaki 偏移（编进 `sasayaki://` textFragmentId），要么让 `__hoshiHighlight('[data-cue-id=...]')` 路径在正文里真能命中并上色（取决于 SRT 书正文 DOM 有无 `data-cue-id` 锚点，需日志 + DOM 实查确认）。
+- **575/627/644 与本链路无关**：分别是 reader god-file 重构（TODO-575）/ 插图页滚轮翻页（TODO-627/BUG-351）/ 制卡 race 快照（TODO-644/BUG-357），均不碰 sasayaki 高亮，是版本号混淆。

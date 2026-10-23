@@ -1,0 +1,278 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/media/manga/manga_reader_preferences.dart';
+import 'package:fushi/src/media/manga/manga_view_prefs.dart';
+import 'package:fushi/src/media/media_item.dart';
+import 'package:fushi/src/pages/implementations/manga_fushi_page.dart';
+import 'package:fushi/src/platform/platform_providers.dart';
+import 'package:fushi_audio/fushi_audio.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:path/path.dart' as p;
+
+import '../helpers/test_platform_services.dart';
+
+/// 与 manga_fushi_page_test 同款测试 AppModel（内存库 + 弹窗布局 getter）。
+class _MangaTestAppModel extends AppModel {
+  _MangaTestAppModel(this._db) : super(testPlatformServices());
+
+  final FushiDatabase _db;
+
+  @override
+  FushiDatabase get database => _db;
+
+  @override
+  bool get lowMemoryMode => false;
+
+  @override
+  double get popupMaxWidth => 360;
+
+  @override
+  double get dictionaryFontSize => 16;
+
+  @override
+  double get popupMaxHeight => 360;
+
+  @override
+  bool get popupBottomDocked => false;
+  @override
+  double get appUiScale => 1.0;
+
+  // PR#474 把跨页偏好/阅读方向/缩放从运行时常量改成 AppModel 持久化偏好，
+  // 这三个 getter 会走 `prefsRepo`；测试 AppModel 从不跑 initialise()，不覆写
+  // 会在 `_loadBook` 里抛 null-check 并让页面卡在加载态。姊妹测试
+  // manga_fushi_page_test.dart 已补，这里当时漏了（BUG-1164）。
+  // 取值与实现字段默认值一致，守卫语义与 PR#474 前等价。
+  @override
+  String get mangaSpreadPreference => 'auto';
+
+  @override
+  String get mangaReadingDirection => 'rtl';
+
+  @override
+  int get mangaZoomPercent => 100;
+
+  // 观看偏好同样必须在 fake 上给出真值：AppModel 这些 getter 都走 prefsRepo，
+  // 而测试里 _prefsRepo 是 null（`prefsRepo` 是 `_prefsRepo!`）。漏一个就在
+  // _loadBook 里抛 _TypeError，表现为页面永远不 ready。
+  @override
+  int get mangaZoomSensitivity => kMangaZoomSensitivityDefault;
+
+  @override
+  String get mangaPageAnimation => MangaPageAnimation.slide.key;
+
+  @override
+  String get mangaPageAnimationSpeed => PageTurnAnimationSpeed.normal.key;
+
+  @override
+  bool get mangaPageTurnFollowDrag => kMangaPageTurnFollowDragDefault;
+
+  @override
+  bool get mangaTapZonePaging => true;
+
+  // 固定顶栏：测试默认要看得见栏里的按钮（悬浮态默认收起）。
+  @override
+  bool get mangaChromeFloating => false;
+
+  @override
+  bool get mangaVolumeKeyPaging => false;
+
+  // 进入即整卷 OCR（_maybeStartVolumeOcr）开书就读这三项：测试里 prefsRepo 是
+  // null，不覆写就在开书后抛 _TypeError。与 manga_fushi_page_test 同口径显式走
+  // manual，免得 widget 测试去碰原生 OCR 后端。
+  @override
+  MangaReaderPreferences get mangaReaderPreferences =>
+      const MangaReaderPreferences(ocrTrigger: 'manual');
+
+  @override
+  String get mangaOcrEnginePreference => 'local_onnx';
+
+  @override
+  String get mangaOcrLensLanguage => 'ja';
+}
+
+Widget _harness(AppModel appModel, String bookKey) {
+  return ProviderScope(
+    overrides: <Override>[
+      // TODO-2936 起页面 initState 会读 profileViewModelProvider（媒体类型绑定），
+      // 其链路要平台层；真实 app 在根 ProviderScope 提供，测试须同样给出。
+      platformServicesProvider.overrideWithValue(testPlatformServices()),
+      appProvider.overrideWith((ref) => appModel),
+    ],
+    child: TranslationProvider(
+      child: MaterialApp(
+        builder: (BuildContext context, Widget? child) =>
+            child ?? const SizedBox.shrink(),
+        home: MangaFushiPage(
+          item: MediaItem(
+            mediaIdentifier: 'fushi://book/$bookKey',
+            mediaSourceIdentifier: 'reader_manga',
+            title: 'Test Manga',
+            mediaTypeIdentifier: 'reader',
+            position: 0,
+            duration: 1,
+            canDelete: false,
+            canEdit: true,
+          ),
+          bookKey: bookKey,
+        ),
+      ),
+    ),
+  );
+}
+
+/// 四页竖版页图（100x150），无 OCR 框。
+String _mangaJson() {
+  return jsonEncode(<String, Object?>{
+    'pages': <Map<String, Object?>>[
+      for (int i = 1; i <= 4; i++)
+        <String, Object?>{
+          'url': 'p00$i.jpg',
+          'width': 100,
+          'height': 150,
+          'blocks': <Object?>[],
+        },
+    ],
+  });
+}
+
+Future<void> _pumpBook(
+  WidgetTester tester,
+  FushiDatabase db,
+  _MangaTestAppModel appModel,
+  String bookKey,
+  Directory bookDir, {
+  int savedPage = 0,
+}) async {
+  await tester.runAsync(() async {
+    await db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: bookKey,
+      title: bookKey,
+      epubPath: 'manga.json',
+      extractDir: bookDir.path,
+      chapterCount: 4,
+      chaptersJson: '[]',
+      importedAt: DateTime.now().millisecondsSinceEpoch,
+      format: const Value<String>('manga'),
+    ));
+    if (savedPage > 0) {
+      // v82：进度键 = epub_books.uid（insertEpubBook 自动生成，取回换算）。
+      await ReaderPositionRepository(db).save(
+        bookUid: (await db.resolveEpubBookUid(bookKey))!,
+        sectionIndex: savedPage,
+        normCharOffset: 0,
+        charOffset: 0,
+      );
+    }
+    await tester.pumpWidget(_harness(appModel, bookKey));
+    for (int i = 0; i < 50; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await tester.pump();
+      if (find
+          .byKey(const ValueKey<String>('manga_content_ready'))
+          .evaluate()
+          .isNotEmpty) {
+        break;
+      }
+    }
+  });
+  await tester.pump();
+}
+
+Directory _bookDir() {
+  final Directory dir =
+      Directory.systemTemp.createTempSync('manga_double_widget_');
+  File(p.join(dir.path, 'manga.json')).writeAsStringSync(_mangaJson());
+  Directory(p.join(dir.path, 'images')).createSync();
+  for (int i = 1; i <= 4; i++) {
+    File(p.join(dir.path, 'images', 'p00$i.jpg')).writeAsBytesSync(<int>[i]);
+  }
+  return dir;
+}
+
+/// 完整页码读数（`页 / 总页`，双页时为区间 `2-3 / 4`）。M3E chrome 下界面显示
+/// 时底部滑块胶囊只分开画「当前页」与「总页数」两枚数字，区间读数只出现在隐藏
+/// 界面后的角落页码角标（与拖动气泡同一个 `_pageLabelFor`）。所以经右上角的
+/// 「隐藏界面」（平铺按钮或 ⋮ 菜单项，与快捷键同一执行体）收起 chrome，再读角标。
+Future<String?> _hiddenPageBadgeText(WidgetTester tester) async {
+  // 右上角动作默认平铺；只有宽度不够时才收进「⋯」。两种形态都走同一执行体。
+  final Finder overflow =
+      find.byKey(const ValueKey<String>('manga_chrome_overflow'));
+  if (overflow.evaluate().isNotEmpty) {
+    await tester.tap(overflow);
+    await tester.pumpAndSettle();
+    await tester.tap(find
+        .byKey(const ValueKey<String>('manga_chrome_hide_button_menu_item')));
+  } else {
+    await tester
+        .tap(find.byKey(const ValueKey<String>('manga_chrome_hide_button')));
+  }
+  await tester.pumpAndSettle();
+  expect(find.byKey(const ValueKey<String>('manga_chrome_show_button')),
+      findsOneWidget,
+      reason: '界面已隐藏');
+  return tester
+      .widget<Text>(
+          find.byKey(const ValueKey<String>('manga_hidden_page_badge')))
+      .data;
+}
+
+void main() {
+  setUp(() {
+    LocaleSettings.setLocale(AppLocale.en);
+  });
+
+  testWidgets('横屏视口自动双页：恢复页落进跨页并显示页码区间', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1200, 700); // 横屏 → auto 双页
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(db.close);
+    final _MangaTestAppModel appModel = _MangaTestAppModel(db);
+    final Directory bookDir = _bookDir();
+    addTearDown(() {
+      if (bookDir.existsSync()) bookDir.deleteSync(recursive: true);
+    });
+
+    // 预存第 3 页（0-based sectionIndex=2）：封面独占（spreadOffset=1）后
+    // 配对 [0],[1,2],[3] → 跨页 1。
+    await _pumpBook(tester, db, appModel, '横屏漫画', bookDir, savedPage: 2);
+
+    expect(find.byKey(const ValueKey<String>('manga_content_ready')),
+        findsOneWidget);
+    // 布局偏好（自动/单页/双页循环）按钮在 spread 模式下可见。
+    expect(
+      find.byKey(const ValueKey<String>('manga_spread_preference_button')),
+      findsOneWidget,
+    );
+    expect(await _hiddenPageBadgeText(tester), '2-3 / 4',
+        reason: '横屏 auto 双页 + 封面独占：恢复到含第 3 页的跨页，指示区间 2-3');
+  });
+
+  testWidgets('竖屏视口自动单页：页码保持单页显示', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(700, 1200); // 竖屏 → auto 单页
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(db.close);
+    final _MangaTestAppModel appModel = _MangaTestAppModel(db);
+    final Directory bookDir = _bookDir();
+    addTearDown(() {
+      if (bookDir.existsSync()) bookDir.deleteSync(recursive: true);
+    });
+
+    await _pumpBook(tester, db, appModel, '竖屏漫画', bookDir, savedPage: 2);
+
+    expect(await _hiddenPageBadgeText(tester), '3 / 4',
+        reason: '竖屏 auto 单页：第 3 页单页显示');
+  });
+}

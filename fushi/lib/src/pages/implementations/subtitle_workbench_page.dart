@@ -1,0 +1,340 @@
+/// 字幕工作台：**全屏页面**，取代原来的字幕下载弹窗。两个作用域：
+/// - 本集：[SubtitleSearchPanel]（搜索 → 版本组/文件 → 下载一个 → 回给播放页应用）；
+/// - 整个合集：[SubtitleCollectionPanel]（绑定系列 → 挑来源 → 逐集批量下载 + 合集级
+///   语言/版本配置）。
+///
+/// 页面本身只是「AppBar + 作用域开关 + 面板」的壳，搜索/批量状态机各自只有一份
+/// （面板文件）。播放页、媒体库右键、合集详情页三处入口都推这一页。
+library;
+
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:http/http.dart' as http;
+
+import 'package:fushi_engine/media/video/download/video_subtitle_registry.dart';
+import 'package:fushi_engine/media/video/subtitle/embedded_reference_subtitle_sync.dart';
+import 'package:fushi/src/media/video/subtitle/subtitle_search_seed.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/pages/implementations/subtitle_collection_panel.dart';
+import 'package:fushi/src/pages/implementations/subtitle_search_panel.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+enum SubtitleWorkbenchScope { episode, collection }
+
+/// 「本集」作用域的输入：搜索种子 + 记忆键。
+class SubtitleEpisodeSearchSpec {
+  const SubtitleEpisodeSearchSpec({
+    required this.initialQuery,
+    required this.seriesKey,
+    this.seed = const SubtitleSearchSeed(),
+    this.videoPath,
+    this.episode,
+    this.season,
+  });
+
+  /// 预填搜索词（文件名解析出的番名 / 刮削名）。
+  final String initialQuery;
+
+  /// 语言记忆键（番名小写 trim，与 prefs `jimaku_pref_langs` 约定一致）。
+  final String seriesKey;
+
+  /// 身份种子（AniList/TMDB id + 日文原名）。
+  final SubtitleSearchSeed seed;
+
+  /// 本地视频路径（OSDb 指纹用；远端流 null）。
+  final String? videoPath;
+
+  /// BUG-2626：预填的集号；null = 输入框留空（列出全部版本，旧行为）。调用方算不出
+  /// 可靠集号时必须传 null，不要拿播放序凑——填错的集号会把用户引到另一集的字幕上。
+  final int? episode;
+
+  /// 文件名 / 远端标题解析出的季号；null = 不知道。面板据此在 AniList 同名多季的
+  /// 候选里挑对应那一季（相关度首条恒为第一季）。
+  final int? season;
+}
+
+/// 「整个合集」作用域的输入。
+class SubtitleCollectionSpec {
+  const SubtitleCollectionSpec({
+    required this.collection,
+    required this.members,
+  });
+
+  final MediaCollectionRow collection;
+
+  /// 合集里**有序**的视频成员。
+  final List<VideoBookRow> members;
+
+  /// 语言记忆键（合集名小写 trim，与批量对话框约定一致）。
+  String get seriesKey => collection.name.trim().toLowerCase();
+}
+
+/// 工作台依赖的宿主能力（全部可注入，便于 widget 测试不碰 AppModel）。
+abstract interface class SubtitleWorkbenchHost {
+  /// 交互式查字幕用的字幕来源（每次搜索 / 下载现取：填 key 会重建 runtime）。
+  /// null = 一个来源都没配。**不能**依赖下载管线是否已启动（BUG-3000）。
+  Future<VideoSubtitleRegistry?> subtitleRegistry();
+  String get jimakuApiKey;
+  Future<void> setJimakuApiKey(String key);
+  Future<http.Client> createHttpClient();
+  String? preferredLanguageFor(String seriesKey);
+  Future<void> setPreferredLanguage(String seriesKey, String langCode);
+  String? get defaultContentLanguage;
+  FushiDatabase get database;
+  Future<void> persistRemoteSubtitle(String bookUid, String path);
+
+  /// 下载落盘前按视频内嵌字幕轨对时间轴；null = 不对齐。
+  AutomaticSubtitleAligner? get subtitleAligner;
+}
+
+/// 生产宿主：全部转发到 [AppModel]。
+class AppSubtitleWorkbenchHost implements SubtitleWorkbenchHost {
+  const AppSubtitleWorkbenchHost(this.appModel);
+
+  final AppModel appModel;
+
+  @override
+  Future<VideoSubtitleRegistry?> subtitleRegistry() =>
+      appModel.subtitleSearchRegistry();
+
+  @override
+  String get jimakuApiKey => appModel.jimakuApiKey;
+
+  @override
+  Future<void> setJimakuApiKey(String key) => appModel.setJimakuApiKey(key);
+
+  @override
+  Future<http.Client> createHttpClient() => appModel.createDownloadHttpClient();
+
+  /// 该系列没有记忆时兜底设置页的默认字幕语言（`''` = 跟随视频语言 → null）。
+  @override
+  String? preferredLanguageFor(String seriesKey) =>
+      appModel.jimakuPreferredLanguages[seriesKey] ??
+      appModel.jimakuDefaultLanguageOrNull;
+
+  @override
+  Future<void> setPreferredLanguage(String seriesKey, String langCode) =>
+      appModel.setJimakuPreferredLanguage(seriesKey, langCode);
+
+  @override
+  String? get defaultContentLanguage {
+    final String value = appModel.prefsRepo.defaultContentLanguage.trim();
+    return value.isEmpty ? null : value;
+  }
+
+  @override
+  FushiDatabase get database => appModel.database;
+
+  /// 远端/流媒体集：episodeIndex 0 = 该 stream book 自身。
+  @override
+  Future<void> persistRemoteSubtitle(String bookUid, String path) =>
+      appModel.setRemoteSubtitleSource(bookUid, 0, path);
+
+  /// 开关在 [AppModel.alignDownloadedSubtitle] 里每次现读。
+  @override
+  AutomaticSubtitleAligner? get subtitleAligner =>
+      appModel.alignDownloadedSubtitle;
+}
+
+class SubtitleWorkbenchPage extends StatefulWidget {
+  const SubtitleWorkbenchPage({
+    required this.host,
+    required this.saveDirectory,
+    this.episode,
+    this.collection,
+    this.initialScope = SubtitleWorkbenchScope.episode,
+    super.key,
+  }) : assert(episode != null || collection != null);
+
+  final SubtitleWorkbenchHost host;
+
+  /// 下载字幕保存目录（绝对路径，调用方已 `AppPaths.videoSubtitlesDirectory()`）。
+  final String saveDirectory;
+
+  /// null = 没有「本集」上下文（媒体库/合集页入口）。
+  final SubtitleEpisodeSearchSpec? episode;
+
+  /// null = 当前视频不属于任何合集。
+  final SubtitleCollectionSpec? collection;
+
+  final SubtitleWorkbenchScope initialScope;
+
+  /// 推整页路由。返回「本集」作用域下载落盘的**全部**字幕绝对路径，按用户勾选
+  /// 顺序（用户直接返回为 null）。
+  ///
+  /// 多选下载完成后由调用方「全部登记进字幕轨列表、只应用第一条」——单值返回
+  /// 表达不了这件事，所以这里是 List。
+  ///
+  /// `fullscreenDialog` + root navigator：播放页全屏态自建的路由在 root 上，工作台
+  /// 必须盖在它之上；关闭后由调用方归还播放器焦点。
+  static Future<List<String>?> open(
+    BuildContext context, {
+    required SubtitleWorkbenchHost host,
+    required String saveDirectory,
+    SubtitleEpisodeSearchSpec? episode,
+    SubtitleCollectionSpec? collection,
+    SubtitleWorkbenchScope initialScope = SubtitleWorkbenchScope.episode,
+  }) {
+    return Navigator.of(context, rootNavigator: true).push<List<String>>(
+      MaterialPageRoute<List<String>>(
+        fullscreenDialog: true,
+        builder: (_) => SubtitleWorkbenchPage(
+          host: host,
+          saveDirectory: saveDirectory,
+          episode: episode,
+          collection: collection,
+          initialScope: initialScope,
+        ),
+      ),
+    );
+  }
+
+  @override
+  State<SubtitleWorkbenchPage> createState() => _SubtitleWorkbenchPageState();
+}
+
+class _SubtitleWorkbenchPageState extends State<SubtitleWorkbenchPage> {
+  late SubtitleWorkbenchScope _scope = _resolveInitialScope();
+
+  SubtitleWorkbenchScope _resolveInitialScope() {
+    if (widget.episode == null) return SubtitleWorkbenchScope.collection;
+    if (widget.collection == null) return SubtitleWorkbenchScope.episode;
+    return widget.initialScope;
+  }
+
+  bool get _canSwitchScope =>
+      widget.episode != null && widget.collection != null;
+
+  Widget _buildEpisodePanel() {
+    final SubtitleEpisodeSearchSpec spec = widget.episode!;
+    final SubtitleWorkbenchHost host = widget.host;
+    return SubtitleSearchPanel(
+      key: const ValueKey<String>('subtitle-workbench-episode'),
+      showTitle: false,
+      seed: spec.seed,
+      videoPath: spec.videoPath,
+      subtitleAligner: host.subtitleAligner,
+      initialQuery: spec.initialQuery,
+      initialEpisode: spec.episode,
+      initialSeason: spec.season,
+      initialApiKey: host.jimakuApiKey,
+      onApiKeyChanged: host.setJimakuApiKey,
+      subtitleRegistry: host.subtitleRegistry,
+      saveDirectory: widget.saveDirectory,
+      httpClientFactory: host.createHttpClient,
+      initialPreferredLanguage: host.preferredLanguageFor(spec.seriesKey),
+      onPreferredLanguageChanged: (String lang) =>
+          host.setPreferredLanguage(spec.seriesKey, lang),
+      onDownloaded: (List<String> paths) =>
+          Navigator.of(context).pop(paths),
+    );
+  }
+
+  Widget _buildCollectionPanel() {
+    final SubtitleCollectionSpec spec = widget.collection!;
+    final SubtitleWorkbenchHost host = widget.host;
+    return SubtitleCollectionPanel(
+      key: const ValueKey<String>('subtitle-workbench-collection'),
+      showTitle: false,
+      database: host.database,
+      collection: spec.collection,
+      members: spec.members,
+      subtitleRegistry: host.subtitleRegistry,
+      initialApiKey: host.jimakuApiKey,
+      onApiKeyChanged: host.setJimakuApiKey,
+      saveDirectory: widget.saveDirectory,
+      httpClientFactory: host.createHttpClient,
+      initialPreferredLanguage: host.preferredLanguageFor(spec.seriesKey),
+      onPreferredLanguageChanged: (String lang) =>
+          host.setPreferredLanguage(spec.seriesKey, lang),
+      globalDefaultContentLanguage: host.defaultContentLanguage,
+      onRemoteSubtitlePersist: host.persistRemoteSubtitle,
+      subtitleAligner: host.subtitleAligner,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Widget panel = _scope == SubtitleWorkbenchScope.episode
+        ? _buildEpisodePanel()
+        : _buildCollectionPanel();
+    // M3E：FushiPageScaffold 浮动页头（返回 + 标题胶囊 + 动作胶囊），滚动收起；
+    // Apple 设计系统下仍是同一套页头的玻璃形态。
+    return FushiPageScaffold(
+      title: t.video_subtitle_workbench_title,
+      // 不叠放：正文是字幕面板（内部 Column + Expanded 的定高版面：顶部控件行
+      // 固定、只有列表区各自滚动），不是单一滚动视图，叠到页头底下顶部控件会被
+      // 胶囊盖住。
+      extendBodyBehindHeader: false,
+      // 作用域开关与标题**同一行**。原来它挂在 `AppBar.bottom` 上独占 56px：
+      // 标题行右侧整条空着，开关与面板之间又多一截死白。
+      //
+      // 开关**只放图标、文案落 tooltip**。页头动作区不给子级任何宽度上界，
+      // 带文字标签的分段开关按自身固有宽度摊开，宽度随译文长度走：实测
+      // zh 220.8px / ru 474.6px / de 502.8px / en 559.2px / fr 643.8px，360 宽
+      // 的手机上后四种当场 `RenderFlex overflowed by 127~296 pixels`、标题被压成
+      // 0 宽（zh 只是压到 44px，所以只按中文验会整批漏掉）。按屏宽设阈值挡不住：
+      // 「放不放得下」同时取决于宽度、语言和字体，一个常量在任一维度上都必然选错。
+      // 去掉文字标签，这三个变量一起消失——图标宽度是常量，再窄也不会溢出。
+      actions: <Widget>[
+          if (_canSwitchScope)
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Center(
+                child: FushiSegmentedButton<SubtitleWorkbenchScope>(
+                  key: const ValueKey<String>('subtitle-workbench-scope'),
+                  showSelectedIcon: false,
+                  segments: <ButtonSegment<SubtitleWorkbenchScope>>[
+                    ButtonSegment<SubtitleWorkbenchScope>(
+                      value: SubtitleWorkbenchScope.episode,
+                      icon: const FushiIcon(FushiIcons.subtitles),
+                      tooltip: t.video_subtitle_scope_episode,
+                    ),
+                    ButtonSegment<SubtitleWorkbenchScope>(
+                      value: SubtitleWorkbenchScope.collection,
+                      icon: const FushiIcon(FushiIcons.collection),
+                      tooltip: t.video_subtitle_scope_collection,
+                    ),
+                  ],
+                  selected: <SubtitleWorkbenchScope>{_scope},
+                  onSelectionChanged: (Set<SubtitleWorkbenchScope> value) =>
+                      setState(() => _scope = value.first),
+                ),
+              ),
+            ),
+        ],
+      body: Padding(
+        padding: withBottomSafeInset(
+          context,
+          const EdgeInsets.fromLTRB(16, 4, 16, 8),
+        ),
+        // 切换作用域：两块面板交叉淡入 + 轻微上浮（effects 弹簧，不过冲）。
+        child: AnimatedSwitcher(
+          duration: context.fushiMotion.effectsDefault.duration,
+          switchInCurve: context.fushiMotion.effectsDefault.curve,
+          switchOutCurve: context.fushiMotion.effectsFast.curve,
+          // 面板要吃满正文（内部 Column + Expanded），默认居中松约束的 Stack
+          // 会把它缩成内容宽。
+          layoutBuilder: (Widget? current, List<Widget> previous) => Stack(
+            fit: StackFit.expand,
+            children: <Widget>[...previous, ?current],
+          ),
+          transitionBuilder: (Widget child, Animation<double> animation) =>
+              FadeTransition(
+            opacity: animation,
+            child: SlideTransition(
+              position: Tween<Offset>(
+                begin: const Offset(0, 0.02),
+                end: Offset.zero,
+              ).animate(animation),
+              child: child,
+            ),
+          ),
+          child: panel,
+        ),
+      ),
+    );
+  }
+}

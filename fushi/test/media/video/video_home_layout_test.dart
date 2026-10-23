@@ -1,0 +1,715 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/media/collections/collection_continue.dart';
+import 'package:fushi/src/media/video/cover_ui/cover_aspect_probe.dart';
+import 'package:fushi/src/media/video/video_home_layout.dart';
+
+/// TODO-2486 视频首页布局/筛选纯函数单测（与页面实现同源消费）。
+void main() {
+  group('videoCardOrientationForAspect', () {
+    test('null（未解码/无封面）默认竖卡', () {
+      expect(
+          videoCardOrientationForAspect(null), VideoCardOrientation.portrait);
+    });
+
+    test('阈值与封面组件同一真相源（kCoverLandscapeAspectThreshold）', () {
+      expect(
+        videoCardOrientationForAspect(kCoverLandscapeAspectThreshold),
+        VideoCardOrientation.landscape,
+      );
+      expect(
+        videoCardOrientationForAspect(kCoverLandscapeAspectThreshold - 0.01),
+        VideoCardOrientation.portrait,
+      );
+    });
+
+    test('典型输入：2:3 海报竖卡、16:9 截帧横卡、方图竖卡', () {
+      expect(
+          videoCardOrientationForAspect(2 / 3), VideoCardOrientation.portrait);
+      expect(videoCardOrientationForAspect(16 / 9),
+          VideoCardOrientation.landscape);
+      expect(videoCardOrientationForAspect(1.0), VideoCardOrientation.portrait);
+    });
+  });
+
+  group('videoCardWidthForOrientation / videoCoverHeightForPortraitWidth', () {
+    test('高度统一下竖卡 2:3、横卡 16:9，竖卡宽反解回目标卡宽', () {
+      final double coverHeight = videoCoverHeightForPortraitWidth(160);
+      expect(coverHeight, 240);
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.portrait,
+          coverHeight: coverHeight,
+        ),
+        closeTo(160, 0.001),
+      );
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.landscape,
+          coverHeight: coverHeight,
+        ),
+        closeTo(240 * 16 / 9, 0.001),
+      );
+    });
+  });
+
+  group('videoRowCoverHeightForPortraitWidth', () {
+    test('横滚行横卡宽 = 竖卡目标宽 × 1.5，不再是库墙的 8/3 倍', () {
+      const double cardWidth = 240;
+      final double rowCoverHeight =
+          videoRowCoverHeightForPortraitWidth(cardWidth);
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.landscape,
+          coverHeight: rowCoverHeight,
+        ),
+        closeTo(cardWidth * kVideoRowLandscapeWidthFactor, 0.001),
+      );
+      // 库墙口径下同一卡宽的横卡宽（8/3 倍）——两者必须真的不同，否则本行的
+      // 「调小」等于没发生。
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.landscape,
+          coverHeight: videoCoverHeightForPortraitWidth(cardWidth),
+        ),
+        closeTo(cardWidth * 8 / 3, 0.001),
+      );
+    });
+
+    test('恒比库墙口径矮，且随卡宽线性缩放', () {
+      for (final double cardWidth in <double>[120, 168, 210, 235, 320]) {
+        expect(
+          videoRowCoverHeightForPortraitWidth(cardWidth),
+          lessThan(videoCoverHeightForPortraitWidth(cardWidth)),
+        );
+      }
+      expect(
+        videoRowCoverHeightForPortraitWidth(200),
+        closeTo(videoRowCoverHeightForPortraitWidth(100) * 2, 0.001),
+      );
+    });
+
+    test('手机窄屏下单张横卡不再宽过屏幕', () {
+      // 宽 380 的手机：可用墙宽约 348、两列 → 卡宽 168。
+      const double phoneCardWidth = 168;
+      const double phoneWidth = 380;
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.landscape,
+          coverHeight: videoCoverHeightForPortraitWidth(phoneCardWidth),
+        ),
+        greaterThan(phoneWidth),
+      );
+      expect(
+        videoCardWidthForOrientation(
+          orientation: VideoCardOrientation.landscape,
+          coverHeight: videoRowCoverHeightForPortraitWidth(phoneCardWidth),
+        ),
+        lessThan(phoneWidth),
+      );
+    });
+  });
+
+  group('allVideoThumbnailTargetWidthForWidth', () {
+    test('桌面宽屏使用更大的 16:9 缩略图目标宽', () {
+      expect(allVideoThumbnailTargetWidthForWidth(1991), 320);
+      expect(allVideoThumbnailTargetWidthForWidth(1440), 300);
+      expect(allVideoThumbnailTargetWidthForWidth(1100), 280);
+      expect(allVideoThumbnailTargetWidthForWidth(800), 240);
+    });
+
+    test('手机保持双列所需的紧凑目标宽', () {
+      expect(allVideoThumbnailTargetWidthForWidth(599), 150);
+      expect(allVideoThumbnailTargetWidthForWidth(360), 150);
+    });
+  });
+
+  group('videoHeroHeightForWidth', () {
+    test('21:9 影院比例，夹在 [220, 420]', () {
+      expect(videoHeroHeightForWidth(840), closeTo(360, 0.001));
+      expect(videoHeroHeightForWidth(300), 220);
+      expect(videoHeroHeightForWidth(4000), 420);
+    });
+  });
+
+  group('videoDiscoveryHeroHeightForViewport', () {
+    test('桌面宽度按 16:9 派生，整张 backdrop 不被上下裁（BUG-2431）', () {
+      // 用户实报的 1920×1125 窗口：旧实现写死 430，图需要 1080 高，砍掉六成。
+      expect(
+        videoDiscoveryHeroHeightForViewport(1920, 1125),
+        closeTo(1080, 0.001),
+      );
+      expect(videoDiscoveryHeroHeightForViewport(1280, 900), closeTo(720, 0.001));
+    });
+
+    test('高度绝不超过视口，hero 不吃满一屏以上', () {
+      // 16:9 图在窄高窗口里需要的高度超过视口时，上限接管。
+      expect(videoDiscoveryHeroHeightForViewport(1920, 800), 800);
+    });
+
+    test('窄屏保住文字排版下限', () {
+      // 400 宽的手机：图只需 225 高，但标题/评分/按钮/状态流程放不下，取下限。
+      expect(videoDiscoveryHeroHeightForViewport(400, 900), 460);
+      // 断点之上换用宽屏下限。
+      expect(videoDiscoveryHeroHeightForViewport(700, 900), 430);
+    });
+
+    test('视口比下限还矮时不炸 clamp', () {
+      expect(videoDiscoveryHeroHeightForViewport(360, 300), 460);
+    });
+  });
+
+  group('videoAirYear / videoAirSeasonQuarter', () {
+    test('TMDB 全日期与裸年份都解析', () {
+      expect(videoAirYear('2024-10-05'), 2024);
+      expect(videoAirYear('2024'), 2024);
+      expect(videoAirYear(' 1999-01-01 '), 1999);
+    });
+
+    test('脏数据归 null（未知桶）', () {
+      expect(videoAirYear(null), isNull);
+      expect(videoAirYear(''), isNull);
+      expect(videoAirYear('未定'), isNull);
+      expect(videoAirYear('0000-01-01'), isNull);
+    });
+
+    test('季度：1-3 冬 / 4-6 春 / 7-9 夏 / 10-12 秋；无月份 null', () {
+      expect(videoAirSeasonQuarter('2024-01-05'), 1);
+      expect(videoAirSeasonQuarter('2024-04-05'), 2);
+      expect(videoAirSeasonQuarter('2024-07-05'), 3);
+      expect(videoAirSeasonQuarter('2024-10-05'), 4);
+      expect(videoAirSeasonQuarter('2024'), isNull);
+      expect(videoAirSeasonQuarter('2024-13'), isNull);
+      expect(videoAirSeasonQuarter(null), isNull);
+    });
+  });
+
+  group('VideoYearFilter', () {
+    test('全部恒真；指定年份精确匹配；未知只收 null 年份', () {
+      const VideoYearFilter all = VideoYearFilter.all();
+      expect(all.isAll, isTrue);
+      expect(all.matches(2024), isTrue);
+      expect(all.matches(null), isTrue);
+
+      const VideoYearFilter y2024 = VideoYearFilter.year(2024);
+      expect(y2024.matches(2024), isTrue);
+      expect(y2024.matches(2023), isFalse);
+      // 无刮削资料的条目在指定年份下不显示，但在「未知」桶下不消失。
+      expect(y2024.matches(null), isFalse);
+
+      const VideoYearFilter unknown = VideoYearFilter.unknown();
+      expect(unknown.matches(null), isTrue);
+      expect(unknown.matches(2024), isFalse);
+    });
+
+    test('值语义（PopupMenu initialValue 依赖 ==）', () {
+      expect(
+          const VideoYearFilter.year(2024), const VideoYearFilter.year(2024));
+      expect(
+          const VideoYearFilter.all(), isNot(const VideoYearFilter.unknown()));
+    });
+  });
+
+  group('matchesVideoWatchStatus', () {
+    test('三档互斥覆盖：未看 / 在看 / 已看完', () {
+      // 已看完。
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.completed,
+          completed: true,
+          lastPositionMs: 0,
+        ),
+        isTrue,
+      );
+      // 在看 = 未完成但有播放痕迹。
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.watching,
+          completed: false,
+          lastPositionMs: 1200,
+        ),
+        isTrue,
+      );
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.watching,
+          completed: true,
+          lastPositionMs: 1200,
+        ),
+        isFalse,
+      );
+      // 未看 = 两者皆无。
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.unwatched,
+          completed: false,
+          lastPositionMs: 0,
+        ),
+        isTrue,
+      );
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.unwatched,
+          completed: false,
+          lastPositionMs: 1,
+        ),
+        isFalse,
+      );
+      // 全部恒真。
+      expect(
+        matchesVideoWatchStatus(
+          filter: VideoWatchStatusFilter.all,
+          completed: false,
+          lastPositionMs: 0,
+        ),
+        isTrue,
+      );
+    });
+  });
+
+  group('BUG-2835 「全部视频」筛选判据', () {
+    test('系列档位偏好：脏值 / 空值退回默认「非系列」', () {
+      expect(videoSeriesFilterFromName('inSeries'), VideoSeriesFilter.inSeries);
+      expect(videoSeriesFilterFromName('all'), VideoSeriesFilter.all);
+      expect(videoSeriesFilterFromName(''), VideoSeriesFilter.standalone);
+      expect(videoSeriesFilterFromName('bogus'), VideoSeriesFilter.standalone);
+    });
+
+    test('媒体类型 / 正片特典 / 来源三档在「全部」态不筛任何条目', () {
+      for (final bool flag in <bool>[true, false]) {
+        expect(
+          matchesVideoMediaType(
+            filter: VideoMediaTypeFilter.all,
+            isAudio: flag,
+          ),
+          isTrue,
+        );
+        expect(
+          matchesVideoExtras(filter: VideoExtrasFilter.all, isExtra: flag),
+          isTrue,
+        );
+      }
+      expect(matchesVideoSource(sourceFilter: null, sourceId: null), isTrue);
+      expect(matchesVideoSource(sourceFilter: null, sourceId: 3), isTrue);
+    });
+
+    test('非「全部」档位是同一判据的正反两面', () {
+      expect(
+        matchesVideoMediaType(filter: VideoMediaTypeFilter.audio, isAudio: true),
+        isTrue,
+      );
+      expect(
+        matchesVideoMediaType(
+          filter: VideoMediaTypeFilter.audio,
+          isAudio: false,
+        ),
+        isFalse,
+      );
+      expect(
+        matchesVideoMediaType(filter: VideoMediaTypeFilter.video, isAudio: true),
+        isFalse,
+      );
+      expect(
+        matchesVideoExtras(filter: VideoExtrasFilter.extras, isExtra: true),
+        isTrue,
+      );
+      expect(
+        matchesVideoExtras(filter: VideoExtrasFilter.main, isExtra: true),
+        isFalse,
+      );
+      expect(matchesVideoSource(sourceFilter: 3, sourceId: 3), isTrue);
+      expect(matchesVideoSource(sourceFilter: 3, sourceId: 4), isFalse);
+      expect(
+        matchesVideoSource(sourceFilter: 3, sourceId: null),
+        isFalse,
+        reason: '没有来源的手动导入条目不属于任何来源',
+      );
+    });
+  });
+
+  group('isVideoRecentlyAdded', () {
+    final DateTime now = DateTime(2026, 8, 1, 12);
+
+    test('14 天窗口内算最近添加；窗口外/无时间戳/未来时刻不算', () {
+      expect(
+        isVideoRecentlyAdded(
+          importedAt:
+              now.subtract(const Duration(days: 13)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isTrue,
+      );
+      expect(
+        isVideoRecentlyAdded(
+          importedAt:
+              now.subtract(const Duration(days: 15)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+      expect(isVideoRecentlyAdded(importedAt: null, now: now), isFalse);
+      expect(isVideoRecentlyAdded(importedAt: 0, now: now), isFalse);
+      expect(
+        isVideoRecentlyAdded(
+          importedAt: now.add(const Duration(days: 1)).millisecondsSinceEpoch,
+          now: now,
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  group('selectVideoHeroUnits', () {
+    test('在看优先按最近观看倒序取前 5', () {
+      final List<VideoHeroCandidate<int>> candidates =
+          <VideoHeroCandidate<int>>[
+        for (int i = 1; i <= 7; i++)
+          VideoHeroCandidate<int>(
+            unit: i,
+            lastWatchedAt: DateTime(2026, 7, i),
+            latestImportedAt: 100 - i,
+            hasUnfinishedTrace: true,
+          ),
+      ];
+      expect(selectVideoHeroUnits(candidates), <int>[7, 6, 5, 4, 3]);
+    });
+
+    test('无在看回落最近添加（成员最近入库倒序）', () {
+      final List<VideoHeroCandidate<int>> candidates =
+          <VideoHeroCandidate<int>>[
+        const VideoHeroCandidate<int>(unit: 1, latestImportedAt: 10),
+        const VideoHeroCandidate<int>(unit: 2, latestImportedAt: 30),
+        const VideoHeroCandidate<int>(unit: 3, latestImportedAt: 20),
+      ];
+      expect(selectVideoHeroUnits(candidates), <int>[2, 3, 1]);
+    });
+
+    test('已整套看完的合集不算在看（hasUnfinishedTrace=false 走回落池）', () {
+      final List<VideoHeroCandidate<int>> candidates =
+          <VideoHeroCandidate<int>>[
+        VideoHeroCandidate<int>(
+          unit: 1,
+          lastWatchedAt: DateTime(2026, 7, 30),
+          latestImportedAt: 1,
+        ),
+        VideoHeroCandidate<int>(
+          unit: 2,
+          lastWatchedAt: DateTime(2026, 7, 1),
+          latestImportedAt: 2,
+          hasUnfinishedTrace: true,
+        ),
+      ];
+      // 只有 2 在看 → 在看池非空 → 只出在看的（1 不混入）。
+      expect(selectVideoHeroUnits(candidates), <int>[2]);
+    });
+
+    test('散装与合集同池混排：最后看的是散装时置顶就是它（PR#712 跟进）', () {
+      // 单元载荷对函数不透明——用字符串区分两类；散装 'b:*' 最近观看晚于合集
+      // 'c:*'，必须排第一。旧实现把散装整体挡在候选外，置顶永远是合集，用户
+      // 实报「置顶不是上一个观看的」。
+      final List<VideoHeroCandidate<String>> candidates =
+          <VideoHeroCandidate<String>>[
+        VideoHeroCandidate<String>(
+          unit: 'c:maid-dragon',
+          lastWatchedAt: DateTime(2026, 8, 1, 20),
+          hasUnfinishedTrace: true,
+        ),
+        VideoHeroCandidate<String>(
+          unit: 'b:happy-end',
+          lastWatchedAt: DateTime(2026, 8, 1, 23),
+          hasUnfinishedTrace: true,
+        ),
+      ];
+      expect(
+        selectVideoHeroUnits(candidates),
+        <String>['b:happy-end', 'c:maid-dragon'],
+      );
+    });
+  });
+
+  group('series playback target', () {
+    test('继续观看取最后实际播放的一集，不取序号最大的未完成集', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 300,
+          positionMs: 180000,
+          completed: false,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 100,
+          positionMs: 60000,
+          completed: false,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 200,
+          positionMs: 0,
+          completed: true,
+        ),
+      ];
+      expect(latestPlayedSeriesIndex(members), 0);
+      expect(nextEpisodeAfterLatestPlayed(members), 1);
+    });
+
+    test('旧数据没有观看时间时回退到顺序中最后一条有痕迹的分集', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 10,
+          completed: false,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: true,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: false,
+        ),
+      ];
+      expect(latestPlayedSeriesIndex(members), 1);
+      expect(nextEpisodeAfterLatestPlayed(members), 2);
+    });
+
+    // 用户实报：一集从头看完再退出，合集就从「继续观看」消失（只剩「下一集」行）；
+    // 中途退出的反而在。本行改走 Next-Up 口径：看完 → 下一集。
+    test('继续观看：最近播放那集已看完 → 落到紧接的下一集', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 300,
+          positionMs: 0,
+          completed: true,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: false,
+        ),
+      ];
+      expect(continueWatchingSeriesIndex(members), 1);
+    });
+
+    test('继续观看：最近播放那集没看完 → 停在它自己', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 100,
+          positionMs: 0,
+          completed: true,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 300,
+          positionMs: 60000,
+          completed: false,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: false,
+        ),
+      ];
+      expect(continueWatchingSeriesIndex(members), 1);
+    });
+
+    test('继续观看：整部看完（最后一集已完成）→ 不进本行', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 100,
+          positionMs: 0,
+          completed: true,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 300,
+          positionMs: 0,
+          completed: true,
+        ),
+      ];
+      expect(continueWatchingSeriesIndex(members), isNull);
+    });
+
+    test('继续观看：整部无痕迹 → 不进本行；位置拖回 0 且未完成 → 停在它', () {
+      const List<VideoSeriesPlaybackState> untouched =
+          <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: false,
+        ),
+      ];
+      expect(continueWatchingSeriesIndex(untouched), isNull);
+      const List<VideoSeriesPlaybackState> rewound = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 300,
+          positionMs: 0,
+          completed: false,
+        ),
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 0,
+          positionMs: 0,
+          completed: false,
+        ),
+      ];
+      // BUG-3370：时刻就是痕迹，与大卡 continueMemberIndex 同答案。
+      expect(continueWatchingSeriesIndex(rewound), 0);
+    });
+
+    // BUG-3370：首页「继续观看」「下一集」与详情大卡（continueMemberIndex）必须
+    // 共用同一个「最近播放」锚点，三处给同一集。
+    group('三处入口同一答案 (BUG-3370)', () {
+      const VideoSeriesPlaybackState none = VideoSeriesPlaybackState(
+        lastWatchedAtMs: 0,
+        positionMs: 0,
+        completed: false,
+      );
+      VideoSeriesPlaybackState done(int at) => VideoSeriesPlaybackState(
+        lastWatchedAtMs: at,
+        positionMs: 0,
+        completed: true,
+      );
+      VideoSeriesPlaybackState openedOnly(int at) => VideoSeriesPlaybackState(
+        lastWatchedAtMs: at,
+        positionMs: 0,
+        completed: false,
+      );
+
+      int hero(List<VideoSeriesPlaybackState> members) =>
+          continueMemberIndex(<CollectionMemberProgress>[
+            for (final VideoSeriesPlaybackState m in members) m.progress,
+          ]);
+
+      void expectAllAt(List<VideoSeriesPlaybackState> members, int index) {
+        expect(continueWatchingSeriesIndex(members), index, reason: '继续观看');
+        expect(nextEpisodeAfterLatestPlayed(members), index, reason: '下一集');
+        expect(hero(members), index, reason: '详情大卡');
+      }
+
+      // 用户实报：看完第 7 集自动连播第 8 集，几秒后退出（第 8 集只有时刻、
+      // 进度 0）。此前「继续观看」整部消失、「下一集」跳到第 9 集。
+      test('相邻集：看完第 7 集、第 8 集只打开过 → 都落在第 8 集', () {
+        final List<VideoSeriesPlaybackState> members =
+            <VideoSeriesPlaybackState>[
+          for (int i = 0; i < 6; i++) done(100 + i),
+          done(200),
+          openedOnly(300),
+          none,
+          none,
+        ];
+        expect(latestPlayedSeriesIndex(members), 7);
+        expectAllAt(members, 7);
+      });
+
+      test('跳集：看完第 7 集、跳到第 12 集几秒退出 → 都落在第 12 集', () {
+        final List<VideoSeriesPlaybackState> members =
+            <VideoSeriesPlaybackState>[
+          for (int i = 0; i < 6; i++) done(100 + i),
+          done(200),
+          for (int i = 7; i < 11; i++) none,
+          openedOnly(300),
+          none,
+        ];
+        expect(latestPlayedSeriesIndex(members), 11);
+        expectAllAt(members, 11);
+      });
+
+      test('只打开过第 1 集几秒 → 继续观看 / 下一集 / 大卡都指向第 1 集', () {
+        final List<VideoSeriesPlaybackState> members =
+            <VideoSeriesPlaybackState>[openedOnly(300), none, none];
+        expect(latestPlayedSeriesIndex(members), 0);
+        expectAllAt(members, 0);
+      });
+
+      test('全部未碰 → 首页两行都不占，大卡从第 1 集开始', () {
+        const List<VideoSeriesPlaybackState> members =
+            <VideoSeriesPlaybackState>[none, none, none];
+        expect(latestPlayedSeriesIndex(members), isNull);
+        expect(continueWatchingSeriesIndex(members), isNull);
+        expect(nextEpisodeAfterLatestPlayed(members), isNull);
+        expect(hero(members), 0);
+      });
+
+      test('有进度的锚点：继续观看与大卡停在它，下一集推进到后一集', () {
+        final List<VideoSeriesPlaybackState> members =
+            <VideoSeriesPlaybackState>[
+          done(100),
+          const VideoSeriesPlaybackState(
+            lastWatchedAtMs: 300,
+            positionMs: 60000,
+            completed: false,
+          ),
+          none,
+        ];
+        expect(continueWatchingSeriesIndex(members), 1);
+        expect(hero(members), 1);
+        expect(nextEpisodeAfterLatestPlayed(members), 2);
+      });
+    });
+
+    test('最后一集之后没有下一集', () {
+      const List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        VideoSeriesPlaybackState(
+          lastWatchedAtMs: 100,
+          positionMs: 1,
+          completed: false,
+        ),
+      ];
+      expect(nextEpisodeAfterLatestPlayed(members), isNull);
+    });
+  });
+
+  // BUG-1731：锚点输入的「最近观看时刻」必须能回落行级 lastPlayedAt（远端回灌
+  // 只写它、不产生本机统计行），否则子端看完的集数推不动 host 的下一集。
+  group('effectiveWatchedAtMs (BUG-1731)', () {
+    test('无统计行时回落行级 lastPlayedAt', () {
+      expect(
+        effectiveWatchedAtMs(statsWatchedAtMs: 0, lastPlayedAt: 5000),
+        5000,
+      );
+    });
+
+    test('统计行较新时仍以统计为准（本机行为不变）', () {
+      expect(
+        effectiveWatchedAtMs(statsWatchedAtMs: 9000, lastPlayedAt: 5000),
+        9000,
+      );
+    });
+
+    test('行级时刻较新时取行级（远端后来又看了该集）', () {
+      expect(
+        effectiveWatchedAtMs(statsWatchedAtMs: 5000, lastPlayedAt: 9000),
+        9000,
+      );
+    });
+
+    test('两者皆无 → 0（没看过）', () {
+      expect(
+        effectiveWatchedAtMs(statsWatchedAtMs: 0, lastPlayedAt: null),
+        0,
+      );
+    });
+
+    test('端到端形状：13 集本机看过、14/15 只有远端回灌时刻 → 锚点 15、下一集 16', () {
+      // 16 集合集：index 12 = 第 13 集（本机统计 t13），index 13/14 = 第 14/15 集
+      // （无统计行，只有远端回灌的 lastPlayedAt，t14 < t15），其余没看过。
+      const int t13 = 1000;
+      const int t14 = 2000;
+      const int t15 = 3000;
+      final List<VideoSeriesPlaybackState> members = <VideoSeriesPlaybackState>[
+        for (int i = 0; i < 16; i++)
+          VideoSeriesPlaybackState(
+            lastWatchedAtMs: switch (i) {
+              12 =>
+                effectiveWatchedAtMs(statsWatchedAtMs: t13, lastPlayedAt: t13),
+              13 =>
+                effectiveWatchedAtMs(statsWatchedAtMs: 0, lastPlayedAt: t14),
+              14 =>
+                effectiveWatchedAtMs(statsWatchedAtMs: 0, lastPlayedAt: t15),
+              _ => 0,
+            },
+            positionMs: i == 12 || i == 13 || i == 14 ? 1200000 : 0,
+            completed: false,
+          ),
+      ];
+      expect(latestPlayedSeriesIndex(members), 14, reason: '锚点 = 第 15 集');
+      expect(nextEpisodeAfterLatestPlayed(members), 15, reason: '下一集 = 第 16 集');
+    });
+  });
+}

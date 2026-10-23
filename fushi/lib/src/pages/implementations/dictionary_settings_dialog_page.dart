@@ -1,0 +1,1416 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, mapEquals;
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi_engine/ai/ai_chat_client.dart';
+import 'package:fushi/src/ai/ai_dict_style_assistant.dart';
+import 'package:fushi_engine/ai/ai_feature.dart';
+import 'package:fushi_engine/ai/ai_provider_config.dart';
+import 'package:fushi/src/dictionary/dict_style_rules.dart';
+import 'package:fushi/src/focus/fushi_focus_scroll.dart';
+import 'package:fushi/src/models/module_registry.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/ai_provider_settings_section.dart'
+    show aiFailureText;
+import 'package:fushi/src/pages/implementations/dict_style_preview.dart';
+import 'package:fushi/src/pages/implementations/dict_style_visual_editor.dart';
+import 'package:fushi/src/profile/profile_view_model.dart';
+import 'package:fushi/src/reader/dictionary_style_css.dart';
+import 'package:fushi_engine/utils/net/url_input_normalizer.dart';
+import 'package:fushi/src/models/audio_source_list_edit.dart';
+import 'package:fushi/utils.dart';
+
+@visibleForTesting
+class AudioSourcesDialog extends StatefulWidget {
+  const AudioSourcesDialog({
+    required this.sources,
+    required this.onSave,
+    this.onPickLocalDb,
+    this.onEditLocalSources,
+    this.isLocalDbAvailable,
+    this.onReplaceLocalDb,
+    super.key,
+  });
+
+  final List<AudioSourceConfig> sources;
+  final FutureOr<void> Function(List<AudioSourceConfig>) onSave;
+
+  /// 选文件并导入为一个 localAudio 源（未持久化）；返回 null 表示用户取消。
+  ///
+  /// [reference] 是**用户意图**（「引用原文件不复制」开关，BUG-483）而非承诺：真正
+  /// 能不能引用由选择器实际交回的是真实路径还是 cache 临时副本决定，wiring 侧按事实
+  /// 降级并提示（BUG-1667）。
+  final Future<AudioSourceConfig?> Function(bool reference)? onPickLocalDb;
+
+  /// 打开某个本地音频库的「子来源顺序 + 逐源启用」编辑器（按库路径）。
+  final Future<void> Function(String path)? onEditLocalSources;
+
+  final Future<bool> Function(String path)? isLocalDbAvailable;
+  final Future<AudioSourceConfig?> Function(String path)? onReplaceLocalDb;
+
+  /// 自定义远端音频 URL 合法性：必须是 http(s) 链接，且至少含一个
+  /// `{term}` / `{reading}` 占位符（否则播放时无法代入查词参数）。
+  /// 规则与控制通道共用 [isValidRemoteAudioUrl]。
+  @visibleForTesting
+  static bool isValidRemoteUrl(String text) => isValidRemoteAudioUrl(text);
+
+  @override
+  State<AudioSourcesDialog> createState() => _AudioSourcesDialogState();
+}
+
+class _AudioSourcesDialogState extends State<AudioSourcesDialog> {
+  /// 统一来源列表（fushiRemote + remoteAudio + localAudio 混排，顺序即优先级）。
+  late List<AudioSourceConfig> _sources;
+  bool _importing = false;
+
+  /// BUG-483：导入本地音频库时「引用原文件（不复制）」的**用户意图**。
+  ///
+  /// BUG-1667 起不再写死 `isDesktopPlatform`：安卓拿到全文件访问后走 SAF 解析真实
+  /// 路径、不产生任何副本，「移动端只能拿缓存副本」的旧前提已不成立。开关在桌面与
+  /// 安卓都可见；真拿不到真实路径（安卓未授权 → 回退 file_picker 的 cache 副本）时
+  /// 由 wiring 侧按事实降级为复制并提示，UI 不再替平台预判。
+  ///
+  /// 安卓默认开：一个 android.db 常见 1~6 GB，复制进内部存储要 2 倍体积，
+  /// 那正是「安卓上配不起来本地音频」的直接原因，复制不该是移动端的默认。
+  /// 桌面维持原默认（关），不改既有行为。
+  bool _referenceOriginal = _referenceOriginalDefault;
+
+  /// 「引用原文件」开关是否可见：能交出用户真实路径的平台才有意义。
+  static bool get _canReferenceOriginal =>
+      isDesktopPlatform || defaultTargetPlatform == TargetPlatform.android;
+
+  static bool get _referenceOriginalDefault =>
+      defaultTargetPlatform == TargetPlatform.android;
+  bool _urlValid = false;
+  final TextEditingController _controller = TextEditingController();
+  final FocusNode _urlFocusNode = FocusNode();
+  final GlobalKey _urlFieldKey = GlobalKey();
+
+  /// 正在编辑的远端来源（按**值身份**而非下标追踪）。远端 URL 过去只能删了重加：写错
+  /// 一个字符就得整条重敲。编辑不另开嵌套弹窗，而是复用下方那个 URL 输入框——载入该行
+  /// URL、`+` 变 ✓、旁边给 ✕ 取消，校验/报错沿用同一条路径，不生第二套输入 UI。
+  ///
+  /// 存值而非 index：编辑中用户仍可拖拽重排（`_sources` 顺序会变），存下标就会把新 URL
+  /// 写到**别人**那行上。[AudioSourceConfig] 是 `@immutable` 且实现了 `==`，提交时用
+  /// `indexOf` 现场定位即可；该行被删掉则 `indexOf` 返回 -1，编辑态在删除处即时清空。
+  AudioSourceConfig? _editingSource;
+
+  final Map<String, Future<bool>> _localAvailability = <String, Future<bool>>{};
+
+  @override
+  void initState() {
+    super.initState();
+    _sources = List<AudioSourceConfig>.of(widget.sources);
+  }
+
+  @override
+  void dispose() {
+    // 任意关闭路径（底部「关闭」按钮 / 点遮罩 / 系统返回 / Esc）都落盘：本对话框没有
+    // 「取消」概念（只有「重置」+「关闭」），用户心智=改了就生效。过去 onSave 只挂在
+    // 底部「关闭」按钮上，点遮罩/返回会丢掉已导入的本地音频（且拷贝副本被 pruneOrphans
+    // 回收）。把持久化下沉到 dispose 后，所有关闭路径行为一致（BUG-053）。
+    widget.onSave(_sources);
+    _controller.dispose();
+    _urlFocusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final double maxHeight =
+        (MediaQuery.of(context).size.height * 0.55).clamp(128.0, 420.0);
+
+    return FushiDialogFrame(
+      maxWidth: 560,
+      maxHeightFactor: 0.92,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: tokens.spacing.card,
+        vertical: tokens.spacing.card,
+      ),
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        title: t.manage_audio_sources,
+        leadingIcon: FushiIcons.audio,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxWidth: double.maxFinite,
+            maxHeight: maxHeight,
+          ),
+          // 整体可滚动：列表 shrinkWrap + NeverScrollable，交由外层 SingleChildScrollView
+          // 滚动；紧凑窗口下内容超高时整体滚动而非 RenderFlex 溢出。
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                _buildSourceList(tokens),
+                SizedBox(height: tokens.spacing.gap),
+                _buildUrlField(tokens),
+                if (widget.onPickLocalDb != null) ...<Widget>[
+                  SizedBox(height: tokens.spacing.gap),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    // M3E：「添加本地库」是本弹窗的主要新增动作，用 tonal 按钮
+                    // 而不是扁平文字链接，与上方列表拉开层级。
+                    child: FushiFilledButton.tonalIcon(
+                      icon: _importing
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: FushiCircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const FushiIcon(FushiIcons.libraryAdd, size: 18),
+                      label: Text(t.local_audio_add_db),
+                      onPressed: _importing ? null : _addLocalDb,
+                    ),
+                  ),
+                  // BUG-483/1667：在能交出真实路径的平台暴露「引用原文件不复制」
+                  // 开关（桌面 + 安卓；安卓未授全文件访问时由 wiring 降级为复制）。
+                  // 走共享 MD3 开关行（AdaptiveSettingsSwitchRow），不直接用
+                  // 裸 SwitchListTile —— 否则触犯 md3 设计系统守卫且 chrome 不一致。
+                  if (_canReferenceOriginal)
+                    AdaptiveSettingsSwitchRow(
+                      icon: FushiIcons.link,
+                      title: t.local_audio_reference_original,
+                      subtitle: t.local_audio_reference_original_desc,
+                      value: _referenceOriginal,
+                      onChanged: _importing
+                          ? null
+                          : (bool v) => setState(() => _referenceOriginal = v),
+                    ),
+                ],
+              ],
+            ),
+          ),
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: <Widget>[
+            adaptiveDialogAction(
+              context: context,
+              onPressed: _resetToDefaults,
+              child: Text(t.reset),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              // 持久化已下沉到 dispose（覆盖所有关闭路径，见 BUG-053），这里只负责出栈。
+              onPressed: () => Navigator.pop(context),
+              child: Text(t.dialog_close),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── 统一来源列表 ───────────────────────────────────────────────────────
+  // 用自实现的 FushiReorderableColumn（局部坐标长按拖拽），而非 SDK 的
+  // ReorderableListView：后者的 Overlay 拖拽代理不认祖先 FushiAppUiScale 的
+  // Transform.scale，缩放界面下长按拖拽会飞出屏幕。前者把拖拽反馈渲染在列表自身坐标系、
+  // 用 globalToLocal 消掉祖先缩放 → 任意缩放下都精确跟手、零偏移且视觉一致。
+  // 上下箭头按钮仍是无障碍/手柄重排路径。
+  Widget _buildSourceList(FushiDesignTokens tokens) {
+    return FushiReorderableColumn(
+      itemCount: _sources.length,
+      keyForIndex: (int index) => ValueKey<String>(_sourceKeyId(index)),
+      onReorder: (int from, int to) {
+        setState(() {
+          final AudioSourceConfig item = _sources.removeAt(from);
+          _sources.insert(to, item);
+        });
+      },
+      // M3E 分段卡：首尾大圆角、行间 2；正在编辑 URL 的那一行用选中形变
+      // （secondaryContainer + 16 圆角）标出「下方输入框改的是它」。
+      itemBuilder: (BuildContext context, int index) => FushiGroupedListItem(
+        index: index,
+        count: _sources.length,
+        selected: _editingSource != null && _editingSource == _sources[index],
+        child: _buildSourceRow(tokens, index),
+      ),
+    );
+  }
+
+  /// 行身份 key（拖拽重排时稳定标识每一行）。
+  String _sourceKeyId(int index) {
+    final AudioSourceConfig source = _sources[index];
+    return source.kind == AudioSourceKind.localAudio
+        ? 'audio_local_${source.path ?? index}'
+        : 'audio_remote_${source.kind.wireName}_${source.url ?? index}';
+  }
+
+  Widget _buildSourceRow(FushiDesignTokens tokens, int index) {
+    final AudioSourceConfig source = _sources[index];
+    final String? dbPath = source.path;
+    if (source.kind != AudioSourceKind.localAudio ||
+        dbPath == null ||
+        widget.isLocalDbAvailable == null) {
+      return _buildSourceRowContent(tokens, index);
+    }
+    return FutureBuilder<bool>(
+      future: _localAvailability.putIfAbsent(
+          dbPath, () => widget.isLocalDbAvailable!(dbPath)),
+      builder: (BuildContext context, AsyncSnapshot<bool> snapshot) {
+        final bool unavailable = snapshot.hasError || snapshot.data == false;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            _buildSourceRowContent(tokens, index),
+            if (unavailable)
+              _UnavailableSourceNotice(
+                onReselect: widget.onReplaceLocalDb == null
+                    ? null
+                    : (_importing ? null : () => _replaceLocalDb(dbPath)),
+                showReselect: widget.onReplaceLocalDb != null,
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildSourceRowContent(FushiDesignTokens tokens, int index) {
+    final AudioSourceConfig source = _sources[index];
+    final bool isFushiRemote = source.kind == AudioSourceKind.fushiRemote;
+    final bool isLocal = source.kind == AudioSourceKind.localAudio;
+    final bool isRemoteUrl = source.kind == AudioSourceKind.remoteAudio;
+    final bool isEditingThis =
+        _editingSource != null && _editingSource == source;
+    final String title =
+        isFushiRemote ? t.audio_source_fushi_interconnect : source.displayLabel;
+    final bool loopbackWarn = source.pointsAtLoopbackHost;
+    final String baseSubtitle = isFushiRemote
+        ? t.remote_audio_source
+        : (isLocal ? (source.path ?? '') : (source.url ?? ''));
+    // 换机后指向本机回环地址的远端音频源本机通常无服务→静默失败。附一行可见
+    // 「换机需重指」提示 + 警告图标，绝不让用户以为源还在正常工作（TODO-1171）。
+    final String subtitle = loopbackWarn
+        ? '$baseSubtitle\n${t.audio_source_loopback_warning}'
+        : baseSubtitle;
+    return AdaptiveSettingsRow(
+      title: title,
+      subtitle: subtitle,
+      icon: loopbackWarn
+          ? FushiIcons.warning
+          : (isLocal ? FushiIcons.music : null),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          // 「调整子来源」只在本地库行出现；放在开关**左侧**，让开关/↑/↓/删除
+          // 四列在所有行右贴边对齐（多出的 tune 只向左凸出，不挤动公共列）。
+          if (isLocal &&
+              widget.onEditLocalSources != null &&
+              (source.path?.isNotEmpty ?? false))
+            FushiIconButton(
+              icon: FushiIcons.settings,
+              size: 18,
+              tooltip: t.local_audio_edit_sources,
+              padding: EdgeInsets.all(tokens.spacing.gap / 2),
+              onTap: () => widget.onEditLocalSources!(source.path!),
+            ),
+          // 「编辑 URL」只在自定义远端行出现，占的是与本地行 tune 完全相同的槽位
+          // （开关左侧）→ 两类行各多一个同尺寸按钮，开关/↑/↓/删除四列仍跨行右贴边
+          // 对齐（BUG-027）。fushiRemote 无 URL 可改、本地库路径由选择器决定，都不给。
+          if (isRemoteUrl)
+            FushiIconButton(
+              icon: isEditingThis
+                  ? FushiIcons.filled(FushiIcons.edit)
+                  : FushiIcons.edit,
+              size: 18,
+              tooltip: t.dialog_edit,
+              enabledColor:
+                  isEditingThis ? Theme.of(context).colorScheme.primary : null,
+              padding: EdgeInsets.all(tokens.spacing.gap / 2),
+              onTap: () => _beginEditRemoteUrl(source),
+            ),
+          FushiSwitch.adaptive(
+            value: source.enabled,
+            onChanged: (bool enabled) => setState(() {
+              _sources[index] = source.copyWith(enabled: enabled);
+            }),
+          ),
+          // Gamepad/keyboard reorder equivalent for the drag handle
+          // (which a controller cannot grab).
+          FushiIconButton(
+            icon: FushiIcons.expandLess,
+            size: 18,
+            tooltip: t.move_up,
+            enabled: index > 0,
+            padding: EdgeInsets.all(tokens.spacing.gap / 2),
+            onTap: () => setState(() {
+              final AudioSourceConfig item = _sources.removeAt(index);
+              _sources.insert(index - 1, item);
+            }),
+          ),
+          FushiIconButton(
+            icon: FushiIcons.expandMore,
+            size: 18,
+            tooltip: t.move_down,
+            enabled: index < _sources.length - 1,
+            padding: EdgeInsets.all(tokens.spacing.gap / 2),
+            onTap: () => setState(() {
+              final AudioSourceConfig item = _sources.removeAt(index);
+              _sources.insert(index + 1, item);
+            }),
+          ),
+          FushiIconButton(
+            icon: FushiIcons.delete,
+            size: 18,
+            tooltip: t.dialog_delete,
+            enabled: !isFushiRemote,
+            padding: EdgeInsets.all(tokens.spacing.gap / 2),
+            onTap: () => setState(() {
+              _sources.removeAt(index);
+              // 删掉的正是在编辑的那行 → 编辑态当场失效（否则提交时 indexOf 找不到
+              // 它，或在存在等值重复行时改到别人头上）。
+              if (isEditingThis) _cancelEdit();
+            }),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUrlField(FushiDesignTokens tokens) {
+    final bool showError = _controller.text.trim().isNotEmpty && !_urlValid;
+    final bool editing = _editingSource != null;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        AdaptiveSettingsTextField(
+          key: _urlFieldKey,
+          controller: _controller,
+          focusNode: _urlFocusNode,
+          // 编辑态给出可见标签，让「这一栏现在改的是已有那行、不是新增」有据可依。
+          labelText: editing ? t.audio_source_edit_url : null,
+          hintText: 'https://...{term}...{reading}',
+          keyboardType: TextInputType.url,
+          onChanged: (String value) => setState(
+            () => _urlValid = AudioSourcesDialog.isValidRemoteUrl(value),
+          ),
+          onSubmitted: (_) => _commitRemoteUrl(),
+          suffixIcon: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              // 编辑态下不再暴露「加入 Fushi 互联源」——那是新增动作，与当前正在改的
+              // 那一行无关，混在一起只会让 ✓ 的语义变模糊。
+              if (!editing && !hasFushiRemoteAudioSource(_sources))
+                FushiIconButton(
+                  icon: FushiIcons.hub,
+                  tooltip: t.audio_source_fushi_interconnect,
+                  padding: EdgeInsets.all(tokens.spacing.gap / 2),
+                  onTap: () => setState(() => _sources.insert(
+                        0,
+                        AudioSourceConfig.fushiRemote(),
+                      )),
+                ),
+              if (editing)
+                FushiIconButton(
+                  icon: FushiIcons.close,
+                  tooltip: t.dialog_cancel,
+                  padding: EdgeInsets.all(tokens.spacing.gap / 2),
+                  onTap: () => setState(_cancelEdit),
+                ),
+              FushiIconButton(
+                icon: editing ? FushiIcons.check : FushiIcons.add,
+                tooltip: editing ? t.dialog_save : t.dialog_add,
+                enabled: _urlValid,
+                padding: EdgeInsets.all(tokens.spacing.gap / 2),
+                onTap: _commitRemoteUrl,
+              ),
+            ],
+          ),
+        ),
+        if (showError)
+          Padding(
+            padding: EdgeInsets.only(top: tokens.spacing.gap / 2),
+            child: Text(
+              t.audio_source_url_invalid,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ),
+      ],
+    );
+  }
+
+  // ── actions ──────────────────────────────────────────────────────────────
+
+  /// 把某个远端行的 URL 载入下方输入框，进入编辑态（光标置末尾，便于改个别字符）。
+  void _beginEditRemoteUrl(AudioSourceConfig source) {
+    final String url = source.url ?? '';
+    setState(() {
+      _editingSource = source;
+      _controller.text = url;
+      _controller.selection = TextSelection.collapsed(offset: url.length);
+      _urlValid = AudioSourcesDialog.isValidRemoteUrl(url);
+    });
+    _urlFocusNode.requestFocus();
+    // 来源多时输入框可能在可视区之外：滚进视野，别让用户以为点了没反应。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final BuildContext? fieldContext = _urlFieldKey.currentContext;
+      if (fieldContext != null && mounted) {
+        // 焦点驱动滚动收口在 focus 包（守卫 test/focus/focus_architecture_static_test.dart）：
+        // 页面不自持滚动实现，统一走 FushiFocusScroll。
+        FushiFocusScroll.ensureVisible(
+          fieldContext,
+          duration: const Duration(milliseconds: 150),
+        );
+      }
+    });
+  }
+
+  /// 退出编辑态并清空输入框。**不**自带 setState：调用点已在 setState 内（删除行）或
+  /// 自行包裹（✕ / 提交），避免嵌套 setState。
+  void _cancelEdit() {
+    _editingSource = null;
+    _controller.clear();
+    _urlValid = false;
+  }
+
+  /// 输入框提交：编辑态改写目标行的 URL，否则按新增插到最前。
+  void _commitRemoteUrl() {
+    // 存归一化后的值，而不是原始文本：否则校验（已折全角）会通过，落库的却仍是
+    // 全角地址，变成「加的时候没报错、播放时永远失败」。
+    final String text = normalizeUrlInput(_controller.text);
+    if (!AudioSourcesDialog.isValidRemoteUrl(text)) {
+      _showSnack(t.audio_source_url_invalid);
+      return;
+    }
+    final AudioSourceConfig? editing = _editingSource;
+    // 现场按值定位：编辑期间的拖拽重排不会让我们写错行（存下标才会）。
+    final int index = editing == null ? -1 : _sources.indexOf(editing);
+    if (editing != null && index < 0) {
+      // 目标行已在编辑期间消失（理论上删除处已清编辑态，这里是兜底）：不静默把它
+      // 当新增塞回去——那等于复活用户刚删掉的来源。
+      setState(_cancelEdit);
+      _showSnack(t.audio_source_edit_target_gone);
+      return;
+    }
+    setState(() {
+      if (index >= 0) {
+        // label / enabled 保持原样：用户改的只是链接，不该顺手重置显示名和启用状态。
+        _sources[index] = _sources[index].copyWith(url: text);
+      } else {
+        _sources.insert(0, AudioSourceConfig.remoteAudio(url: text));
+      }
+      _cancelEdit();
+    });
+    _showSnack(index >= 0 ? t.audio_source_updated : t.audio_source_added);
+  }
+
+  Future<void> _addLocalDb() async {
+    setState(() => _importing = true);
+    try {
+      final AudioSourceConfig? added = await widget
+          .onPickLocalDb!(_referenceOriginal && _canReferenceOriginal);
+      if (!mounted) return;
+      if (added != null) {
+        setState(() => _sources.insert(0, added));
+        // 导入即落盘：拷贝本地库是离散动作，当场持久化才让「导入成功」名副其实，
+        // 且此后即便不经任何关闭路径退出（甚至杀进程）也不丢（BUG-053）；dispose
+        // 的兜底保存仍覆盖此后的排序/开关/URL 等批量编辑。
+        await widget.onSave(List<AudioSourceConfig>.of(_sources));
+        if (!mounted) return;
+        _showSnack(t.local_audio_imported);
+      }
+      // added == null 表示用户取消选择，不弹反馈。
+    } catch (e, st) {
+      // BUG-446：原 `catch (_)` 整个吞掉异常对象，只弹通用文案，真因（PlatformException /
+      // StateError / FileSystemException + errno）全丢。改为记完整诊断进 ErrorLogService
+      // （错误日志页可查、可回传），并把异常类型摘要带进可见 snackbar，让用户能复述。
+      ErrorLogService.instance.log('AudioSourcesDialog.addLocalDb', e, st);
+      if (mounted) {
+        // BUG-779：无效文件（zip / 备份 zip / 空库）给专属可读文案，不把裸异常字符串
+        // 甩给用户；其它真·失败（权限 / 磁盘 / 平台）仍带异常摘要便于复述。
+        _showSnack(e is InvalidLocalAudioDbException
+            ? t.local_audio_invalid_db
+            : t.local_audio_import_failed_detail(reason: '$e'));
+      }
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  Future<void> _replaceLocalDb(String oldPath) async {
+    setState(() => _importing = true);
+    try {
+      final AudioSourceConfig? replacement =
+          await widget.onReplaceLocalDb!(oldPath);
+      if (!mounted || replacement == null) return;
+      // 选择器打开期间允许排序/切换；按路径重新定位，保留用户最新的开关状态。
+      final int index = _sources.indexWhere((AudioSourceConfig source) =>
+          source.kind == AudioSourceKind.localAudio && source.path == oldPath);
+      if (index < 0) return;
+      setState(() {
+        _sources[index] = _sources[index].copyWith(path: replacement.path);
+        _localAvailability.remove(oldPath);
+      });
+      await widget.onSave(List<AudioSourceConfig>.of(_sources));
+      if (!mounted) return;
+      _showSnack(t.local_audio_imported);
+    } catch (e, stack) {
+      ErrorLogService.instance
+          .log('AudioSourcesDialog.replaceLocalDb', e, stack);
+      if (mounted) {
+        _showSnack(e is InvalidLocalAudioDbException
+            ? t.local_audio_invalid_db
+            : t.local_audio_import_failed_detail(reason: '$e'));
+      }
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
+  void _resetToDefaults() {
+    setState(() {
+      // 整表重建 → 编辑目标不再属于新列表，编辑态必须一起清掉。
+      _cancelEdit();
+      // Anki 本地音频服务器内置预设：重置默认后也在列（默认关闭，与新装一致）。
+      _sources = resetAudioSourcesToDefaults(
+        _sources,
+        ankiLocalAudioUrl: AppModel.ankiLocalAudioUrl,
+      );
+    });
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.maybeOf(context)
+        ?.showSnackBar(FushiSnackBar(content: Text(message)));
+  }
+}
+
+/// 本地音频库文件丢失：M3E errorContainer 色块（错误图标 + 说明 + 重新选择），
+/// 而不是一行裸红字——用户要一眼看出「这一行坏了、点这里修」。
+class _UnavailableSourceNotice extends StatelessWidget {
+  const _UnavailableSourceNotice({
+    required this.onReselect,
+    required this.showReselect,
+  });
+
+  final VoidCallback? onReselect;
+  final bool showReselect;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final ColorScheme colors = Theme.of(context).colorScheme;
+    final bool glass = isGlassDesign(context);
+    final Color background = glass
+        ? appleColorsOf(context).destructive.withValues(alpha: 0.12)
+        : colors.errorContainer;
+    final Color foreground =
+        glass ? appleColorsOf(context).destructive : colors.onErrorContainer;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        tokens.spacing.gap,
+        0,
+        tokens.spacing.gap,
+        tokens.spacing.gap,
+      ),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: background,
+          borderRadius: FushiM3eShape.smallRadius,
+        ),
+        child: Padding(
+          padding: EdgeInsets.symmetric(
+            horizontal: tokens.spacing.gap + 4,
+            vertical: tokens.spacing.gap,
+          ),
+          // BUG-3023：按钮另起一行靠尾对齐，不与说明同处一个 Row——同行时按钮按
+          // 固有宽度先占位，说明（Expanded）在窄弹窗/长译文下只剩十几像素宽、
+          // 逐字换行撑高整行，把「重新选择」推出列表的可滚视口。
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  FushiIcon(FushiIcons.error, size: 20, color: foreground),
+                  SizedBox(width: tokens.spacing.gap),
+                  Expanded(
+                    child: Text(
+                      t.local_audio_file_unavailable,
+                      style:
+                          tokens.type.listSubtitle.copyWith(color: foreground),
+                    ),
+                  ),
+                ],
+              ),
+              if (showReselect)
+                Align(
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: FushiTextButton.icon(
+                    onPressed: onReselect,
+                    icon: const FushiIcon(FushiIcons.folderOpen),
+                    label: Text(t.local_audio_file_reselect),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DictCssDraftSession {
+  _DictCssDraftSession({
+    required this.appModel,
+    required this.profileDraftScope,
+    required this.selectedDictionaryName,
+  });
+
+  final AppModel appModel;
+  final Object profileDraftScope;
+  final Map<String?, String> cssByDictionary = <String?, String>{};
+  String? selectedDictionaryName;
+
+  /// 可视化规则表草稿。与手写 CSS 同一个「保存 / 取消」闸门——两者分开落盘会让
+  /// 「取消」只撤回一半，同一个对话框出现两套生效语义。
+  ///
+  /// null = 本次会话还没碰过可视化页，保存时也就不该覆写已存规则。
+  List<DictStyleRule>? styleRules;
+
+  /// [styleRules] 上次与磁盘对齐时的规则快照（[dictStyleRulesSnapshot]）。
+  ///
+  /// 规则表也会被对话框之外改（`fushi_cli config items lookup.custom_css.cli.visual_rules`）。
+  /// 以前保存是「按草稿整份覆盖」，对话框开着时别处的改动会被陈旧草稿悄悄抹掉。
+  /// 有了基线才分得清哪几条是本地改过的：没改过的跟随磁盘刷新，保存只写改过的
+  /// （[overlayDirtyDictStyleRules]）。与 [styleRules] 同时为 null / 非 null。
+  Map<String, String>? styleRulesBaseline;
+
+  /// 把磁盘上别处写入的变化并进规则草稿（没碰过可视化页时什么都不做）。
+  /// 返回草稿是否变了。
+  bool rebaseStyleRules(List<DictStyleRule> persisted) {
+    final List<DictStyleRule>? rules = styleRules;
+    final Map<String, String>? baseline = styleRulesBaseline;
+    if (rules == null || baseline == null) return false;
+    final Map<String, String> now = dictStyleRulesSnapshot(persisted);
+    if (mapEquals(now, baseline)) return false;
+    styleRules = overlayDirtyDictStyleRules(
+      draft: rules,
+      baseline: baseline,
+      persisted: persisted,
+    );
+    styleRulesBaseline = now;
+    return true;
+  }
+
+  /// 可视化页当前选中的部位，跨 tab 切换保持。
+  DictStylePart selectedPart = DictStylePart.glossaryContent;
+
+  /// 当前停在哪个 tab（0 = 可视化，1 = 手写 CSS）。
+  int tabIndex = 0;
+}
+
+_DictCssDraftSession? _dictCssDraftSession;
+
+/// 测试注入口：替换掉可视化页里的真 WebView 预览。
+///
+/// 与 `LapisStyleEditorPage.previewBuilder` 同一模式——widget 测试跑不了平台
+/// WebView，而本对话框的草稿/保存语义又必须能测。
+typedef DictStylePreviewBuilder = Widget Function(
+  BuildContext context,
+  String css,
+  DictStylePart highlightPart,
+  ValueChanged<DictStylePart> onPickPart,
+);
+
+/// 解析「词典弹窗样式」功能当前可用的 AI 提供商。返回 null = 没配 / 配的那家已被
+/// 删或没配全，对话框据此提示去设置里配，而**不发请求**。
+///
+/// 生产路径默认从 `AppModel.prefsRepo` 读；做成回调是给 widget 测试留缝——测试里
+/// 的假 AppModel 没有初始化偏好仓库。
+typedef DictStyleAiProviderResolver = AiProviderConfig? Function();
+
+/// 造 AI 调用客户端。测试注入假 `http.Client` 走这条缝；生产路径恒是
+/// [AiChatClient] 的默认构造。
+typedef DictStyleAiClientFactory = AiChatClient Function();
+
+class DictCssEditorDialog extends StatefulWidget {
+  const DictCssEditorDialog({
+    super.key,
+    this.initialDictionaryName,
+    this.previewBuilder,
+    this.resolveAiProvider,
+    this.aiClientFactory,
+  });
+
+  final String? initialDictionaryName;
+
+  /// 非 null 时用它替代 [DictStylePreview]（仅测试传）。
+  final DictStylePreviewBuilder? previewBuilder;
+
+  /// 非 null 时替代默认的「从 AppModel 偏好里解析」（仅测试传）。
+  @visibleForTesting
+  final DictStyleAiProviderResolver? resolveAiProvider;
+
+  @visibleForTesting
+  final DictStyleAiClientFactory? aiClientFactory;
+
+  @override
+  State<DictCssEditorDialog> createState() => _DictCssEditorDialogState();
+}
+
+class _DictCssEditorDialogState extends State<DictCssEditorDialog> {
+  late int _selectedIndex;
+  late TextEditingController _cssController;
+  late List<String> _dictNames;
+
+  /// 与 [_dictNames] 同序的**显示名**，只喂给下拉的 label。作用域主键、CSS
+  /// 选择器、草稿里存的 selectedDictionaryName 一律仍用 [_dictNames] 的真名。
+  late List<String> _dictDisplayNames;
+  late AppModel _appModel;
+  late ProfileDraftCoordinator _profileDraftCoordinator;
+  late _DictCssDraftSession _draft;
+  bool _draftFinalized = false;
+  bool _isSaving = false;
+
+  final TextEditingController _aiRequestController = TextEditingController();
+
+  /// AI 区的一句话状态（已填入 / 没配提供商 / 失败原因）。null = 还没跑过。
+  String? _aiMessage;
+
+  /// AI 对自己这组改动的说明，原样显示。
+  String _aiExplanation = '';
+  bool _aiBusy = false;
+
+  bool get _isGlobal => _selectedIndex == 0;
+  String get _currentDictName => _dictNames[_selectedIndex - 1];
+  String? get _selectedDictionaryName => _isGlobal ? null : _currentDictName;
+
+  @override
+  void initState() {
+    super.initState();
+    _appModel =
+        ProviderScope.containerOf(context, listen: false).read(appProvider);
+    _profileDraftCoordinator = ProviderScope.containerOf(
+      context,
+      listen: false,
+    ).read(profileDraftCoordinatorProvider);
+    final Object profileDraftScope = _profileDraftCoordinator.draftScope;
+    _dictNames = _appModel.dictionaries.map((d) => d.name).toList();
+    _dictDisplayNames =
+        _appModel.dictionaries.map((d) => d.effectiveDisplayName).toList();
+    final _DictCssDraftSession? existingDraft = _dictCssDraftSession;
+    if (existingDraft != null &&
+        identical(existingDraft.appModel, _appModel) &&
+        identical(existingDraft.profileDraftScope, profileDraftScope)) {
+      _draft = existingDraft;
+      _selectedIndex =
+          _selectedIndexForDictionary(_draft.selectedDictionaryName);
+    } else {
+      _selectedIndex = _initialSelectedIndex();
+      _draft = _DictCssDraftSession(
+        appModel: _appModel,
+        profileDraftScope: profileDraftScope,
+        selectedDictionaryName: _selectedDictionaryName,
+      );
+      _dictCssDraftSession = _draft;
+    }
+    _draft.selectedDictionaryName = _selectedDictionaryName;
+    _cssController = TextEditingController(text: _currentDraftCss);
+    // 复用的会话草稿在对话框关着期间没人监听：先对齐一次磁盘，再开始监听。
+    _draft.rebaseStyleRules(_appModel.dictStyleRules);
+    _appModel.addListener(_onAppModelChanged);
+  }
+
+  /// 规则表落盘后 `AppModel.saveDictStyleRules` 会通知：没改过的规则跟随刷新。
+  void _onAppModelChanged() {
+    if (!mounted || _draftFinalized) return;
+    if (_draft.rebaseStyleRules(_appModel.dictStyleRules)) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    _appModel.removeListener(_onAppModelChanged);
+    if (!_draftFinalized) {
+      _stashCurrentScope();
+    }
+    _cssController.dispose();
+    _aiRequestController.dispose();
+    super.dispose();
+  }
+
+  // ── AI 生成 ──────────────────────────────────────────────────────────────
+
+  AiProviderConfig? _resolveAiProvider() {
+    final DictStyleAiProviderResolver? injected = widget.resolveAiProvider;
+    if (injected != null) return injected();
+    final PreferencesRepository prefs = _appModel.prefsRepo;
+    return prefs.aiFeatureAssignments.resolve(
+      AiFeature.dictStyle,
+      prefs.aiProviders,
+    );
+  }
+
+  Future<void> _runAi() async {
+    if (_aiBusy) return;
+    final String request = _aiRequestController.text.trim();
+    if (request.isEmpty) return;
+    final AiProviderConfig? provider = _resolveAiProvider();
+    if (provider == null) {
+      // 没有可用提供商就**一个请求都不发**：发出去只会拿回一条脱敏错误码，用户
+      // 还得自己猜「是 key 错了还是根本没配」。
+      setState(() {
+        _aiMessage = t.ai_assist_no_provider;
+        _aiExplanation = '';
+      });
+      return;
+    }
+    setState(() {
+      _aiBusy = true;
+      _aiMessage = null;
+      _aiExplanation = '';
+    });
+    final AiChatClient client =
+        widget.aiClientFactory?.call() ?? AiChatClient();
+    try {
+      final AiDictStyleSuggestion suggestion = await requestAiDictStyle(
+        client: client,
+        provider: provider,
+        request: request,
+        currentRules: _currentDraftRules,
+        currentCss: _cssController.text,
+        dictionaryName: _selectedDictionaryName,
+        availableDictionaries: _dictNames,
+      );
+      if (!mounted) return;
+      if (suggestion.isEmpty) {
+        setState(() => _aiMessage = t.ai_assist_empty);
+        return;
+      }
+      // 只进**草稿**：规则并进可视化规则表，CSS 追加到当前作用域的手写框，
+      // 保存仍然只有底部那一个按钮——AI 不是第二条落盘路径。
+      setState(() {
+        if (suggestion.rules.isNotEmpty) {
+          _draft.styleRules = mergeAiDictStyleRules(
+            _currentDraftRules,
+            suggestion.rules,
+          );
+        }
+        if (suggestion.css.isNotEmpty) {
+          _cssController.text = appendAiCss(
+            _cssController.text,
+            suggestion.css,
+          );
+          _stashCurrentScope();
+        }
+        _aiMessage = t.dict_style_ai_applied;
+        _aiExplanation = suggestion.explanation;
+      });
+      _showSnack(
+        suggestion.explanation.isEmpty
+            ? t.dict_style_ai_applied
+            : '${t.dict_style_ai_applied}\n${suggestion.explanation}',
+      );
+    } on AiChatFailure catch (failure) {
+      if (!mounted) return;
+      setState(
+        () => _aiMessage = t.ai_assist_failed(
+          reason: aiFailureText(failure.message),
+        ),
+      );
+    } finally {
+      client.close();
+      if (mounted) setState(() => _aiBusy = false);
+    }
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.maybeOf(context)
+        ?.showSnackBar(FushiSnackBar(content: Text(message)));
+  }
+
+  /// 「让 AI 帮忙」区：一行输入 + 生成按钮，结果状态在下面一行。放在两个 tab 共用
+  /// 的对话框底部——AI 同时产出规则（可视化页）与 CSS（手写页），不属于任一页。
+  Widget _buildAiSection(FushiDesignTokens tokens) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: <Widget>[
+            Expanded(
+              child: FushiTextField(
+                key: const ValueKey<String>('dict-style-ai-request'),
+                controller: _aiRequestController,
+                labelText: t.ai_assist_section,
+                hintText: t.dict_style_ai_hint,
+                minLines: 1,
+                maxLines: 2,
+              ),
+            ),
+            SizedBox(width: tokens.spacing.gap),
+            FushiFilledButton.icon(
+              key: const ValueKey<String>('dict-style-ai-generate'),
+              onPressed: _aiBusy || _isSaving ? null : () => unawaited(_runAi()),
+              icon: _aiBusy
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: FushiCircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const FushiIcon(FushiIcons.ai),
+              label: Text(_aiBusy ? t.ai_assist_working : t.ai_assist_generate),
+            ),
+          ],
+        ),
+        // 结果状态进 M3E tonal 色块（已填入 = tertiaryContainer、没配提供商 /
+        // 失败 = errorContainer），出现 / 消失走弹簧尺寸过渡，不再是一行灰字。
+        AnimatedSize(
+          duration: context.fushiMotion.spatialDefault.duration,
+          curve: context.fushiMotion.spatialDefault.curve,
+          alignment: AlignmentDirectional.topStart,
+          child: _aiMessage == null && _aiExplanation.isEmpty
+              ? const SizedBox(width: double.infinity)
+              : Padding(
+                  padding: EdgeInsets.only(top: tokens.spacing.gap),
+                  child: _buildAiStatus(tokens),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAiStatus(FushiDesignTokens tokens) {
+    final ColorScheme colors = Theme.of(context).colorScheme;
+    final bool ok = _aiMessage == null || _aiMessage == t.dict_style_ai_applied;
+    final bool glass = isGlassDesign(context);
+    final Color background = glass
+        ? fushiNeutralBlockColor(context)
+        : (ok ? colors.tertiaryContainer : colors.errorContainer);
+    final Color foreground = glass
+        ? (ok ? colors.primary : appleColorsOf(context).destructive)
+        : (ok ? colors.onTertiaryContainer : colors.onErrorContainer);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: FushiM3eShape.smallRadius,
+      ),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: tokens.spacing.gap + 4,
+          vertical: tokens.spacing.gap,
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            FushiIcon(
+              ok ? FushiIcons.ai : FushiIcons.warning,
+              size: 20,
+              color: foreground,
+            ),
+            SizedBox(width: tokens.spacing.gap),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  if (_aiMessage != null)
+                    Text(
+                      _aiMessage!,
+                      key: const ValueKey<String>('dict-style-ai-message'),
+                      style: context.fushiType.labelLargeEmphasized
+                          .copyWith(color: foreground),
+                    ),
+                  if (_aiExplanation.isNotEmpty)
+                    Padding(
+                      padding: EdgeInsets.only(
+                        top: _aiMessage != null ? tokens.spacing.gap / 2 : 0,
+                      ),
+                      child: Text(
+                        _aiExplanation,
+                        key: const ValueKey<String>(
+                          'dict-style-ai-explanation',
+                        ),
+                        style: tokens.type.listSubtitle.copyWith(
+                          color: foreground,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _onScopeChanged(int? index) {
+    if (index == null || index == _selectedIndex) return;
+    _stashCurrentScope();
+    _selectedIndex = index;
+    _draft.selectedDictionaryName = _selectedDictionaryName;
+    _cssController.text = _currentDraftCss;
+    setState(() {});
+  }
+
+  void _stashCurrentScope() {
+    _draft.cssByDictionary[_selectedDictionaryName] = _cssController.text;
+  }
+
+  Future<void> _saveDraft() async {
+    if (_isSaving) return;
+    _stashCurrentScope();
+    setState(() => _isSaving = true);
+    try {
+      final bool saved = await _profileDraftCoordinator.saveDraftIfCurrent(
+        _draft.profileDraftScope,
+        () async {
+          for (final MapEntry<String?, String> entry
+              in _draft.cssByDictionary.entries) {
+            final String? dictionaryName = entry.key;
+            if (dictionaryName == null) {
+              await _appModel.setGlobalDictCSS(entry.value);
+            } else {
+              await _appModel.setCustomCSSForDict(
+                dictionaryName,
+                entry.value,
+              );
+            }
+          }
+          // null = 本次没碰过可视化页。不能拿 `?? []` 兜底——那会把用户已存的
+          // 规则在「只改了手写 CSS 就保存」时整份清空。
+          final List<DictStyleRule>? rules = _draft.styleRules;
+          final Map<String, String>? baseline = _draft.styleRulesBaseline;
+          if (rules != null && baseline != null) {
+            // 按条合并：以磁盘当前表为底，只写本地改过的规则——对话框开着时
+            // 别处（CLI）写入的、本地没碰过的规则不被陈旧草稿覆盖。
+            final List<DictStyleRule> merged = overlayDirtyDictStyleRules(
+              draft: rules,
+              baseline: baseline,
+              persisted: _appModel.dictStyleRules,
+            );
+            // 先推进基线再写：写入会同步通知 [_onAppModelChanged]。
+            _draft.styleRules = merged;
+            _draft.styleRulesBaseline = dictStyleRulesSnapshot(merged);
+            await _appModel.saveDictStyleRules(merged);
+          }
+        },
+      );
+      if (!saved) {
+        // Profile 可能被媒体自动切换等后台路径替换。旧 Profile 的草稿绝不能通过
+        // 当前 AppModel 写进新 Profile；切换即精确失效，后续重开会从新 Profile
+        // 的持久化值初始化。
+        _finalizeDraft();
+        if (mounted) {
+          Navigator.pop(context);
+        }
+        return;
+      }
+      _finalizeDraft();
+      if (mounted) {
+        Navigator.pop(context);
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isSaving = false);
+      }
+    }
+  }
+
+  void _cancelDraft() {
+    _finalizeDraft();
+    Navigator.pop(context);
+  }
+
+  void _finalizeDraft() {
+    _draftFinalized = true;
+    if (identical(_dictCssDraftSession, _draft)) {
+      _dictCssDraftSession = null;
+    }
+  }
+
+  int _initialSelectedIndex() {
+    return _selectedIndexForDictionary(widget.initialDictionaryName);
+  }
+
+  int _selectedIndexForDictionary(String? dictionaryName) {
+    if (dictionaryName == null) return 0;
+    final int dictIndex = _dictNames.indexOf(dictionaryName);
+    return dictIndex < 0 ? 0 : dictIndex + 1;
+  }
+
+  /// 规则表草稿。首次读时从 AppModel 惰性取一份副本。
+  List<DictStyleRule> get _currentDraftRules {
+    final List<DictStyleRule>? existing = _draft.styleRules;
+    if (existing != null) return existing;
+    final List<DictStyleRule> persisted = _appModel.dictStyleRules;
+    _draft.styleRulesBaseline = dictStyleRulesSnapshot(persisted);
+    return _draft.styleRules = persisted;
+  }
+
+  String get _currentDraftCss {
+    return _draft.cssByDictionary.putIfAbsent(
+      _selectedDictionaryName,
+      () => _isGlobal
+          ? _appModel.globalDictCSS
+          : _appModel.getCustomCSSForDict(_currentDictName),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+
+    // 尺寸向 `LapisStyleEditorPage` 看齐：那边是整页 + 内容区 maxWidth 1180，
+    // 这边是对话框，同样取 1180 并把高度撑满到允许的 0.88 屏高。
+    // 之前写死的 `height: (屏高*0.55).clamp(280, 480)` 直接删掉而不是换个大常数：
+    // 固定高度在矮屏上会超过 [FushiDialogFrame] 的高度帽而溢出，而 body 本来
+    // 就是 Flexible、列里又有 Expanded，交给约束自己决定就行。
+    return FushiDialogFrame(
+      maxWidth: 1180,
+      maxHeightFactor: 0.88,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: tokens.spacing.card,
+        vertical: tokens.spacing.card,
+      ),
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        // 不再只是「自定义 CSS」——里面现在有可视化和手写两页。
+        title: t.dict_style_title,
+        leadingIcon: FushiIcons.appearance,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              FushiSegmentedButton<int>(
+                showSelectedIcon: false,
+                segments: <ButtonSegment<int>>[
+                  ButtonSegment<int>(
+                    value: 0,
+                    icon: const FushiIcon(FushiIcons.appearance, size: 18),
+                    label: Text(t.dict_style_tab_visual),
+                  ),
+                  ButtonSegment<int>(
+                    value: 1,
+                    icon: const FushiIcon(FushiIcons.edit, size: 18),
+                    label: Text(t.dict_style_tab_code),
+                  ),
+                ],
+                selected: <int>{_draft.tabIndex},
+                onSelectionChanged: (Set<int> picked) =>
+                    setState(() => _draft.tabIndex = picked.first),
+              ),
+              SizedBox(height: tokens.spacing.gap),
+              _buildScopeDropdown(context),
+              SizedBox(height: tokens.spacing.gap),
+              Expanded(
+                child: _draft.tabIndex == 0
+                    ? _buildVisualTab(tokens)
+                    : FushiEditorPanel(controller: _cssController),
+              ),
+              // AI 模块（`ModuleId.ai`）关掉时「让 AI 帮忙」整段不渲染。
+              if (isAiModuleEnabled(_appModel.moduleVisibility)) ...<Widget>[
+                SizedBox(height: tokens.spacing.gap),
+                _buildAiSection(tokens),
+              ],
+            ],
+          ),
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: [
+            adaptiveDialogAction(
+              context: context,
+              onPressed: _isSaving ? null : _cancelDraft,
+              child: Text(t.dialog_cancel),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              isDefaultAction: true,
+              onPressed: _isSaving ? null : _saveDraft,
+              child: Text(t.dialog_save),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 可视化页：上半预览、下半控件。
+  ///
+  /// 预览喂的是「本次草稿编译出的 CSS」，不含用户已存的手写 CSS——混进去就分不清
+  /// 屏幕上这个效果是这次改的还是老规则带来的。
+  Widget _buildVisualTab(FushiDesignTokens tokens) {
+    final List<DictStyleRule> rules = _currentDraftRules;
+    final String? scope = _selectedDictionaryName;
+    final String previewCss = mergeGeneratedAndAuthoredCss(
+      buildGlobalDictStyleCss(rules),
+      // 单典规则在预览里也要能看见效果。预览的 DOM 里 [data-dictionary] 是真实
+      // 存在的（样例词条带两本词典），所以这里必须自己加一次作用域前缀——真实
+      // 下发链上那一次是 constructDictCss 加的，预览没走那条链。
+      <String>[
+        for (final String name in dictionariesWithStyleRules(rules))
+          _scopeCssToDictionary(buildPerDictionaryStyleCss(rules, name), name),
+      ].join('\n'),
+    );
+    // 预览框：MD3 = 页面底 + outline 细边框；Apple = 分组圆角 + 物理 1px
+    // separator 细线（Apple 内容层不画 MD3 那种实描边框，只用分隔线色勾边界）。
+    final bool glass = isGlassDesign(context);
+    final BorderRadius previewRadius = glass
+        ? FushiAppleMetrics.of(context).groupBorderRadius
+        : FushiM3eShape.cardRadius;
+    final Widget preview = DecoratedBox(
+      decoration: BoxDecoration(
+        color: tokens.surfaces.page,
+        borderRadius: previewRadius,
+        border: Border.all(
+          color: glass
+              ? appleColorsOf(context).separator
+              : tokens.surfaces.outline,
+          width: glass ? fushiHairline(context) : 1,
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: previewRadius,
+        child: widget.previewBuilder?.call(
+              context,
+              previewCss,
+              _draft.selectedPart,
+              (DictStylePart part) =>
+                  setState(() => _draft.selectedPart = part),
+            ) ??
+            DictStylePreview(
+              css: previewCss,
+              highlightPart: _draft.selectedPart,
+              onPickPart: (DictStylePart part) =>
+                  setState(() => _draft.selectedPart = part),
+            ),
+      ),
+    );
+    final Widget hint = Row(
+      children: <Widget>[
+        FushiIcon(
+          FushiIcons.touch,
+          size: 16,
+          color: tokens.surfaces.onVariant,
+        ),
+        SizedBox(width: tokens.spacing.gap / 2),
+        Expanded(
+          child: Text(t.dict_style_pick_hint, style: tokens.type.listSubtitle),
+        ),
+      ],
+    );
+    Widget controls({required bool compact}) => DictStyleVisualEditor(
+      compact: compact,
+      rules: rules,
+      scopeDictionary: scope,
+      selectedPart: _draft.selectedPart,
+      onSelectPart: (DictStylePart part) =>
+          setState(() => _draft.selectedPart = part),
+      onRulesChanged: (List<DictStyleRule> next) =>
+          setState(() => _draft.styleRules = next),
+    );
+
+    // 断点和分栏比例抄 `LapisStyleEditorPage`：宽于 820 时左预览右控件（控件定宽
+    // 340），窄于 820 时上下堆叠。两个编辑器读起来才是同一个东西。
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints constraints) {
+        if (constraints.maxWidth >= 820) {
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: <Widget>[
+              Expanded(
+                flex: 5,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Expanded(child: preview),
+                    SizedBox(height: tokens.spacing.gap / 2),
+                    hint,
+                  ],
+                ),
+              ),
+              SizedBox(width: tokens.spacing.card),
+              SizedBox(width: 340, child: controls(compact: false)),
+            ],
+          );
+        }
+        // 窄屏（应用内反馈 10-09，Android 384×853）：预览钉在上半、控件在下半自己滚，
+        // 改任何属性时预览都在视野里。旧比例 2:3 留给预览的不到 140dp，预览本身还得
+        // 上下滑才看得到正在改的部位；改成对半分，部位选择收成一行横滑（compact），
+        // 预览按所选部位自动滚到它（DictStylePreview）。
+        return Column(
+          children: <Widget>[
+            Expanded(child: preview),
+            SizedBox(height: tokens.spacing.gap / 2),
+            hint,
+            SizedBox(height: tokens.spacing.gap / 2),
+            Expanded(child: controls(compact: true)),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 给一段无前缀的单典 CSS 加上 `[data-dictionary="名"]` 作用域。
+  ///
+  /// 只用于预览。生产路径上这一步由 `assets/popup/dict-media.js` 的
+  /// `constructDictCss()` 做，那是个完整的 CSS 分词器（认 @media / 嵌套 / `&`）。
+  /// 这里的输入是我们自己编译出来的、形状固定的「选择器 { 声明 }」平铺列表，
+  /// 所以按行加前缀就够，不需要把那个分词器搬到 Dart 来。
+  String _scopeCssToDictionary(String css, String dictionaryName) {
+    if (css.trim().isEmpty) return '';
+    final String escaped = dictionaryName
+        .replaceAll('\\', r'\\')
+        .replaceAll('"', r'\"')
+        .replaceAll('\n', r'\A ')
+        .replaceAll('\r', '');
+    return css
+        .split('\n')
+        .where((String line) => line.trim().isNotEmpty)
+        .map((String line) => '[data-dictionary="$escaped"] $line')
+        .join('\n');
+  }
+
+  Widget _buildScopeDropdown(BuildContext context) {
+    return GamepadMenuDropdown<int>(
+      width: double.infinity,
+      label: t.custom_dict_css,
+      selected: _selectedIndex,
+      onChanged: _onScopeChanged,
+      entries: <GamepadDropdownEntry<int>>[
+        (value: 0, label: t.custom_dict_css_global),
+        for (int i = 0; i < _dictNames.length; i++)
+          (value: i + 1, label: _dictDisplayNames[i]),
+      ],
+    );
+  }
+}

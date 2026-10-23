@@ -1,0 +1,1229 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+
+import 'package:archive/archive_io.dart';
+import 'package:flutter/foundation.dart';
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:path/path.dart' as path;
+
+import 'package:fushi/utils.dart';
+import 'package:fushi_engine/models/dictionary_directory.dart';
+import 'package:fushi_engine/utils/archive/native_zip.dart';
+import 'package:fushi/src/models/dictionary_repository.dart';
+
+class DictionaryImportManager {
+  DictionaryImportManager({
+    required DictionaryRepository dictRepo,
+    required Directory resourceDirectory,
+    required Map<String, DictionaryFormat> formats,
+  })  : _dictRepo = dictRepo,
+        _resourceDirectory = resourceDirectory,
+        _formats = formats;
+
+  final DictionaryRepository _dictRepo;
+  final Directory _resourceDirectory;
+  final Map<String, DictionaryFormat> _formats;
+
+  /// BUG-1903：压缩包里**每个各自成典**的条目（`.mdx` / `.dsl`）。
+  ///
+  /// 判据刻意只认这两种扩展名：Yomitan 包里有几十个 `term_bank_N.json`，那仍然是
+  /// **一本**词典，按文件数拆会把一本拆成几十本；而 MDX / DSL 是「一个文件一本
+  /// 词典」，同一个包里出现两个就是两本。
+  ///
+  /// 大小写与路径分隔符已由 [_readZipFileNames] 归一（全小写）。
+  ///
+  /// BUG-2952：「词典整合包」——zip 里再套 zip（`01_英汉/COBUILD10.zip` …），或
+  /// 根下多个子目录各带一份 `index.json`——同样是一包多典。内层 `.zip` 一个算一本；
+  /// `index.json` 只在出现**两份以上**时才按所在目录各算一本（只有一份就是普通
+  /// Yomitan 包，绝不能拆）。以前这种包整个丢给 native：内层 zip 不是词典数据，
+  /// 多份 index.json 只认得到第一份，结果是一句含糊的「导入失败」。
+  static List<String> archivedDictionaryEntries(List<String> zipEntryNames) {
+    final List<String> indexRoots = <String>[
+      for (final String name in zipEntryNames)
+        if (name == 'index.json' || name.endsWith('/index.json')) name,
+    ];
+    return <String>[
+      for (final String name in zipEntryNames)
+        if (name.endsWith('.mdx') ||
+            name.endsWith('.dsl') ||
+            name.endsWith('.zip'))
+          name,
+      if (indexRoots.length > 1) ...indexRoots,
+    ];
+  }
+
+  /// BUG-2952：一包多典（见 [archivedDictionaryEntries]）里是否含有「本身不能直接
+  /// 喂给 native」的条目——内层 zip 或多份 index.json。这种包哪怕只有一本也必须先
+  /// 解开：native 不会递归进内层 zip。
+  @visibleForTesting
+  static bool isDictionaryBundle(List<String> archivedEntries) =>
+      archivedEntries.length > 1 ||
+      archivedEntries.any((String e) => e.endsWith('.zip'));
+
+  /// BUG-2952：native 导入失败时给用户看的原因。native 在「写盘时卷空间不足」
+  /// 时把稳定标记 `FUSHI_ERR_STORAGE_FULL` 放在错误首行（`importer.hpp`
+  /// `kStorageFullMarker`）——那种失败的原始文本是 iostream / errno 碎片
+  /// （`ios_base::clear: unspecified iostream_category error`），用户看了无从下手。
+  @visibleForTesting
+  static String nativeImportErrorMessage(String error) {
+    if (error.contains(kNativeStorageFullMarker)) {
+      return t.dict_import_storage_full;
+    }
+    return error.isNotEmpty ? error : t.import_failed;
+  }
+
+  /// 与 native `dictionary_importer::kStorageFullMarker` 逐字一致。
+  @visibleForTesting
+  static const String kNativeStorageFullMarker = 'FUSHI_ERR_STORAGE_FULL';
+
+  DictionaryFormat detectFormat(File file) {
+    final ext = path.extension(file.path).toLowerCase();
+    if (ext == '.dsl') return _formats['abbyy_lingvo']!;
+    if (ext == '.mdx') return _formats['mdict']!;
+    if (ext == '.zip') {
+      final fileNames = _readZipFileNames(file);
+
+      if (fileNames.isEmpty) return _formats['yomichan']!;
+
+      if (fileNames
+          .any((f) => f == 'index.json' || f.endsWith('/index.json'))) {
+        return _formats['yomichan']!;
+      }
+      if (fileNames.any((f) => f.endsWith('.mdx') || f.endsWith('.mdd'))) {
+        return _formats['mdict']!;
+      }
+      if (fileNames.any((f) => f.endsWith('.json'))) {
+        return _formats['migaku']!;
+      }
+      return _formats['yomichan']!;
+    }
+    throw Exception(t.import_unsupported_file_format(ext: ext));
+  }
+
+  DictionaryFormat detectFormatFromDirectory(Directory dir) {
+    final indexFile = File(path.join(dir.path, 'index.json'));
+    if (indexFile.existsSync()) return _formats['yomichan']!;
+    final hasJson = dir
+        .listSync()
+        .whereType<File>()
+        .any((f) => f.path.toLowerCase().endsWith('.json'));
+    if (hasJson) return _formats['migaku']!;
+    throw Exception(t.dictionary_unrecognized_format);
+  }
+
+  /// BUG-927：把一本词典的 native 导入结果摘要写进 [ErrorLogService]（错误日志页
+  /// 可查）。成功但各类计数全为 0 通常意味着 native 端把所有 bank 解成空——这正是
+  /// TODO-892 的 zip.cpp 压缩比守卫误杀合法 yomitan bank 时的症状——留下这条摘要后
+  /// 「某本词典导入后没有词条」就能从日志直接定位，而不必逐本盲猜。
+  ///
+  /// TODO-943：错误日志页是**单通道无级别**日志器（所有 entry 同显于「错误日志」），
+  /// 旧实现**无条件**把每本导入结果写进去——连「成功导入 N 词条」的正常摘要也被
+  /// 当成错误展示，用户看到成功结果出现在错误日志里困惑。改为仅在真正需要排查的
+  /// 情况（导入失败、或成功但 0 词条＝被吞空）才写入；正常成功不再落错误日志。
+  /// BUG-927 想要的诊断（失败 / 0 词条）依旧可在错误日志查到。
+  void _logImportResultSummary(String source, FushiImportResult result) {
+    final int total = result.termCount +
+        result.metaCount +
+        result.freqCount +
+        result.pitchCount +
+        result.kanjiCount;
+    if (!shouldLogImportResult(success: result.success, totalEntries: total)) {
+      return;
+    }
+    ErrorLogService.instance.log(
+      'DictImport.result',
+      '$source success=${result.success} title="${result.title}" '
+          'term=${result.termCount} meta=${result.metaCount} '
+          'freq=${result.freqCount} pitch=${result.pitchCount} '
+          'kanji=${result.kanjiCount} media=${result.mediaCount} '
+          'total=$total'
+          '${result.error.isNotEmpty ? ' error=${result.error}' : ''}'
+          '${result.success && total == 0 ? ' [WARN:0 entries imported]' : ''}',
+    );
+  }
+
+  /// TODO-943：是否把一次词典导入结果摘要写进 [ErrorLogService]（错误日志页）。
+  ///
+  /// 错误日志是单通道无级别日志器，只该收真正需要排查的情况：
+  /// - 导入失败（`!success`）→ 写；
+  /// - 成功但 0 词条（`success && totalEntries == 0`，native 把 bank 解空，
+  ///   BUG-927/TODO-892 症状）→ 写；
+  /// - 正常成功（`success && totalEntries > 0`）→ **不写**（否则成功结果误现于
+  ///   错误日志，TODO-943 用户困惑的根因）。
+  @visibleForTesting
+  static bool shouldLogImportResult({
+    required bool success,
+    required int totalEntries,
+  }) {
+    return !success || totalEntries == 0;
+  }
+
+  Future<void> importFromDirectory({
+    required Directory directory,
+    required ValueNotifier<String> progressNotifier,
+    required ValueNotifier<int?> countNotifier,
+    required ValueNotifier<int?> totalNotifier,
+    required Function() onImportSuccess,
+    required bool lowMemoryMode,
+    VoidCallback? onMemoryError,
+  }) async {
+    final entities = directory.listSync();
+    // 逐个导入的次序是用户可见的（进度 i/N + failedNames 汇总），listSync
+    // 的平台顺序不能当稳定输入——同文件 _importArchivedDictionaries 已经这么做。
+    final zipFiles = entities.whereType<File>().where((f) {
+      final ext = path.extension(f.path).toLowerCase();
+      return ext == '.zip' || ext == '.dsl' || ext == '.mdx';
+    }).toList()
+      ..sort((File a, File b) => a.path.compareTo(b.path));
+
+    if (zipFiles.isNotEmpty) {
+      final cssFiles = entities
+          .whereType<File>()
+          .where((f) => f.path.toLowerCase().endsWith('.css'))
+          .toList();
+      final fontDirs = <Directory>[];
+      for (final d in entities.whereType<Directory>()) {
+        try {
+          final hasFont = d.listSync().whereType<File>().any((f) {
+            final ext = path.extension(f.path).toLowerCase();
+            return ext == '.otf' ||
+                ext == '.ttf' ||
+                ext == '.woff' ||
+                ext == '.woff2';
+          });
+          if (hasFont) fontDirs.add(d);
+        } catch (e, stack) {
+          ErrorLogService.instance.log('DictImport.scanFontDir', e, stack);
+          debugPrint('[Fushi] error scanning font dir ${d.path}: $e');
+        }
+      }
+
+      totalNotifier.value = zipFiles.length;
+      final List<DictionaryTaskFailure> failedNames =
+          <DictionaryTaskFailure>[];
+      for (int i = 0; i < zipFiles.length; i++) {
+        countNotifier.value = i + 1;
+        try {
+          await importFromFile(
+            file: zipFiles[i],
+            progressNotifier: progressNotifier,
+            cssFiles: cssFiles,
+            fontDirs: fontDirs,
+            onImportSuccess: onImportSuccess,
+            lowMemoryMode: lowMemoryMode,
+            onMemoryError: onMemoryError,
+          );
+        } catch (e, stack) {
+          ErrorLogService.instance.log('DictImport.importZip', e, stack);
+          failedNames.add(
+            DictionaryTaskFailure(
+              name: path.basenameWithoutExtension(zipFiles[i].path),
+              stage: DictionaryTaskStage.import,
+              error: e,
+            ),
+          );
+        }
+      }
+      if (failedNames.isNotEmpty) {
+        FushiToast.show(
+          msg: formatImportFailureSummary(failedNames),
+          toastLength: Toast.LENGTH_LONG,
+          severity: ToastSeverity.error,
+        );
+      }
+      // TODO-082：成功导入数 = 总数 - 失败数；> 0 给一条明确成功提示，与失败汇总
+      // 可同时出现（部分成功部分失败）。
+      final int succeeded = zipFiles.length - failedNames.length;
+      if (succeeded > 0) {
+        FushiToast.show(
+          msg: t.dict_import_success_summary(n: succeeded),
+          severity: ToastSeverity.success,
+        );
+      }
+      return;
+    }
+
+    // TODO-379：到这里说明目录里没有 .zip/.dsl/.mdx 词典包，下面会把整个目录
+    // 递归打包成一个 zip 喂给 native（yomichan 散文件 / migaku JSON 目录路径）。
+    // 但用户可能选错目录——里头只有 QQ 下载的 `.conf` 等无关文件、没有任何词典
+    // 主文件（index.json / *.json）。旧实现会无脑把无关文件打包后再让 native 报一句含糊的 import_failed。
+    // 先做一次递归预检：目录里压根没有可识别的词典主文件时，直接抛明确的
+    // 「无法识别的词典格式」，让用户知道是选错了目录而非 app 坏了。预检与 packDirectoryToZip
+    // 同样递归，故子目录里的词典不会被误杀。
+    if (!directoryContainsImportableDictionary(directory)) {
+      throw Exception(t.dictionary_unrecognized_format);
+    }
+
+    _dictRepo.clearDictionaryResultsCache();
+
+    try {
+      progressNotifier.value = t.import_extract;
+
+      final tempZipPath =
+          path.join(_resourceDirectory.path, 'import_temp_dir.zip');
+      final tempZip = File(tempZipPath);
+
+      // 把整个目录读进内存再 zip 压缩是纯文件操作但很重（大词典目录可达数百
+      // MB），若在主 isolate 同步跑会卡死 UI（TODO-082）。参数都是 String 路径，
+      // 可安全丢进后台 isolate，让 UI 在打包期保持响应。native FFI 导入本就在
+      // 自己的 isolate（FushiDicts.importDictionary）。
+      await Isolate.run(() => packDirectoryToZip(directory.path, tempZipPath));
+
+      try {
+        final tempOutputDir =
+            Directory(path.join(_resourceDirectory.path, 'import_temp'));
+        if (tempOutputDir.existsSync()) {
+          tempOutputDir.deleteSync(recursive: true);
+        }
+        tempOutputDir.createSync(recursive: true);
+
+        ErrorLogService.instance
+            .markImportStart('native 词典导入(目录)未返回：${directory.path}');
+        final FushiImportResult result;
+        try {
+          result = await importDictionaryViaFushidicts(
+            zipPath: tempZipPath,
+            outputDir: tempOutputDir.path,
+            breadcrumbDir: ErrorLogService.instance.importStepBreadcrumbDir,
+          );
+        } finally {
+          ErrorLogService.instance.markImportEnd();
+        }
+        // BUG-927：记每本导入的结果摘要（标题 + 各类计数）。零计数 + success
+        // 说明 native 把 bank 解空了（曾被 zip.cpp 压缩比守卫误杀），这里留痕即可
+        // 一眼定位「哪本被吞空」而不必猜。
+        _logImportResultSummary('dir:${directory.path}', result);
+
+        if (!result.success) {
+          throw Exception(nativeImportErrorMessage(result.error));
+        }
+
+        final name = _sanitizeTitle(result.title);
+        progressNotifier.value = t.import_name(name: name);
+
+        // 目录导入是普通批量入口，没有「被点击的词典」→ 无显式替换目标。
+        final UpdateDecision decision = _decideUpdate(
+          name,
+          force: false,
+          hasReplaceTarget: false,
+        );
+        if (decision == UpdateDecision.alreadyUpToDate) {
+          _notifyAlreadyUpToDate(progressNotifier, name);
+          if (tempOutputDir.existsSync()) {
+            tempOutputDir.deleteSync(recursive: true);
+          }
+          return;
+        }
+
+        final Dictionary? preservedSettings = await resolveAndRemoveReplaced(
+          newName: name,
+          decision: decision,
+          replaceTarget: null,
+        );
+        final int order = preservedSettings?.order ?? _nextOrder();
+
+        final innerDataDir = Directory(path.join(tempOutputDir.path, name));
+        final finalDir = Directory(path.join(_resourceDirectory.path, name));
+        _validatePath(finalDir);
+        // 走原语：残留同名目录可能仍被引擎映射着，裸 deleteSync 在 Windows 上
+        // 会抛 ERROR_USER_MAPPED_FILE（BUG-1756）。
+        await deleteDictionaryDirectory(finalDir,
+            reloadEngine: _dictRepo.rebuildEngine);
+
+        if (innerDataDir.existsSync()) {
+          await _publishImportedDir(innerDataDir, finalDir.path);
+        } else {
+          await _publishImportedDir(tempOutputDir, finalDir.path);
+        }
+        if (tempOutputDir.existsSync()) {
+          tempOutputDir.deleteSync(recursive: true);
+        }
+
+        final detectedType = _parseType(result.detectedType);
+        await _dictRepo.persistDictionary(Dictionary(
+          order: order,
+          name: name,
+          formatKey: 'yomichan',
+          type: detectedType,
+          // TODO-609 来源 metadata + TODO-622 混合词典也进 kanji 桶(add_term+add_kanji)。
+          metadata: <String, String>{
+            ...readSourceMetadataFromIndex(finalDir),
+            if (result.kanjiCount > 0) 'hasKanji': 'true',
+            // 导入时 native 已经数过 term/kanji 记录，等于类型探测刚做完：直接落
+            // 标记，启动期的自愈循环就不会再对这本做一次全表扫描。
+            kDictTypeProbeKey: kDictTypeProbeVersion,
+          },
+          hiddenLanguages: preservedSettings?.hiddenLanguages ?? const [],
+          collapsedLanguages: preservedSettings?.collapsedLanguages ?? const [],
+          expandedLanguages: preservedSettings?.expandedLanguages ?? const [],
+          // 用户手动指定的内容语言属于用户设置，重导必须继承——metadata 会被包内
+          // index.json 整体重建，塞那里等于每次更新都被抹掉。
+          languageOverride: preservedSettings?.languageOverride,
+          // 同理：用户给词典起的显示名重导后必须还在，否则「在线更新一次就变回
+          // 包里那个丑名字」。
+          displayName: preservedSettings?.displayName,
+        ));
+
+        progressNotifier.value = t.import_complete;
+        onImportSuccess();
+        // TODO-082：单目录导入成功，给一条明确成功提示（与文件/批量路径一致）。
+        FushiToast.show(
+          msg: t.dict_import_success_summary(n: 1),
+          severity: ToastSeverity.success,
+        );
+      } finally {
+        if (tempZip.existsSync()) tempZip.deleteSync();
+      }
+    } catch (e, stack) {
+      ErrorLogService.instance.log('DictImport(dir)', e, stack);
+      // BUG-082: do not block 3s per failure; signal the memory case once and
+      // rethrow so the caller can report the failure.
+      final bool mem = _isMemoryError(e) && !lowMemoryMode;
+      if (mem) onMemoryError?.call();
+      throw DictionaryImportException(e, isMemoryError: mem);
+    }
+  }
+
+  /// 整合包内层 zip 递归解包的最大深度（外层不计）。
+  static const int _kMaxNestedBundleDepth = 4;
+
+  /// BUG-1903：把一个装了多本词典的压缩包拆开、逐本导入。
+  ///
+  /// 解压保持原有目录层级：MDX 的样式表 / 资源（`.css` / `.mdd`）就躺在它自己那本
+  /// 词典的目录里，摊平会让 A 典的样式套到 B 典头上。每本只带**同目录**的 css。
+  ///
+  /// 单本失败不中断其余（与 [importFromDirectory] 同策略）：三本里坏一本，另外两本
+  /// 照样进库，最后用同一套汇总提示告诉用户哪本没进去。
+  Future<void> _importArchivedDictionaries({
+    required File archive,
+    required ValueNotifier<String> progressNotifier,
+    required Function() onImportSuccess,
+    required bool lowMemoryMode,
+    VoidCallback? onMemoryError,
+  }) async {
+    final String baseWork =
+        path.join(_resourceDirectory.path, 'import_multi_temp');
+    // BUG-2952：整合包里的内层 zip 自己也可能是一包多典，会递归回到这里。递归层
+    // 必须用外层工作目录**里面**的独立目录——共用同一个固定目录会在外层还在逐本
+    // 导入时把它整个删掉。外层 finally 删目录时连带清掉。
+    final bool nested = path.isWithin(baseWork, archive.path);
+    // 自包含 / 恶意深层嵌套的包会无限递归、一层层解压直到磁盘写满：限深，超限这一本
+    // 按失败处理（外层逐本循环照常汇总）。
+    if (nested &&
+        '.extracted'
+                .allMatches(path.relative(archive.path, from: baseWork))
+                .length >=
+            _kMaxNestedBundleDepth) {
+      throw StateError('Dictionary bundle nested too deeply: ${archive.path}');
+    }
+    final Directory work = nested
+        ? Directory('${archive.path}.extracted')
+        : Directory(baseWork);
+    if (work.existsSync()) work.deleteSync(recursive: true);
+    work.createSync(recursive: true);
+    try {
+      progressNotifier.value = t.import_extract;
+      await Future<void>.delayed(Duration.zero);
+      // 后台 isolate + 原生 zlib 逐条目流式落盘：archive 的 extractFileToDisk 在
+      // 主 isolate 上把每个条目整个解压进内存再写（几百 MB 的 MDD 直接卡 UI / OOM）。
+      final String zipPath = archive.path;
+      final String workPath = work.path;
+      await Isolate.run(() => extractZipFileToDirectory(zipPath, workPath));
+
+      final List<File> dictionaries =
+          work.listSync(recursive: true).whereType<File>().where((File f) {
+        final String ext = path.extension(f.path).toLowerCase();
+        return ext == '.mdx' || ext == '.dsl' || ext == '.zip';
+      }).toList();
+      // BUG-2952：多份 index.json 的整合包——每个带 index.json 的目录是一本
+      // Yomitan 散文件词典，打成临时 zip 后走同一条 [importFromFile]。只有一份
+      // index.json 且没有别的词典时不会走到这里（[isDictionaryBundle]）；只有
+      // 一份但旁边还有内层 zip / MDX 时它也是整合包里的一本，同样要导。
+      final List<Directory> yomitanRoots = work
+          .listSync(recursive: true)
+          .whereType<File>()
+          .where((File f) =>
+              path.basename(f.path).toLowerCase() == 'index.json')
+          .map((File f) => f.parent)
+          .toList();
+      if (yomitanRoots.length > 1 || dictionaries.isNotEmpty) {
+        // 根目录本身就可能是一个 Yomitan 根（根上有 index.json、旁边还有内层 zip / MDX）：
+        // 打包时必须避开别的词典（内层 zip / MDX / MDD / DSL、嵌套的其它 Yomitan 根、
+        // 先打好的临时包与正在写的这份 zip 自己），否则整包重复进这一本的 media。
+        final Set<String> mddFiles = <String>{
+          for (final File f in work.listSync(recursive: true).whereType<File>())
+            if (path.extension(f.path).toLowerCase() == '.mdd') f.path,
+        };
+        for (int i = 0; i < yomitanRoots.length; i++) {
+          final String packed = path.join(work.path, '_bundle_dict_$i.zip');
+          final String root = yomitanRoots[i].path;
+          final Set<String> skipPaths = <String>{
+            ...mddFiles,
+            for (final File f in dictionaries) f.path,
+            // 只排除落在本根之下的其它 Yomitan 根（嵌套子词典）。祖先根与兄弟根
+            // 本来就不在 root 的遍历范围里；把祖先根放进来会让 isWithin 把本根
+            // 自己的全部文件判成「在别的词典里」，子词典被打成空包（BUG-2995）。
+            for (final Directory d in yomitanRoots)
+              if (path.isWithin(root, d.path)) d.path,
+          };
+          await Isolate.run(
+            () => packDirectoryToZip(root, packed, skipPaths: skipPaths),
+          );
+          dictionaries.add(File(packed));
+        }
+      }
+      dictionaries.sort((File a, File b) => a.path.compareTo(b.path));
+      if (dictionaries.length > 1) {
+        progressNotifier.value =
+            t.dict_import_bundle_detected(n: dictionaries.length);
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      final List<DictionaryTaskFailure> failedNames =
+          <DictionaryTaskFailure>[];
+      for (int i = 0; i < dictionaries.length; i++) {
+        final File dictionary = dictionaries[i];
+        final List<File> cssFiles = Directory(path.dirname(dictionary.path))
+            .listSync()
+            .whereType<File>()
+            .where((File f) => f.path.toLowerCase().endsWith('.css'))
+            .toList();
+        try {
+          await importFromFile(
+            file: dictionary,
+            progressNotifier: progressNotifier,
+            cssFiles: cssFiles,
+            onImportSuccess: onImportSuccess,
+            lowMemoryMode: lowMemoryMode,
+            onMemoryError: onMemoryError,
+          );
+        } catch (e, stack) {
+          ErrorLogService.instance.log('DictImport.multiArchive', e, stack);
+          failedNames.add(
+            DictionaryTaskFailure(
+              name: path.basenameWithoutExtension(dictionary.path),
+              stage: DictionaryTaskStage.import,
+              error: e,
+            ),
+          );
+        }
+      }
+
+      if (failedNames.isNotEmpty) {
+        FushiToast.show(
+          msg: formatImportFailureSummary(failedNames),
+          toastLength: Toast.LENGTH_LONG,
+          severity: ToastSeverity.error,
+        );
+      }
+      final int succeeded = dictionaries.length - failedNames.length;
+      if (succeeded > 0) {
+        FushiToast.show(
+          msg: t.dict_import_success_summary(n: succeeded),
+          severity: ToastSeverity.success,
+        );
+      }
+    } finally {
+      if (work.existsSync()) {
+        try {
+          work.deleteSync(recursive: true);
+        } catch (e, stack) {
+          ErrorLogService.instance
+              .log('DictImport.multiArchiveCleanup', e, stack);
+        }
+      }
+    }
+  }
+
+  Future<void> importFromFile({
+    required File file,
+    required ValueNotifier<String> progressNotifier,
+    required Function() onImportSuccess,
+    required bool lowMemoryMode,
+    List<File> cssFiles = const [],
+    List<Directory> fontDirs = const [],
+    VoidCallback? onMemoryError,
+    // TODO-609：强制重导（在线更新走这条）。true 时完全同名走 replaceExact 而非
+    // alreadyUpToDate 跳过；默认 false，普通拖入/导入同名仍跳过（现有语义不破）。
+    bool forceReplaceExisting = false,
+    // TODO-609：在线下载来源回填（catalog 的 url 当 downloadUrl/indexUrl）。导入后
+    // 与 readSourceMetadataFromIndex 合并落进 Dictionary.metadata；index.json 的
+    // 真值优先覆盖，缺失字段由本 override 补上。默认 null（本地导入不带来源）。
+    Map<String, String>? sourceOverride,
+    // BUG-1595：显式替换目标（更新入口被点击的那本词典）。非空时替换语义由目标
+    // 本身决定：不再让新包 title 走 decideUpdate 分派（新包标题带版本号变化时会
+    // 误判 newDictionary、把「更新」做成「追加」），导入成功后删除该目标的磁盘
+    // 目录 + meta，新词典继承其 order/hiddenLanguages/collapsedLanguages（与
+    // replaceOldVersion 分支同待遇）。普通导入入口不传，行为不变。
+    Dictionary? replaceTarget,
+  }) async {
+    // BUG-1903：一个压缩包里装了多本词典时，native 侧只认它找到的第一本、其余
+    // **静默丢弃**并照样报 success——用户把打包好的「日语辞典三件套」拖进来，只会
+    // 多出一本，另外两本无声无息（实测：三本 MDX 的包导入后只剩旺文社一本）。
+    // 拆开逐本走同一条 [importFromFile]，与目录导入的循环同形。
+    //
+    // 三个「这是在更新某一本」的入口（强制重导 / 来源回填 / 显式替换目标）不分流：
+    // 它们的语义是「用这个包替换那一本」，拆包会把一次更新变成多次追加。
+    if (replaceTarget == null &&
+        !forceReplaceExisting &&
+        sourceOverride == null &&
+        path.extension(file.path).toLowerCase() == '.zip') {
+      final List<String> archived =
+          archivedDictionaryEntries(_readZipFileNames(file));
+      if (isDictionaryBundle(archived)) {
+        await _importArchivedDictionaries(
+          archive: file,
+          progressNotifier: progressNotifier,
+          onImportSuccess: onImportSuccess,
+          lowMemoryMode: lowMemoryMode,
+          onMemoryError: onMemoryError,
+        );
+        return;
+      }
+    }
+
+    _dictRepo.clearDictionaryResultsCache();
+
+    try {
+      progressNotifier.value = t.import_extract;
+      await Future<void>.delayed(Duration.zero);
+
+      final tempOutputDir =
+          Directory(path.join(_resourceDirectory.path, 'import_temp'));
+      if (tempOutputDir.existsSync()) {
+        tempOutputDir.deleteSync(recursive: true);
+      }
+      tempOutputDir.createSync(recursive: true);
+
+      ErrorLogService.instance.markImportStart('native 词典导入未返回：${file.path}');
+      final FushiImportResult result;
+      try {
+        result = await importDictionaryViaFushidicts(
+          zipPath: file.path,
+          outputDir: tempOutputDir.path,
+          breadcrumbDir: ErrorLogService.instance.importStepBreadcrumbDir,
+        );
+      } finally {
+        ErrorLogService.instance.markImportEnd();
+      }
+      // BUG-927：记每本导入结果摘要（见上 dir 路径同名 helper 的说明）。
+      _logImportResultSummary('file:${file.path}', result);
+
+      if (!result.success) {
+        throw Exception(nativeImportErrorMessage(result.error));
+      }
+
+      final name = _sanitizeTitle(result.title);
+      progressNotifier.value = t.import_name(name: name);
+
+      final UpdateDecision decision = _decideUpdate(
+        name,
+        force: forceReplaceExisting,
+        hasReplaceTarget: replaceTarget != null,
+      );
+      if (decision == UpdateDecision.alreadyUpToDate) {
+        _notifyAlreadyUpToDate(progressNotifier, name);
+        if (tempOutputDir.existsSync()) {
+          tempOutputDir.deleteSync(recursive: true);
+        }
+        return;
+      }
+
+      final Dictionary? preservedSettings = await resolveAndRemoveReplaced(
+        newName: name,
+        decision: decision,
+        replaceTarget: replaceTarget,
+      );
+      final int order = preservedSettings?.order ?? _nextOrder();
+
+      final innerDataDir = Directory(path.join(tempOutputDir.path, name));
+      final finalDir = Directory(path.join(_resourceDirectory.path, name));
+      _validatePath(finalDir);
+      // 同上（BUG-1756）：删旧目录必须经原语，先让引擎释放映射。
+      await deleteDictionaryDirectory(finalDir,
+          reloadEngine: _dictRepo.rebuildEngine);
+
+      if (innerDataDir.existsSync()) {
+        await _publishImportedDir(innerDataDir, finalDir.path);
+      } else {
+        await _publishImportedDir(tempOutputDir, finalDir.path);
+      }
+      if (tempOutputDir.existsSync()) {
+        tempOutputDir.deleteSync(recursive: true);
+      }
+
+      for (final css in cssFiles) {
+        if (css.existsSync()) {
+          css.copySync(path.join(finalDir.path, path.basename(css.path)));
+        }
+      }
+      for (final fontDir in fontDirs) {
+        if (fontDir.existsSync()) {
+          _copyDirectory(fontDir,
+              Directory(path.join(finalDir.path, path.basename(fontDir.path))));
+        }
+      }
+
+      final detectedType = _parseType(result.detectedType);
+      // TODO-609：合并来源。revision **永远**取自本地导入包的 index.json（实际装的
+      // 是哪个版本，才是后续比对的本地基准）；来源身份字段（isUpdatable/indexUrl/
+      // downloadUrl）则优先用 [sourceOverride]——它是我们从在线 catalog / 更新链路
+      // 拿到的权威来源，胜过包内 index.json 的字段。这修掉「包内 index.json 不声明
+      // isUpdatable（很多 yomitan 包不带）→ 写回成 false → 更新一次后丢失可更新性、
+      // 按钮消失无法二次更新」的缺口（W-2）：sourceOverride 带 isUpdatable:'true' 时
+      // 它必须压过包内的 false。sourceOverride 不携带 revision（强制以本地包为准）。
+      final Map<String, String> metadata = mergeSourceMetadata(
+        readSourceMetadataFromIndex(finalDir),
+        sourceOverride,
+      );
+      await _dictRepo.persistDictionary(Dictionary(
+        order: order,
+        name: name,
+        formatKey: 'yomichan',
+        type: detectedType,
+        // TODO-622: 混合词典也进 kanji 桶(叠加 609 的来源 metadata)。
+        metadata: <String, String>{
+          ...metadata,
+          if (result.kanjiCount > 0) 'hasKanji': 'true',
+          // 同目录导入路径：native 刚数完记录，探测标记直接落库（见另一处注释）。
+          kDictTypeProbeKey: kDictTypeProbeVersion,
+        },
+        hiddenLanguages: preservedSettings?.hiddenLanguages ?? const [],
+        collapsedLanguages: preservedSettings?.collapsedLanguages ?? const [],
+        expandedLanguages: preservedSettings?.expandedLanguages ?? const [],
+        // 同上：用户手动指定的内容语言随 preservedSettings 继承，不被重导冲掉。
+        languageOverride: preservedSettings?.languageOverride,
+        // 同上：用户起的显示名也继承，在线更新不把名字打回原形。
+        displayName: preservedSettings?.displayName,
+      ));
+
+      progressNotifier.value = t.import_complete;
+      onImportSuccess();
+    } catch (e, stack) {
+      ErrorLogService.instance.log('DictImport(file)', e, stack);
+      // BUG-082: do not block 3s per failed dictionary. Signal the memory case
+      // once and rethrow a typed exception so the batch caller can collect the
+      // failure and show a single summary at the end.
+      final bool mem = _isMemoryError(e) && !lowMemoryMode;
+      if (mem) onMemoryError?.call();
+      throw DictionaryImportException(e, isMemoryError: mem);
+    }
+  }
+
+  // ── private helpers ──────────────────────────────────────────────────
+
+  int _nextOrder() {
+    final dicts = _dictRepo.dictionaries;
+    if (dicts.isEmpty) return 1;
+    return dicts.map((d) => d.order).reduce((a, b) => a > b ? a : b) + 1;
+  }
+
+  void _validatePath(Directory dir) {
+    if (!path.isWithin(_resourceDirectory.path, dir.path)) {
+      throw Exception('Invalid dictionary title: path traversal detected');
+    }
+  }
+
+  List<String> _readZipFileNames(File file) {
+    try {
+      final input = InputFileStream(file.path);
+      final dir = ZipDirectory.read(input);
+      final names = dir.fileHeaders
+          .map((h) => h.filename)
+          .where((n) => n.isNotEmpty)
+          .map((n) => n.toLowerCase())
+          .toList();
+      input.closeSync();
+      return names;
+    } catch (e, stack) {
+      ErrorLogService.instance.log('DictImport.readZipNames', e, stack);
+      return [];
+    }
+  }
+
+  static String _sanitizeTitle(String raw) {
+    final cleaned = path.basename(raw.trim()).replaceAll(RegExp(r'[/\\]'), '_');
+    if (cleaned.isEmpty || cleaned == '.' || cleaned == '..') {
+      throw Exception('Dictionary title is empty');
+    }
+    return cleaned;
+  }
+
+  /// TODO-839：在**不导入**的前提下，从一个 yomitan zip 包里廉价探出 `index.json`
+  /// 的 `title`，供「从文件重选覆盖更新」在导入前判断新旧包是否同名（异名时弹确认，
+  /// 避免 [decideUpdate] 把异名包静默改判成新增导入、原词典原封不动留着的语义陷阱）。
+  ///
+  /// 只解压 zip 里**唯一一个** `index.json` entry 并解析 title，不解压全量、不落盘、
+  /// 不改任何状态——纯函数（仅依赖入参 [File] 与磁盘只读）。
+  ///
+  /// 仅支持 yomitan zip：dsl/mdx 的 title 不在 index.json（要等 native 导入后才知道），
+  /// 廉价 peek 拿不到 → 返回 null（调用方退化为纯 force 重导，不弹异名确认）。坏包 /
+  /// 无 index.json / title 缺失也返回 null。
+  static String? peekDictionaryTitle(File file) {
+    if (path.extension(file.path).toLowerCase() != '.zip') return null;
+    try {
+      final InputFileStream input = InputFileStream(file.path);
+      try {
+        final ZipDirectory dir = ZipDirectory.read(input);
+        ZipFileHeader? indexHeader;
+        for (final ZipFileHeader header in dir.fileHeaders) {
+          final String name = header.filename.toLowerCase();
+          if (name == 'index.json' || name.endsWith('/index.json')) {
+            indexHeader = header;
+            break;
+          }
+        }
+        final ZipFile? entry = indexHeader?.file;
+        if (entry == null) return null;
+        final dynamic decoded = jsonDecode(utf8.decode(entry.content));
+        if (decoded is! Map) return null;
+        final dynamic title = decoded['title'];
+        if (title is! String) return null;
+        final String trimmed = title.trim();
+        return trimmed.isEmpty ? null : _sanitizeTitle(trimmed);
+      } finally {
+        input.closeSync();
+      }
+    } catch (e, stack) {
+      ErrorLogService.instance.log('DictImport.peekTitle', e, stack);
+      return null;
+    }
+  }
+
+  static DictionaryType _parseType(String type) {
+    switch (type) {
+      case 'frequency':
+        return DictionaryType.frequency;
+      case 'pitch':
+        return DictionaryType.pitch;
+      case 'kanji':
+        return DictionaryType.kanji;
+      default:
+        return DictionaryType.term;
+    }
+  }
+
+  /// 判断 [dir] 目录（含任意层子目录）里是否存在可被 native 导入的词典主文件。
+  ///
+  /// TODO-379：「导入文件夹词典」走整目录打包时，旧实现不做任何预检——哪怕目录里
+  /// 只有 QQ 下载的随机名 `.conf` 等无关文件、没有任何词典，也照样打包丢给 native，
+  /// 让用户看到一句含糊的「导入失败」。这里复用与 native yomichan / migaku 导入器
+  /// 一致的判据（顶层或任意子目录里有 `index.json`，或存在任意 `.json` 文件即视为
+  /// 词典 JSON 集合），把「目录里没有词典」变成一个可明确诊断的正常情况，而非交给
+  /// native 去含糊报错。递归扫描，与 [packDirectoryToZip] 的 `recursive: true`
+  /// 打包范围对齐，故子目录里的 yomitan/migaku 词典不会被误判为「无词典」。
+  /// 扫描期单个目录不可读（权限等）按「该子树无词典」处理，不抛异常。
+  @visibleForTesting
+  static bool directoryContainsImportableDictionary(Directory dir) {
+    final List<FileSystemEntity> entities;
+    try {
+      entities = dir.listSync(recursive: true);
+    } on FileSystemException {
+      return false;
+    }
+    for (final FileSystemEntity entity in entities) {
+      if (entity is! File) continue;
+      final String lower = path.basename(entity.path).toLowerCase();
+      if (lower == 'index.json' || lower.endsWith('.json')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// 把 [srcDirPath] 目录递归打包成 [zipPath] 处的 zip 文件。**纯路径输入/纯文件
+  /// 输出**，不触碰任何实例状态，可安全在后台 isolate 经 [Isolate.run] 执行
+  /// （TODO-082：避免大目录的同步读取+压缩卡死主 isolate）。暴露给测试以在 host
+  /// 上验证打包正确性（无需 native FFI）。
+  @visibleForTesting
+  static void packDirectoryToZip(
+    String srcDirPath,
+    String zipPath, {
+    Set<String> skipPaths = const <String>{},
+  }) {
+    final Directory directory = Directory(srcDirPath);
+    // [skipPaths] 里的文件、以及落在其中某个目录下的文件一律不打进来；输出 zip 若就在
+    // 源目录里（整合包根即词典根），它自己也不能被打进自己。
+    bool skipped(String p) =>
+        path.equals(p, zipPath) ||
+        skipPaths.any((String s) => path.equals(p, s) || path.isWithin(s, p));
+    // STORE（不压缩）+ 逐文件流式写盘：这个 zip 只是给 native 导入器当输入的
+    // 临时容器，native 拿到后立刻 inflate——在 Dart 里 deflate 一遍纯属白干（几百
+    // MB 的 MDX/MDD 目录要压好几秒）。以前还把整个目录读进内存组 Archive、再
+    // encode 成第二份内存拷贝才落盘（~2× 目录大小的峰值，正是 OOM 路径的来源）；
+    // ZipFileEncoder 一次只持有一个文件。native 侧的压缩比守卫对 STORE 比 1:1
+    // 天然放行。
+    final ZipFileEncoder encoder = ZipFileEncoder();
+    encoder.create(zipPath, level: ZipFileEncoder.STORE);
+    try {
+      for (final FileSystemEntity entity
+          in directory.listSync(recursive: true)) {
+        if (entity is File && !skipped(entity.path)) {
+          final String relativePath =
+              path.relative(entity.path, from: directory.path);
+          final InputFileStream fileStream = InputFileStream(entity.path);
+          try {
+            encoder.addArchiveFile(
+              ArchiveFile.stream(relativePath, entity.lengthSync(), fileStream)
+                ..compress = false,
+            );
+          } finally {
+            fileStream.closeSync();
+          }
+        }
+      }
+    } finally {
+      encoder.closeSync();
+    }
+  }
+
+  static void _copyDirectory(Directory source, Directory destination) {
+    destination.createSync(recursive: true);
+    for (final entity in source.listSync()) {
+      final newPath = path.join(destination.path, path.basename(entity.path));
+      if (entity is File) {
+        entity.copySync(newPath);
+      } else if (entity is Directory) {
+        _copyDirectory(entity, Directory(newPath));
+      }
+    }
+  }
+
+  static Future<void> _copyDirectoryAsync(
+      Directory source, Directory destination) async {
+    await destination.create(recursive: true);
+    await for (final entity in source.list()) {
+      final newPath = path.join(destination.path, path.basename(entity.path));
+      if (entity is File) {
+        await entity.copy(newPath);
+      } else if (entity is Directory) {
+        await _copyDirectoryAsync(entity, Directory(newPath));
+      }
+    }
+  }
+
+  /// 把已导入的词典目录从暂存区 [source] 发布到最终路径 [destPath]。
+  ///
+  /// Windows Defender / 搜索索引器会在文件刚落盘后异步打开扫描、短暂持有句柄，
+  /// 致紧接着的目录 rename（`MoveFileExW`）报 ERROR_ACCESS_DENIED(5) 或
+  /// SHARING_VIOLATION(32)（BUG-050）。这是**不可控的外部平台行为**（无法阻止
+  /// AV/索引器扫描刚写入的文件），故对 rename 做有界重试；用尽后回退「递归复制+删源」
+  /// （copy 用共享读打开源文件，容忍扫描句柄）。POSIX 下 rename 一次即成功、不触发
+  /// 重试分支。本进程自身的 native 句柄在 `import_` 返回时已关闭（RAII），故非同进程
+  /// 句柄泄漏——间歇性失败(4/14)证实锁来自外部、可经重试规避。
+  Future<void> _publishImportedDir(Directory source, String destPath) {
+    return publishImportedDir(
+      rename: () => source.rename(destPath),
+      copyThenDelete: () async {
+        await _copyDirectoryAsync(source, Directory(destPath));
+        try {
+          await source.delete(recursive: true);
+        } catch (_) {
+          // 删源失败留下的残留 temp 由下一轮 import 的 import_temp 清理覆盖。
+        }
+      },
+      sleep: (ms) => Future<void>.delayed(Duration(milliseconds: ms)),
+      isWindows: Platform.isWindows,
+    );
+  }
+
+  /// [_publishImportedDir] 的纯逻辑核心，依赖项全部注入便于测试。
+  /// 仅当 [isWindows] 且 OS 错误码为瞬时锁（5/32）时重试；用尽 [maxAttempts]
+  /// 后调 [copyThenDelete] 回退。其余错误（非 Windows、或非瞬时码）原样抛出。
+  @visibleForTesting
+  static Future<DictPublishMethod> publishImportedDir({
+    required Future<void> Function() rename,
+    required Future<void> Function() copyThenDelete,
+    required Future<void> Function(int delayMs) sleep,
+    required bool isWindows,
+    int maxAttempts = 10,
+  }) async {
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await rename();
+        return DictPublishMethod.renamed;
+      } on FileSystemException catch (e) {
+        final int? code = e.osError?.errorCode;
+        final bool transient = isWindows && (code == 5 || code == 32);
+        if (!transient) rethrow;
+        if (attempt == maxAttempts) {
+          await copyThenDelete();
+          return DictPublishMethod.copied;
+        }
+        await sleep(50 * attempt); // 退避：50ms,100ms,… 给 AV 扫描窗口让路
+      }
+    }
+    return DictPublishMethod.renamed; // 不可达：循环内必返回或抛出
+  }
+
+  UpdateDecision _decideUpdate(
+    String newName, {
+    required bool force,
+    required bool hasReplaceTarget,
+  }) {
+    return decideUpdate(
+      hasExactName: _dictRepo.hasDictionaryNamed(newName),
+      hasUpdatableVersion: _dictRepo.findUpdatable(newName) != null,
+      force: force,
+      hasReplaceTarget: hasReplaceTarget,
+    );
+  }
+
+  /// [_decideUpdate] 的纯逻辑核心（依赖全部入参注入，便于测试）。
+  ///
+  /// BUG-1595：[hasReplaceTarget]（更新入口显式指定被替换词典）压过一切按 title
+  /// 的判定 → 恒 [UpdateDecision.replaceExact]。按 title 判定对「标题里携带版本号」
+  /// 的包（如「… V2026.08.11」→「… V2026.08.13」，不匹配 [YYYY-MM-DD] 尾缀）会
+  /// 落到 newDictionary，把「更新」做成「追加」、两版并存——显式目标下 title 只是
+  /// 展示名，不再承载替换语义。
+  ///
+  /// 无显式目标时维持 TODO-609 语义：完全同名优先，命中则按 [force] 区分
+  /// [UpdateDecision.replaceExact]（强制更新重导）/ [UpdateDecision.alreadyUpToDate]
+  /// （普通导入跳过）。否则若存在同 base 名的不同日期版本 →
+  /// [UpdateDecision.replaceOldVersion]（与 [force] 无关，旧行为）。都不命中 →
+  /// [UpdateDecision.newDictionary]。
+  @visibleForTesting
+  static UpdateDecision decideUpdate({
+    required bool hasExactName,
+    required bool hasUpdatableVersion,
+    required bool force,
+    bool hasReplaceTarget = false,
+  }) {
+    if (hasReplaceTarget) return UpdateDecision.replaceExact;
+    if (hasExactName) {
+      return force
+          ? UpdateDecision.replaceExact
+          : UpdateDecision.alreadyUpToDate;
+    }
+    if (hasUpdatableVersion) return UpdateDecision.replaceOldVersion;
+    return UpdateDecision.newDictionary;
+  }
+
+  /// BUG-1595：解析本次导入要顶替的旧本并删除其磁盘目录 + meta，返回被继承设置
+  /// （order/hiddenLanguages/collapsedLanguages）的旧本；非替换类决策返回 null、
+  /// 不删任何东西。
+  ///
+  /// [replaceTarget] 非空（更新入口显式指定被点击的词典）时以它为准；否则按
+  /// [decision] 用新包 title 反查（replaceExact 精确同名 / replaceOldVersion 走
+  /// [DictionaryRepository.findUpdatable]，TODO-609 的既有语义，行为不变）。
+  ///
+  /// 撞名收尾：显式替换目标异名时，新包 title 可能恰好等于**另一本**已存词典——
+  /// 后续发布会覆盖那本的磁盘目录、persistDictionary 会按名 upsert 覆盖它的
+  /// meta。按同样待遇先删干净（meta 删除即触发引擎重载，不留指向被覆盖目录的
+  /// 索引窗口，BUG-1492）。该分支在无 replaceTarget 的旧路径上结构性不可达：
+  /// replaceExact 时 existing.name == newName；replaceOldVersion 时精确同名不存在
+  /// （否则 decideUpdate 早已走 exact 分支）。
+  @visibleForTesting
+  Future<Dictionary?> resolveAndRemoveReplaced({
+    required String newName,
+    required UpdateDecision decision,
+    required Dictionary? replaceTarget,
+  }) async {
+    if (decision != UpdateDecision.replaceExact &&
+        decision != UpdateDecision.replaceOldVersion) {
+      return null;
+    }
+    final Dictionary existing = replaceTarget ??
+        (decision == UpdateDecision.replaceExact
+            ? _dictRepo.dictionaries
+                .firstWhere((Dictionary d) => d.name == newName)
+            : _dictRepo.findUpdatable(newName)!);
+    await _removeDictionaryDirAndMeta(existing.name);
+    if (existing.name != newName && _dictRepo.hasDictionaryNamed(newName)) {
+      await _removeDictionaryDirAndMeta(newName);
+    }
+    return existing;
+  }
+
+  /// 删除一本词典的磁盘目录与 meta（替换/覆盖导入的旧本清理共用）。目录不存在
+  /// 时只删 meta；[DictionaryRepository.deleteDictionaryMeta] 本身幂等。
+  Future<void> _removeDictionaryDirAndMeta(String name) async {
+    // 顺序不可交换（BUG-1756）：先撤 meta —— [DictionaryRepository
+    // .deleteDictionaryMeta] 会触发 _onCacheRebuild，把引擎重载到「不含这本」的
+    // 集合，连带释放它常驻的 mmap view；之后目录才删得掉。
+    //
+    // 旧实现反着写：先 deleteSync 旧目录，此时引擎还攥着 hash.table / blobs.bin，
+    // Windows 上必抛 ERROR_USER_MAPPED_FILE → 整个覆盖导入失败。用户侧表现就是
+    // 「词典更新不了，只能每次重新导入」。
+    await _dictRepo.deleteDictionaryMeta(name);
+    await deleteDictionaryDirectory(
+      Directory(path.join(_resourceDirectory.path, name)),
+      reloadEngine: _dictRepo.rebuildEngine,
+    );
+  }
+
+  /// TODO-609 / W-2：合并词典来源元数据。[fromIndex] 是导入包内 index.json 提取的
+  /// 真值（[readSourceMetadataFromIndex]），[sourceOverride] 是在线 catalog / 更新
+  /// 链路提供的权威来源身份。
+  ///
+  /// 规则：
+  /// - `revision` **永远**取 [fromIndex]（实际装的是哪个版本，才是本地比对基准）；
+  ///   [sourceOverride] 携带的 revision 一律忽略。
+  /// - 来源身份字段（`isUpdatable`/`indexUrl`/`downloadUrl`）优先 [sourceOverride]
+  ///   （它压过包内字段），缺失时回退包内 [fromIndex]。
+  ///
+  /// 这修掉「包内 index.json 不声明 isUpdatable（很多 yomitan 包不带）→ glaze 写回
+  /// 成 false → 更新一次后丢失可更新性、按钮消失无法二次更新」的缺口：更新链路传
+  /// `isUpdatable:'true'` 的 override 必须压过包内的 false。
+  @visibleForTesting
+  static Map<String, String> mergeSourceMetadata(
+    Map<String, String> fromIndex,
+    Map<String, String>? sourceOverride,
+  ) {
+    final Map<String, String> override =
+        Map<String, String>.from(sourceOverride ?? const <String, String>{})
+          ..remove('revision');
+    return <String, String>{...fromIndex, ...override};
+  }
+
+  static bool _isMemoryError(Object e) {
+    final msg = e.toString().toLowerCase();
+    return e is OutOfMemoryError || msg.contains('out of memory');
+  }
+
+  /// 「已是最新、跳过」的提示：进度文字 + 一条 toast，**不阻塞**导入循环。
+  ///
+  /// 之前这里 `Future.delayed(2s)` 只为让进度文字停留两秒——批量重导一个已装
+  /// 目录时每本都白等 2 秒（30 本 = 60 秒纯睡眠）。toast 自带停留时间，循环
+  /// 立即进入下一本。
+  static void _notifyAlreadyUpToDate(
+    ValueNotifier<String> progressNotifier,
+    String name,
+  ) {
+    final String msg = t.import_duplicate(name: name);
+    progressNotifier.value = msg;
+    FushiToast.show(msg: msg, severity: ToastSeverity.info);
+  }
+
+  /// 批量任务结束后，把失败项汇总成一条提示文案（单条/多条不同措辞）。
+  /// 供在线下载、文件批量与目录批量三条路径复用，统一在循环结束后一次性展示
+  /// （BUG-082）。
+  ///
+  /// BUG-2188：入参从 `List<String>`（只有名字）换成 [DictionaryTaskFailure]
+  /// （名字 + 阶段 + 异常）。旧签名把异常在收集那一刻就降维成了一个名字，于是
+  /// **无论怎么改渲染，原因都已经不在数据里了**；而且措辞恒为「导入失败」，下载阶段
+  /// 失败也照报导入，制造了「下载失败之后又导入失败」的假象。
+  static String formatImportFailureSummary(
+    List<DictionaryTaskFailure> failures,
+  ) {
+    if (failures.length == 1) return failures.first.headline;
+    return '${t.dict_task_failed_summary(n: failures.length)}\n'
+        '${failures.map((DictionaryTaskFailure f) => f.line).join('\n')}';
+  }
+
+  /// 把一批失败拼成可复制的全文诊断（BUG-2188），供「错误详情」框展示。
+  static String formatFailureDetails(List<DictionaryTaskFailure> failures) =>
+      failures.map((DictionaryTaskFailure f) => f.details).join('\n\n');
+}
+
+/// 词典批量任务里一项失败发生在哪个阶段（BUG-2188）。措辞按它选，不再一律叫
+/// 「导入失败」。
+enum DictionaryTaskStage { download, import }
+
+/// 词典批量任务里的一条失败：名字 + 阶段 + **原始异常**（BUG-2188）。
+///
+/// 存在的理由：以前失败只以名字进汇总，异常在 `catch` 里就被丢掉，用户拿到的提示
+/// 天生带不出原因。这个结构把异常一路带到渲染层，[reason] 给一行人话、[details]
+/// 给可复制的全文诊断。
+class DictionaryTaskFailure {
+  const DictionaryTaskFailure({
+    required this.name,
+    required this.stage,
+    required this.error,
+    this.url,
+  });
+
+  /// 词典显示名。
+  final String name;
+
+  final DictionaryTaskStage stage;
+
+  /// 原始异常，不做任何降维。
+  final Object error;
+
+  /// 下载阶段的原始地址（catalog 条目）；文件导入路径为 null。
+  final String? url;
+
+  /// 一行人话原因，进 toast / 汇总。
+  String get reason => describeDictionaryFailure(error);
+
+  /// 「下载失败：名字（原因）」——单条失败时的完整提示。
+  String get headline => switch (stage) {
+        DictionaryTaskStage.download =>
+          t.dict_task_failed_download(name: name, reason: reason),
+        DictionaryTaskStage.import =>
+          t.dict_task_failed_import(name: name, reason: reason),
+      };
+
+  /// 多条汇总里的一行。
+  String get line => '$name: $reason';
+
+  /// 可复制的全文诊断，进「错误详情」框。**不本地化**：它是给开发者/日志看的。
+  String get details {
+    final StringBuffer buffer = StringBuffer()..writeln(headline);
+    final String? source = url;
+    if (source != null) buffer.writeln('url: $source');
+    buffer.write(error.toString());
+    return buffer.toString();
+  }
+}
+
+/// 把词典链路的异常翻成一行人话（BUG-2188）。
+///
+/// 传输层失败按 [DictionaryDownloadFailureKind] 给出「连不上谁」——用户截图里那句被
+/// 截断的 `DioError [connection ...` 就是这一类。其余异常回退到 `toString()`：它可能
+/// 很长，但汇总里只占一行，全文另有「错误详情」可看，不会再被静默截掉。
+String describeDictionaryFailure(Object error) {
+  if (error is DictionaryDownloadException) {
+    final String host = error.host;
+    switch (error.kind) {
+      case DictionaryDownloadFailureKind.connectTimeout:
+        return t.dict_error_connect_timeout(host: host);
+      case DictionaryDownloadFailureKind.stallTimeout:
+        return t.dict_error_stall_timeout(host: host);
+      case DictionaryDownloadFailureKind.connectionError:
+        return t.dict_error_connection(host: host);
+      case DictionaryDownloadFailureKind.badResponse:
+        return t.dict_error_http_status(
+          host: host,
+          status: '${error.statusCode ?? '?'}',
+        );
+      case DictionaryDownloadFailureKind.cancelled:
+      case DictionaryDownloadFailureKind.other:
+        return error.cause.toString();
+    }
+  }
+  return error.toString();
+}
+
+/// TODO-609：导入时对「同名/同 base 名词典已存在」的决策。
+/// - [newDictionary]：全新词典，正常追加。
+/// - [alreadyUpToDate]：完全同名且非强制 → 跳过（普通拖入同名的现有语义，不破）。
+/// - [replaceExact]：完全同名且强制更新 → 走 replaceOldVersion 链路重导带新 revision。
+/// - [replaceOldVersion]：不同日期版本（base 名同、全名不同）→ 删旧版重导。
+enum UpdateDecision {
+  newDictionary,
+  alreadyUpToDate,
+  replaceExact,
+  replaceOldVersion,
+}
+
+/// 单本词典导入失败时抛出的类型化异常，携带「是否内存不足」标志。
+///
+/// BUG-082：旧实现在每个失败项的 catch 里 `Future.delayed(3s)` 阻塞、且**不**
+/// 重抛，导致批量导入逐个卡 3 秒、上层无法汇总。改为不阻塞、抛出本异常，由
+/// 批量调用方收集失败项并在循环结束后统一展示，内存不足提示也只触发一次。
+class DictionaryImportException implements Exception {
+  DictionaryImportException(this.cause, {this.isMemoryError = false});
+
+  final Object cause;
+  final bool isMemoryError;
+
+  @override
+  String toString() => cause.toString();
+}
+
+/// [DictionaryImportManager.publishImportedDir] 的发布方式：直接 rename 成功，
+/// 或重试用尽后回退到复制+删源。
+enum DictPublishMethod { renamed, copied }

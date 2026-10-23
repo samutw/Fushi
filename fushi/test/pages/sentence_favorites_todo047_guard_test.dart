@@ -1,0 +1,358 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import '../helpers/source_guard.dart';
+import 'video_fushi_page_source_corpus.dart';
+
+/// TODO-047 part2/3/4 守卫：句子收藏扩展接线不得回归。
+/// B=视频端收藏句子按钮（且为句子星标、非 BUG-123 删的单词☆）
+/// C=收藏夹入口收敛到首页 dashboard（库页页头不再挂）
+/// D=收藏夹页展示 video 来源句子
+/// E=两统计页的「所选范围」卡有「收藏语句」行
+void main() {
+  String read(String rel) => File(rel).readAsStringSync();
+
+  group('B 视频端收藏句子按钮', () {
+    // TODO-590 batch13: `_toggleFavoriteSentenceForVideo` / `_matchingVideoFavorites`
+    // 等收藏方法已搬进 lookup_favorite.part.dart，改读合并语料（header 的
+    // `buildPopupHeaderFor` 仍在主壳，合并语料含主壳，断言不受影响）。
+    final String src = readVideoFushiSource();
+
+    test('视频查词浮层 header 渲染句子收藏星标（star/star_border）', () {
+      expect(
+        src,
+        contains('buildPopupHeaderFor'),
+        reason: '应覆写 mixin 的 buildPopupHeaderFor 注入句子收藏星标',
+      );
+      expect(src, contains("Key('video_favorite_sentence_button')"));
+      expect(src, contains('Icons.star'));
+      expect(src, contains('Icons.star_border'));
+    });
+
+    test('收藏句子来源标 video、记 dateKey=今日键', () {
+      expect(src, contains('source: kFavoriteSentenceSourceVideo'));
+      expect(src, contains('dateKey: statTodayKey()'));
+      expect(src, contains('_toggleFavoriteSentenceForVideo'));
+    });
+
+    test('视频收藏句写入 cue startMs 锚点并用兼容匹配判定收藏态', () {
+      expect(
+        src,
+        contains('normCharOffset: cue.startMs'),
+        reason: '字幕列表收藏必须把 cue.startMs 存入 FavoriteSentence',
+      );
+      expect(
+        src,
+        contains('sectionIndex: _favoriteSectionIndex'),
+        reason:
+            '收藏 sectionIndex 走 _favoriteSectionIndex（本地每集独立行=null；'
+            '远端多集=当前集），统一合集 Phase 3',
+      );
+      expect(
+        src,
+        contains('_matchingVideoFavorites'),
+        reason: '收藏态需要同时兼容新 startMs 锚点和旧 text-only 条目',
+      );
+    });
+
+    test('只在顶层(index==0)显示，嵌套递归层不显示', () {
+      // 窗口=该覆写方法体（花括号配对），不再是 `idx + 200` 定长窗口：早退语句前
+      // 多插一行局部变量、或 header 结构改动，都不该让守卫塌掉。
+      final String body = methodBody(
+        src,
+        'Widget? buildPopupHeaderFor(int index)',
+      );
+      expect(
+        body.contains('if (index != 0) return null'),
+        isTrue,
+        reason: 'index>0 是递归查词层，不属于某条字幕句',
+      );
+    });
+
+    test('不恢复 BUG-123 删除的单词收藏☆按钮', () {
+      // 句子星标走 FavoriteSentence；不得引入单词收藏 favoriteEntry 弹窗按钮工厂。
+      expect(src, isNot(contains('createFavoriteButton')));
+    });
+  });
+
+  group('B mixin header 钩子默认 null（其它 mixin 使用方零行为变化）', () {
+    final String src = read(
+      'lib/src/pages/implementations/dictionary_page_mixin.dart',
+    );
+    test('buildPopupHeaderFor 默认返回 null 并注入 headerWidget', () {
+      expect(src, contains('Widget? buildPopupHeaderFor(int index) => null'));
+      expect(src, contains('headerWidget: buildPopupHeaderFor(index)'));
+    });
+  });
+
+  group('C 收藏夹入口收敛到首页 dashboard（2026-10-14）', () {
+    // 历史：TODO-047 给视频页头补了收藏夹入口、与书架页头对齐。用户 2026-10-14
+    // 定案翻转：收藏夹不按模块隔离，各库页右上角都挂一个打开的都是同一页，反而
+    // 误导成「本模块的收藏夹」；入口与统计中心（2026-09-01）一样收敛到首页。
+    final String dashboard = read(
+      'lib/src/pages/implementations/home_dashboard_page.dart',
+    );
+
+    test('首页 dashboard 导入 CollectionsPage 并有 _openCollections 入口', () {
+      expect(
+        dashboard,
+        contains(
+          "import 'package:fushi/src/pages/implementations/collections_page.dart';",
+        ),
+      );
+      expect(dashboard, contains('void _openCollections()'));
+      expect(dashboard, contains('CollectionsPage()'));
+      expect(
+        containsCodeLine(dashboard, 'onPressed: _openCollections'),
+        isTrue,
+        reason: '收藏夹入口必须在首页浮动工具栏可达',
+      );
+      expect(containsCodeLine(dashboard, 'label: t.collections'), isTrue);
+      expect(
+        containsCodeLine(dashboard, 'onPressed: _openStatisticsCenter'),
+        isTrue,
+        reason: '统计中心入口必须在首页 dashboard 可达',
+      );
+      expect(containsCodeLine(dashboard, 'icon: FushiIcons.barChart'), isTrue);
+    });
+
+    test('库页页头不再挂收藏夹 / 统计入口', () {
+      for (final String path in <String>[
+        'lib/src/pages/implementations/home_video_page.dart',
+        'lib/src/pages/implementations/reader_fushi_history_page.dart',
+      ]) {
+        final String src = read(path);
+        final String header = methodBody(src, 'Widget _buildPageHeader(');
+        expect(
+          containsCodeLine(header, 'tooltip: t.collections'),
+          isFalse,
+          reason: '$path：收藏夹入口已收敛到首页 dashboard',
+        );
+        expect(
+          containsCodeLine(header, 'Icons.collections_bookmark_outlined'),
+          isFalse,
+          reason: '$path：页头不再有收藏夹图标',
+        );
+        expect(
+          containsCodeLine(header, 'Icons.bar_chart_outlined'),
+          isFalse,
+          reason: '$path：统计入口已收敛到首页 dashboard',
+        );
+      }
+      // 整个库页文件都不再 push 收藏夹页（防止入口换个方法名又长回页头）。
+      for (final String path in <String>[
+        'lib/src/pages/implementations/home_video_page.dart',
+        'lib/src/pages/implementations/reader_fushi_history_page.dart',
+        'lib/src/pages/implementations/games_library_page.dart',
+        'lib/src/pages/implementations/galgame_home_page.dart',
+        'lib/src/pages/implementations/home_game_page.dart',
+      ]) {
+        final String src = read(path);
+        expect(
+          src.contains('CollectionsPage('),
+          isFalse,
+          reason: '$path：收藏夹唯一入口在首页 dashboard',
+        );
+        expect(
+          src.contains('_openCollections'),
+          isFalse,
+          reason: '$path：库页收藏夹入口处理器应随入口一起删除',
+        );
+      }
+    });
+  });
+
+  group('D 收藏夹页展示 video 来源', () {
+    final String src = read(
+      'lib/src/pages/implementations/collections_page.dart',
+    );
+    test('_CollectionItem 带 source 并从 fav.source 透传', () {
+      expect(src, contains('final String source'));
+      expect(src, contains('source: fav.source'));
+    });
+
+    test('视频来源句子标注「视频」前缀且跳回视频 startMs（不当书打开）', () {
+      expect(src, contains('kFavoriteSentenceSourceVideo'));
+      // BUG-1120：视频/书区分从 isVideoSentence bool 升级为 SentenceSourceKind
+      // 穷尽 switch（audiobook/lyrics 不再被降维归并进书）。
+      expect(src, contains('SentenceSourceKind.video'));
+      expect(
+        src,
+        contains('VideoFushiPage.neutralized'),
+        reason: 'video 来源 bookKey 是视频 uid，应打开视频页而不是 EPUB 阅读器',
+      );
+      expect(
+        src,
+        contains('initialCueStartMs: target.startMs'),
+        reason: '收藏页必须把视频 cue startMs 传给视频页 seek',
+      );
+      expect(
+        src,
+        contains('initialEpisodeIndex: target.episodeIndex'),
+        reason: '播放列表收藏页必须把 episode index 传给视频页，避免只靠 bookUid+startMs 打开错集',
+      );
+      expect(
+        src,
+        contains('initialSubtitleListVisible: true'),
+        reason: '跳回视频后打开字幕列表，让当前 cue 高亮/星标可见',
+      );
+      expect(
+        src,
+        contains('_resolveVideoFavoriteStartMs'),
+        reason: '旧收藏无 startMs 时要按文本从已保存 cue 里回退解析',
+      );
+      expect(src, contains('t.nav_video'), reason: '视频来源句子前缀标注');
+    });
+
+    test('视频页初始化：收藏页跳回打开该集 bookUid，_loadSingle 消费 cue startMs', () {
+      // 统一合集 Phase 3：每集是独立 VideoBooks 行，收藏句 bookKey=集 uid，collections
+      // 页跳回直接 open 该集 bookUid（+ initialCueStartMs）；起播点由单视频路径
+      // _loadSingle 消费（widget.initialCueStartMs ?? row.lastPositionMs）。
+      final String videoSrc = read(
+        'lib/src/pages/implementations/video_fushi_page.dart',
+      );
+      expect(
+        compactCode(methodBody(videoSrc, 'Future<void> _loadSingle(')),
+        contains(
+          compactCode(
+            'initialPositionMs: '
+            'widget.sourceReview?.startMs ?? '
+            'widget.initialCueStartMs ?? row.lastPositionMs,',
+          ),
+        ),
+        reason: '收藏 cue 起点 / 续播由 _loadSingle 消费',
+      );
+    });
+
+    test('播放列表旧收藏无 episode 锚点时保持文本 fallback 但不伪造稳定定位', () {
+      expect(
+        src,
+        contains('resolveVideoFavoriteOpenTarget'),
+        reason: '新收藏有 episode 锚点时必须精确定位',
+      );
+      expect(
+        src,
+        contains('favoriteSectionIndex == null'),
+        reason: '旧收藏缺 episode identity 时只能保留兼容 fallback，不能假装稳定定位到某集',
+      );
+    });
+  });
+
+  group('TODO-310 收藏夹音频播放反馈 + 视频收藏句播放按钮', () {
+    final String src = read(
+      'lib/src/pages/implementations/collections_page.dart',
+    );
+
+    test('① 抽音失败(result==null)弹 audio_clip_failed 提示，不再静默(BUG-252)', () {
+      // 修前 _playItemAudio 在 result!=null 时才 playFile，else 什么都不做。
+      expect(
+        compactCode(src),
+        contains(compactCode('FushiToast.show(msg: t.audio_clip_failed,')),
+        reason: 'ffmpeg 抽音失败必须给用户可见反馈，否则点了像没反应',
+      );
+      // 失败提示必须挂在 extractAudioSegment 返回 null 的 else 分支上。
+      // 窗口=`_extractAndPlay` 的方法体（花括号配对），不再是 `playIdx + 900`
+      // 定长窗口。旧窗口离塌只差两行：方法体实测 945 字，`t.audio_clip_failed`
+      // 落在第 ~700 字，try 块里再多写两条语句就把 else 分支挤出窗口 → 要求型
+      // 断言凭空变红，而根本没有任何行为退化。
+      final String body = methodBody(src, 'Future<void> _extractAndPlay({');
+      expect(body.contains('if (result != null)'), isTrue);
+      expect(
+        body.contains('} else {') && body.contains('t.audio_clip_failed'),
+        isTrue,
+        reason: '失败提示必须在 result==null 的 else 分支',
+      );
+    });
+
+    test('② 视频来源句也能解析音频片段并显示播放按钮', () {
+      // _load 增查 VideoBookRepository 填 _videoRowMap。
+      expect(src, contains('VideoBookRepository(db)'));
+      expect(src, contains('_videoRowMap'));
+      expect(src, contains('getByBookUid'));
+      // _hasAudio / _playItemAudio 对视频来源走 resolveVideoFavoriteAudioClip。
+      expect(src, contains('resolveVideoFavoriteAudioClip'));
+      expect(
+        src,
+        contains('item.source == kFavoriteSentenceSourceVideo'),
+        reason: '视频来源句的音频解析路径必须与书内/有声书分开',
+      );
+      expect(src, contains('_playVideoFavoriteAudio'));
+    });
+
+    test('视频抽音复用 cue 时间窗(normCharOffset=startMs / normCharLength=时长)', () {
+      // 收藏字段语义：视频收藏句的 normCharOffset 存 cue startMs、normCharLength 存时长。
+      expect(src, contains('favoriteStartMs: item.normCharOffset'));
+      expect(src, contains('favoriteDurationMs: item.normCharLength'));
+      expect(src, contains('favoriteSectionIndex: item.sectionIndex'));
+    });
+  });
+
+  group('E 两统计页有「收藏语句」卡片', () {
+    test('阅读统计页加收藏语句桶（非 video 来源）', () {
+      final String src = read(
+        'lib/src/pages/implementations/reading_statistics_page.dart',
+      );
+      // 2026-10-09 统计中心精简删了「时段明细」四张卡：收藏语句只剩「所选范围」卡的
+      // 计数行（共享件 [buildStatRangeCounterLines]，标签在那里出）。
+      expect(src, contains('favoritedSentences: _favoritedSentenceEvents'));
+      expect(
+        src,
+        contains('favoriteSentenceEvents(source: StatSourceKind.book)'),
+        reason: '取数与分桶判据收敛进 StatCounterFacts（三个统计 tab 共用一份）',
+      );
+    });
+
+    test('所选范围卡的计数行带「收藏语句」（四个 tab 共用）', () {
+      final String src = read(
+        'lib/src/pages/implementations/stat_range_bar.dart',
+      );
+      expect(src, contains('buildStatRangeCounterLines'));
+      expect(src, contains('label: t.stat_favorited_sentence'));
+      expect(src, contains('sumStatEventsInRange(favoritedSentences, range)'));
+    });
+
+    test('收藏语句的来源切分与日期回退判据只在 StatCounterFacts 里', () {
+      // stat_facts 已随引擎抽取搬走（cwd 是 fushi/，所以往上一级）。
+      final String src = read(
+        '../packages/fushi_engine/lib/stats/stat_facts.dart',
+      );
+      expect(
+        src,
+        contains('s.source != kFavoriteSentenceSourceVideo'),
+        reason: '书内/有声书/歌词归阅读统计',
+      );
+      expect(
+        src,
+        contains('s.source == kFavoriteSentenceSourceVideo'),
+        reason: '视频来源归视频统计',
+      );
+      expect(
+        src,
+        contains('s.dateKey ?? FushiDatabase.statDateKeyOf(s.createdAt)'),
+        reason:
+            'BUG-893：旧收藏无 dateKey 按 createdAt 回退归桶'
+            '（旧的 `dateKey != null` 过滤把它们滤光 → 统计恒 0，已根治）',
+      );
+    });
+
+    test('视频统计页加收藏语句桶（仅 video 来源）', () {
+      final String src = read(
+        'lib/src/pages/implementations/video_statistics_page.dart',
+      );
+      expect(src, contains('favoritedSentences: _favoritedSentenceEvents'));
+      expect(
+        src,
+        contains('favoriteSentenceEvents(source: StatSourceKind.video)'),
+      );
+      expect(
+        src,
+        isNot(contains('s.dateKey != null')),
+        reason:
+            'BUG-893 的读取端回退此前只修了阅读侧；视频侧也不许再按 '
+            'dateKey 非空过滤（写入端补 dateKey 之前的视频收藏会被整批漏掉，'
+            '且总览的跨域和会不等于两个域 tab 之和）',
+      );
+    });
+  });
+}

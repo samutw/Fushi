@@ -1,0 +1,152 @@
+import 'package:flutter_test/flutter_test.dart';
+
+import 'reader_fushi_page_source_corpus.dart';
+
+/// 守卫：阅读器「阅读统计」按钮必须是布局模型里的一颗真按钮（任何槽位都能放），
+/// 点击开统计侧栏、有稳定 semantics id、沿用既有 i18n key。
+///
+/// 由来：移动端此前唯一的统计入口是「齿轮 → 快速设置 sheet → 阅读统计行」三步。
+/// 2026-09-13 起顶栏 / 底栏按钮全部由 [ReaderControlLayout] 驱动（与视频页同一套
+/// 泛型布局），按钮「按下去干什么」的唯一真相源是 `_readerControlAction`，
+/// 「此刻有没有」是 `_shouldRenderReaderControl`——本守卫钉这两处，而不是钉某条
+/// 硬编码的底栏 Row（那条 Row 已不存在）。
+///
+/// 静态守卫而非 widget 测试：这些方法长在 `_ReaderFushiPageState` 的私有 build 路径
+/// 里，渲染它要整页起 WebView（真 InAppWebView 平台视图），测试环境跑不动。
+String _member(String src, String signature, String nextMarker) {
+  final int start = src.indexOf(signature);
+  expect(start, greaterThanOrEqualTo(0), reason: '找不到 `$signature`，请更新守卫。');
+  final int end = src.indexOf(nextMarker, start + signature.length);
+  expect(end, greaterThanOrEqualTo(0), reason: '找不到 `$nextMarker`，请更新守卫。');
+  return src.substring(start, end);
+}
+
+void main() {
+  group('阅读器统计按钮守卫（布局模型）', () {
+    // expect 只能在 test 体内调：切片放 setUpAll。
+    late String src;
+    late String action;
+    late String render;
+    setUpAll(() {
+      src = readReaderPageSource();
+      action = _member(
+        src,
+        '  ReaderHeaderAction _readerControlAction(ReaderControlItem item) {',
+        '  List<ReaderHeaderAction> _readerControlActionsIn(',
+      );
+      render = _member(
+        src,
+        '  bool _shouldRenderReaderControl(ReaderControlItem item) {',
+        '  List<ReaderControlItem> _renderableControlsIn(',
+      );
+    });
+
+    test('统计按钮点击开统计侧栏、有稳定 semantics id、沿用既有 i18n key', () {
+      final int at = action.indexOf('case ReaderControlItem.statistics:');
+      expect(at, greaterThanOrEqualTo(0));
+      final String stats = action.substring(
+        at,
+        action.indexOf('case ReaderControlItem.', at + 1),
+      );
+      expect(stats, contains("semanticsId: 'fushi.reader.header.statistics'"),
+          reason: '集成测试按这个 identifier 找控件');
+      expect(stats, contains('onPressed: _openReadingStatistics'),
+          reason: '统计键点击必须开阅读统计侧栏');
+      expect(stats, contains('t.reading_statistics'),
+          reason: '沿用既有 i18n key，不新造');
+      expect(stats, isNot(contains('_toggleStudyClockManualPause')),
+          reason: '点击语义恒为「打开统计」，停 / 续表在侧栏、状态行计时块与计时开关键上做');
+    });
+
+    test('计时开关键（悬浮球 / 顶底栏可放）走同一个停 / 续入口，恒渲染', () {
+      final int at = action.indexOf('case ReaderControlItem.studyTimer:');
+      expect(at, greaterThanOrEqualTo(0));
+      final String timer = action.substring(
+        at,
+        action.indexOf('case ReaderControlItem.', at + 1),
+      );
+      expect(timer, contains('onPressed: _toggleStudyClockManualPause'),
+          reason: '与状态行计时键、快捷键同一入口，不另起一套停表逻辑');
+      expect(
+          timer, contains("semanticsId: 'fushi.reader.control.study_timer'"));
+      expect(timer, contains('_studyClockManualPause'),
+          reason: '图标 / 文案必须跟手动暂停旗走，否则按了不变样');
+      expect(timer, contains('t.reader_stats_clock_pause'));
+      expect(timer, contains('t.reader_stats_clock_resume'));
+      final String alwaysGroup = render.substring(
+        render.indexOf('case ReaderControlItem.back:'),
+        render.indexOf('return true;'),
+      );
+      expect(alwaysGroup, contains('case ReaderControlItem.studyTimer:'),
+          reason: '计时与有没有有声书无关，任何书都要能停 / 续');
+    });
+
+    test('统计按钮任何模式都渲染；目录 / 插图只在正文模式', () {
+      // 与 _readerControlAction 同一张 switch：statistics 归在恒 true 那一组。
+      final String alwaysGroup = render.substring(
+        render.indexOf('case ReaderControlItem.back:'),
+        render.indexOf('return true;'),
+      );
+      expect(alwaysGroup, contains('case ReaderControlItem.statistics:'));
+      expect(alwaysGroup, contains('case ReaderControlItem.settings:'));
+      final String navGroup = render.substring(
+        render.indexOf('case ReaderControlItem.navigation:'),
+        render.indexOf('case ReaderControlItem.audiobook:'),
+      );
+      expect(navGroup, contains('return !_lyricsMode;'),
+          reason: '歌词页翻章会把歌词文档换成 EPUB 章节，目录 / 插图只在正文模式挂');
+    });
+
+    test('顶栏 / 底栏都从布局槽位取按钮，不再硬编码 barItems', () {
+      final String header = _member(
+        src,
+        '  Widget _buildDesktopHeader() {',
+        '  /// 顶部工具栏「统计」',
+      );
+      expect(header,
+          contains('_readerControlActionsIn(ReaderControlSlot.topLeft)'));
+      // 2026-10：布局的「更多」槽恒进 ⋮；悬浮样式顶栏同样从槽位取按钮。
+      expect(header, contains('overflowActions: _overflowControlActions()'));
+      expect(header, contains('_renderableControlsIn(ReaderControlSlot.topRight)'));
+      expect(
+          header,
+          contains(
+              'trailing: _readerControlActionsIn(ReaderControlSlot.topRight)'));
+      final String bottom = _member(
+        src,
+        '  Widget _buildSettingsBar() {',
+        "  // TODO-796: resolve a TOC entry's href",
+      );
+      expect(bottom, contains('_bottomSlotButtons()'));
+      expect(
+          bottom, contains('reversed ? barItems.reversed.toList() : barItems'),
+          reason: '「反转底栏」仍是整体镜像');
+      expect(bottom, isNot(contains('IconButton(')),
+          reason: '底栏不再手写任何一颗按钮，全部来自布局槽位');
+    });
+
+    test('有声书播放条在场时底栏槽位按钮并进它的右端', () {
+      final String bar = _member(
+        src,
+        '  Widget _buildAudiobookBar() {',
+        '  Widget? _buildAudiobookBarTrailing() {',
+      );
+      expect(bar, contains('trailing: _buildAudiobookBarTrailing(),'));
+      final String trailing = _member(
+        src,
+        '  Widget? _buildAudiobookBarTrailing() {',
+        '  /// 小说页的窗口全屏切换',
+      );
+      // 底栏槽位按钮仍由布局槽位驱动并进播放条右端；与播放条自带传输键重复的
+      // 那几颗被滤掉（6213bc5a59：同一行不出两份上一句 / 播放 / 下一句）。
+      expect(trailing, contains('_renderableControlsIn(slot)'));
+      expect(trailing, contains('!_isDuplicatedByAudiobookPlayBar(item)'),
+          reason: '与播放条传输键重复的槽位按钮不得再并进来');
+      expect(trailing,
+          contains('_readerControlButton(_readerControlAction(item))'));
+      expect(
+          trailing, contains('_playbackStatusInline ? _buildBarStatusText()'),
+          reason: '状态读数仍是播放条右端的落点');
+    });
+  });
+}

@@ -1,0 +1,244 @@
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+
+import 'package:flutter/services.dart' show FontLoader;
+import 'package:fushi/src/media/video/ass_font_metrics.dart';
+import 'package:fushi/src/models/font_decoder.dart';
+import 'package:fushi/src/models/woff2_decoder.dart';
+import 'package:fushi/src/reader/reader_settings.dart' show ReaderCustomFontCss;
+import 'package:fushi/src/utils/misc/error_log_service.dart';
+import 'package:path/path.dart' as p;
+
+/// Registers a user-imported custom font with the Flutter engine so it can be
+/// used for the app-wide UI [TextTheme], not just the reader WebView.
+///
+/// The reader serves font files to its WebView via CSS `@font-face`; that path
+/// never touches the Flutter engine. To make a font file usable by Flutter
+/// widgets it must be loaded at runtime through [FontLoader] — there is no
+/// pubspec asset declaration for user files. This helper resolves entries from
+/// the passed font list (TODO-049: the app-wide UI target, `appUiFonts`) and
+/// returns the family name(s) to feed into `TextStyle.fontFamily` /
+/// `fontFamilyFallback`: [resolveAndLoadAll] for targets that consume the whole
+/// ordered list as a fallback chain, [resolveAndLoad] for single-family targets.
+class AppFontLoader {
+  AppFontLoader._();
+
+  /// Raw sfnt the Flutter engine loads as-is.
+  static const Set<String> _directExtensions = <String>{'.ttf', '.otf', '.ttc'};
+
+  /// Web-font containers decoded to sfnt before loading: WOFF 1.0 via
+  /// [FontDecoder] (zlib) and WOFF2 via [Woff2Decoder] (Brotli + glyf/loca
+  /// transform). An entry that fails to decode is skipped, falling through to
+  /// the next usable candidate.
+  static const String _woffExtension = '.woff';
+  static const String _woff2Extension = '.woff2';
+
+  /// Family names already registered this process. [FontLoader] cannot unload a
+  /// family, so re-registering the same one is wasteful and pointless.
+  static final Set<String> _loadedFamilies = <String>{};
+
+  /// 这个字体条目能否被 Windows native 分层窗（DirectWrite）真正用上。
+  ///
+  /// [path] 为 null = 系统字体，native 按族名找，恒 true。文件字体只有裸 sfnt
+  /// （[_directExtensions]）能被 DirectWrite 的本地文件 API 吃下；WOFF/WOFF2 在
+  /// Flutter 侧能解码（[_resolveEntry]），native 侧不能。
+  ///
+  /// [resolveForNativeOverlay] 用它跳过不可用项，字体库 UI 用它把对应用途的开关
+  /// 置灰——**同一个判据两处共用**，否则 UI 会让用户勾一个浮窗静默忽略的字体，
+  /// 表现就是「设了不生效」且毫无反馈。
+  static bool nativeOverlayCanUse(String? path) =>
+      path == null ||
+      _directExtensions.contains(p.extension(path).toLowerCase());
+
+  /// Resolves the first font the Windows native DirectWrite overlay can use.
+  ///
+  /// System fonts carry only a family name. Imported fonts additionally carry
+  /// their canonical file path so the runner can build a private DirectWrite
+  /// font collection without installing the font globally. DirectWrite's local
+  /// file API accepts raw OpenType containers; WOFF/WOFF2 entries are therefore
+  /// skipped here and resolution continues to the next enabled entry (Flutter
+  /// targets still support them through [_resolveEntry]'s decoder).
+  ///
+  /// Returning a record keeps the MethodChannel boundary explicit and avoids
+  /// pretending a process-private Flutter [FontLoader] registration is visible
+  /// to the separate Win32 DirectWrite renderer.
+  static ({String family, String? path})? resolveForNativeOverlay(
+    List<Map<String, dynamic>> fonts, {
+    required Iterable<String> allowedDirectories,
+  }) {
+    final Set<String> allowedRoots = allowedDirectories
+        .where((String path) => path.isNotEmpty)
+        .map(p.canonicalize)
+        .toSet();
+    for (final Map<String, dynamic> font in fonts) {
+      if (!(font['enabled'] as bool? ?? true)) continue;
+      final String? rawName = font['name'] as String?;
+      if (rawName == null) continue;
+      final String family =
+          ReaderCustomFontCss.normalizedFontFamilyName(rawName);
+      if (family.isEmpty) continue;
+
+      final String? rawPath = font['path'] as String?;
+      if (rawPath == null) return (family: family, path: null);
+      if (!nativeOverlayCanUse(rawPath)) continue;
+      final String? safePath = ReaderCustomFontCss.safeFontPath(
+        rawPath,
+        allowedRoots: allowedRoots,
+      );
+      if (safePath == null || !File(safePath).existsSync()) continue;
+      return (family: family, path: safePath);
+    }
+    return null;
+  }
+
+  /// Resolves the app-wide custom font from [fonts] (the `customFonts` list,
+  /// each entry `{name, path, enabled}`), registering its file with the engine
+  /// when needed. Returns the family name to use, or `null` when no usable
+  /// custom font is set — the caller then falls back to the language default.
+  ///
+  /// Stops at the first usable entry: targets that render with a single family
+  /// (video subtitles, which carry their own CJK fallback chain) must not pay
+  /// for registering fonts they will never reference. Targets that DO consume
+  /// the whole ordered list use [resolveAndLoadAll].
+  static Future<String?> resolveAndLoad(
+    List<Map<String, dynamic>> fonts,
+  ) async {
+    for (final Map<String, dynamic> font in fonts) {
+      final String? family = await _resolveEntry(font);
+      if (family != null) return family;
+    }
+    return null;
+  }
+
+  /// Resolves **every** usable entry of [fonts], in the user's order, and
+  /// registers each one with the engine.
+  ///
+  /// The font library is an ordered list, and for the app-UI target that order
+  /// IS the fallback chain (`TextStyle.fontFamily` + `fontFamilyFallback`, see
+  /// `app_ui_font_chain.dart`). [resolveAndLoad] returning only the first entry
+  /// silently dropped every later one — a user whose primary font lacks a glyph
+  /// never reached their own second choice, the engine's default fallback took
+  /// over instead. A family that is never registered here is a dead name in a
+  /// Flutter fallback chain, so registration must cover the whole list.
+  ///
+  /// Unusable entries (disabled / unnamed / unreadable / undecodable) are
+  /// skipped, never throwing; the result keeps the surviving entries' order.
+  static Future<List<String>> resolveAndLoadAll(
+    List<Map<String, dynamic>> fonts,
+  ) async {
+    // 各条目并发解析（读文件 + 解码 + 注册互不依赖），结果按用户顺序收集——
+    // 一条 CJK 字体十几二十 MB，三条链串行装是首帧前的可见等待。
+    final List<String?> resolved = await Future.wait<String?>(
+      fonts.map(_resolveEntry),
+    );
+    final List<String> families = <String>[];
+    for (final String? family in resolved) {
+      // 同名条目只保留一次：重复家族名在回退链里没有意义（引擎按名解析），
+      // 只会让「第几个生效」变得无法推理。
+      if (family != null && !families.contains(family)) families.add(family);
+    }
+    return families;
+  }
+
+  /// 同一家族正在注册中的 future：并发解析时两条链里的同名条目只装一次，
+  /// 后来者等前者的结果（[FontLoader] 不能卸载，重复注册只是白读白解一遍）。
+  static final Map<String, Future<String?>> _inFlight =
+      <String, Future<String?>>{};
+
+  /// Resolves one `{name, path, enabled}` entry to a registered family name, or
+  /// null when the entry is unusable. Registration is idempotent per family.
+  static Future<String?> _resolveEntry(Map<String, dynamic> font) async {
+    final bool enabled = font['enabled'] as bool? ?? true;
+    if (!enabled) return null;
+
+    final String? rawName = font['name'] as String?;
+    if (rawName == null || rawName.trim().isEmpty) return null;
+
+    // Use the SAME family identifier the reader uses (underscores → spaces)
+    // so the App UI and the reader WebView reference one font under one name.
+    final String family = ReaderCustomFontCss.normalizedFontFamilyName(rawName);
+    if (family.isEmpty) return null;
+
+    final String? path = font['path'] as String?;
+
+    // System font (no imported file): the platform resolves it by family
+    // name directly, no FontLoader registration is possible or needed.
+    if (path == null) {
+      return family;
+    }
+
+    final String ext = p.extension(path).toLowerCase();
+    final bool isWoff = ext == _woffExtension;
+    final bool isWoff2 = ext == _woff2Extension;
+    if (!_directExtensions.contains(ext) && !isWoff && !isWoff2) return null;
+
+    final File file = File(path);
+    if (!file.existsSync()) return null;
+
+    if (_loadedFamilies.contains(family)) return family;
+    // 在飞去重只能复用**成功**的结果。
+    //
+    // `_loadedFamilies.add(family)` 只在 `loader.load()` 成功后才执行，所以在串行
+    // 年代「第一个同名条目失败」不会污染后续条目：A 装 P1 失败返回 null，B 照常去
+    // 装自己的 P2。改成并发 + 共享 future 之后，B 在 `_inFlight` 里拿到的是 A 的
+    // future，得到 null 就直接返回——**P2 永不被尝试**，family F 整条不可用，
+    // UI/字幕/游戏文本一起回落到主题字体。
+    // 触发条件不窄：`resolveAllHealth` 内部就是 Future.wait（同一条链的条目全部同时
+    // 在飞），AppModel 又把 appUiFonts / videoSubtitleFonts / gameLookupFonts 三条链
+    // 并发跑，而「跨链同名家族」正是 `_inFlight` 存在的理由。
+    final Future<String?>? pending = _inFlight[family];
+    if (pending != null) {
+      final String? shared = await pending;
+      if (shared != null) return shared;
+      // 前一个装载失败了：不复用它的失败，退回去装自己这一份。
+      // 此时它已经把自己从 _inFlight 里摘掉了（finally），不会再互相等。
+      return _loadFileFamily(file, family, isWoff: isWoff, isWoff2: isWoff2);
+    }
+    final Future<String?> loading =
+        _loadFileFamily(file, family, isWoff: isWoff, isWoff2: isWoff2);
+    _inFlight[family] = loading;
+    try {
+      return await loading;
+    } finally {
+      _inFlight.remove(family);
+    }
+  }
+
+  static Future<String?> _loadFileFamily(
+    File file,
+    String family, {
+    required bool isWoff,
+    required bool isWoff2,
+  }) async {
+    try {
+      Uint8List bytes = await file.readAsBytes();
+      if (isWoff || isWoff2) {
+        // FontLoader only accepts raw sfnt, so unwrap the web-font
+        // container (WOFF2 first, then WOFF 1.0). Brotli + glyf/loca 变换是
+        // 纯 CPU、几十毫秒到几百毫秒，放后台 isolate，别占首帧前的 UI isolate。
+        final Uint8List? sfnt = await Isolate.run(
+          () => isWoff2
+              ? Woff2Decoder.toSfnt(bytes)
+              : FontDecoder.woffToSfnt(bytes),
+        );
+        if (sfnt == null) return null;
+        bytes = sfnt;
+      }
+      final FontLoader loader = FontLoader(family)
+        ..addFont(Future<ByteData>.value(
+            bytes.buffer.asByteData(bytes.offsetInBytes, bytes.lengthInBytes)));
+      await loader.load();
+      _loadedFamilies.add(family);
+      // BUG-897：自定义字体不在系统字体目录（扫描不到），把字节同步喂进 ASS 字号
+      // 换算索引（OS/2 win cell 语义），别名=本处注册的家族名——视频字幕用自定义
+      // 字体时字号也与 mpv/libass 同源。
+      AssFontCellIndex.instance
+          .registerFontBytes(bytes, aliases: <String>[family]);
+    } catch (e, stack) {
+      ErrorLogService.instance.log('AppFontLoader.resolveAndLoad', e, stack);
+      return null;
+    }
+    return family;
+  }
+}

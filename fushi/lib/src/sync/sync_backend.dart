@@ -1,0 +1,403 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:fushi/src/sync/dropbox_sync_backend.dart';
+import 'package:fushi/src/sync/ftp_sync_backend.dart';
+import 'package:fushi/src/sync/google_drive_sync_backend.dart';
+import 'package:fushi/src/sync/interconnect_sync_backend.dart';
+import 'package:fushi/src/sync/obfuscating_sync_backend.dart';
+import 'package:fushi/src/sync/onedrive_sync_backend.dart';
+import 'package:fushi/src/sync/sftp_sync_backend.dart';
+import 'package:fushi_engine/sync/sync_asset_store.dart';
+import 'package:fushi/src/sync/sync_repository.dart';
+import 'package:fushi_engine/sync/ttu_filename.dart';
+import 'package:fushi/src/sync/sync_file_ref.dart';
+import 'package:fushi_engine/sync/ttu_models.dart';
+import 'package:fushi/src/sync/webdav_sync_backend.dart';
+import 'package:fushi_engine/sync/sync_backend_type.dart';
+export 'package:fushi_engine/sync/sync_asset_store.dart'
+    show SyncTransferProgress, syncTransferFractionOnly;
+export 'package:fushi_engine/sync/sync_backend_type.dart';
+
+
+class SyncBackendError implements Exception {
+  SyncBackendError(this.message, {this.isRetryable = false});
+  final String message;
+  final bool isRetryable;
+
+  @override
+  String toString() => 'SyncBackendError: $message';
+}
+
+/// BUG-1693：互联「所有候选地址都探不到已配对对端」的类型化错误。
+///
+/// 它既不是「网络故障」（本机网络多半好好的）也不该以裸英文上屏——最常见成因
+/// 是**对端设备没运行 Fushi**（app 关了 / 设备睡眠 / 不在同一网段）。此前抛的是
+/// 裸 `SyncBackendError('No reachable Fushi server address')`，错误文案层
+/// （sync_error_messages 的 `_friendlyClause`）任何分支都命不中 → 英文原文直接
+/// 进 SnackBar/对话框，用户误以为自己网络坏了。判据是类型，不是字符串
+/// （与 SyncAuthFailureKind 的教训同款）。
+class SyncPeerUnreachableError extends SyncBackendError {
+  SyncPeerUnreachableError()
+      : super('No reachable Fushi server address', isRetryable: true);
+}
+
+/// 鉴权类失败的三种**互不相同**的语义（BUG-1323 / BUG-1348）。
+///
+/// 压成同一条 `SyncAuthError('Authentication failed')` 会把 [forbidden] 误报成
+/// [credentials]：「服务端按策略拒绝了这次请求」被说成「登录已过期」，
+/// 把用户引去反复重配一个根本没问题的凭据（BUG-1311 的用户可见症状）。
+enum SyncAuthFailureKind {
+  /// 凭据本身不被接受：HTTP 401、凭据未配置、OAuth 授权过期/被撤销/被拒。
+  /// 可操作项 = 重新登录 / 重新填凭据。**会话已经不可用**，登出是正确反应。
+  credentials,
+
+  /// 凭据**已经被接受**，但服务端按策略拒绝了这一次请求：HTTP 403。
+  /// 可操作项 = 看服务端给出的原因（如「service config 必须走 HTTPS」），
+  /// **不是**去动凭据；把用户登出只会毁掉一个好端端的会话。
+  forbidden,
+
+  /// 桌面 loopback 流程里**浏览器的授权回调始终没回到 app**（等待超时）。BUG-1348：
+  /// 这跟凭据毫无关系——用户可能压根没在浏览器里点完，也可能点完了但发往
+  /// `http://127.0.0.1:<port>` 的回调被全局代理吞掉。可操作项 = 重试并让代理放行回环
+  /// 地址，**不是**「重新登录」。
+  ///
+  /// 单独立一个枚举值的原因：这条错误的消息里带 "authorization" 字样，而
+  /// `sync_error_messages.dart` 曾按 `contains('auth')` 猜类型，于是它被抢先判成
+  /// 「登录已过期」——把「浏览器没回来」说成「凭据坏了」，把用户指向完全错误的修复
+  /// 方向。判据是类型，不是字符串。
+  browserTimeout,
+
+  /// 用户在桌面 loopback 等待对话框里自己点了「取消」（BUG-2120）。既不是凭据坏了，
+  /// 也不是浏览器没回来，而是**用户决定不等了**——UI 对它必须静默：不弹错误、不写
+  /// 错误日志、不登出。单立枚举值的理由同 [browserTimeout]：判据是类型，不是字符串。
+  cancelled,
+
+  /// 互联（Fushi 互联）的**配对凭据被对端拒绝**：对端对本机的请求回了 401
+  /// （BUG-2377）。与 [credentials] 的差别不是程度而是**凭据模型**——互联根本没有
+  /// 「登录会话」这回事，凭据是配对时对端发给本机的 per-peer token。压成
+  /// [credentials] 会让 UI 说「登录已过期，请重新登录」，把用户指向一个应用里
+  /// **不存在**的操作；真正可操作的是重新配对。
+  ///
+  /// 成因基本只有一种：对端把本机从已配对列表里删了（server 端 token 缓存随即
+  /// 清空，被删设备下一次请求立刻 401，见 `FushiServerController`），或对端重置/
+  /// 重装后 token 换了。
+  ///
+  /// 与 [credentials] 的第二个差别是**不得登出**：`InterconnectSyncBackend.signOut`
+  /// 会清空 `sync_hibiki_client_urls`，把全部对端地址、TOFU 指纹和 per-peer token
+  /// 一并抹掉——用一台对端的 401 去清整份配对配置，正是 BUG-1550 / BUG-1578 要
+  /// 消灭的株连行为。
+  pairingRejected,
+
+  /// 互联**压根没有凭据可发**：一台对端都没配对，或配对信息已被清空。既不是
+  /// 「凭据被拒」（还没走到发请求那一步），也不是 [credentials] 说的「登录过期」。
+  /// 可操作项 = 去「Fushi 互联」里完成配对。
+  ///
+  /// 此前它靠消息字面量 `'Fushi server credentials not configured'` 落进
+  /// `sync_error_messages` 的 `contains('not configured')` 分支 → 返回 null →
+  /// **裸英文原文直接上屏**。判据改成类型（同 [SyncPeerUnreachableError] 的教训）。
+  pairingNotConfigured,
+
+  /// 服务端对这次请求回的是一份 **HTML 网页**，而不是同步协议的响应（BUG-2631）。
+  /// 三种成因长得一样：Cloudflare 一类 CDN 的人机挑战页（`Just a moment...`）、
+  /// 反向代理自己的错误页、或者用户填的 URL 压根就是个网站（`https://anidb.net/anime`
+  /// 当 WebDAV 地址填）。共同点是**凭据根本没被评估过**——服务端还没走到鉴权那一步，
+  /// 所以既不是 [credentials]，也不该像 [forbidden] 那样说「你的登录没问题」。
+  ///
+  /// 单立枚举值的理由：只有它的可操作项是「换个地址 / 这不是 WebDAV 端点」；而
+  /// `serverReason` 在这条上只放网页 `<title>`（读不出就为空），整页标记绝不上屏。
+  htmlPage,
+}
+
+class SyncAuthError implements Exception {
+  SyncAuthError(
+    this.message, {
+    this.kind = SyncAuthFailureKind.credentials,
+    this.serverReason,
+  });
+
+  final String message;
+
+  /// 见 [SyncAuthFailureKind]。默认 [SyncAuthFailureKind.credentials] —— 仓库里既有的
+  /// 三十余处抛出点（OAuth 流程、「credentials not configured」、FTP/SFTP 协议层拒绝）
+  /// 语义上全是「凭据不被接受」，故默认值让它们的行为逐字不变；只有真正
+  /// 知道自己拿到 403 的抛出点才显式传 [SyncAuthFailureKind.forbidden]。
+  final SyncAuthFailureKind kind;
+
+  /// 服务端在响应体里给出的拒绝原因原文（如 `HTTPS required for service config`）。
+  /// 只在服务端真的说了话时非空；`checkStatus` 以前把它整个丢掉。
+  final String? serverReason;
+
+  /// 服务端拒绝（403），而不是凭据不被接受（401）。
+  bool get isForbidden => kind == SyncAuthFailureKind.forbidden;
+
+  @override
+  String toString() {
+    final String? reason = serverReason;
+    if (reason == null || reason.isEmpty) return 'SyncAuthError: $message';
+    return 'SyncAuthError: $message ($reason)';
+  }
+}
+
+/// The per-book sync folder name for [bookTitle] (its sanitized title), or throw
+/// when that name would be empty.
+///
+/// `sanitizeTtuFilename('')` returns `''`, and every backend derives a per-book
+/// folder as `<root>/<sanitized>/`. An empty sanitized name therefore collapses
+/// that folder onto the sync root, scattering the book's `progress_*` /
+/// `statistics_*` / `audioBook_*` JSON (and cover / epub / audiobook package)
+/// directly into `fushi-data/` next to real book folders (BUG-619, TODO-1329).
+/// An empty title also has no unique `bookKey`, so such a row is not syncable —
+/// refuse to resolve a folder for it instead of silently targeting the root.
+/// The single guarded chokepoint every backend's [SyncBackend.ensureBookFolder]
+/// funnels its title→folder-name derivation through.
+String requireBookFolderName(String bookTitle) {
+  final String name = sanitizeTtuFilename(bookTitle);
+  if (name.isEmpty) {
+    throw SyncBackendError(
+      'refusing to resolve a book sync folder for an empty title: '
+      'it would collapse onto the sync root',
+    );
+  }
+  return name;
+}
+
+/// Path-style backends (WebDAV, Fushi interconnect) use a book/namespace
+/// folderId as a bare path PREFIX: a child is addressed as `folderId + name`
+/// with NO separator inserted (see `WebDavOps.uploadJson`). The prefix therefore
+/// MUST end with `/`, or `folderId + fileName` fuses the two into a sibling of
+/// the folder — `<root>/<title>audioBook_1_6_….json` lands directly in the sync
+/// root with the title glued to the file name instead of inside
+/// `<root>/<title>/` (BUG-845, a re-report of BUG-619 / BUG-653's spill).
+///
+/// `ensureBookFolder` appends the slash when it CREATES a folder, but folder ids
+/// also enter the cache from server PROPFIND hrefs
+/// (`cacheBookFolderIds` / `restoreCache`), and some WebDAV servers (e.g.
+/// Nutstore / 坚果云) return collection hrefs WITHOUT a trailing slash. Run every
+/// such id through this before caching or returning it so the invariant "a
+/// cached folderId ends with `/`" holds by construction — and any already
+/// poisoned persisted cache self-heals the next time it is loaded.
+String ensureFolderIdTrailingSlash(String folderId) =>
+    folderId.endsWith('/') ? folderId : '$folderId/';
+
+/// 惰性封面字节来源，交给 [SyncBackend.ensureBookFolder]。
+///
+/// TODO-2657: 每个后端的 `ensureBookFolder` 在书名→folderId 缓存命中时**直接
+/// return**，封面字节根本没被看一眼。此前调用方（`SyncManager._syncBookOnce`）
+/// 却在调用前就 `readAsBytesSync()` 读完整张封面图，于是稳态下每本书每轮都白读
+/// 一整张图再丢弃。改成惰性回调后，只有真正走到「新建/确认文件夹 + 上传封面」
+/// 分支的后端才会去读磁盘——cache-miss 分支的行为一字不变。
+///
+/// 返回 `null` 表示这本书没有可用封面（路径缺失/读失败），与旧的
+/// `coverData == null` 完全同义。
+typedef SyncCoverDataProvider = Future<Uint8List?> Function();
+
+abstract class SyncBackend implements SyncAssetStore {
+  // ── Auth ──────────────────────────────────────────────────────────
+
+  Future<bool> get isAuthenticated;
+  Future<String?> get currentEmail;
+  Future<void> authenticate({required SyncRepository repo});
+  Future<void> signOut({required SyncRepository repo});
+  Future<bool> restoreAuth(SyncRepository repo);
+  Future<void> refreshAuth();
+
+  // ── Folder operations ─────────────────────────────────────────────
+
+  Future<String> findOrCreateRootFolder();
+  Future<List<SyncFileRef>> listBooks(String rootFolderId);
+
+  /// [readCoverData] 只在实现真的要上传封面时才调用（见 [SyncCoverDataProvider]）；
+  /// 缓存命中的快路径必须**不**调用它。
+  Future<String> ensureBookFolder({
+    required String bookTitle,
+    required String rootFolderId,
+    SyncCoverDataProvider? readCoverData,
+  });
+
+  // ── Metadata sync (JSON) ──────────────────────────────────────────
+
+  Future<SyncFileTrio> listSyncFiles(String folderId);
+
+  Future<TtuProgress> getProgressFile(String fileId);
+  Future<List<TtuStatistics>> getStatsFile(String fileId);
+  Future<TtuAudioBook> getAudioBookFile(String fileId);
+  Future<void> updateProgressFile({
+    required String folderId,
+    required String? fileId,
+    required TtuProgress progress,
+  });
+  Future<void> updateStatsFile({
+    required String folderId,
+    required String? fileId,
+    required List<TtuStatistics> stats,
+  });
+  Future<void> updateAudioBookFile({
+    required String folderId,
+    required String? fileId,
+    required TtuAudioBook audioBook,
+  });
+
+  // ── Content file sync ─────────────────────────────────────────────
+
+  Future<void> uploadContentFile({
+    required String folderId,
+    required String fileName,
+    required File file,
+    SyncTransferProgress? onProgress,
+  });
+  Future<void> downloadContentFile({
+    required String fileId,
+    required File destination,
+    SyncTransferProgress? onProgress,
+  });
+  Future<SyncFileRef?> findContentFile(String folderId, String fileName);
+
+  // ── Cache ─────────────────────────────────────────────────────────
+
+  void clearCache();
+  void restoreCache({
+    String? rootFolderId,
+    Map<String, String>? titleToFolderId,
+  });
+  String? get cachedRootFolderId;
+  Map<String, String> get cachedFolderIds;
+  void cacheBookFolderIds(List<SyncFileRef> folders);
+
+  /// 删除某本书的远端文件夹（[folderId] = `ensureBookFolder` 返回的定位符）后，
+  /// 把它从书名→folderId 缓存里逐出（按值反查，删所有指向 [folderId] 的条目）。
+  ///
+  /// 不逐出会留下「书名仍映射到已删/已 trash 的 folderId」的陈旧态：Google Drive
+  /// 的 folderId 是不可变 ID，删后进回收站仍能被缓存命中，`ensureBookFolder` 命中
+  /// 即返回 trashed folderId，后续上传打向 trashed 文件夹（其 `files.list` 返回空而
+  /// 非 404，绕过 404 自愈）→ 复传石沉（BUG-202）。调用方逐出内存后须再
+  /// `SyncRepository.setFolderCache(cachedFolderIds)` 重写持久化缓存。
+  void evictFolderId(String folderId);
+}
+
+/// SyncAssetStore 默认委托（与 [SyncBackendFileTrioMixin]/[SyncFolderCache]
+/// 同款模式：挂在具体后端的 `with` 列表，SyncBackend 接口零变化——测试 fake 用
+/// `implements SyncBackend` 不受影响）。
+mixin SyncAssetStoreDefaults on SyncBackend {
+  //
+  // findAsset/putAsset/getAsset were byte-identical across the ID-style backends
+  // (ftp/sftp/dropbox/onedrive), each forwarding verbatim to the per-backend
+  // content primitives, so they live here once instead of six copies. The
+  // concrete findContentFile / uploadContentFile / downloadContentFile each
+  // already take their own backend lock (_opLock / _guarded / WebDavOps), so
+  // these defaults MUST NOT wrap them in another lock — re-acquiring a
+  // non-reentrant mutex would deadlock (do not re-wrap).
+  //
+  // Path-style backends (WebDAV, Fushi interconnect) probe existence with a
+  // HEAD rather than findContentFile, so they still override findAsset; nothing
+  // else diverges. The lone readiness difference — InterconnectSyncBackend must
+  // settle on a reachable host before any per-asset op — is funnelled through
+  // the [ensureAssetReady] hook (default no-op) instead of duplicated call sites.
+
+  /// Protected readiness hook awaited before the default [putAsset] / [getAsset]
+  /// forward. Default no-op; a backend that must settle a session first
+  /// (InterconnectSyncBackend → resolve a reachable host) overrides it.
+  Future<void> ensureAssetReady() async {}
+
+  @override
+  Future<AssetEntry?> findAsset(String namespaceId, String name) async {
+    // Delegates to the already-locking findContentFile; do not re-wrap.
+    final SyncFileRef? file = await findContentFile(namespaceId, name);
+    if (file == null) return null;
+    return AssetEntry(id: file.id, name: file.name);
+  }
+
+  @override
+  Future<void> putAsset(
+    String namespaceId,
+    String name,
+    File file, {
+    SyncTransferProgress? onProgress,
+  }) async {
+    await ensureAssetReady();
+    // Delegates to the already-locking uploadContentFile; do not re-wrap.
+    await uploadContentFile(
+      folderId: namespaceId,
+      fileName: name,
+      file: file,
+      onProgress: onProgress,
+    );
+  }
+
+  @override
+  Future<void> getAsset(
+    String assetId,
+    File destination, {
+    SyncTransferProgress? onProgress,
+  }) async {
+    await ensureAssetReady();
+    // Delegates to the already-locking downloadContentFile; do not re-wrap.
+    await downloadContentFile(
+      fileId: assetId,
+      destination: destination,
+      onProgress: onProgress,
+    );
+  }
+}
+
+// HBK-AUDIT-091: resolver lives next to SyncBackendType (its switch subject)
+// instead of inside the concrete GoogleDrive backend, so no single concrete
+// backend is forced to import all of its siblings.
+SyncBackend resolveSyncBackend(SyncBackendType type) {
+  final SyncBackend raw;
+  switch (type) {
+    case SyncBackendType.googleDrive:
+      raw = GoogleDriveSyncBackend.instance;
+    case SyncBackendType.webDav:
+      raw = WebDavSyncBackend.instance;
+    case SyncBackendType.fushiServer:
+      // 局域网双端（Fushi 自有 server）不是「防扫盘」场景：两端都是用户自己的
+      // 设备/服务，混淆只会徒增开销并破坏 Fushi client/server 的字节协议契约，
+      // 所以 fushiServer 直接返回裸后端，不包 ObfuscatingSyncBackend（TODO-623 A1）。
+      return InterconnectSyncBackend.instance;
+    case SyncBackendType.oneDrive:
+      raw = OneDriveSyncBackend.instance;
+    case SyncBackendType.dropbox:
+      raw = DropboxSyncBackend.instance;
+    case SyncBackendType.ftp:
+      raw = FtpSyncBackend.instance;
+    case SyncBackendType.sftp:
+      raw = SftpSyncBackend.instance;
+  }
+  // 其余均为云端/第三方存储：包一层字节混淆装饰器防扫盘看到明文内容（TODO-623 A1）。
+  return ObfuscatingSyncBackend(raw);
+}
+
+/// [resolveSyncBackend] 的逆：一个后端实例属于哪条通道的持久化槽位
+/// （BUG-1576 / BUG-1578 / BUG-1579 / BUG-1580）。
+///
+/// 为什么是「按实例反查」而不是在 [SyncBackend] 上加一个抽象成员：消费方
+/// （SyncManager / SyncOrchestrator / 对比对话框）手上已经只有后端实例，加抽象成员
+/// 会让二十多个 `implements SyncBackend` 的测试 fake 全部编译失败，却一点信息也没
+/// 多出来。反查表就放在 [resolveSyncBackend] 旁边，两者是同一张表的两个方向；
+/// 「每个 [SyncBackendType] 解析出来的后端都能反查回自己」这条不变式由
+/// `sync_channel_scope_test` 对 `SyncBackendType.values` 逐值钉住，新增后端漏改
+/// 会当场红。
+///
+/// 认不出来的实例（只可能是测试 fake）落 [SyncChannelScope.unscoped]——一格独立
+/// 的槽位，不与任何真实通道共用，绝不会把测试状态写进用户通道的账上。
+SyncChannelScope syncChannelScopeOf(SyncBackend backend) {
+  // 混淆装饰器是纯包装：槽位属于被它包着的那个真后端。
+  final SyncBackend inner =
+      backend is ObfuscatingSyncBackend ? backend.inner : backend;
+  return switch (inner) {
+    GoogleDriveSyncBackend() =>
+      SyncChannelScope.forBackendType(SyncBackendType.googleDrive),
+    InterconnectSyncBackend() =>
+      SyncChannelScope.forBackendType(SyncBackendType.fushiServer),
+    WebDavSyncBackend() =>
+      SyncChannelScope.forBackendType(SyncBackendType.webDav),
+    OneDriveSyncBackend() =>
+      SyncChannelScope.forBackendType(SyncBackendType.oneDrive),
+    DropboxSyncBackend() =>
+      SyncChannelScope.forBackendType(SyncBackendType.dropbox),
+    FtpSyncBackend() => SyncChannelScope.forBackendType(SyncBackendType.ftp),
+    SftpSyncBackend() => SyncChannelScope.forBackendType(SyncBackendType.sftp),
+    _ => SyncChannelScope.unscoped,
+  };
+}

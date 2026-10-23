@@ -1,0 +1,678 @@
+function normalizeDictMediaPath(raw) {
+    return `${raw}`.trim().replace(/\\/g, '/').replace(/^(?:\.\/|\/)+/, '');
+}
+
+function rewriteDictionaryMediaPath(rawPath, dictName) {
+    const trimmed = `${rawPath}`.trim();
+    if (!trimmed || /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i.test(trimmed)) {
+        return null;
+    }
+    const normalized = normalizeDictMediaPath(rawPath);
+    // TODO-1215: a real browser has no image:// scheme handler, so gaiji /
+    // pitch-accent SVG images would break (ERR_UNKNOWN_URL_SCHEME). In the
+    // extension, bridge-shim.js pre-fills window.__fushiDictMedia with the
+    // running server's base URL + token (from background cfg()); when present,
+    // rewrite to the server's http media endpoint. In-app that global is unset
+    // -> the original image:// path is kept (the app WebView resolves it).
+    const media = (typeof window !== 'undefined') ? window.__fushiDictMedia : null;
+    if (media && media.base && media.token) {
+        return `${media.base}/api/media/dictionary` +
+            `?dictionary=${encodeURIComponent(dictName)}` +
+            `&path=${encodeURIComponent(normalized)}` +
+            `&token=${encodeURIComponent(media.token)}`;
+    }
+    return `image://?dictionary=${encodeURIComponent(dictName)}&path=${encodeURIComponent(normalized)}`;
+}
+
+function rewriteDictLinks(html, dictName) {
+    return html.replace(/<link[^>]*href=['"]([^'"]+)['"][^>]*>/gi, (match, href) => {
+        const normalized = normalizeDictMediaPath(href);
+        // BUG-1718：真实浏览器同样没有 dictmedia:// scheme handler，词条 HTML 里指向词典包内
+        // 样式表的 <link> 在扩展里是死链（app 内由 WebView 自定义 scheme 解析）。与 <img> 同款
+        // 处理：扩展环境下降级成无 token 的占位属性，由 resolveDictMediaPlaceholders 取字节后
+        // 换成 <style>。app 内（该全局未设）保持 dictmedia:// 原样。
+        const linkMedia = (typeof window !== 'undefined') ? window.__fushiDictMedia : null;
+        if (linkMedia && linkMedia.base && linkMedia.token) {
+            return `<link data-fushi-media-dict="${encodeURIComponent(dictName)}" data-fushi-media-path="${encodeURIComponent(href)}">`;
+        }
+        return `<link rel="stylesheet" href="dictmedia://${encodeURIComponent(normalized)}?dictionary=${encodeURIComponent(dictName)}">`;
+    }).replace(/<img\b[^>]*\bsrc=(['"])([^'"]+)\1[^>]*>/gi, (match, quote, src) => {
+        const rewritten = rewriteDictionaryMediaPath(src, dictName);
+        if (rewritten === null) {
+            return match;
+        }
+        // TODO-1215 安全：扩展环境（window.__fushiDictMedia 已设）下，这段 HTML 会经 innerHTML
+        // 直落宿主页 DOM——绝不能把带原始 sync token 的媒体 URL 写进 <img src>（哪怕只存在一帧也会被
+        // MutationObserver 截获）。改成无 token 的占位 data-* 属性（去掉 src），popup.js 在 innerHTML
+        // 之后据此 fetch→blob 补 src（token 只在 fetch 调用里）。app 内（该全局未设）保持原样。
+        const media = (typeof window !== 'undefined') ? window.__fushiDictMedia : null;
+        if (media && media.base && media.token) {
+            return match.replace(/src=(['"])([^'"]+)\1/i,
+                `data-fushi-media-dict="${encodeURIComponent(dictName)}" data-fushi-media-path="${encodeURIComponent(src)}"`);
+        }
+        return match.replace(/src=(['"])([^'"]+)\1/i, `src=${quote}${rewritten}${quote}`);
+    });
+}
+
+/* 词典 CSS 作用域化的结果**只由** (css, dictName, scopePrefix) 决定——纯函数，
+   同输入必同输出。但它的调用点是 createGlossarySection，即「每个词条的每个词典块」
+   各调一次：N 条词条 × M 本词典就是 N×M 次把同一本词典那份（Yomitan 词典动辄几十 KB
+   的）CSS 重新做一遍逐字符扫描（下面的 while 循环对空白字符是一个字符 push 一次数组）。
+   查一次词就白烧几十上百遍完全相同的解析。
+   这里按三元组做 memo：外层用 css 串本身分桶（内容变了自然落到新桶，无需失效钩子，
+   也就不存在「换词典集后拿到旧作用域 CSS」的风险），内层用 dictName+scopePrefix。
+   递归分支走未缓存的实现，避免把每个 at-block 的子串都塞进缓存。 */
+const __dictCssCache = new Map();
+// 桶数上限 = 同时活着的「带 styles.css 的词典」数。一次查词按「词条 × 词典」轮询全部词典的
+// css，桶数一旦小于词典数就是逐次全 miss（LRU 对循环访问同样无解），所以上限必须明显
+// 大于任何真实词典集；淘汰用 LRU（Map 保持插入序，命中即挪到队尾）只为换词典集时先
+// 清最久没用的，而不是把还在用的一起清空。
+const __dictCssCacheMaxBuckets = 256;
+
+function constructDictCss(css, dictName, scopePrefix) {
+    if (!css) return '';
+    let byScope = __dictCssCache.get(css);
+    if (byScope === undefined) {
+        // 词典集切换/重新导入会带来新的 css 串；给桶数封顶，别让缓存无界增长。
+        if (__dictCssCache.size >= __dictCssCacheMaxBuckets) {
+            __dictCssCache.delete(__dictCssCache.keys().next().value);
+        }
+        byScope = new Map();
+    } else {
+        __dictCssCache.delete(css); // 命中：挪到队尾（最近使用）
+    }
+    __dictCssCache.set(css, byScope);
+    const key = JSON.stringify([dictName || '', scopePrefix || '']);
+    let out = byScope.get(key);
+    if (out === undefined) {
+        out = constructDictCssUncached(css, dictName, scopePrefix);
+        byScope.set(key, out);
+    }
+    return out;
+}
+
+function constructDictCssUncached(css, dictName, scopePrefix) {
+    if (!css) return '';
+    const prefix = scopePrefix || `[data-dictionary="${dictName}"]`;
+    const parts = [];
+    let i = 0;
+    while (i < css.length) {
+        while (i < css.length && /\s/.test(css[i])) {
+            parts.push(css[i++]);
+        }
+        if (css.slice(i, i + 2) === '/*') {
+            const end = css.indexOf('*/', i + 2);
+            if (end === -1) break;
+            parts.push(css.slice(i, end + 2));
+            i = end + 2;
+            continue;
+        }
+        const bracePos = css.indexOf('{', i);
+        const semiPos = css.indexOf(';', i);
+        // Statement at-rules (`@import`, `@charset`, `@namespace`, `@layer a, b;`)
+        // terminate with `;` before any block — pass them through verbatim; they
+        // carry no selector that could (or should) be scoped.
+        if (semiPos !== -1 && (bracePos === -1 || semiPos < bracePos)) {
+            const statement = css.slice(i, semiPos + 1);
+            if (statement.trimStart().startsWith('@')) {
+                parts.push(statement);
+                i = semiPos + 1;
+                continue;
+            }
+        }
+        if (bracePos === -1) break;
+        const selectorPart = css.slice(i, bracePos);
+        const selectorPrelude = selectorPart.trim();
+        // Block at-rules need their prelude preserved unscoped. Two families:
+        //  - Conditional groups (`@media`/`@supports`/`@container`/`@layer`/`@scope`)
+        //    wrap nested STYLE RULES, so their inner rules must still be scoped.
+        //  - Other at-rules (`@font-face`/`@keyframes`/`@page`/`@font-feature-values`/...)
+        //    contain declarations or keyframe-selectors that must NOT be prefixed.
+        const atRuleMatch = selectorPrelude.match(/^@([a-z-]+)/i);
+        if (atRuleMatch) {
+            const atName = atRuleMatch[1].toLowerCase();
+            const isConditionalGroup =
+                atName === 'media' ||
+                atName === 'supports' ||
+                atName === 'container' ||
+                atName === 'layer' ||
+                atName === 'scope';
+            // Capture the at-rule's own block so we can decide per-family.
+            i = bracePos + 1;
+            let atDepth = 1;
+            const atBlockStart = i;
+            while (i < css.length && atDepth > 0) {
+                if (css[i] === '{') atDepth++;
+                else if (css[i] === '}') atDepth--;
+                i++;
+            }
+            const atBlockContent = css.slice(atBlockStart, i - 1);
+            parts.push(selectorPart, ' {');
+            if (isConditionalGroup) {
+                // Recurse so inner style rules get the prefix; the prelude stays raw.
+                parts.push(constructDictCssUncached(atBlockContent, dictName, scopePrefix));
+            } else {
+                // @font-face / @keyframes / @page: body is declarations or
+                // keyframe selectors — emit verbatim, never prefixed.
+                parts.push(atBlockContent);
+            }
+            parts.push('}');
+            continue;
+        }
+        const selectors = selectorPart.split(',').map(s => {
+            const trimmed = s.trim();
+            if (!trimmed) return '';
+            if (trimmed.startsWith('&')) return s;
+            return `${prefix} ${trimmed}`;
+        });
+        parts.push(selectors.join(', '), ' {');
+        i = bracePos + 1;
+        let depth = 1;
+        let blockStart = i;
+        while (i < css.length && depth > 0) {
+            if (css[i] === '{') depth++;
+            else if (css[i] === '}') depth--;
+            i++;
+        }
+        const blockContent = css.slice(blockStart, i - 1);
+        if (blockContent.includes('{')) {
+            let pos = 0;
+            let properties = '';
+            let nestedRules = '';
+            while (pos < blockContent.length) {
+                while (pos < blockContent.length && /\s/.test(blockContent[pos])) pos++;
+                if (pos >= blockContent.length) break;
+                let nextSemi = blockContent.indexOf(';', pos);
+                let nextBrace = blockContent.indexOf('{', pos);
+                if (nextBrace !== -1 && (nextSemi === -1 || nextBrace < nextSemi)) {
+                    let nestedDepth = 1;
+                    let nestedEnd = nextBrace + 1;
+                    while (nestedEnd < blockContent.length && nestedDepth > 0) {
+                        if (blockContent[nestedEnd] === '{') nestedDepth++;
+                        else if (blockContent[nestedEnd] === '}') nestedDepth--;
+                        nestedEnd++;
+                    }
+                    nestedRules += blockContent.slice(pos, nestedEnd);
+                    pos = nestedEnd;
+                } else if (nextSemi !== -1) {
+                    properties += blockContent.slice(pos, nextSemi + 1);
+                    pos = nextSemi + 1;
+                } else {
+                    properties += blockContent.slice(pos);
+                    break;
+                }
+            }
+            parts.push(properties);
+            if (nestedRules) parts.push(constructDictCssUncached(nestedRules, dictName, scopePrefix));
+        } else {
+            parts.push(blockContent);
+        }
+        parts.push('}');
+    }
+    return parts.join('');
+}
+
+// BUG-1718：把 rewriteDictLinks 落下的占位属性（data-fushi-media-dict / data-fushi-media-path）
+// 解析成真正可显示的资源。TODO-1215 当初为了不把 sync token 写进宿主页 DOM，只把 <img src>
+// 换成了占位属性，却**从没有人来兑现这些占位**——扩展里 mdx 词典词条内的图片（gaiji / 插图 /
+// 声调图）因此一直是裂图。这里补上兑现方：token 只出现在 fetch 调用参数里，落到 DOM 的是
+// blob: URL（<img>）或内联 <style>（<link>），宿主页 MutationObserver 拿不到 token。
+function fushiDictMediaEndpoint(media, encodedDict, encodedPath) {
+    const path = normalizeDictMediaPath(decodeURIComponent(encodedPath));
+    return `${media.base}/api/media/dictionary`
+        + `?dictionary=${encodedDict}`
+        + `&path=${encodeURIComponent(path)}`
+        + `&token=${encodeURIComponent(media.token)}`;
+}
+
+function resolveDictMediaPlaceholders(root) {
+    const media = (typeof window !== 'undefined') ? window.__fushiDictMedia : null;
+    if (!media || !media.base || !media.token || !root || !root.querySelectorAll) return;
+    const nodes = root.querySelectorAll('[data-fushi-media-path]');
+    for (const node of nodes) {
+        const encodedDict = node.getAttribute('data-fushi-media-dict') || '';
+        const encodedPath = node.getAttribute('data-fushi-media-path') || '';
+        // 先摘属性：解析只做一次。失败也不重试，避免 MutationObserver ↔ 失败 无限打转。
+        node.removeAttribute('data-fushi-media-path');
+        if (!encodedPath) continue;
+        const url = fushiDictMediaEndpoint(media, encodedDict, encodedPath);
+        const isLink = node.tagName === 'LINK';
+        fetch(url).then((r) => {
+            if (!r.ok) return null;
+            return isLink ? r.text() : r.blob();
+        }).then((payload) => {
+            if (payload === null || !node.parentNode) return;
+            if (isLink) {
+                const style = document.createElement('style');
+                style.textContent = payload;
+                node.parentNode.replaceChild(style, node);
+                return;
+            }
+            const objectUrl = URL.createObjectURL(payload);
+            node.addEventListener('load', () => URL.revokeObjectURL(objectUrl), { once: true });
+            node.addEventListener('error', () => URL.revokeObjectURL(objectUrl), { once: true });
+            node.src = objectUrl;
+        }).catch(() => { /* 取不到就保持裂图/无样式，绝不阻断查词渲染 */ });
+    }
+}
+
+// 弹窗内容是 popup.js 分批渲染的（懒展开、嵌套查词都会再插 DOM），所以不能只在一次渲染后扫一遍：
+// 在弹窗根上装一个 MutationObserver，任何新插入的占位都会被兑现。每个 root 只装一次。
+function installDictMediaPlaceholderResolver(root) {
+    if (!root || root.__fushiDictMediaObserver) return;
+    if (typeof MutationObserver !== 'function') return;
+    const observer = new MutationObserver(() => resolveDictMediaPlaceholders(root));
+    observer.observe(root, { childList: true, subtree: true });
+    root.__fushiDictMediaObserver = observer;
+    resolveDictMediaPlaceholders(root);
+}
+
+// BUG-1718：把查词响应里的「弹窗 CSS 尾段」落到 popup.js 读取的三个全局上。app 内弹窗由
+// popup_settings_injection 注入同名三件套，扩展只能从 /api/lookup/dictionary 响应拿；不落这一步
+// 的话 window.dictionaryStyles 恒为 undefined，mdx 词典自带样式在扩展里 100% 失效。
+function applyFushiPopupCss(data) {
+    if (!data || typeof data !== 'object') return;
+    window.dictionaryStyles =
+        (data.dictionaryStyles && typeof data.dictionaryStyles === 'object')
+            ? data.dictionaryStyles : {};
+    window.globalDictCSS =
+        typeof data.globalDictCSS === 'string' ? data.globalDictCSS : '';
+    window.customDictCSS =
+        (data.customDictCSS && typeof data.customDictCSS === 'object')
+            ? data.customDictCSS : {};
+    // 词典改名（v95）：popup.js 的 __fushiDictDisplayName 读这张表。缺了不会崩
+    // （回落真名），但改名在扩展里就不生效。
+    window.dictionaryDisplayNames =
+        (data.dictionaryDisplayNames && typeof data.dictionaryDisplayNames === 'object')
+            ? data.dictionaryDisplayNames : {};
+    // popup.js 的 dictionaryLanguageOf 读这张表给释义区标 lang（app 内由 Dart 注入同名全局）。
+    window.__fushiDictionaryLanguages =
+        (data.dictionaryLanguages && typeof data.dictionaryLanguages === 'object')
+            ? data.dictionaryLanguages : {};
+    // 「统一词典样式」：app 内弹窗由 popup_settings_injection 注入同名全局，扩展从查词响应的
+    // dictionaryUnifiedStyle 取 app 的同一个偏好。只认 true：字段缺失（旧 app / 未接线）一律关，
+    // 与 app 默认值一致。不进 stylesRevision 门控——每次查词都随响应下发，改了下次查词即生效。
+    window.__fushiDictUnifiedStyle = data.dictionaryUnifiedStyle === true;
+    fushiApplyDictionaryFont(data);
+}
+
+// 用户在 app 里设的「词典字体」（设置 · 字体 · 词典），与 app 内弹窗同一份设置：
+//   - dictionaryFontCss：按内容语言分流的字体链（用户字体接在每条链首），挂进弹窗根
+//     （shadow root / 嵌套层文档），根选择器是 #entries-container；
+//   - dictionaryFontFaces：[{family, src, format, weight?}]，src 是 app 端点的相对路径。
+// 字体字节与图片同一约定：token 只出现在 fetch 参数里，拿到字节后 new FontFace(family, buffer)
+// 注册进 document.fonts——带 token 的 URL 不进任何网页可读的样式表 / DOM。
+// @font-face 写进 shadow root 本就不生效（Blink 只认文档级），FontFaceSet 是文档级的，正合适。
+// 同一 realm 里每个 (family, src) 只取一次；配置还没到（__fushiDictMedia 未就绪）就留给下次渲染。
+const __fushiDictFontFaces = new Map(); // family + '|' + src -> FontFace | Promise | null
+let __fushiLastDictFontData = null;
+// __fushiDictMedia 是异步拿到的（嵌套层 iframe 尤其常晚于首次渲染）：拿到后补一次字体。
+function fushiRetryDictionaryFont() {
+    if (__fushiLastDictFontData) fushiApplyDictionaryFont(__fushiLastDictFontData);
+}
+function fushiApplyDictionaryFont(data) {
+    __fushiLastDictFontData = data;
+    const css = typeof data.dictionaryFontCss === 'string' ? data.dictionaryFontCss : '';
+    // 只挂弹窗根，**绝不**回落到 document.head：页面弹窗的 shadow root 要到首次渲染才建，
+    // 那之前落进宿主页 <head> 的 :lang(ja) 规则会改掉整张网页的字体。根建好后由 content.js
+    // 调 fushiRetryDictionaryFont 补挂。
+    const root = (typeof window !== 'undefined' && window.__fushiRoot) || null;
+    if (root && typeof root.getElementById === 'function') {
+        let style = root.getElementById('fushi-dict-font');
+        if (css) {
+            if (!style) {
+                style = document.createElement('style');
+                style.id = 'fushi-dict-font';
+                root.appendChild(style);
+            }
+            if (style.textContent !== css) style.textContent = css;
+        } else if (style && style.parentNode) {
+            style.parentNode.removeChild(style);
+        }
+    }
+
+    const faces = Array.isArray(data.dictionaryFontFaces) ? data.dictionaryFontFaces : [];
+    const wanted = new Set();
+    for (const face of faces) {
+        const family = face && typeof face.family === 'string' ? face.family.trim() : '';
+        const src = face && typeof face.src === 'string' ? face.src : '';
+        const weight = face && typeof face.weight === 'string' && /^\d{1,4}( \d{1,4})?$/.test(face.weight)
+            ? face.weight : '';
+        if (!family || !src.startsWith('/api/extension/fonts/dictionary?')) continue;
+        const key = family + '|' + src;
+        wanted.add(key);
+        if (__fushiDictFontFaces.has(key)) continue;
+        const media = (typeof window !== 'undefined') ? window.__fushiDictMedia : null;
+        if (!media || !media.base || !media.token) continue;
+        if (typeof FontFace !== 'function' || typeof document === 'undefined' || !document.fonts) continue;
+        const url = media.base + src + '&token=' + encodeURIComponent(media.token);
+        const pending = fetch(url).then((r) => (r.ok ? r.arrayBuffer() : null)).then((buffer) => {
+            if (!buffer || __fushiDictFontFaces.get(key) !== pending) return null;
+            // weight = 文件真实字重（'400' / '100 900'）：同一家族的常规 + 粗体文件各注册
+            // 一个字面，粗体请求才会选中粗体文件而不是把常规字面合成加粗。
+            const descriptors = { display: 'swap' };
+            if (weight) descriptors.weight = weight;
+            const fontFace = new FontFace(family, buffer, descriptors);
+            document.fonts.add(fontFace);
+            __fushiDictFontFaces.set(key, fontFace);
+            return fontFace;
+        }).catch(() => {
+            // 取不到就落回字体链的下一位；记 null 防止每次渲染都重打一遍失败请求。
+            if (__fushiDictFontFaces.get(key) === pending) __fushiDictFontFaces.set(key, null);
+            return null;
+        });
+        __fushiDictFontFaces.set(key, pending);
+    }
+    // 用户换掉 / 停用的字体：从 document.fonts 摘掉，别让旧字体继续命中同名家族。
+    for (const [key, value] of Array.from(__fushiDictFontFaces.entries())) {
+        if (wanted.has(key)) continue;
+        __fushiDictFontFaces.delete(key);
+        if (value && typeof value.then !== 'function' && document.fonts) {
+            try { document.fonts.delete(value); } catch (_) { /* 已被移除 */ }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+   词典自带脚本的执行。
+
+   MDX 词典的条目 HTML 是一个完整网页片段：它 <link> 自己的样式表，也 <script>
+   自己的脚本（NLT 词频用脚本把「頻度」列画成条形图；OALDPEX 用脚本驱动整套配置
+   界面和中文翻译显示开关）。样式表走 styles.css 内联注入，脚本此前则**完全不
+   执行**——经 innerHTML 插入的 <script> 按 HTML 规范永远不会跑，所以这些词典在
+   我们这里只剩一个没有交互的骨架。
+
+   这里补上执行，但**不是**放回全局作用域就完事。词典脚本是按「一个条目 = 一个
+   独立文档」写的：NLT 那份直接 document.querySelectorAll('tr')，在我们这种把多本
+   词典塞进同一个弹窗文档的宿主里，它会把别的词典的表格一起改掉。所以每份脚本都
+   在一个把查询限制在本词典子树内的 document 代理下运行（见 createScopedDocument）。
+
+   三条实现上的必要选择：
+   - 同一个词典块的多段脚本**拼成一段**执行，因为同一文档里的多个 <script> 共享
+     全局作用域：前一段的 `var oaldpexConfig = …` 后一段要看得见。每段各自包在
+     try 里，一段语法/运行错误不会带走其余段。
+   - 编译结果按代码串缓存：一次查词可能渲染多个词条，每个都有该词典的一块，而
+     OALDPEX 的脚本有 210KB，重复解析是实打实的开销。
+   - 源码经 bridge 按需取并缓存，而不是随每次查词注入——同样是 210KB 起步的量，
+     内联进每次弹窗就是 BUG-1868 那条老路。
+--------------------------------------------------------------------------- */
+
+const __dictAssetCache = new Map();      // JSON.stringify([dict, path]) -> 源码字符串 / null
+const __dictScriptFnCache = new Map();   // 拼接后的代码串 -> 编译好的 Function
+const __dictScriptsRan = new WeakSet();  // 已经跑过脚本的词典块
+const __scopedWindows = new WeakMap();   // 词典块 root -> 它那份 window 代理
+const __boundHostFns = new WeakMap();    // 宿主方法 -> 绑回真 window 的那一份
+
+function reportDictScriptError(dictName, label, error) {
+    try {
+        const bridge = window.flutter_inappwebview;
+        if (bridge && typeof bridge.callHandler === 'function') {
+            bridge.callHandler('reportJsError', {
+                source: 'dictScript',
+                message: `[${dictName}] ${label}: ${error && error.message ? error.message : error}`,
+                stack: error && error.stack ? String(error.stack) : '',
+            });
+        }
+    } catch (_) { /* 诊断失败不能反过来毁掉渲染 */ }
+}
+
+/* 取一份词典资源的文本。native 侧已把 .mdd 里的文件和 .mdx 旁边的散文件收进同一个
+   媒体库，所以这里只有一条按名取的通道。词典引用了但根本不存在的脚本（OALDPEX 的
+   oaldpex_img.js 等在包里就是缺的）返回 null，与浏览器 404 后继续跑其余脚本一致。 */
+async function fetchDictAsset(dictName, path) {
+    const key = JSON.stringify([dictName, path]);
+    if (__dictAssetCache.has(key)) return __dictAssetCache.get(key);
+    let source = null;
+    try {
+        const bridge = window.flutter_inappwebview;
+        if (bridge && typeof bridge.callHandler === 'function') {
+            const reply = await bridge.callHandler('getDictAsset', { dictionary: dictName, path });
+            if (typeof reply === 'string' && reply.length) source = reply;
+        }
+    } catch (_) {
+        source = null;
+    }
+    __dictAssetCache.set(key, source);
+    return source;
+}
+
+/* 一个把「整篇文档」重定向到本词典子树的 document 代理。
+
+   只改写按选择器找元素、以及 body/documentElement/readyState 这几处：其余属性和
+   方法一律透传真 document（createElement、createTextNode、cookie……），所以 jQuery
+   这类通用库照常工作，只是它的选择器看到的世界缩小到了这本词典。
+
+   DOMContentLoaded / load / readystatechange 是必须特判的一项：弹窗是长驻页面，
+   这些事件在词典脚本跑起来之前早就过去了，照原样注册等于永远不触发——而 MDict
+   生态里几乎每份脚本都把入口挂在 DOMContentLoaded 上。这里立刻（微任务）回调，
+   对应真实宿主里「文档已就绪」的语义。 */
+function createScopedDocument(root, dictName) {
+    const fireSoon = (handler, type) => {
+        Promise.resolve().then(() => {
+            try {
+                handler.call(proxy, new Event(type));
+            } catch (error) {
+                reportDictScriptError(dictName, `on${type}`, error);
+            }
+        });
+    };
+
+    const overrides = {
+        querySelector: (selector) => root.querySelector(selector),
+        querySelectorAll: (selector) => root.querySelectorAll(selector),
+        getElementsByClassName: (name) => root.getElementsByClassName(name),
+        getElementsByTagName: (name) => root.getElementsByTagName(name),
+        getElementsByName: (name) => root.querySelectorAll(`[name="${CSS.escape(name)}"]`),
+        getElementById: (id) => {
+            try {
+                return root.querySelector(`#${CSS.escape(id)}`);
+            } catch (_) {
+                return null;
+            }
+        },
+        addEventListener: (type, handler, options) => {
+            if (type === 'DOMContentLoaded' || type === 'load' || type === 'readystatechange') {
+                if (typeof handler === 'function') fireSoon(handler, type);
+                else if (handler && typeof handler.handleEvent === 'function') {
+                    fireSoon(handler.handleEvent.bind(handler), type);
+                }
+                return undefined;
+            }
+            return root.addEventListener(type, handler, options);
+        },
+        removeEventListener: (type, handler, options) => root.removeEventListener(type, handler, options),
+        // `document.defaultView` 是另一条摸回真 window 的路（jQuery 取 computed style
+        // 与判 isWindow 都走它），指回本块的 window 代理；代理还没建好时（只用 scoped
+        // document、不跑脚本的调用方）照旧透传。
+        get defaultView() {
+            return __scopedWindows.get(root) || Reflect.get(document, 'defaultView');
+        },
+    };
+
+    const proxy = new Proxy(document, {
+        get(target, prop) {
+            if (Object.prototype.hasOwnProperty.call(overrides, prop)) return overrides[prop];
+            if (prop === 'body' || prop === 'documentElement') return root;
+            if (prop === 'readyState') return 'complete';
+            const value = Reflect.get(target, prop);
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+        set(target, prop, value) {
+            // 词典脚本往 document 上挂自己的字段时，别让它落到真 document 上。
+            try {
+                root[`__dict_${String(prop)}`] = value;
+            } catch (_) { /* 只读属性，忽略 */ }
+            return true;
+        },
+    });
+    return proxy;
+}
+
+/* 与 [createScopedDocument] 配套的 window 代理：词典脚本拿到的 `window` 也必须是本
+   词典块私有的。
+
+   弹窗是**常驻页面**：每换一次词就重建整棵结果 DOM，并把同一本词典的同一份脚本再跑
+   一遍。只代理 document 挡不住脚本的全局副作用——它们照样能经 `window` 逃出本块：
+
+   · jQuery 这类 UMD 库内部第一句就是 `var document = window.document`，拿到的是**真**
+     document，`$(document).on('click', …)` 于是绑在真 document 上。第二次查词再绑一份，
+     同一次点击被两份监听各处理一次：MDX 词典的折叠块（OALD 的 Verb Forms / Extra
+     Examples 那种 `.unbox`）展开又立刻收起，用户看到的就是「第二次查词后折叠字段点
+     不开」；第三次查词监听数回到奇数，又能开了。
+   · 脚本拿 `window.__inited` 之类做幂等守卫时更彻底：第二次起直接短路返回，新 DOM 一
+     次都绑不上，从此永久点不开。
+
+   代理把 document 换成 scoped 版、把 window 级监听收到本块 root 上、把属性写入关进本块
+   私有表；读取时先查私有表再回落真 window，宿主 API（setTimeout / location / navigator
+   ……）照常可用。旧块随 DOM 一起被丢弃，它挂的监听与标记自然作废，第 N 次查词和第一次
+   完全等价。
+
+   target 是那张私有表而不是真 window：真 window 上 `window` / `top` 这类**不可配置的数据
+   属性**会让「get 返回代理自身」撞上 Proxy 不变量检查（TypeError）；而拿私有表当 target，
+   没实现的陷阱（`defineProperty` / `getOwnPropertyDescriptor` / `ownKeys`）默认就落在同一
+   张表上，与 get/set 看到的是同一份数据——`Object.defineProperty(window, …)` 写进去之后
+   读得回来。回落真 window 由 get / has 自己做。 */
+function createScopedWindow(root, scopedDocument, dictName) {
+    const own = Object.create(null);
+
+    function addScopedListener(type, handler, options) {
+        // 生命周期事件与 document 代理同语义：弹窗早就 ready 了，照原样注册永不触发，
+        // 这里立刻（微任务）补发一次。
+        if (type === 'DOMContentLoaded' || type === 'load' || type === 'readystatechange') {
+            let fn = null;
+            if (typeof handler === 'function') {
+                fn = handler;
+            } else if (handler && typeof handler.handleEvent === 'function') {
+                fn = handler.handleEvent.bind(handler);
+            }
+            if (fn) {
+                Promise.resolve().then(() => {
+                    try {
+                        fn.call(proxy, new Event(type));
+                    } catch (error) {
+                        reportDictScriptError(dictName, `on${type}`, error);
+                    }
+                });
+            }
+            return undefined;
+        }
+        return root.addEventListener(type, handler, options);
+    }
+
+    // 具名而不是每次 get 现造一个箭头函数：脚本存下引用再比对（`window.removeEventListener
+    // === saved`）时身份要稳定。
+    function removeScopedListener(type, handler, options) {
+        return root.removeEventListener(type, handler, options);
+    }
+
+    const proxy = new Proxy(own, {
+        get(_target, prop) {
+            if (prop === 'document') return scopedDocument;
+            // 自指属性全部指回代理，别让脚本经 window.window / self / top 摸回真 window。
+            if (prop === 'window' || prop === 'self' || prop === 'globalThis'
+                || prop === 'parent' || prop === 'top') {
+                return proxy;
+            }
+            if (prop === 'addEventListener') return addScopedListener;
+            if (prop === 'removeEventListener') return removeScopedListener;
+            if (prop in own) return own[prop];
+            const value = Reflect.get(window, prop);
+            if (typeof value !== 'function') return value;
+            // 构造器 / 类（Object、Promise、Date、Node、词典自己的构造函数……）**必须原样
+            // 交出去**：`bind` 出来的函数既没有 `prototype`，也不带 target 的静态成员，
+            // `Object.keys(…)` / `Promise.resolve(…)` / `new Date()` 会当场 TypeError。
+            // 而 `with (window)` 让脚本里**每个裸标识符**都走这条 get——一 bind 就等于把
+            // 整个全局环境换成残废版，jQuery 第一行就炸。
+            //
+            // 真正需要绑回真 window 的只有那些不可 new 的宿主方法（setTimeout /
+            // getComputedStyle / fetch / atob……）：它们以代理为 this 调用会 Illegal
+            // invocation。这类内置方法一律没有 `prototype`，正好拿它当判据。
+            // bind 结果按原函数缓存，`window.setTimeout === window.setTimeout` 仍成立。
+            if (value.prototype !== undefined) return value;
+            let bound = __boundHostFns.get(value);
+            if (bound === undefined) {
+                bound = value.bind(window);
+                __boundHostFns.set(value, bound);
+            }
+            return bound;
+        },
+        set(_target, prop, value) {
+            own[prop] = value;
+            return true;
+        },
+        has(_target, prop) {
+            // `with (window) { … }` 靠这一项决定裸标识符走不走代理：本块写过的（jQuery /
+            // $）命中私有表，宿主已有的回落真 window，两边都没有的（第一份脚本执行到一半
+            // 时的 jQuery）照旧落到外层作用域，与不加代理时一致。
+            return prop in own || prop in window;
+        },
+        deleteProperty(_target, prop) {
+            delete own[prop];
+            return true;
+        },
+    });
+
+    __scopedWindows.set(root, proxy);
+    return proxy;
+}
+
+/* 跑完一个词典块里的全部 <script>。root 是该词典的 wrapper（div[data-dictionary]），
+   同时充当脚本的作用域根。执行完把 script 节点摘掉：它们已经跑过，留着只会让制卡
+   导出等下游再处理一遍。 */
+async function runDictScripts(root, dictName) {
+    if (!root || __dictScriptsRan.has(root)) return;
+    __dictScriptsRan.add(root);
+
+    const nodes = Array.from(root.querySelectorAll('script'));
+    if (!nodes.length) return;
+
+    const chunks = [];
+    const labels = [];
+    for (const node of nodes) {
+        const src = node.getAttribute('src');
+        let code = null;
+        let label = 'inline';
+        if (src) {
+            label = src;
+            code = await fetchDictAsset(dictName, normalizeDictMediaPath(src));
+        } else {
+            code = node.textContent;
+        }
+        node.remove();
+        if (!code) continue;
+        // 只有段序号（数字）被拼进代码，标签本身留在数组里。词典 HTML 里的 src
+        // 是外来串，而 JSON.stringify **不转义 U+2028/U+2029**——那两个字符在 JS
+        // 源码里是行终结符，插进来会当场把拼接结果劈成语法错误。
+        const index = labels.push(label) - 1;
+        chunks.push(
+            `try{\n${code}\n}catch(__dictScriptError){` +
+            `__reportDictScriptError(${index}, __dictScriptError);}`
+        );
+    }
+    if (!chunks.length) return;
+
+    // `with (window)` 把**裸标识符**也接到 window 代理上（见 createScopedWindow）。少了它，
+    // 代理只管得住 `window.x` 这种带前缀的写法：jQuery 把自己写进 window（→ 本块私有表）
+    // 之后，同一本词典的下一份脚本里裸写的 `$(…)` 会解析到真全局、拿到 undefined。
+    const combined = `with (window) {\n${chunks.join('\n;\n')}\n}`;
+    let factory = __dictScriptFnCache.get(combined);
+    if (factory === undefined) {
+        try {
+            factory = new Function('document', 'window', 'self', '__reportDictScriptError', combined);
+        } catch (error) {
+            factory = null;  // 整段都编译不了（语法错误）；记一次，别每个词条再试一遍
+            reportDictScriptError(dictName, 'compile', error);
+        }
+        __dictScriptFnCache.set(combined, factory);
+    }
+    if (!factory) return;
+
+    const scopedDocument = createScopedDocument(root, dictName);
+    const scopedWindow = createScopedWindow(root, scopedDocument, dictName);
+    try {
+        factory.call(scopedWindow, scopedDocument, scopedWindow, scopedWindow,
+            (index, error) => reportDictScriptError(dictName, labels[index] ?? `#${index}`, error));
+    } catch (error) {
+        reportDictScriptError(dictName, 'run', error);
+    }
+}

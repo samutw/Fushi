@@ -1,0 +1,92 @@
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "../memory/memory.hpp"
+
+// Sizes are 64-bit to hold values resolved from a ZIP64 0x0001 extra field.
+// Downstream (has_entry_payload / read / read_media / libdeflate) consumes them
+// as size_t; on a 32-bit ABI that assumes individual entries stay <4GB, which
+// holds for dictionary archives (they are forced-ZIP64 for layout, not size).
+struct ZipEntry {
+  std::string name;
+  uint16_t compression_method;
+  uint64_t compressed_size;    // ZIP64 may store true size via 0x0001 extra
+  uint64_t uncompressed_size;  // ZIP64 may store true size via 0x0001 extra
+  size_t data_offset;
+};
+
+// BUG-927: absolute upper bound (1 GiB) on a single entry's declared
+// uncompressed_size. has_entry_payload() only bounds the *compressed* payload, so
+// this is the sole guard stopping a forged/oversized ZIP64 uncompressed_size from
+// driving result.resize() into a multi-GB allocation. Exposed (was an anonymous
+// helper) so the boundary can be unit-tested without depending on the exact ratio
+// libdeflate happens to emit. The previous ratio-based cap (uncompressed <=
+// compressed * 1100) wrongly rejected legitimate high-compression yomitan banks.
+constexpr uint64_t kMaxUncompressedEntryBytes = 1024ull * 1024ull * 1024ull;
+bool zip_uncompressed_size_in_range(const ZipEntry& e);
+
+// BUG-2053: entries macOS adds to an archive that are not part of the payload
+// and must not decide its layout. Compressing a folder in Finder emits an
+// AppleDouble resource-fork tree next to it ("__MACOSX/MyDict/._index.json"),
+// which turns a wrapped dictionary into a two-top-level-directory archive that
+// compute_root_prefix() then refuses to strip; Finder also drops a ".DS_Store"
+// beside the folder, a root-level *file* that ends the peel outright. Both are
+// fixed, Apple-owned names, so they are skipped by name -- this is deliberately
+// NOT a general "ignore junk" heuristic. They are also excluded from the media
+// files, since a resource fork is not dictionary media.
+bool is_packaging_noise(std::string_view name);
+
+struct Zip {
+  memory::mapped_file file;
+  std::vector<ZipEntry> entries;
+
+  // The single top-level directory every entry sits under, with its trailing
+  // '/' (e.g. "MyDict/"), or "" when entries already live at the archive root.
+  // Re-zipping an extracted dictionary is the common way to gain such a layer,
+  // and every consumer here addresses entries by their *dictionary-relative*
+  // name ("index.json", "term_bank_1.json", "img/a.png"). Stripping the layer
+  // once, here, keeps that the only name shape the rest of the importer sees.
+  // Computed by open(); see compute_root_prefix() in zip.cpp for the rules.
+  std::string root_prefix;
+
+  ~Zip();
+  bool open(const std::string& path);
+
+  // Entry name with root_prefix removed — the name callers should match on.
+  // Out-of-range index yields "".
+  std::string_view logical_name(int index) const;
+
+  // Matches against logical_name(), so "index.json" finds both a root-level
+  // entry and one nested under a single wrapper directory.
+  int find(const std::string& name) const;
+  std::string read(int index) const;
+
+  struct MediaResult {
+    std::string path;
+    std::vector<char> blob;
+  };
+
+  std::optional<MediaResult> read_media(int index) const;
+
+  // Decompress entry [index] straight into the file at [out_path] without ever
+  // holding the entry on the heap (BUG-3234). read() materialises the whole
+  // entry in a std::string, which is fine for a JSON bank but not for an MDict
+  // .mdx/.mdd riding inside a zip: those run to hundreds of MB, and on Android
+  // a heap spike that size gets the process killed by lmkd with nothing for any
+  // catch to see. Stored entries are copied out of the input mapping; deflate
+  // entries are inflated into a writable mapping of the output file, whose
+  // pages are file-backed and can be written back instead of counting as
+  // anonymous memory. Returns false (and leaves no file behind) for an entry
+  // that is out of range, truncated, oversized, uses an unsupported method, or
+  // fails to decompress. A full disk or unwritable path throws
+  // memory::map_error / std::ios_base::failure, like every other import write.
+  bool extract_to(int index, const std::string& out_path) const;
+
+ private:
+  bool parse_central_directory();
+};

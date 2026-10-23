@@ -1,0 +1,1490 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_languages.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_merge.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_models.dart';
+
+void main() {
+  test('TMDB supplement cannot replace the AniDB media kind', () {
+    final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+      VideoMetadataWork(
+        provider: VideoMetadataProviderKind.anidb,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'AniDB TV identity',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '1'),
+        ],
+      ),
+      VideoMetadataWork(
+        provider: VideoMetadataProviderKind.tmdb,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'TMDB movie match',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'tmdb', value: '2'),
+        ],
+      ),
+    );
+
+    expect(merged.kind, VideoMetadataMediaKind.tv);
+    expect(merged.provider, VideoMetadataProviderKind.anidb);
+    expect(merged.ids.map((VideoMetadataId id) => id.type),
+        containsAll(<String>['anidb', 'tmdb']));
+  });
+
+  test('非 TMDB 主源保留展示字段并接入 TMDB 身份和季集骨架', () {
+    final VideoMetadataWork primary = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.anidb,
+      kind: VideoMetadataMediaKind.tv,
+      title: '主源标题',
+      plot: '主源简介',
+      ids: const <VideoMetadataId>[VideoMetadataId(type: 'anidb', value: '1')],
+    );
+    final VideoMetadataWork tmdb = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.tmdb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'TMDB title',
+      plot: 'TMDB plot',
+      ids: const <VideoMetadataId>[
+        VideoMetadataId(type: 'tmdb', value: '2'),
+        VideoMetadataId(type: 'tvdb', value: '3'),
+      ],
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(seasonNumber: 1, title: 'Season 1'),
+      ],
+    );
+
+    final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+      primary,
+      tmdb,
+    );
+    expect(merged.provider, VideoMetadataProviderKind.anidb);
+    expect(merged.title, '主源标题');
+    expect(merged.plot, '主源简介');
+    expect(merged.ids.map((VideoMetadataId id) => id.type), <String>[
+      'anidb',
+      'tmdb',
+      'tvdb',
+    ]);
+    expect(merged.seasons, hasLength(1));
+  });
+
+  test('海报按资料语言优先，高分外语海报压不住本语言海报', () {
+    // 用户报告的原始路径：资料语言 ja，TMDB 回来一张 8 分中文海报和一张低分
+    // 日文海报——评分先于语言时中文永远赢，「资料语言」对海报形同虚设。
+    const List<VideoMetadataImage> covers = <VideoMetadataImage>[
+      VideoMetadataImage(
+        kind: VideoMetadataImageKind.cover,
+        url: 'high-zh',
+        provider: VideoMetadataProviderKind.tmdb,
+        language: 'zh',
+        voteAverage: 8,
+        voteCount: 100,
+      ),
+      VideoMetadataImage(
+        kind: VideoMetadataImageKind.cover,
+        url: 'low-ja',
+        provider: VideoMetadataProviderKind.tmdb,
+        language: 'ja',
+        voteAverage: 5,
+        voteCount: 3,
+      ),
+      VideoMetadataImage(
+        kind: VideoMetadataImageKind.cover,
+        url: 'mid-neutral',
+        provider: VideoMetadataProviderKind.tmdb,
+        voteAverage: 6,
+        voteCount: 10,
+      ),
+    ];
+    expect(
+      selectVideoMetadataImages(
+        primary: covers,
+        languageOrder: const VideoMetadataLanguages('ja').imageLanguages,
+      ).single.url,
+      'low-ja',
+    );
+    // 同一批候选换成中文用户，选出来的就是中文那张：语言序真的在起作用，
+    // 不是恰好 ja 那张排前面。
+    expect(
+      selectVideoMetadataImages(
+        primary: covers,
+        languageOrder: const VideoMetadataLanguages('zh-CN').imageLanguages,
+      ).single.url,
+      'high-zh',
+    );
+    // 本语言没有海报时回落 en → 无语言纯图，而不是随便拿一张外语的。
+    expect(
+      selectVideoMetadataImages(
+        primary: covers,
+        languageOrder: const VideoMetadataLanguages('de-DE').imageLanguages,
+      ).single.url,
+      'mid-neutral',
+    );
+  });
+
+  test('同一语言内海报仍按评分票数排序', () {
+    final List<VideoMetadataImage> selected = selectVideoMetadataImages(
+      primary: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'low-ja',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'ja',
+          voteAverage: 5,
+          voteCount: 100,
+        ),
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'high-ja',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'ja',
+          voteAverage: 9,
+          voteCount: 10,
+        ),
+      ],
+      languageOrder: const VideoMetadataLanguages('ja').imageLanguages,
+    );
+    expect(selected.single.url, 'high-ja');
+  });
+
+  test('分集剧照是画面不是文字：0 票的 en 剧照压不住高分无标签剧照', () {
+    // TMDB 给剧照打的语言标签不代表上面印了字；按语言优先会选错。
+    final List<VideoMetadataImage> selected = selectVideoMetadataImages(
+      primary: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.thumb,
+          url: 'still-en-zero-votes',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'en',
+          seasonNumber: 1,
+          episodeNumber: 1,
+          voteAverage: 0,
+          voteCount: 0,
+        ),
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.thumb,
+          url: 'still-untagged-high',
+          provider: VideoMetadataProviderKind.tmdb,
+          seasonNumber: 1,
+          episodeNumber: 1,
+          voteAverage: 8.5,
+          voteCount: 40,
+        ),
+      ],
+      languageOrder: const VideoMetadataLanguages('ja').imageLanguages,
+    );
+    expect(selected.single.url, 'still-untagged-high');
+  });
+
+  test('背景图是画面不是文字：评分优先，语言只作同分兜底（与修复前一致）', () {
+    final List<VideoMetadataImage> selected = selectVideoMetadataImages(
+      primary: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.backdrop,
+          url: 'low-ja-backdrop',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'ja',
+          voteAverage: 5,
+          voteCount: 100,
+        ),
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.backdrop,
+          url: 'high-neutral-backdrop',
+          provider: VideoMetadataProviderKind.tmdb,
+          voteAverage: 9,
+          voteCount: 10,
+        ),
+      ],
+      languageOrder: const VideoMetadataLanguages('ja').imageLanguages,
+      maxPerKind: const <VideoMetadataImageKind, int>{
+        VideoMetadataImageKind.backdrop: 1,
+      },
+    );
+    expect(selected.single.url, 'high-neutral-backdrop');
+  });
+
+  // Shoko TMDB.MaxAutoPosters / Backdrops / Logos：每类保留张数可配，0 = 不限；
+  // 分集剧照恒 1（MaxAutoThumbnails）；同一 URL 只算一张。
+  test('每类图按上限保留，0 不限，剧照恒 1，同 URL 去重', () {
+    VideoMetadataImage cover(String url, double score) => VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: url,
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'ja',
+          voteAverage: score,
+          voteCount: 10,
+        );
+    final List<VideoMetadataImage> covers = <VideoMetadataImage>[
+      for (int i = 1; i <= 12; i++) cover('c$i', i.toDouble()),
+      // TMDB 详情的 poster_path 与 images.posters 会重复：同一 URL 不算两张。
+      const VideoMetadataImage(
+        kind: VideoMetadataImageKind.cover,
+        url: 'c12',
+        provider: VideoMetadataProviderKind.tmdb,
+      ),
+      for (int i = 1; i <= 3; i++)
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.thumb,
+          url: 't$i',
+          provider: VideoMetadataProviderKind.tmdb,
+          seasonNumber: 1,
+          episodeNumber: 1,
+          voteAverage: i.toDouble(),
+        ),
+    ];
+    final List<String> order = const VideoMetadataLanguages('ja').imageLanguages;
+    final List<VideoMetadataImage> ten = selectVideoMetadataImages(
+      primary: covers,
+      languageOrder: order,
+      maxPerKind: const <VideoMetadataImageKind, int>{
+        VideoMetadataImageKind.cover: 10,
+        VideoMetadataImageKind.thumb: 5,
+      },
+    );
+    expect(
+        ten
+            .where((VideoMetadataImage i) => i.kind == VideoMetadataImageKind.cover)
+            .map((VideoMetadataImage i) => i.url)
+            .toList(),
+        <String>['c12', 'c11', 'c10', 'c9', 'c8', 'c7', 'c6', 'c5', 'c4', 'c3'],
+        reason: '评分高的 10 张，c12 只出现一次');
+    expect(
+        ten
+            .where((VideoMetadataImage i) => i.kind == VideoMetadataImageKind.thumb)
+            .map((VideoMetadataImage i) => i.url),
+        <String>['t3'],
+        reason: '剧照上限传 5 也只留 1（Shoko MaxAutoThumbnails = 1）');
+    expect(
+        selectVideoMetadataImages(
+          primary: covers,
+          languageOrder: order,
+          maxPerKind: const <VideoMetadataImageKind, int>{
+            VideoMetadataImageKind.cover: 0,
+          },
+        ).where((VideoMetadataImage i) => i.kind == VideoMetadataImageKind.cover),
+        hasLength(12),
+        reason: '0 = 不限');
+    expect(
+        selectVideoMetadataImages(primary: covers, languageOrder: order)
+            .where((VideoMetadataImage i) => i.kind == VideoMetadataImageKind.cover),
+        hasLength(1),
+        reason: '没给上限的图种默认 1');
+  });
+
+  // Shoko 图片语言序的 Main 槽：作品原语插在资料语言之后、英文之前。
+  test('原语（Main 槽）插在资料语言之后：zh 用户的日本动画先 zh 再 ja 再 en', () {
+    expect(
+        imageLanguageOrderWithMain(
+            const VideoMetadataLanguages('zh-CN').imageLanguages,
+            mainLanguage: 'ja'),
+        <String>['zh', 'ja', 'en', '']);
+    expect(
+        imageLanguageOrderWithMain(
+            const VideoMetadataLanguages('ja').imageLanguages,
+            mainLanguage: 'ja'),
+        <String>['ja', 'en', ''],
+        reason: '已在序里不重复');
+    expect(
+        imageLanguageOrderWithMain(
+            const VideoMetadataLanguages('de-DE').imageLanguages,
+            mainLanguage: null),
+        <String>['de', 'en', '']);
+    final List<VideoMetadataImage> selected = selectVideoMetadataImages(
+      primary: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'en-cover',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'en',
+          voteAverage: 9,
+        ),
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'ja-cover',
+          provider: VideoMetadataProviderKind.tmdb,
+          language: 'ja',
+          voteAverage: 5,
+        ),
+      ],
+      languageOrder: const VideoMetadataLanguages('zh-CN').imageLanguages,
+      mainLanguage: 'ja',
+    );
+    expect(selected.single.url, 'ja-cover',
+        reason: '没有 zh 海报时原语海报压过英文海报（Shoko Main 在 English 前）');
+  });
+
+  test('续季单主源先重映射到本地季号再与 TMDB 全剧骨架合并', () {
+    final VideoMetadataWork primary = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.anidb,
+      kind: VideoMetadataMediaKind.tv,
+      title: '作品 第二季',
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: '主源当前季',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: '主源续季第一集',
+            ),
+          ],
+        ),
+      ],
+    );
+    final VideoMetadataWork tmdb = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.tmdb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'Show',
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: 'TMDB Season 1',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: 'TMDB S01E01',
+            ),
+          ],
+        ),
+        VideoMetadataSeason(
+          seasonNumber: 2,
+          title: 'TMDB Season 2',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 2,
+              episodeNumber: 1,
+              title: 'TMDB S02E01',
+            ),
+          ],
+        ),
+      ],
+    );
+
+    final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+      remapStandaloneVideoMetadataSeason(primary, 2),
+      tmdb,
+    );
+
+    expect(merged.seasons, hasLength(2));
+    expect(merged.seasons.first.episodes.single.title, 'TMDB S01E01');
+    expect(merged.seasons.last.seasonNumber, 2);
+    expect(merged.seasons.last.episodes.single.title, '主源续季第一集');
+  });
+
+  test('specials season zero never remaps AniDB regular episodes', () {
+    final VideoMetadataWork primary = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.anidb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'Anime',
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: 'Regular episodes',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: 'Regular episode 1',
+            ),
+          ],
+        ),
+      ],
+    );
+
+    final VideoMetadataWork result = remapStandaloneVideoMetadataSeason(
+      primary,
+      0,
+    );
+
+    expect(result, same(primary));
+    expect(result.seasons.single.seasonNumber, 1);
+    expect(result.seasons.single.episodes.single.seasonNumber, 1);
+  });
+
+  test('TMDB 按季集号深合并且主源标题、简介、声优和图片优先', () {
+    final VideoMetadataCredit primaryVoice = VideoMetadataCredit(
+      kind: VideoMetadataCreditKind.voiceActor,
+      person: VideoMetadataPerson(
+        name: '声优',
+        profileUrl: 'primary-profile',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: 'person-1'),
+        ],
+      ),
+      character: VideoMetadataCharacter(
+        name: '角色',
+        imageUrl: 'primary-character',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: 'character-1'),
+        ],
+      ),
+      language: 'ja',
+    );
+    final VideoMetadataWork primary = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.anidb,
+      kind: VideoMetadataMediaKind.tv,
+      title: '主源作品名',
+      plot: '主源作品简介',
+      ids: const <VideoMetadataId>[
+        VideoMetadataId(type: 'anidb', value: 'work-1'),
+      ],
+      credits: <VideoMetadataCredit>[primaryVoice],
+      images: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'primary-cover',
+          provider: VideoMetadataProviderKind.anidb,
+        ),
+      ],
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: '主源第一季',
+          plot: '主源季简介',
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'anidb', value: 'season-1'),
+          ],
+          images: const <VideoMetadataImage>[
+            VideoMetadataImage(
+              kind: VideoMetadataImageKind.cover,
+              url: 'primary-season-cover',
+              provider: VideoMetadataProviderKind.anidb,
+              seasonNumber: 1,
+            ),
+          ],
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: '主源第一集',
+              plot: '主源分集简介',
+              ids: const <VideoMetadataId>[
+                VideoMetadataId(type: 'anidb', value: 'episode-1'),
+              ],
+              credits: <VideoMetadataCredit>[primaryVoice],
+              images: const <VideoMetadataImage>[
+                VideoMetadataImage(
+                  kind: VideoMetadataImageKind.thumb,
+                  url: 'primary-still',
+                  provider: VideoMetadataProviderKind.anidb,
+                  seasonNumber: 1,
+                  episodeNumber: 1,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ],
+    );
+    final VideoMetadataWork tmdb = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.tmdb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'TMDB title',
+      plot: 'TMDB work plot',
+      ids: const <VideoMetadataId>[VideoMetadataId(type: 'tmdb', value: '100')],
+      credits: <VideoMetadataCredit>[
+        VideoMetadataCredit(
+          kind: VideoMetadataCreditKind.voiceActor,
+          person: VideoMetadataPerson(
+            name: '声优',
+            profileUrl: 'tmdb-profile',
+            ids: const <VideoMetadataId>[
+              VideoMetadataId(type: 'tmdb', value: 'person-100'),
+            ],
+          ),
+          character: VideoMetadataCharacter(
+            name: '角色',
+            imageUrl: 'tmdb-character',
+            ids: const <VideoMetadataId>[
+              VideoMetadataId(type: 'tmdb', value: 'character-100'),
+            ],
+          ),
+          language: 'ja',
+        ),
+      ],
+      images: const <VideoMetadataImage>[
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.cover,
+          url: 'tmdb-cover',
+          provider: VideoMetadataProviderKind.tmdb,
+        ),
+        VideoMetadataImage(
+          kind: VideoMetadataImageKind.logo,
+          url: 'tmdb-logo',
+          provider: VideoMetadataProviderKind.tmdb,
+        ),
+      ],
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: 'TMDB Season 1',
+          plot: 'TMDB season plot',
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'tmdb', value: 'season-100'),
+          ],
+          images: const <VideoMetadataImage>[
+            VideoMetadataImage(
+              kind: VideoMetadataImageKind.cover,
+              url: 'tmdb-season-cover',
+              provider: VideoMetadataProviderKind.tmdb,
+              seasonNumber: 1,
+            ),
+            VideoMetadataImage(
+              kind: VideoMetadataImageKind.logo,
+              url: 'tmdb-season-logo',
+              provider: VideoMetadataProviderKind.tmdb,
+              seasonNumber: 1,
+            ),
+          ],
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: 'TMDB Episode 1',
+              plot: 'TMDB episode plot',
+              ids: const <VideoMetadataId>[
+                VideoMetadataId(type: 'tmdb', value: 'episode-100'),
+              ],
+              credits: <VideoMetadataCredit>[
+                VideoMetadataCredit(
+                  kind: VideoMetadataCreditKind.voiceActor,
+                  person: VideoMetadataPerson(
+                    name: '声优',
+                    profileUrl: 'tmdb-profile',
+                    ids: const <VideoMetadataId>[
+                      VideoMetadataId(type: 'tmdb', value: 'person-100'),
+                    ],
+                  ),
+                  character: VideoMetadataCharacter(
+                    name: '角色',
+                    imageUrl: 'tmdb-character',
+                    ids: const <VideoMetadataId>[
+                      VideoMetadataId(type: 'tmdb', value: 'character-100'),
+                    ],
+                  ),
+                  language: 'ja',
+                ),
+              ],
+              images: const <VideoMetadataImage>[
+                VideoMetadataImage(
+                  kind: VideoMetadataImageKind.thumb,
+                  url: 'tmdb-still',
+                  provider: VideoMetadataProviderKind.tmdb,
+                  seasonNumber: 1,
+                  episodeNumber: 1,
+                ),
+                VideoMetadataImage(
+                  kind: VideoMetadataImageKind.landscape,
+                  url: 'tmdb-landscape',
+                  provider: VideoMetadataProviderKind.tmdb,
+                  seasonNumber: 1,
+                  episodeNumber: 1,
+                ),
+              ],
+            ),
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 2,
+              title: 'TMDB Episode 2',
+            ),
+          ],
+        ),
+        VideoMetadataSeason(seasonNumber: 2, title: 'TMDB Season 2'),
+      ],
+    );
+
+    final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+      primary,
+      tmdb,
+    );
+    expect(merged.title, '主源作品名');
+    expect(merged.plot, '主源作品简介');
+    expect(merged.images.map((VideoMetadataImage image) => image.url), <String>[
+      'primary-cover',
+      'tmdb-logo',
+    ]);
+    expect(merged.credits, hasLength(1));
+    expect(merged.credits.single.person.profileUrl, 'primary-profile');
+    expect(
+      merged.credits.single.person.ids.map((VideoMetadataId id) => id.type),
+      <String>['anidb', 'tmdb'],
+    );
+
+    expect(
+      merged.seasons.map((VideoMetadataSeason season) => season.seasonNumber),
+      <int>[1, 2],
+    );
+    final VideoMetadataSeason firstSeason = merged.seasons.first;
+    expect(firstSeason.title, '主源第一季');
+    expect(firstSeason.plot, '主源季简介');
+    expect(
+      firstSeason.images.map((VideoMetadataImage image) => image.url),
+      <String>['primary-season-cover', 'tmdb-season-logo'],
+    );
+    expect(
+      firstSeason.episodes.map(
+        (VideoMetadataEpisode episode) => episode.episodeNumber,
+      ),
+      <int>[1, 2],
+    );
+    final VideoMetadataEpisode firstEpisode = firstSeason.episodes.first;
+    expect(firstEpisode.title, '主源第一集');
+    expect(firstEpisode.plot, '主源分集简介');
+    expect(firstEpisode.ids.map((VideoMetadataId id) => id.type), <String>[
+      'anidb',
+      'tmdb',
+    ]);
+    expect(firstEpisode.credits, hasLength(1));
+    expect(
+      firstEpisode.credits.single.character?.imageUrl,
+      'primary-character',
+    );
+    expect(
+      firstEpisode.images.map((VideoMetadataImage image) => image.url),
+      <String>['primary-still', 'tmdb-landscape'],
+    );
+    expect(firstSeason.episodes.last.title, 'TMDB Episode 2');
+    expect(merged.seasons.last.title, 'TMDB Season 2');
+  });
+
+  group('supplementVideoMetadata 有序合并', () {
+    VideoMetadataWork mal({
+      String? plot,
+      String? tagline,
+      List<String> genres = const <String>[],
+      List<String> aliases = const <String>[],
+      double? rating,
+    }) =>
+        VideoMetadataWork(
+          provider: VideoMetadataProviderKind.mal,
+          kind: VideoMetadataMediaKind.tv,
+          title: 'MAL title',
+          originalTitle: '日本語原題',
+          plot: plot,
+          tagline: tagline,
+          genres: genres,
+          aliases: aliases,
+          rating: rating,
+          ratingVotes: rating == null ? null : 1000,
+          studios: const <String>['MAPPA'],
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'mal', value: '1')
+          ],
+        );
+    VideoMetadataWork tmdb({
+      String? plot,
+      String? tagline,
+      List<String> genres = const <String>[],
+      List<String> aliases = const <String>[],
+    }) =>
+        VideoMetadataWork(
+          provider: VideoMetadataProviderKind.tmdb,
+          kind: VideoMetadataMediaKind.tv,
+          title: 'TMDB title',
+          plot: plot,
+          tagline: tagline,
+          genres: genres,
+          aliases: aliases,
+          studios: const <String>['mappa', 'Studio B'],
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'tmdb', value: '2')
+          ],
+        );
+
+    test('对称：TMDB 主源时 MAL 补评分、日文原名、别名', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        tmdb(plot: 'TMDB plot'),
+        mal(
+            plot: 'MAL synopsis',
+            rating: 8.7,
+            aliases: const <String>['Alias']),
+      );
+
+      expect(merged.provider, VideoMetadataProviderKind.tmdb);
+      expect(merged.title, 'TMDB title');
+      expect(merged.plot, 'TMDB plot', reason: '无首选语言 → 先到者独占');
+      expect(merged.rating, 8.7);
+      expect(merged.ratingVotes, 1000);
+      expect(merged.originalTitle, '日本語原題');
+      expect(merged.aliases, <String>['Alias']);
+      expect(merged.ids.map((VideoMetadataId id) => id.type),
+          <String>['tmdb', 'mal']);
+    });
+
+    test('集合并集去重：primary 在前，supplement 只追加归一化后不重复的项', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        mal(
+          genres: const <String>['Action', 'Sci-Fi', '動作'],
+          aliases: const <String>['Ａlias One'],
+        ),
+        tmdb(
+          genres: const <String>['action', 'Sci Fi', 'Drama', '动作', ' '],
+          aliases: const <String>['alias one', 'Alias Two'],
+        ),
+      );
+
+      expect(merged.genres, <String>['Action', 'Sci-Fi', '動作', 'Drama']);
+      expect(merged.studios, <String>['MAPPA', 'Studio B']);
+      expect(merged.aliases, <String>['Ａlias One', 'Alias Two']);
+    });
+
+    test('plot 语言感知：zh-CN 首选下 MAL 英文简介被 TMDB 中文简介覆盖', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        mal(plot: 'English synopsis', tagline: 'English tagline'),
+        tmdb(plot: '中文简介', tagline: '中文标语'),
+        preferredLanguage: 'zh-CN',
+      );
+
+      expect(merged.plot, '中文简介');
+      expect(merged.tagline, '中文标语');
+    });
+
+    test('标题语言感知：zh-CN 首选下 MAL 日文原文标题被 TMDB 中文译名替换，原文与别名不丢', () {
+      // 「刮削同语言」：同一趟刮到的简介、海报已是中文，标题不能还留日文。
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        mal(plot: 'English synopsis'),
+        tmdb(plot: '中文简介'),
+        preferredLanguage: 'zh-CN',
+      );
+
+      expect(merged.title, 'TMDB title');
+      expect(merged.originalTitle, '日本語原題', reason: '主源自带原名优先保留');
+      expect(merged.aliases, contains('MAL title'),
+          reason: '被换下来的主源标题进别名池，exact gate 匹配面不缩');
+      expect(merged.aliases, isNot(contains('TMDB title')));
+      expect(merged.provider, VideoMetadataProviderKind.mal,
+          reason: '只换标题文字，主源身份不变');
+    });
+
+    test('标题语言感知：ja / en 首选下 MAL 给的就是本语言标题，不被 TMDB 替换', () {
+      for (final String preferred in <String>['ja', 'ja-JP', 'en-US']) {
+        final VideoMetadataWork merged = supplementVideoMetadata(
+          mal(),
+          tmdb(),
+          preferredLanguage: preferred,
+        );
+        expect(merged.title, 'MAL title', reason: 'preferredLanguage=$preferred');
+      }
+    });
+
+    test('标题语言感知：无首选语言（旧调用方）标题仍先到者独占', () {
+      expect(supplementVideoMetadataWithTmdb(mal(), tmdb()).title, 'MAL title');
+    });
+
+    test('标题语言感知：主源标题语言不明（AniDB）时不动，不能把「不明」当「非首选」', () {
+      final VideoMetadataWork anidb = VideoMetadataWork(
+        provider: VideoMetadataProviderKind.anidb,
+        kind: VideoMetadataMediaKind.tv,
+        title: '紫罗兰永恒花园',
+        ids: const <VideoMetadataId>[VideoMetadataId(type: 'anidb', value: '9')],
+      );
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        anidb,
+        tmdb(),
+        preferredLanguage: 'zh-CN',
+      );
+      expect(merged.title, '紫罗兰永恒花园');
+    });
+
+    test('标题语言感知：分集名跟作品名同一条规则换译名，缺译名的分集保留原文', () {
+      VideoMetadataWork withEpisodes(
+        VideoMetadataProviderKind provider,
+        Map<int, String> titles,
+      ) =>
+          VideoMetadataWork(
+            provider: provider,
+            kind: VideoMetadataMediaKind.tv,
+            title: provider.name,
+            ids: <VideoMetadataId>[
+              VideoMetadataId(type: provider.name, value: '1')
+            ],
+            seasons: <VideoMetadataSeason>[
+              VideoMetadataSeason(
+                seasonNumber: 1,
+                title: 'S1',
+                episodes: <VideoMetadataEpisode>[
+                  for (final MapEntry<int, String> entry in titles.entries)
+                    VideoMetadataEpisode(
+                      seasonNumber: 1,
+                      episodeNumber: entry.key,
+                      title: entry.value,
+                    ),
+                ],
+              ),
+            ],
+          );
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        withEpisodes(
+            VideoMetadataProviderKind.mal, <int, String>{1: '第一話', 2: '第二話'}),
+        withEpisodes(
+            VideoMetadataProviderKind.tmdb, <int, String>{1: '第一集', 2: '  '}),
+        preferredLanguage: 'zh-CN',
+      );
+      final List<VideoMetadataEpisode> episodes =
+          merged.seasons.single.episodes;
+      expect(episodes.first.title, '第一集');
+      expect(episodes.last.title, '第二話', reason: '补充源分集名空白 → 保留主源');
+    });
+
+    test('plot 语言感知：supplement 首选但为空时回落 primary', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        mal(plot: 'English synopsis'),
+        tmdb(plot: '   '),
+        preferredLanguage: 'zh',
+      );
+
+      expect(merged.plot, 'English synopsis');
+    });
+
+    test('plot 语言感知：en 首选下 MAL 简介保留', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        mal(plot: 'English synopsis'),
+        tmdb(plot: 'English overview from TMDB'),
+        preferredLanguage: 'en-US',
+      );
+
+      expect(merged.plot, 'English synopsis');
+    });
+
+    test('plot 语言感知：TMDB 主源 zh 首选时 MAL 英文不覆盖', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        tmdb(plot: '中文简介'),
+        mal(plot: 'English synopsis'),
+        preferredLanguage: 'zh-Hans',
+      );
+
+      expect(merged.plot, '中文简介');
+    });
+
+    test('preferredLanguage 为 null 时退化成「空才补」', () {
+      expect(
+        supplementVideoMetadata(
+          mal(plot: 'English synopsis'),
+          tmdb(plot: '中文简介'),
+        ).plot,
+        'English synopsis',
+      );
+      expect(
+        supplementVideoMetadata(mal(), tmdb(plot: '中文简介')).plot,
+        '中文简介',
+      );
+    });
+
+    test('同 provider 原样返回', () {
+      final VideoMetadataWork primary = mal(plot: 'a');
+      expect(
+        supplementVideoMetadata(primary, mal(plot: 'b'),
+            preferredLanguage: 'zh'),
+        same(primary),
+      );
+      expect(supplementVideoMetadata(primary, null), same(primary));
+    });
+
+    test('旧别名 supplementVideoMetadataWithTmdb 行为不变', () {
+      final VideoMetadataWork tmdbPrimary = tmdb(plot: 'TMDB plot');
+      expect(
+        supplementVideoMetadataWithTmdb(tmdbPrimary, tmdb(plot: 'other')),
+        same(tmdbPrimary),
+        reason: 'primary 已是 TMDB → 原样返回',
+      );
+      final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+        mal(plot: 'English synopsis'),
+        tmdb(plot: '中文简介', genres: const <String>['Drama']),
+      );
+      expect(merged.plot, 'English synopsis', reason: '不做语言感知');
+      expect(merged.genres, <String>['Drama']);
+      expect(merged.provider, VideoMetadataProviderKind.mal);
+    });
+  });
+
+  test('主源字段缺失时由 TMDB 补齐但不替换 provider 和标题', () {
+    final VideoMetadataWork primary = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.anidb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'Primary title',
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: 'Primary season',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: 'Primary episode',
+            ),
+          ],
+        ),
+      ],
+    );
+    final VideoMetadataWork tmdb = VideoMetadataWork(
+      provider: VideoMetadataProviderKind.tmdb,
+      kind: VideoMetadataMediaKind.tv,
+      title: 'TMDB title',
+      originalTitle: 'Original',
+      year: 2025,
+      plot: 'TMDB plot',
+      runtimeMinutes: 24,
+      genres: const <String>['Animation'],
+      seasons: <VideoMetadataSeason>[
+        VideoMetadataSeason(
+          seasonNumber: 1,
+          title: 'TMDB season',
+          plot: 'TMDB season plot',
+          episodes: <VideoMetadataEpisode>[
+            VideoMetadataEpisode(
+              seasonNumber: 1,
+              episodeNumber: 1,
+              title: 'TMDB episode',
+              plot: 'TMDB episode plot',
+              runtimeMinutes: 24,
+            ),
+          ],
+        ),
+      ],
+    );
+
+    final VideoMetadataWork merged = supplementVideoMetadataWithTmdb(
+      primary,
+      tmdb,
+    );
+    expect(merged.provider, VideoMetadataProviderKind.anidb);
+    expect(merged.title, 'Primary title');
+    expect(merged.originalTitle, 'Original');
+    expect(merged.year, 2025);
+    expect(merged.plot, 'TMDB plot');
+    expect(merged.runtimeMinutes, 24);
+    expect(merged.genres, <String>['Animation']);
+    expect(merged.seasons.single.title, 'Primary season');
+    expect(merged.seasons.single.plot, 'TMDB season plot');
+    expect(merged.seasons.single.episodes.single.title, 'Primary episode');
+    expect(merged.seasons.single.episodes.single.plot, 'TMDB episode plot');
+  });
+
+  group('mergeVideoMetadataCredits 跨源同一关系（BUG-2612）', () {
+    VideoMetadataCredit mal(String name, String role, {String? photo}) =>
+        VideoMetadataCredit(
+          kind: VideoMetadataCreditKind.voiceActor,
+          person: VideoMetadataPerson(
+            name: name,
+            profileUrl: photo,
+            ids: <VideoMetadataId>[
+              VideoMetadataId(type: 'mal', value: name.hashCode.toString()),
+            ],
+          ),
+          character: VideoMetadataCharacter(name: role),
+          roleName: role,
+          language: 'ja',
+        );
+    VideoMetadataCredit tmdb(String name, String role, {String? photo}) =>
+        VideoMetadataCredit(
+          kind: VideoMetadataCreditKind.actor,
+          person: VideoMetadataPerson(
+            name: name,
+            profileUrl: photo,
+            ids: <VideoMetadataId>[
+              VideoMetadataId(type: 'tmdb', value: name.hashCode.toString()),
+            ],
+          ),
+          character: VideoMetadataCharacter(name: role),
+          roleName: role,
+        );
+
+    test('追加的补充条目 order 接在主表之后，不与主表从 0 起交错', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[
+          mal('Tanezaki, Atsumi', 'Frieren').copyWith(order: 0),
+          mal('Ichinose, Kana', 'Fern').copyWith(order: 1),
+        ],
+        <VideoMetadataCredit>[
+          // 第二 cour / TMDB 汇总各自从 0 起。
+          mal('Kobayashi, Chiaki', 'Stark').copyWith(order: 0),
+          mal('Tanezaki, Atsumi', 'Frieren').copyWith(order: 1),
+          mal('Toyosaki, Aki', 'Ubel').copyWith(order: 2),
+        ],
+      );
+      expect(
+        merged.map((VideoMetadataCredit c) => c.person.name).toList(),
+        <String>[
+          'Tanezaki, Atsumi',
+          'Ichinose, Kana',
+          'Kobayashi, Chiaki',
+          'Toyosaki, Aki',
+        ],
+      );
+      expect(
+        merged.map((VideoMetadataCredit c) => c.order).toList(),
+        <int>[0, 1, 2, 3],
+        reason: '落库后 ORDER BY sortOrder 才不会让第二季配角插进第一季主角中间',
+      );
+    });
+
+    test('MAL「姓, 名」声优与 TMDB「名 姓」演员 + (voice) 角色认成同一条', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[mal('Tanezaki, Atsumi', 'Frieren')],
+        <VideoMetadataCredit>[
+          tmdb('Atsumi Tanezaki', 'Frieren (voice)', photo: 'tmdb-photo'),
+        ],
+      );
+      expect(merged, hasLength(1));
+      final VideoMetadataCredit credit = merged.single;
+      expect(credit.kind, VideoMetadataCreditKind.voiceActor,
+          reason: '主源的 kind 与名字保留');
+      expect(credit.person.name, 'Tanezaki, Atsumi');
+      expect(credit.person.profileUrl, 'tmdb-photo',
+          reason: 'MAL 没照片（占位已归 null）时用 TMDB 的补');
+      expect(
+        credit.person.ids.map((VideoMetadataId id) => id.type),
+        containsAll(<String>['mal', 'tmdb']),
+      );
+    });
+
+    test('同人不同角色、同角色不同人都不并', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[mal('Ichinose, Kana', 'Ubel')],
+        <VideoMetadataCredit>[
+          tmdb('Kana Ichinose', 'Young Ubel (voice)'),
+          tmdb('Someone Else', 'Ubel (voice)'),
+        ],
+      );
+      expect(merged, hasLength(3));
+    });
+
+    test('导演与同名演员不会因为人名相同而并掉', () {
+      final VideoMetadataCredit director = VideoMetadataCredit(
+        kind: VideoMetadataCreditKind.director,
+        person: VideoMetadataPerson(name: 'Saito Keiichiro'),
+        job: 'Director',
+      );
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[director],
+        <VideoMetadataCredit>[tmdb('Keiichiro Saito', 'Cameo')],
+      );
+      expect(merged, hasLength(2));
+    });
+
+    test('stripVoiceRoleSuffix 只剥尾部 (voice)', () {
+      expect(stripVoiceRoleSuffix('Frieren (voice)'), 'Frieren');
+      expect(stripVoiceRoleSuffix('Frieren (Voice) '), 'Frieren');
+      expect(stripVoiceRoleSuffix('Voice of Reason'), 'Voice of Reason');
+      expect(stripVoiceRoleSuffix('Himmel (young)'), 'Himmel (young)');
+    });
+  });
+
+  group('BUG-2795 语言感知合并与跨写法人物', () {
+    VideoMetadataWork work(
+      VideoMetadataProviderKind provider, {
+      String? plot,
+      List<String> genres = const <String>[],
+      List<VideoMetadataCredit> credits = const <VideoMetadataCredit>[],
+    }) =>
+        VideoMetadataWork(
+          provider: provider,
+          kind: VideoMetadataMediaKind.tv,
+          title: provider.name,
+          plot: plot,
+          genres: genres,
+          credits: credits,
+        );
+    VideoMetadataCredit voice(
+      String name,
+      String role, {
+      String? originalName,
+      String? photo,
+      VideoMetadataCreditKind kind = VideoMetadataCreditKind.voiceActor,
+    }) =>
+        VideoMetadataCredit(
+          kind: kind,
+          person: VideoMetadataPerson(
+            name: name,
+            originalName: originalName,
+            profileUrl: photo,
+          ),
+          character: VideoMetadataCharacter(name: role),
+          roleName: role,
+        );
+    VideoMetadataCredit staff(VideoMetadataCreditKind kind, String name) =>
+        VideoMetadataCredit(
+          kind: kind,
+          person: VideoMetadataPerson(name: name),
+          job: kind.name,
+        );
+
+    test('资料语言 zh：MAL 英文简介让位 TMDB 中文简介', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        work(
+          VideoMetadataProviderKind.mal,
+          plot: 'English synopsis (Source: Crunchyroll)',
+        ),
+        work(VideoMetadataProviderKind.tmdb, plot: '中文简介'),
+        preferredLanguage: 'zh-CN',
+      );
+      expect(merged.plot, '中文简介');
+    });
+
+    test('类型不跨语言取并集：取资料语言那一边，空了才退回另一边', () {
+      final VideoMetadataWork mal = work(
+        VideoMetadataProviderKind.mal,
+        genres: const <String>['Drama', 'Slice of Life'],
+      );
+      expect(
+        supplementVideoMetadata(
+          mal,
+          work(
+            VideoMetadataProviderKind.tmdb,
+            genres: const <String>['动画', '喜剧'],
+          ),
+          preferredLanguage: 'zh-CN',
+        ).genres,
+        <String>['动画', '喜剧'],
+      );
+      expect(
+        supplementVideoMetadata(
+          mal,
+          work(VideoMetadataProviderKind.tmdb),
+          preferredLanguage: 'zh-CN',
+        ).genres,
+        <String>['Drama', 'Slice of Life'],
+        reason: 'TMDB 没给类型时退回 MAL 的，不能留空',
+      );
+      expect(
+        supplementVideoMetadata(
+          mal,
+          work(
+            VideoMetadataProviderKind.tmdb,
+            genres: const <String>['Animation', 'Comedy'],
+          ),
+          preferredLanguage: 'en-US',
+        ).genres,
+        <String>['Drama', 'Slice of Life', 'Animation', 'Comedy'],
+        reason: '两边同为资料语言时照旧并集',
+      );
+    });
+
+    test('不传资料语言时类型照旧取并集（旧调用方行为不变）', () {
+      expect(
+        supplementVideoMetadataWithTmdb(
+          work(VideoMetadataProviderKind.mal, genres: const <String>['Drama']),
+          work(VideoMetadataProviderKind.tmdb, genres: const <String>['剧情']),
+        ).genres,
+        <String>['Drama', '剧情'],
+      );
+    });
+
+    test('AniList 文本按英文计：资料语言 ja 时类型与简介取 TMDB', () {
+      final VideoMetadataWork merged = supplementVideoMetadata(
+        work(
+          VideoMetadataProviderKind.anilist,
+          plot: 'English description',
+          genres: const <String>['Comedy'],
+        ),
+        work(
+          VideoMetadataProviderKind.tmdb,
+          plot: '日本語のあらすじ',
+          genres: const <String>['アニメーション', 'コメディ'],
+        ),
+        preferredLanguage: 'ja',
+      );
+      expect(merged.plot, '日本語のあらすじ');
+      expect(merged.genres, <String>['アニメーション', 'コメディ']);
+    });
+
+    test('TMDB original_name 是罗马字时与 MAL「姓, 名」认成同一人，角色写法不可比不拦', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[voice('Suzuki, Aina', 'Fukuga, Kurumi')],
+        <VideoMetadataCredit>[
+          voice(
+            '鈴木愛奈',
+            '福賀くるみ',
+            originalName: 'Aina Suzuki',
+            photo: 'tmdb-photo',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+        ],
+      );
+      expect(merged, hasLength(1));
+      expect(merged.single.person.name, 'Suzuki, Aina', reason: '主源名字保留');
+      expect(merged.single.person.profileUrl, 'tmdb-photo');
+    });
+
+    test('汉字名去空白后比较：「鈴木 愛奈」与「鈴木愛奈」同一人同一角色', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[voice('鈴木 愛奈', '福賀 くるみ')],
+        <VideoMetadataCredit>[
+          voice('鈴木愛奈', '福賀くるみ (voice)', kind: VideoMetadataCreditKind.actor),
+        ],
+      );
+      expect(merged, hasLength(1));
+    });
+
+    test('人名写法完全不可比（罗马字 vs 汉字）时不追加，免得同一批声优出现两遍', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[
+          voice('Suzuki, Aina', 'Fukuga, Kurumi'),
+          voice('Tomita, Miyu', 'Some Character'),
+          staff(VideoMetadataCreditKind.director, 'Someone, Director'),
+        ],
+        <VideoMetadataCredit>[
+          voice('鈴木愛奈', '福賀くるみ', kind: VideoMetadataCreditKind.actor),
+          voice('富田美憂', '誰か', kind: VideoMetadataCreditKind.actor),
+          staff(VideoMetadataCreditKind.director, '監督太郎'),
+          // 主表没有编剧组：整组照旧补进来（只补空）。
+          staff(VideoMetadataCreditKind.writer, '脚本花子'),
+        ],
+      );
+      expect(
+        merged.map((VideoMetadataCredit c) => c.person.name).toList(),
+        <String>['Suzuki, Aina', 'Tomita, Miyu', 'Someone, Director', '脚本花子'],
+      );
+    });
+
+    test('写法可比仍对不上的补充条目是另一个人，照旧追加', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[voice('Suzuki, Aina', 'Fukuga, Kurumi')],
+        <VideoMetadataCredit>[
+          voice('Miyu Tomita', 'Another (voice)',
+              kind: VideoMetadataCreditKind.actor),
+        ],
+      );
+      expect(merged, hasLength(2));
+    });
+  });
+
+  group('BUG-2797 AniList 写法桥：罗马字与汉字认成同一人', () {
+    VideoMetadataCredit credit(
+      String provider,
+      String name,
+      String role, {
+      String? originalName,
+      String? roleOriginal,
+      String? photo,
+      String? id,
+      VideoMetadataCreditKind kind = VideoMetadataCreditKind.voiceActor,
+    }) => VideoMetadataCredit(
+      kind: kind,
+      person: VideoMetadataPerson(
+        id: id,
+        name: name,
+        originalName: originalName,
+        profileUrl: photo,
+        ids: <VideoMetadataId>[
+          if (id != null) VideoMetadataId(type: provider, value: id),
+        ],
+      ),
+      character: VideoMetadataCharacter(name: role, originalName: roleOriginal),
+      roleName: role,
+    );
+    VideoMetadataWork work(
+      VideoMetadataProviderKind provider,
+      List<VideoMetadataCredit> credits,
+    ) => VideoMetadataWork(
+      provider: provider,
+      kind: VideoMetadataMediaKind.tv,
+      title: provider.name,
+      credits: credits,
+    );
+
+    final VideoMetadataWork mal =
+        work(VideoMetadataProviderKind.mal, <VideoMetadataCredit>[
+          credit('mal', 'Suzuki, Aina', 'Fukuga, Kurumi', id: '1'),
+          credit('mal', 'Tomita, Miyu', 'Some, Else', id: '2'),
+        ]);
+    final VideoMetadataWork tmdb =
+        work(VideoMetadataProviderKind.tmdb, <VideoMetadataCredit>[
+          credit(
+            'tmdb',
+            '鈴木愛奈',
+            '福賀くるみ',
+            originalName: '鈴木愛奈',
+            photo: 'tmdb-suzuki',
+            id: '10',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+          credit(
+            'tmdb',
+            '富田美憂',
+            '誰か',
+            originalName: '富田美憂',
+            photo: 'tmdb-tomita',
+            id: '20',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+        ]);
+    final VideoMetadataWork anilist =
+        work(VideoMetadataProviderKind.anilist, <VideoMetadataCredit>[
+          credit(
+            'anilist',
+            'Aina Suzuki',
+            'Kurumi Fukuga',
+            originalName: '鈴木愛奈',
+            roleOriginal: '福賀くるみ',
+            id: '100',
+          ),
+          credit(
+            'anilist',
+            'Miyu Tomita',
+            'Else Some',
+            originalName: '富田美憂',
+            roleOriginal: '誰か',
+            id: '200',
+          ),
+        ]);
+
+    List<VideoMetadataCredit> mergeInOrder(List<VideoMetadataWork> works) {
+      final VideoMetadataCreditNameBridge names =
+          VideoMetadataCreditNameBridge.fromWorks(works);
+      VideoMetadataWork merged = works.first;
+      for (final VideoMetadataWork supplement in works.skip(1)) {
+        merged = supplementVideoMetadata(
+          merged,
+          supplement,
+          creditNames: names,
+        );
+      }
+      return merged.credits;
+    }
+
+    void expectBridged(List<VideoMetadataCredit> credits) {
+      expect(
+        credits.map((VideoMetadataCredit c) => c.person.name).toList(),
+        <String>['Suzuki, Aina', 'Tomita, Miyu'],
+        reason: '主源（MAL）条目保留，TMDB 汉字条目不再追加第二遍',
+      );
+      final VideoMetadataCredit suzuki = credits.first;
+      expect(suzuki.person.id, '1', reason: '主源 id 不被覆盖');
+      expect(suzuki.person.originalName, '鈴木愛奈');
+      expect(suzuki.person.profileUrl, 'tmdb-suzuki', reason: 'TMDB 照片补进主条目');
+      expect(
+        suzuki.person.ids.map((VideoMetadataId id) => '${id.type}:${id.value}'),
+        containsAll(<String>['mal:1', 'tmdb:10', 'anilist:100']),
+      );
+      expect(suzuki.character?.originalName, '福賀くるみ');
+      expect(credits[1].person.profileUrl, 'tmdb-tomita');
+    }
+
+    test('MAL 罗马字 + TMDB 汉字 + AniList 双写法 → 一条人物，原名 / 照片 / id 带齐', () {
+      expectBridged(mergeInOrder(<VideoMetadataWork>[mal, tmdb, anilist]));
+    });
+
+    test('交换补充源顺序结果不变（桥先收集再合并，不依赖 AniList 排在中间）', () {
+      expectBridged(mergeInOrder(<VideoMetadataWork>[mal, anilist, tmdb]));
+    });
+
+    test('纯函数：桥由第三方来源提供时两边直接认成同一人', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        mal.credits,
+        tmdb.credits,
+        names: VideoMetadataCreditNameBridge.fromWorks(<VideoMetadataWork>[
+          mal,
+          tmdb,
+          anilist,
+        ]),
+      );
+      expect(merged, hasLength(2));
+      expect(merged.first.person.profileUrl, 'tmdb-suzuki');
+      expect(merged.first.person.originalName, '鈴木愛奈');
+    });
+
+    test('没有桥时维持现状：不追加重复，也不误合并', () {
+      final List<VideoMetadataCredit> merged = mergeInOrder(<VideoMetadataWork>[
+        mal,
+        tmdb,
+      ]);
+      expect(
+        merged.map((VideoMetadataCredit c) => c.person.name).toList(),
+        <String>['Suzuki, Aina', 'Tomita, Miyu'],
+      );
+      expect(
+        merged.first.person.profileUrl,
+        isNull,
+        reason: '证明不了同一人，不能把 TMDB 照片挂上去',
+      );
+    });
+
+    test('同一声优两个角色：角色桥把 TMDB 汉字角色并到对应的罗马字角色上', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[
+          credit('mal', 'Suzuki, Aina', 'Alpha, Ichiro', id: '1'),
+          credit('mal', 'Suzuki, Aina', 'Beta, Jiro', id: '1'),
+        ],
+        <VideoMetadataCredit>[
+          credit(
+            'tmdb',
+            '鈴木愛奈',
+            '次郎',
+            photo: 'tmdb-photo',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+        ],
+        names: VideoMetadataCreditNameBridge.fromCredits(<VideoMetadataCredit>[
+          credit(
+            'anilist',
+            'Aina Suzuki',
+            'Ichiro Alpha',
+            originalName: '鈴木愛奈',
+            roleOriginal: '一郎',
+          ),
+          credit(
+            'anilist',
+            'Aina Suzuki',
+            'Jiro Beta',
+            originalName: '鈴木愛奈',
+            roleOriginal: '次郎',
+          ),
+        ]),
+      );
+      expect(merged, hasLength(2));
+      expect(merged[0].person.profileUrl, isNull, reason: '一郎不是这条');
+      expect(merged[1].person.profileUrl, 'tmdb-photo');
+      expect(merged[1].character?.name, 'Beta, Jiro');
+    });
+
+    test('罗马字同名的两个人：桥有歧义时不用，不把两人并成一个', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[credit('mal', 'Kobayashi, Yuu', 'Role A')],
+        <VideoMetadataCredit>[
+          credit(
+            'tmdb',
+            '小林優',
+            '役B',
+            photo: 'tmdb-photo',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+        ],
+        names: VideoMetadataCreditNameBridge.fromCredits(<VideoMetadataCredit>[
+          credit('anilist', 'Yuu Kobayashi', 'Role A', originalName: '小林ゆう'),
+          credit('anilist', 'Yuu Kobayashi', 'Role B', originalName: '小林優'),
+        ]),
+      );
+      expect(merged, hasLength(1));
+      expect(merged.single.person.profileUrl, isNull);
+    });
+
+    test('同一条目里的两个原文写法（繁简 / 译名 + original_name）不算歧义', () {
+      final List<VideoMetadataCredit> merged = mergeVideoMetadataCredits(
+        <VideoMetadataCredit>[credit('mal', 'Suzuki, Aina', 'Fukuga, Kurumi')],
+        <VideoMetadataCredit>[
+          credit(
+            'tmdb',
+            '铃木爱奈',
+            '福贺久留美',
+            originalName: '鈴木愛奈',
+            photo: 'tmdb-photo',
+            kind: VideoMetadataCreditKind.actor,
+          ),
+        ],
+        names: VideoMetadataCreditNameBridge.fromCredits(<VideoMetadataCredit>[
+          credit('tmdb', '铃木爱奈', '福贺久留美', originalName: '鈴木愛奈'),
+          credit(
+            'anilist',
+            'Aina Suzuki',
+            'Kurumi Fukuga',
+            originalName: '鈴木愛奈',
+          ),
+        ]),
+      );
+      expect(merged, hasLength(1));
+      expect(merged.single.person.profileUrl, 'tmdb-photo');
+    });
+  });
+}

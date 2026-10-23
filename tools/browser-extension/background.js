@@ -1,0 +1,1575 @@
+// TODO-1087：自动配置默认值。app 安装助手在解压时把当前 server 真值写进 fushi-defaults.js，
+// 于是加载已解压扩展后无需手填。用户仍可在 options 手动覆盖（chrome.storage.local 优先于默认）。
+try { importScripts('fushi-defaults.js', 'locales/en.js', 'i18n.js', 'connection-diagnostics.js', 'mine-outcome.js', 'self-update.js', 'site-cookie-export.js'); } catch (_) { /* 缺省文件时回落硬编码默认 */ }
+const FUSHI_DEFAULTS =
+    (self.FUSHI_DEFAULTS) || { host: '127.0.0.1', port: 19633, token: '' };
+
+let connectionConfigPromise = null;
+// 界面文案走 i18n.js（SW 里经 importScripts 装入；缺席时退回键名）。
+function bgT(key, params) {
+  return (typeof self.fushiT === 'function') ? self.fushiT(key, params) : key;
+}
+const LOOKUP_PERF_STORAGE_KEY = 'fushiLookupPerfLogs';
+const LOOKUP_PERF_LIMIT = 80;
+let lookupPerfSequence = 0;
+let lookupPerfLogs = [];
+let lookupPerfFlushTimer = null;
+let lookupPerfStorageEpoch = 0;
+let lookupPerfWritePromise = Promise.resolve();
+const lookupPerfReady = chrome.storage.local.get(LOOKUP_PERF_STORAGE_KEY)
+  .then((saved) => {
+    const items = saved && saved[LOOKUP_PERF_STORAGE_KEY];
+    lookupPerfLogs = Array.isArray(items) ? items.slice(-LOOKUP_PERF_LIMIT) : [];
+  })
+  .catch(() => { lookupPerfLogs = []; });
+
+function nextLookupPerfId() {
+  try {
+    if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  } catch (_) {}
+  return Date.now().toString(36) + '-' + (++lookupPerfSequence).toString(36);
+}
+
+function parseLookupServerTiming(header) {
+  if (!header) return {};
+  const names = {
+    'request-json': 'serverRequestJsonMs',
+    'handler-map': 'serverHandlerMapMs',
+    'normalize': 'serverNormalizeMs',
+    'popup-cache': 'serverPopupCacheMs',
+    'full-cache': 'serverFullCacheMs',
+    'ffi-cache': 'serverFfiCacheMs',
+    'ffi-lookup': 'serverFfiLookupMs',
+    'popup-json': 'serverPopupJsonMs',
+    'service-total': 'serverServiceTotalMs',
+    'json-encode': 'serverJsonEncodeMs',
+    'server-total': 'serverTotalMs',
+  };
+  const out = {};
+  for (const part of String(header).split(',')) {
+    const match = /^\s*([a-z-]+)\s*;\s*dur=([0-9]+(?:\.[0-9]+)?)/i.exec(part);
+    if (!match) continue;
+    const key = names[match[1].toLowerCase()];
+    if (!key) continue;
+    const value = Number(match[2]);
+    if (Number.isFinite(value)) out[key] = value;
+  }
+  return out;
+}
+
+function scheduleLookupPerfFlush() {
+  if (lookupPerfFlushTimer !== null) clearTimeout(lookupPerfFlushTimer);
+  const epoch = lookupPerfStorageEpoch;
+  lookupPerfFlushTimer = setTimeout(() => {
+    lookupPerfFlushTimer = null;
+    const snapshot = lookupPerfLogs.slice();
+    lookupPerfWritePromise = lookupPerfWritePromise.then(async () => {
+      if (epoch !== lookupPerfStorageEpoch) return;
+      await chrome.storage.local.set({ [LOOKUP_PERF_STORAGE_KEY]: snapshot });
+    }).catch(() => {});
+  }, 250);
+}
+
+function recordLookupPerf(entry, persist = true) {
+  const source = entry && typeof entry === 'object' ? entry : {};
+  const item = {
+    at: new Date().toISOString(),
+    ...source,
+  };
+  // 阅读/字幕原文属于敏感浏览数据。性能日志只保留字符数，不把词句写入 console、
+  // chrome.storage 或“复制完整日志”；复现者用时间与 lookup id 关联即可。
+  if (typeof item.term === 'string') {
+    item.termLength = Array.from(item.term).length;
+    delete item.term;
+  }
+  lookupPerfReady.then(() => {
+    lookupPerfLogs.push(item);
+    if (lookupPerfLogs.length > LOOKUP_PERF_LIMIT) {
+      lookupPerfLogs.splice(0, lookupPerfLogs.length - LOOKUP_PERF_LIMIT);
+    }
+    if (persist) scheduleLookupPerfFlush();
+  });
+}
+async function cfg() {
+  if (!connectionConfigPromise) {
+    // Yomitan 的热路径不会在每次扫描前重新读取扩展存储。连接配置在 service worker
+    // 生命周期内复用；options 写入时由 storage.onChanged 精确失效。
+    connectionConfigPromise = chrome.storage.local.get(['host', 'port', 'token']).then((saved) => {
+      const host = (saved.host != null && saved.host !== '')
+          ? saved.host : FUSHI_DEFAULTS.host;
+      const port = (saved.port != null && saved.port !== 0)
+          ? saved.port : FUSHI_DEFAULTS.port;
+      const token = (saved.token != null && saved.token !== '')
+          ? saved.token : FUSHI_DEFAULTS.token;
+      return { base: `http://${host}:${port}`, token };
+    }).catch((error) => {
+      connectionConfigPromise = null;
+      throw error;
+    });
+  }
+  return connectionConfigPromise;
+}
+function authHeader(token) { return 'Basic ' + btoa('fushi:' + token); }
+// /api/extension/fonts 的条目 → 给 options 下拉 / 覆盖层 @font-face 用的形状：只留 id/name/family/ext，
+// 再拼上文件端点 URL（token 在查询串）。坏条目（无 id 或 family）丢掉。
+function decorateSubtitleFonts(fonts, base, token) {
+  if (!Array.isArray(fonts)) return [];
+  const out = [];
+  for (const f of fonts) {
+    if (!f || typeof f.id !== 'string' || !f.id || typeof f.family !== 'string' || !f.family) continue;
+    out.push({
+      id: f.id,
+      name: typeof f.name === 'string' ? f.name : f.family,
+      family: f.family,
+      ext: typeof f.ext === 'string' ? f.ext.toLowerCase() : '',
+      url: base + '/api/extension/fonts/file?id=' + encodeURIComponent(f.id) + '&token=' + encodeURIComponent(token),
+    });
+  }
+  return out;
+}
+
+// BUG-1079：/api/extension/status 请求体统一自报「浏览器中实际加载的版本」
+// （FUSHI_DEFAULTS.build + manifest version）。此前写死 '{}'，app 端对浏览器里实际
+// 跑的是哪个 build 零感知。旧 app 忽略 body → 向后兼容。
+function statusRequestBody() {
+  try {
+    return self.FUSHI_SELF_UPDATE.statusRequestBody(
+        FUSHI_DEFAULTS, chrome.runtime.getManifest().version);
+  } catch (_) { return '{}'; }
+}
+
+let connectionCache = null;
+// 扩展主题（options 的 extensionTheme，见 theme.js）。显式 light/dark 时查词请求带
+// colorScheme 提示，app 按该明暗生成弹窗 --md-* 配色；auto 不带（app 按自己当前明暗）。
+// SW 里没有 matchMedia，「跟随系统」只能由各页面自己决议，这里只关心显式值。
+let extensionThemePromise = null;
+function extensionColorScheme() {
+  if (!extensionThemePromise) {
+    extensionThemePromise = chrome.storage.local.get('extensionTheme').then((saved) => {
+      const v = saved && saved.extensionTheme;
+      return (v === 'light' || v === 'dark') ? v : null;
+    }).catch(() => null);
+  }
+  return extensionThemePromise;
+}
+try {
+  chrome.storage.onChanged.addListener((changes, areaName) => {
+    if (areaName !== 'local') return;
+    if (changes.host || changes.port || changes.token) {
+      connectionConfigPromise = null;
+      connectionCache = null;
+    }
+    if (changes.extensionTheme) extensionThemePromise = null;
+  });
+} catch (_) { /* 非扩展测试壳没有 storage.onChanged。 */ }
+async function responseJson(resp) {
+  try { return await resp.json(); } catch (_) { return null; }
+}
+async function diagnoseConnection(force) {
+  const { base, token } = await cfg();
+  const cacheKey = base + '|' + token;
+  const now = Date.now();
+  if (!force && connectionCache && connectionCache.key === cacheKey && now - connectionCache.at < 5000) {
+    return connectionCache.value;
+  }
+  let primary = null;
+  let legacy = null;
+  let version = null;
+  let networkError = false;
+  try {
+    const r = await fetch(base + '/api/extension/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+      body: statusRequestBody(),
+    });
+    primary = { status: r.status, body: await responseJson(r) };
+    if (r.status === 404 || r.status === 405) {
+      const old = await fetch(base + '/api/lookup/dictionary', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+        body: JSON.stringify({ term: '', popupOnly: true }),
+      });
+      legacy = { status: old.status, body: await responseJson(old) };
+    }
+    const preliminary = self.FUSHI_CONNECTION.classify(primary, legacy, null, false);
+    if (preliminary !== self.FUSHI_CONNECTION.states.connected &&
+        preliminary !== self.FUSHI_CONNECTION.states.legacy &&
+        preliminary !== self.FUSHI_CONNECTION.states.unauthorized) {
+      const v = await fetch(base + '/serverVersion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      version = { status: v.status, body: await responseJson(v) };
+    }
+  } catch (_) {
+    networkError = true;
+  }
+  const state = self.FUSHI_CONNECTION.classify(primary, legacy, version, networkError);
+  const value = { state, base, port: Number(new URL(base).port) || 19633 };
+  connectionCache = { key: cacheKey, at: now, value };
+  return value;
+}
+
+async function diagnoseConnectionCapped(base, timeoutMs = 750) {
+  let timer = null;
+  let port = 19633;
+  try { port = Number(new URL(base).port) || port; } catch (_) {}
+  const offline = { state: 'offline', base, port };
+  // BUG-3146：限时内状态探测没回话 ≠ API 没开。连不上（拒绝连接 / 端口没人听）会在几毫秒内
+  // 以 networkError 落成 offline；能拖过时限的只有「端口上的 Fushi 在跑却没有应答」。此前两者
+  // 都报「Fushi API 未开启，请去设置里打开」——用户明明开着，只会被误导去翻设置。
+  const noResponse = { state: 'no-response', base, port };
+  try {
+    return await Promise.race([
+      diagnoseConnection(true).catch(() => offline),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(noResponse), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
+// BUG-1718：查词弹窗「CSS 尾段」缓存（词典包自带 styles.css + 用户全局/单典自定义 CSS）。
+// 这三件套是 popup.js 渲染词典自带样式的唯一输入；app 内弹窗由 Dart 侧注入，扩展只能随查词
+// 响应拿。但它体量大（实测整库 285 KB，单本 OALDPE 就 210 KB），不能每次 hover 查词都传，
+// 故走 revision 门控：请求里带上已缓存的 revision，server 只在指纹变了（用户导入/删词典、
+// 改自定义 CSS）时才回全量，其余时候只回指纹。SW 被回收后缓存清空，下次查词自动重取一次。
+// 词典字体（dictionaryFontFaces / dictionaryFontCss / dictionaryLanguages）与 CSS 三件套同属弹窗
+// 旁路数据，走同一条 revision 门控：用户在 app 里换词典字体 → 指纹变 → 下次查词全量重取。
+const FUSHI_EMPTY_POPUP_CSS_BODY = Object.freeze({
+  dictionaryStyles: {}, globalDictCSS: '', customDictCSS: {}, dictionaryDisplayNames: {},
+  dictionaryFontFaces: [], dictionaryFontCss: '', dictionaryLanguages: {},
+});
+let fushiPopupCss = { revision: null, ...FUSHI_EMPTY_POPUP_CSS_BODY };
+
+// 把服务端这次查词响应里的 CSS 尾段并进缓存，并把**完整**尾段回填进 data，
+// 让 content.js / side-panel.js 无论命中缓存与否都能拿到同一份可直接赋给 window.* 的值。
+function fushiMergePopupCss(data) {
+  if (!data || typeof data !== 'object') return data;
+  const revision = typeof data.dictionaryStylesRevision === 'string'
+    ? data.dictionaryStylesRevision : null;
+  if (revision === null) return data; // 老 app：没有该契约，保持旧行为（扩展侧退化为空样式）
+  if (data.dictionaryStyles && typeof data.dictionaryStyles === 'object') {
+    fushiPopupCss = {
+      revision,
+      dictionaryStyles: data.dictionaryStyles,
+      globalDictCSS: typeof data.globalDictCSS === 'string' ? data.globalDictCSS : '',
+      customDictCSS: (data.customDictCSS && typeof data.customDictCSS === 'object')
+        ? data.customDictCSS : {},
+      // 词典改名（v95）：真名 -> 显示名。与 CSS 同一条 revision 门控，改名会改
+      // 指纹 → 下次查词全量重取一次。
+      dictionaryDisplayNames:
+        (data.dictionaryDisplayNames && typeof data.dictionaryDisplayNames === 'object')
+          ? data.dictionaryDisplayNames : {},
+      dictionaryFontFaces: Array.isArray(data.dictionaryFontFaces) ? data.dictionaryFontFaces : [],
+      dictionaryFontCss: typeof data.dictionaryFontCss === 'string' ? data.dictionaryFontCss : '',
+      dictionaryLanguages: (data.dictionaryLanguages && typeof data.dictionaryLanguages === 'object')
+        ? data.dictionaryLanguages : {},
+    };
+  } else if (fushiPopupCss.revision !== revision) {
+    // 指纹变了但这次响应没带正文（不该发生；真发生时宁可清空也不能用陈旧样式）。
+    fushiPopupCss = { revision, ...FUSHI_EMPTY_POPUP_CSS_BODY };
+  }
+  data.dictionaryStyles = fushiPopupCss.dictionaryStyles;
+  data.globalDictCSS = fushiPopupCss.globalDictCSS;
+  data.customDictCSS = fushiPopupCss.customDictCSS;
+  data.dictionaryDisplayNames = fushiPopupCss.dictionaryDisplayNames;
+  data.dictionaryFontFaces = fushiPopupCss.dictionaryFontFaces;
+  data.dictionaryFontCss = fushiPopupCss.dictionaryFontCss;
+  data.dictionaryLanguages = fushiPopupCss.dictionaryLanguages;
+  return data;
+}
+
+// BUG-726：扩展自更新。app 启动时会把 <appSupport> 的已解压副本刷新到当前内置版本，并把
+// 内容指纹写进 fushi-defaults.js（build）+ 随查词响应下发（extensionBuild）。这里比对
+// 两者：不一致 = 磁盘上已有新版而当前加载的还是旧版 → chrome.runtime.reload() 从磁盘拉新
+// （等价于扩展管理页的「重新加载」，未解压包路径不变）。防护：
+// - 任一侧缺指纹（旧 app / 占位默认）→ 不动（向后兼容，绝不空转 reload）；
+// - storage 记录已为该指纹 reload 过 → 不再重复 reload（防「磁盘没刷成」时无限循环）；
+// - 正在 Netflix 逐句回放录制 → 跳过（reload 会杀掉 offscreen 录制，等录完下次查词再说）。
+// BUG-1079：latch 不再是「永久静默」——每次心跳仍重新比对（决策抽成 self-update.js 的
+// 纯状态机）：已 reload 过仍不一致 = 自更新失效（用户从别的目录加载 / 磁盘没刷成 /
+// 浏览器拒绝 reload），落 chrome.storage.local.fushiUpdateStale {remote, local} 供
+// action-popup 显示「需手动重载」提示 + 图标角标；恢复一致时清除 stale 与角标。
+// app 当前 UI 语言（status 响应 `locale` / 查词响应 `appLocale`）落 chrome.storage.local.appLocale，
+// i18n.js 默认「跟随 Fushi」读它。同值不重复写（storage.onChanged 会惊动所有页面）。
+let lastAppLocale = null;
+function rememberAppLocale(tag) {
+  if (typeof tag !== 'string' || !tag || tag === lastAppLocale) return;
+  lastAppLocale = tag;
+  try { chrome.storage.local.set({ appLocale: tag }); } catch (_) {}
+}
+
+// app 当前主题配色（查词响应 `theme`，app_model.dart browserExtensionThemeColors 下发的
+// --md-* / --text-color / --background-color）按明暗镜像到 chrome.storage.local.appThemeMirror
+// = { light?: {...}, dark?: {...} }，供扩展调色板「跟随 Fushi」（theme.js extensionPalette
+// = 'app'）给设置页 / 侧边栏 / 抽屉 / 字幕覆盖层上色——那些表面没有查词响应可读。只是镜像、
+// 只取颜色键；同值不重复写。
+const APP_THEME_MIRROR_KEYS = [
+  '--text-color', '--background-color', '--md-primary', '--md-on-primary',
+  '--md-surface-container', '--md-surface-container-high', '--md-on-surface',
+  '--md-on-surface-variant', '--md-outline-variant',
+  // M3 容器 / tertiary / 错误角色（新 app 随 theme 下发；扩展「跟随 Fushi」时 M3E 色块与 app 同色）。
+  '--md-primary-container', '--md-on-primary-container', '--md-secondary-container',
+  '--md-on-secondary-container', '--md-tertiary', '--md-on-tertiary', '--md-tertiary-container',
+  '--md-on-tertiary-container', '--md-surface-container-highest', '--md-error',
+  // 完整 ColorScheme 表面 / 反色 / 错误容器角色，以及生成它的种子 / 变体 / 纯黑（app 2026-10-06 起随
+  // theme 下发）：「跟随 Fushi」时扩展页面与 app 逐色一致，另一明暗按同一种子同一算法派生。
+  '--md-surface', '--md-surface-container-lowest', '--md-surface-container-low', '--md-outline',
+  '--md-inverse-surface', '--md-inverse-on-surface', '--md-inverse-primary', '--md-secondary',
+  '--md-on-secondary', '--md-on-error', '--md-error-container', '--md-on-error-container',
+  '--fushi-theme-seed', '--fushi-theme-variant', '--fushi-theme-neutral', '--fushi-pure-black',
+  '--fushi-theme-system', '--fushi-theme-palette-id',
+];
+let appThemeMirror = null;
+let appThemeMirrorLoaded = null;
+function rememberAppTheme(theme) {
+  if (!theme || typeof theme !== 'object') return;
+  const scheme = theme['--fushi-color-scheme'];
+  if (scheme !== 'light' && scheme !== 'dark') return;
+  const colors = {};
+  for (const k of APP_THEME_MIRROR_KEYS) {
+    if (typeof theme[k] === 'string' && theme[k]) colors[k] = theme[k];
+  }
+  if (!colors['--text-color'] || !colors['--background-color'] || !colors['--md-primary']) return;
+  if (!appThemeMirrorLoaded) {
+    appThemeMirrorLoaded = chrome.storage.local.get('appThemeMirror').then((saved) => {
+      const v = saved && saved.appThemeMirror;
+      if (v && typeof v === 'object' && !appThemeMirror) appThemeMirror = v;
+    }).catch(() => {});
+  }
+  appThemeMirrorLoaded.then(() => {
+    const prev = appThemeMirror && appThemeMirror[scheme];
+    // current = app 此刻的明暗：扩展「跟随 Fushi」+ 明暗「自动」时，侧边栏 / 设置页 / 页内浮层与
+    // 查词弹窗一起跟它（theme.js resolve），不再一边跟 app、一边跟系统。
+    if (prev && JSON.stringify(prev) === JSON.stringify(colors) && appThemeMirror.current === scheme) return;
+    appThemeMirror = Object.assign({}, appThemeMirror || {}, { [scheme]: colors, current: scheme });
+    try { chrome.storage.local.set({ appThemeMirror }); } catch (_) {}
+  });
+}
+
+// 沉浸时间（视频）：content script 的 study-tracker.js 每秒交一个位置样本，这里原样
+// POST /api/extension/study（与 popup-size 同一鉴权）。app 没开 / 旧 app 无此端点时退避
+// 15s 再试，避免每秒一次白打；样本本身是幂等状态快照，丢几条不影响口径。
+let studyBackoffUntil = 0;
+async function forwardStudySample(sample) {
+  if (!sample || typeof sample !== 'object') return { ok: false, error: 'no sample' };
+  if (Date.now() < studyBackoffUntil) return { ok: false, error: 'backoff' };
+  try {
+    const { base, token } = await cfg();
+    const r = await fetch(base + '/api/extension/study', {
+      method: 'POST',
+      signal: AbortSignal.timeout(4000),
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+      body: JSON.stringify(sample),
+    });
+    if (!r.ok) studyBackoffUntil = Date.now() + 15000;
+    return { ok: r.ok, status: r.status };
+  } catch (error) {
+    studyBackoffUntil = Date.now() + 15000;
+    return { ok: false, error: String(error && error.message || error) };
+  }
+}
+
+async function maybeSelfReload(data) {
+  try {
+    rememberAppLocale(data && data.locale);
+    const remote = data && data.extensionBuild;
+    const local = FUSHI_DEFAULTS.build;
+    const st = await chrome.storage.local.get(
+        ['fushiReloadedForBuild', 'fushiUpdateStale']);
+    const decision = self.FUSHI_SELF_UPDATE.decide(
+        // 批量制卡进行中（Netflix 录制 / YouTube 队列）都先不重载：reload 会把循环拦腰斩断。
+        remote, local, st.fushiReloadedForBuild, (await isOffscreenRecording()) || !!fushiYtBatch);
+    if (decision.action === 'clear') {
+      if (st.fushiUpdateStale) {
+        await chrome.storage.local.remove(['fushiUpdateStale']);
+        refreshUpdateBadge();
+      }
+      return;
+    }
+    if (decision.action === 'stale') {
+      const prev = st.fushiUpdateStale;
+      if (!prev || prev.remote !== remote || prev.local !== local) {
+        await chrome.storage.local.set({ fushiUpdateStale: decision.stale });
+      }
+      refreshUpdateBadge();
+      return;
+    }
+    if (decision.action !== 'reload') return;
+    // BUG-1047：置重注入标记，reload 后新 SW 据此把 content script 补回已打开网页
+    // （chrome.runtime.reload() 会让所有已注入页的 content script 上下文失效 → 不补的话
+    // 用户必须手动刷新浏览器才恢复）。
+    await chrome.storage.local.set({
+      fushiReloadedForBuild: remote,
+      fushiReinjectPending: true,
+    });
+    chrome.runtime.reload();
+  } catch (_) { /* 自更新失败不影响查词本身 */ }
+}
+
+// BUG-1079：自更新失效角标。stale 存在且**不在录制**时在扩展图标打「↑」提醒；录制角标
+// 优先（红点 ● 绝不被盖掉——录制中本函数整个跳过，录制结束由 setRecordingBadge(false)
+// 回调这里恢复）。只动 badge，不动 title（title 归录制状态机管）。
+async function refreshUpdateBadge() {
+  try {
+    if (await isOffscreenRecording()) return; // 录制角标优先
+    const st = await chrome.storage.local.get(['fushiUpdateStale']);
+    const stale = !!st.fushiUpdateStale;
+    chrome.action.setBadgeBackgroundColor({ color: stale ? '#F9A825' : '#00000000' });
+    chrome.action.setBadgeText({ text: stale ? '↑' : '' });
+  } catch (_) { /* badge 在某些上下文不可用：忽略 */ }
+}
+
+// BUG-1047：自更新 chrome.runtime.reload() 会让所有已打开标签页里注入的 content script
+// 上下文失效（"Extension context invalidated"），这些页在用户手动刷新前扩展就是死的。
+// reload 后由新 SW 把 content script 重新注入已打开的普通网页，页面无感恢复，无需刷新浏览器。
+// - 仅对 reload 前置的 fushiReinjectPending 标记生效，普通 SW 冷启动不全量重注入；
+// - 逐页探测 window.__fushiExtension（content.js 注入后置真、隔离世界随 reload 被拆即丢），
+//   已有活着的 content script 就跳过，避免重复注入导致重复监听；
+// - 受限页（chrome:// / 扩展页 / file://）与注入被拒的 tab 逐个 try/catch 忽略。
+async function reinjectOpenTabs() {
+  if (!chrome.scripting || !chrome.tabs) return;
+  const groups = (chrome.runtime.getManifest().content_scripts || [])
+      .filter((g) => Array.isArray(g.matches) && g.matches.includes('<all_urls>'));
+  if (!groups.length) return;
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({}); } catch (_) { return; }
+  for (const tab of tabs) {
+    if (!tab || tab.id == null) continue;
+    const url = tab.url || '';
+    if (!/^https?:\/\//i.test(url)) continue;
+    for (const g of groups) {
+      try {
+        const probe = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => !!window.__fushiExtension,
+        });
+        if (probe && probe[0] && probe[0].result === true) continue;
+        if (Array.isArray(g.css) && g.css.length) {
+          await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: g.css });
+        }
+        if (Array.isArray(g.js) && g.js.length) {
+          await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: g.js });
+        }
+      } catch (_) { /* 受限页/注入被拒：忽略该 tab */ }
+    }
+  }
+}
+
+async function maybeReinjectAfterReload() {
+  try {
+    const st = await chrome.storage.local.get(['fushiReinjectPending']);
+    if (!st.fushiReinjectPending) return;
+    await chrome.storage.local.set({ fushiReinjectPending: false });
+    await reinjectOpenTabs();
+  } catch (_) { /* 重注入失败：用户仍可手动刷新恢复，不影响其它功能 */ }
+}
+
+// 自更新升级点：启动即主动检查版本（此前只有用户实际查词后才比对 → app 升级当天不查词
+// 就一直停在旧弹窗）。SW 每次唤醒（顶层）+ 浏览器启动（onStartup）+ 安装/更新（onInstalled）
+// 都打一次 /api/extension/status 拿当前内置指纹，走同一个 maybeSelfReload：不一致即从磁盘
+// 拉新。附带效果：这次请求也刷新 app 侧扩展 last-seen（连接检测据此判断「插件已正常启用」）。
+async function checkVersionOnStartup() {
+  try {
+    const { base, token } = await cfg();
+    // BUG-1079：请求体自报 build/version（不再写死 '{}'），app 端据此显示「浏览器中
+    // 实际加载的版本」并在与内置指纹不一致时给出更新提示。
+    const r = await fetch(base + '/api/extension/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+      body: statusRequestBody(),
+    });
+    if (!r.ok) return;
+    const status = await responseJson(r);
+    if (status) await maybeSelfReload(status);
+  } catch (_) { /* server 未开 / 离线：启动检查静默失败，下次查词仍会兜底比对 */ }
+}
+checkVersionOnStartup(); // SW 每次启动都主动检查一次版本 + 刷新 last-seen。
+chrome.runtime.onStartup.addListener(() => { checkVersionOnStartup(); });
+chrome.runtime.onInstalled.addListener((details) => {
+  checkVersionOnStartup();
+  // 用户反馈「扩展配置根本看不见」：工具栏图标被 default_popup 占着（onClicked 永不触发，
+  // 见下方注释），options_page 在 Chrome 里只能经「chrome://extensions → 详情 → 扩展程序
+  // 选项」或右键图标进入，装完扩展的人根本不知道有这一页。首装（且仅首装）自动打开一次，
+  // 让用户至少见过它一面；后续更新（details.reason === 'update'）不打扰。
+  try {
+    if (details && details.reason === 'install') chrome.runtime.openOptionsPage();
+  } catch (_) { /* 无 UI 环境 / 已被用户关闭：忽略 */ }
+});
+maybeReinjectAfterReload(); // BUG-1047：若上一轮是自更新 reload，补回已打开网页的 content script。
+
+// BUG-1045：app 侧「插件已连接」判定 = 扩展最近 120s 内打过本机 server，且该 last-seen
+// 只存在 app 内存里（app 重启即丢）。MV3 SW 空闲 ~30s 被回收、无常驻定时器 → 用户不主动
+// 划词就会在 ~120s 后被判「未连接」，app 重启后更是一直「未连接」直到下次划词唤醒 SW。
+// 用 chrome.alarms 每 60s（< 120s 窗口）唤醒 SW 打一次 /api/extension/status 刷新 last-seen，
+// 让连接指示真实反映「扩展已加载可达」，app 重启后 ≤60s 自愈。复用 checkVersionOnStartup
+// （既刷 last-seen 又顺带比对版本），自更新仍只在 build 变化时触发一次、由 BUG-1047 无感恢复。
+try { chrome.alarms.create('fushiHeartbeat', { periodInMinutes: 1 }); } catch (_) { /* 无 alarms 权限：跳过心跳 */ }
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === 'fushiHeartbeat') {
+      checkVersionOnStartup();
+      maybeExportSiteCookies(null);
+    }
+  });
+}
+
+// BUG-2480：漫画源登录——把浏览器里已登录的站点会话送给 Fushi。
+// app 登录页点「从浏览器导入」后在 status 回包里登记 { host, nonce } 并在系统浏览器打开
+// 该站；这边在该站页面加载完成 / 心跳时看到登记就 getAll 后回传。见 site-cookie-export.js。
+let siteCookieExportInflight = null;
+async function fetchCookieImportRequest() {
+  const api = self.FUSHI_SITE_COOKIES;
+  if (!api) return null;
+  const { base, token } = await cfg();
+  try {
+    const r = await fetch(base + '/api/extension/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+      body: statusRequestBody(),
+    });
+    if (!r.ok) return null;
+    return api.parseImportRequest(await responseJson(r));
+  } catch (_) {
+    return null;
+  }
+}
+async function siteHasOpenTab(host) {
+  const api = self.FUSHI_SITE_COOKIES;
+  try {
+    const tabs = await chrome.tabs.query({});
+    return tabs.some((tab) => api.hostBelongsTo(api.hostOfUrl(tab && tab.url), host));
+  } catch (_) {
+    return false;
+  }
+}
+// 只在「登记的站点确实开着标签页」时才送：登记存在但站点没打开，说明用户还没走到
+// 浏览器那一步，送一份陈旧会话只会让 app 那边误以为已导入。
+async function maybeExportSiteCookies(loadedUrl) {
+  const api = self.FUSHI_SITE_COOKIES;
+  if (!api || !chrome.cookies) return;
+  if (siteCookieExportInflight) return;
+  siteCookieExportInflight = (async () => {
+    const request = await fetchCookieImportRequest();
+    if (!request) return;
+    if (loadedUrl != null) {
+      if (!api.hostBelongsTo(api.hostOfUrl(loadedUrl), request.host)) return;
+    } else if (!(await siteHasOpenTab(request.host))) {
+      return;
+    }
+    let cookies = [];
+    try {
+      cookies = await chrome.cookies.getAll({ domain: request.host });
+    } catch (_) {
+      return;
+    }
+    const { base, token } = await cfg();
+    try {
+      await fetch(base + '/api/extension/site-cookies', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+        body: JSON.stringify(api.toPayload(request, cookies)),
+      });
+    } catch (_) { /* app 没开 / 登记已撤：下次再说 */ }
+  })().finally(() => { siteCookieExportInflight = null; });
+}
+if (chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    if (info && info.status === 'complete' && tab && tab.url) maybeExportSiteCookies(tab.url);
+  });
+}
+
+// TODO-1000 Netflix：offscreen 文档承载 tabCapture MediaRecorder。批量生成时按字幕逐句「回放
+// 录制」——每句 seek 到句首、播到句尾录成一段自包含 webm（beginClip/endClip），随 mineClip 发给
+// Fushi 转 GIF+句子音频。点扩展图标启动（需 activeTab 手势 + 关硬件加速才非黑），跨集自动切换。
+let captureActive = false;
+
+async function ensureOffscreen() {
+  const has = await chrome.offscreen.hasDocument?.();
+  if (has) return;
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['USER_MEDIA'],
+    justification: 'Record the streaming tab to build Anki GIF cards (TODO-1000).',
+  });
+}
+
+// 徽标反馈：录制中在扩展图标上打红点，让用户**看得见**正在录（否则不知道录没录 → 制卡无音频
+// 时误以为坏了）。tabCapture 需用户手势（点图标）启动，无法自动开——这是 Chrome 平台约束。
+function setRecordingBadge(on) {
+  try {
+    chrome.action.setBadgeBackgroundColor({ color: on ? '#D32F2F' : '#00000000' });
+    chrome.action.setBadgeText({ text: on ? '●' : '' });
+    chrome.action.setTitle({
+      title: on
+          ? bgT('bg_badge_generating')
+          : bgT('bg_badge_idle'),
+    });
+  } catch (_) { /* setBadge 在某些上下文不可用：忽略，不影响录制 */ }
+  // BUG-1079：录制角标撤下后恢复自更新失效角标（若 stale 仍在）。录制中绝不动录制红点。
+  if (!on) refreshUpdateBadge();
+}
+
+// 录制真相源是 **offscreen 文档**（它持有 MediaStream，跨整场持续录），不是这个易失的
+// captureActive 标志——MV3 的 service worker 空闲约 30s 就被杀、重启后全局变量复位成 false，
+// 但 offscreen 仍在录。故所有「在不在录」的判断都回 offscreen 问真态，SW 重启也不误判。
+async function isOffscreenRecording() {
+  try {
+    const has = await chrome.offscreen.hasDocument?.();
+    if (!has) return false;
+    const resp = await chrome.runtime.sendMessage({ target: 'offscreen', type: 'isRecording' });
+    return !!(resp && resp.recording);
+  } catch (_) { return false; }
+}
+
+// SW 启动 / 点图标前：从 offscreen 真态回填 captureActive + 徽标（修复休眠重启后红点消失、
+// 制卡误判「没录制」）。
+async function syncCaptureState() {
+  captureActive = await isOffscreenRecording();
+  setRecordingBadge(captureActive);
+  return captureActive;
+}
+syncCaptureState().catch(() => {}); // SW 每次启动都对齐一次真态
+
+async function startTabCapture(tabId) {
+  await ensureOffscreen();
+  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  const resp = await chrome.runtime.sendMessage({
+    target: 'offscreen', type: 'startCapture', streamId,
+  });
+  captureActive = !!(resp && resp.ok);
+  setRecordingBadge(captureActive);
+  return captureActive;
+}
+
+async function stopTabCapture() {
+  try {
+    await chrome.runtime.sendMessage({ target: 'offscreen', type: 'stopCapture' });
+  } catch (_) { /* offscreen 已关：忽略 */ }
+  captureActive = false;
+  setRecordingBadge(false);
+}
+
+// 点扩展图标（唯一手势入口）：
+// - 正在生成中/残留卡住状态 → 取消并清理（逃生口）。
+// - Netflix 剧集播放页且本集有待生成项 → **就地**逐句回放录制（不 reload！Netflix DRM 会拒绝
+//   为一个正在被录屏的**新加载**播放器解密 → M7375；录一个**已经在放**的播放器则没问题）。
+// - YouTube → 让页面跑 YouTube 队列生成（等同点浮动按钮）。
+// ── YouTube 批量制卡（在 service worker 里跑）──
+// 每条只是 {videoId, 起止} → POST /api/mine，服务端 resolveYoutubeSource 从真实流精确裁
+// GIF+音频，无需录屏、无回放，也**不需要视频页**。旧实现把循环放在 YouTube 页的 content
+// script 里，于是按钮只在 YouTube 页可点，用户得先「点队列条目跳到视频页、等页面加载完」才能
+// 生成（用户 2026-10-04：「点进去放一会儿视频才能制卡，能不能全自动」）。挪到这里后任何 tab
+// 都能直接生成。进度/结果：popup 开着时看按钮（fushiYtBatchProgress 广播），关了看图标角标
+// （剩余张数）+ 点击时所在页的 toast（普通网页才有 content script，chrome:// 页只有角标）。
+//
+// 进行中状态只放内存：SW 被杀 = 循环也没了，内存态天然与事实一致；放 storage 会留下
+// 「永远生成中」的残影把按钮锁死。
+//
+// MV3 会杀掉空闲 30 秒、或等一个 fetch 太久的 SW，而单条裁 GIF+音频可能很慢。所以：
+// ① 每成功一条**立刻**出队——被杀最多丢在途那一条，重跑时服务端回 duplicate 照样出队；
+// ② 批量期间定时调扩展 API 续命；③ 进度 toast 不用常驻（SW 死了不会有人来撤它）；
+// ④ popup 在 running 态定时回问 fushiYtBatchStatus，SW 重启后内存态为 null 即自动解锁。
+let fushiYtBatch = null; // {done, total}；null = 空闲（total 为 0 = 已占位、还在读队列）
+const FUSHI_YT_KEEPALIVE_MS = 20000;
+
+/**
+ * 单条 YouTube 制卡请求。返回与 content 时代 mineYoutube 消息完全同形的 resp，
+ * 交给 mine-outcome.js 的 fushiMineOutcome 分类。
+ * @param {object} q 队列项（site:'youtube'）
+ * @returns {Promise<{ok: boolean, status?: number, data?: object|null, error?: string}>}
+ */
+async function fushiMineYoutubeItem(q) {
+  try {
+    const { base, token } = await cfg();
+    const r = await fetch(base + '/api/mine', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+      body: JSON.stringify({
+        fields: q.fields, sentence: q.sentence || '',
+        youtubeVideoId: q.youtubeId,
+        clipStartMs: q.startV, clipEndMs: q.endV,
+      }),
+    });
+    return { ok: r.ok, status: r.status, data: r.ok ? await r.json() : null };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+}
+
+/** @returns {Promise<object[]>} 当前队列（storage 是跨标签唯一真相源）。 */
+async function fushiReadQueue() {
+  const got = await chrome.storage.local.get(['fushiQueue']);
+  return Array.isArray(got.fushiQueue) ? got.fushiQueue : [];
+}
+
+/**
+ * 只按 id 剔除一项：storage 读-改-写，生成期间别处新入队的不会被误删。
+ * @param {string} id
+ * @returns {Promise<void>}
+ */
+async function fushiRemoveQueuedId(id) {
+  const fresh = await fushiReadQueue();
+  await chrome.storage.local.set({ fushiQueue: fresh.filter((it) => !it || it.id !== id) });
+}
+
+/**
+ * 与 action-popup.js fushiTabSite 同判据（hostname 后缀），不能用 URL 子串——
+ * `google.com/search?q=netflix.com` 不是 Netflix 页。
+ * @param {string} url
+ * @returns {boolean}
+ */
+function fushiIsNetflixUrl(url) {
+  try {
+    const h = new URL(String(url || '')).hostname;
+    return h === 'netflix.com' || h.endsWith('.netflix.com');
+  } catch (_) { return false; }
+}
+
+/**
+ * 借某个 tab 的 content script 弹 toast；没有 content script（chrome:// 页、已关）就算了。
+ * @param {number|null|undefined} tabId
+ * @param {string} text
+ * @param {{sticky?: boolean, openSettings?: boolean}} [opts]
+ * @returns {void}
+ */
+function fushiToastTab(tabId, text, opts) {
+  if (!Number.isInteger(tabId)) return;
+  const o = opts || {};
+  try {
+    chrome.tabs.sendMessage(tabId,
+      { type: 'fushiToastMsg', text, sticky: !!o.sticky, openSettings: !!o.openSettings },
+      () => { try { void chrome.runtime.lastError; } catch (_) {} });
+  } catch (_) {}
+}
+
+/** @returns {Promise<void>} 进度推给 popup（开着的话）+ 角标显示剩余张数。 */
+async function fushiYtBatchPublish() {
+  try {
+    chrome.runtime.sendMessage({ type: 'fushiYtBatchProgress', batch: fushiYtBatch },
+      () => { try { void chrome.runtime.lastError; } catch (_) {} });
+  } catch (_) {}
+  try {
+    if (await isOffscreenRecording()) return; // Netflix 录制红点优先
+    if (!fushiYtBatch) { await refreshUpdateBadge(); return; }
+    chrome.action.setBadgeBackgroundColor({ color: '#1565C0' });
+    chrome.action.setBadgeText({ text: String(fushiYtBatch.total - fushiYtBatch.done) });
+  } catch (_) {}
+}
+
+/**
+ * 逐条生成队列里全部 YouTube 项。只出队成功（含已存在）的项，失败留队下次重试。
+ * @param {number|null|undefined} toastTabId 点击时的当前 tab（用来弹进度/结果 toast）
+ * @returns {Promise<void>}
+ */
+async function fushiRunYoutubeQueue(toastTabId) {
+  // 已在跑：重复点击不再开第二条循环。占位必须在第一个 await 之前同步完成——否则双击的两条
+  // 消息都会先过这道检查再各自 await，跑出两条循环、每张卡制两遍。
+  if (fushiYtBatch) return;
+  fushiYtBatch = { done: 0, total: 0 };
+  const keepAlive = setInterval(() => {
+    try { chrome.runtime.getPlatformInfo(() => { try { void chrome.runtime.lastError; } catch (_) {} }); } catch (_) {}
+  }, FUSHI_YT_KEEPALIVE_MS);
+  let items = [];
+  let ok = 0, unconfigured = 0, skipped = 0;
+  let firstNotice = null;
+  try {
+    items = (await fushiReadQueue()).filter((it) => it && it.site === 'youtube' && it.youtubeId);
+    if (!items.length) { fushiToastTab(toastTabId, bgT('gen_youtube_queue_empty')); return; }
+    fushiYtBatch = { done: 0, total: items.length };
+    await fushiYtBatchPublish();
+    fushiToastTab(toastTabId, bgT('gen_progress', fushiYtBatch));
+    for (const q of items) {
+      // 生成期间用户可能在 popup 里删了/清空了：每条开工前对一次真相源，删掉的不制。
+      if ((await fushiReadQueue()).some((it) => it && it.id === q.id)) {
+        const o = self.fushiMineOutcome(await fushiMineYoutubeItem(q), bgT);
+        if (o.cls === 'done') { ok++; await fushiRemoveQueuedId(q.id); }
+        if (o.cls === 'unconfigured') unconfigured++;
+        // 一条条弹会被下一条进度盖掉；留第一条原因随最终结果一起给（同类失败通常同因）。
+        if (o.notice && !firstNotice) firstNotice = o;
+      } else {
+        skipped++;
+      }
+      fushiYtBatch = { done: fushiYtBatch.done + 1, total: items.length };
+      await fushiYtBatchPublish();
+      fushiToastTab(toastTabId, bgT('gen_progress', fushiYtBatch));
+    }
+  } finally {
+    clearInterval(keepAlive);
+    fushiYtBatch = null;
+    await fushiYtBatchPublish();
+  }
+  const fail = items.length - ok - skipped;
+  let summary = unconfigured > 0
+    ? bgT('gen_partial_anki_unconfigured', { done: ok, kept: fail })
+    : bgT('gen_done_processed', { done: ok }) + (fail ? bgT('gen_done_failed_suffix', { fail }) : '');
+  if (firstNotice) summary += '\n' + firstNotice.notice;
+  fushiToastTab(toastTabId, summary, { openSettings: !!(firstNotice && firstNotice.settingsFixable) });
+}
+
+async function fushiIconClick(tab) {
+  const got = await chrome.storage.local.get(['fushiQueue', 'fushiNfBatch']);
+  if (got.fushiNfBatch && got.fushiNfBatch.active) {
+    await stopTabCapture();
+    try { await chrome.storage.local.remove(['fushiNfBatch']); } catch (_) {}
+    try { await chrome.tabs.sendMessage(tab.id, { type: 'fushiToastMsg', text: bgT('bg_generation_cancelled') }); } catch (_) {}
+    return;
+  }
+  const url = tab.url || '';
+  const q = Array.isArray(got.fushiQueue) ? got.fushiQueue : [];
+  // 与 action-popup.js fushiGenButtonState 同判据：只有「在 Netflix 页且有 Netflix 待生成项」才
+  // 录 Netflix；其余一律在这里跑 YouTube 队列（不需要视频页，任何 tab 都行）。
+  if (!(fushiIsNetflixUrl(url) && q.some((it) => it && it.site === 'netflix' && it.netflixId))) {
+    await fushiRunYoutubeQueue(tab.id);
+    return;
+  }
+  // 队列里所有含待生成项的剧集（去重）。当前正播这集若在其中，排到最前 → 它就地录（不导航、手势
+  // 现成，最稳）；其余集靠导航（导航时**不录**，到位再录，避开「加载中录屏」的 M7375）。
+  const episodes = [];
+  for (const it of q) {
+    if (it && it.site === 'netflix' && it.netflixId && episodes.indexOf(it.netflixId) < 0) episodes.push(it.netflixId);
+  }
+  if (!episodes.length) {
+    try { await chrome.tabs.sendMessage(tab.id, { type: 'fushiToastMsg', text: bgT('bg_no_netflix_pending') }); } catch (_) {}
+    return;
+  }
+  const curId = (url.match(/\/watch\/(\d+)/) || [])[1];
+  if (curId && episodes.indexOf(curId) > 0) { episodes.splice(episodes.indexOf(curId), 1); episodes.unshift(curId); }
+  await chrome.storage.local.set({ fushiNfBatch: { active: true, episodes: episodes, idx: 0, originalUrl: url } });
+  if (curId && episodes[0] === curId) {
+    // 第一集就是当前播放页 → 就地录：立刻起录屏（手势现成消费），content 收到 storage 变化即跑。
+    await startTabCapture(tab.id);
+  } else {
+    // 当前不在第一集 → 导航过去（此时不录；到位后由 content 的 nfEnsureCapture 再开录）。
+    await chrome.tabs.update(tab.id, { url: 'https://www.netflix.com/watch/' + episodes[0] });
+  }
+}
+
+// TODO-1184：manifest 的 action 现在设了 default_popup（vendor/action-popup.html）→ 点图标只会
+// 打开 popup，chrome.action.onClicked **永不触发**（故不再注册它）。原「点图标起录/跑队列」入口
+// 迁到 action-popup.js 的「开始生成/录制」按钮：按钮点击是用户手势，query 到当前 tab 后发
+// fushiIconAction 消息到这里，由下方 onMessage 分支调用同一个 fushiIconClick（逻辑不变，只换触发口）。
+
+// 审计报告 #1295：抽屉 iframe 的面板过去把「宿主 origin」写在 URL 参数里自证——
+// 任意网站嵌一句 `side-panel.html?fushiEmbed=1&fushiHostOrigin=https://evil.com`
+// 就能让自己的 origin 通过校验。改为 **SW 背书的双向兑换**：
+//   ① 抽屉 content script 要 token：SW 从 `sender.tab.url`（网页不可见、不可伪造）
+//      取真 origin，签发一次性凭证（绑定 tabId，TTL 10 分钟）；
+//   ② 面板 iframe 拿 token 来兑：核销 tabId 相符后回真 origin，供 ev.origin 校验。
+// 攻击者直接嵌 iframe 手里没有 token（web 页发不了 runtime 消息），兑换必然落空 →
+// EMBED_HOST_ORIGIN 恒为 ''，宿主消息全数丢弃（面板照常渲染，只是驱动不进来）。
+const fushiEmbedTokens = new Map(); // token -> {tabId, origin, exp}
+function fushiIssueEmbedToken(tabId, tabUrl) {
+  let origin = '';
+  try { origin = new URL(tabUrl).origin; } catch (_) { return null; }
+  if (!origin || origin === 'null' || !Number.isInteger(tabId)) return null;
+  const now = Date.now();
+  for (const [t, r] of fushiEmbedTokens) if (r.exp < now) fushiEmbedTokens.delete(t);
+  let token;
+  try { token = crypto.randomUUID(); } catch (_) {
+    token = now.toString(36) + '-' + Math.random().toString(36).slice(2);
+  }
+  fushiEmbedTokens.set(token, { tabId, origin, exp: now + 600000 });
+  return token;
+}
+function fushiRedeemEmbedToken(token, senderTabId) {
+  if (!token || typeof token !== 'string') return '';
+  const rec = fushiEmbedTokens.get(token);
+  if (!rec || rec.exp < Date.now()) { fushiEmbedTokens.delete(token); return ''; }
+  // token 换 Tab 用不了：核销方必须是签发时那个标签页。
+  if (!Number.isInteger(senderTabId) || rec.tabId !== senderTabId) return '';
+  return rec.origin;
+}
+
+// BUG-2574：B 站番剧（PGC）的 playurl 必须在**页面主世界**里取，返回原始响应体（音轨仍由
+// 服务端解析）。
+//
+// 为什么不是服务端：`pgc/player/web/playurl` 的大会员内容要带 SESSDATA，而服务端是匿名请求
+// （`bilibili_clip_miner.dart`）→ 拿不到音频流，整张卡失败。
+// 为什么不是本 SW 直接 fetch：该接口的 CORS 只放行 `https://www.bilibili.com` 一个源（实测
+// `Access-Control-Allow-Origin` 就是它 + `Access-Control-Allow-Credentials: true`），从
+// chrome-extension 源发出的请求**读不到响应体**。
+// 页面主世界两者都满足（Origin 是页面自己、cookie 自动带上），且只回传响应体——凭据不出浏览器。
+// 番剧页 CSP 实测为空，`world:'MAIN'` 注入不会被拦；真被拦/未登录/接口改版都返回 null，
+// 调用方据此回落到「没有可裁源」的既有行为。
+const FUSHI_BILIBILI_PGC_RESOLVE_TIMEOUT_MS = 8000;
+
+async function fushiResolveBilibiliPgcPlayurl(tabId, epId) {
+  let results = null;
+  try {
+    results = await Promise.race([
+      chrome.scripting.executeScript({
+        target: { tabId: tabId },
+        world: 'MAIN',
+        // func 被序列化后注入另一个世界，**不得闭包引用本作用域**的任何变量。
+        args: [String(epId)],
+        func: async (epid) => {
+          try {
+            const res = await fetch(
+              'https://api.bilibili.com/pgc/player/web/playurl?ep_id='
+                + encodeURIComponent(epid) + '&fnval=4048&fourk=1',
+              { credentials: 'include' });
+            if (!res.ok) return null;
+            return await res.text();
+          } catch (_) {
+            return null;
+          }
+        },
+      }),
+      // 注入可能被页面 CSP 拦、页面可能正忙：制卡不该被它挂住，超时即当作解析失败。
+      new Promise((resolve) => {
+        setTimeout(() => resolve(null), FUSHI_BILIBILI_PGC_RESOLVE_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (_) {
+    return null;
+  }
+  const body = results && results[0] ? results[0].result : null;
+  return (typeof body === 'string' && body) ? body : null;
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // 发给 offscreen 的消息由 offscreen 处理，background 不插手。
+  if (msg && msg.target === 'offscreen') return false;
+  // TODO-1184：来自 action popup「开始生成/录制」按钮的手势入口（替代已失效的 onClicked）。
+  // popup 已 query 到当前 tab（{id,url}），这里直接跑原 fushiIconClick（Netflix 就地录 / YouTube 队列）。
+  if (msg && msg.type === 'fushiIconAction') {
+    fushiIconClick(msg.tab || {}).catch(() => {});
+    sendResponse({ ok: true });
+    return true;
+  }
+  // popup 打开时问一次 YouTube 批量进度（内存态，见 fushiYtBatch）。
+  if (msg && msg.type === 'fushiYtBatchStatus') {
+    sendResponse({ ok: true, batch: fushiYtBatch });
+    return true;
+  }
+  // 原生浏览器侧边栏入口（**尽力而为的兜底路径**，不是主路径）。
+  //
+  // chrome.sidePanel.open() 要求「瞬态用户激活」，而扩展消息**不传递**用户激活：内容脚本里
+  // Shift+S 那个真实按键的激活，跨 runtime.sendMessage 到达 service worker 时已经没有了。
+  // 内容脚本自己又调不到 sidePanel API（该命名空间只存在于扩展页面/SW 上下文）。所以页面内
+  // 的任何手势都开不了侧边栏——唯一可靠入口是扩展图标 popup，它本身就在扩展上下文里，
+  // vendor/action-popup.js 已改成在 click 的同步栈第一句直接调 open()，不再绕这条消息。
+  //
+  // 这里保留本分支的意义有两条：① 若将来 Chrome 放宽（或 popup 兜底转发到这里）能直接生效；
+  // ② **把失败原样回报给调用方**，让页面侧给用户可见提示，而不是静默什么都不发生。
+  // 另外：open() 必须是拿到激活后的第一句——原实现先 `await setOptions(...)`，其 resolve 落在
+  // 新的宏任务里，激活早已过期，等于自己把仅有的机会也丢掉了。setOptions 不需要激活，挪到
+  // open() 之后补（manifest 的 side_panel.default_path 已足以让 open() 用对页面）。
+  // 字幕抽屉（mobile-drawer.js）：iframe 里的扩展页拿不到宿主标签身份，content script
+  // 又没有 chrome.tabs 可用。这里 SW 如实认出发信标签，据此签发嵌入 token（见下）；
+  // tabId 一并回报只作诊断，**不供抽屉拼进 URL**——面板要用的 tabId 走 drawerEmbedVerify
+  // 现取，参数自证的路已经拆掉（审计报告 #1295）。
+  if (msg && msg.type === 'drawerSelfTab') {
+    const tid = _sender && _sender.tab && Number.isInteger(_sender.tab.id) ? _sender.tab.id : null;
+    sendResponse({
+      ok: true,
+      tabId: tid,
+      // 审计报告 #1295：随标签 id 一并签发嵌入凭证（真 origin 由 SW 从 sender.tab.url
+      // 取得，只有拿 token 来兑的面板能知道）。签发失败（异常 sender）回 null——
+      // 面板端 fail-closed，宿主消息通道整个关死。
+      token: tid != null ? fushiIssueEmbedToken(tid, _sender.tab.url) : null,
+    });
+    return true;
+  }
+  if (msg && msg.type === 'drawerEmbedVerify') {
+    // 面板 iframe 持 token 核销；核销方 tab 必须与签发时一致。
+    const senderTid = _sender && _sender.tab && Number.isInteger(_sender.tab.id)
+      ? _sender.tab.id
+      : null;
+    // 审计报告 #1295 第二半：**目标 tabId 同样不许自证**。旧版把它写在
+    // side-panel.html?fushiTabId=N 里，嵌入方随手填别人的号，就能拿这张面板去驱动
+    // 受害者的另一个标签页（跨源读不到内容，但点击劫持能借用户的手点选轨/跳转）。
+    // 面板真正该驱动的只有「装着它自己的那一页」——正是 sender.tab.id，SW 如实给出，
+    // 网页伪造不了。它不依赖 token：file:// 这类签不出 origin 的页面照样拿得到 tabId，
+    // 只是宿主消息通道仍关着（origin 兑不出）。
+    sendResponse({
+      ok: true,
+      origin: fushiRedeemEmbedToken(msg.token, senderTid),
+      tabId: senderTid,
+    });
+    return true;
+  }
+  if (msg && msg.type === 'openSubtitleSidePanel') {
+    const tabId = Number.isInteger(msg.tabId)
+      ? msg.tabId
+      : (_sender && _sender.tab && Number.isInteger(_sender.tab.id) ? _sender.tab.id : null);
+    if (tabId == null || !chrome.sidePanel || typeof chrome.sidePanel.open !== 'function') {
+      sendResponse({ ok: false, error: 'side-panel-unavailable' });
+      return true;
+    }
+    let opening = null;
+    try {
+      opening = chrome.sidePanel.open({ tabId });
+    } catch (error) {
+      sendResponse({ ok: false, error: String(error && error.message || error) });
+      return true;
+    }
+    Promise.resolve(opening).then(
+      () => {
+        try { chrome.sidePanel.setOptions({ tabId, path: 'side-panel.html', enabled: true }); } catch (_) {}
+        sendResponse({ ok: true });
+      },
+      (error) => { sendResponse({ ok: false, error: String(error && error.message || error) }); });
+    return true;
+  }
+  // 「打开扩展设置」：content script 里 chrome.runtime.openOptionsPage 不可用（只在扩展页面
+  // 上下文存在），故页面侧（字幕面板齿轮、报错 toast）统一发这条消息，由 SW 代开。
+  if (msg && msg.type === 'openOptions') {
+    try { chrome.runtime.openOptionsPage(); } catch (_) {}
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg && msg.type === 'studySample') {
+    forwardStudySample(msg.sample).then(sendResponse, () => sendResponse({ ok: false }));
+    return true;
+  }
+  // BUG-1525：查词性能诊断不走 cfg()/localhost，避免“记录日志”本身污染被测热路径。
+  // 最近 80 条异步 debounce 到扩展本地存储；设置页可查看/复制/清空，SW 重启后仍在。
+  if (msg && msg.type === 'lookupPerf') {
+    recordLookupPerf(msg.entry);
+    sendResponse({ ok: true });
+    return true;
+  }
+  if (msg && msg.type === 'lookupPerfGet') {
+    lookupPerfReady.then(() => sendResponse({ ok: true, logs: lookupPerfLogs.slice() }));
+    return true;
+  }
+  if (msg && msg.type === 'lookupPerfClear') {
+    lookupPerfReady.then(async () => {
+      try {
+        lookupPerfStorageEpoch += 1;
+        lookupPerfLogs = [];
+        if (lookupPerfFlushTimer !== null) clearTimeout(lookupPerfFlushTimer);
+        lookupPerfFlushTimer = null;
+        // 已经进入 storage.set 的旧写入必须先结束，再 remove；epoch 同时让尚未开始的
+        // 旧快照失效，清空不会被竞态写回“复活”。
+        await lookupPerfWritePromise.catch(() => {});
+        await chrome.storage.local.remove(LOOKUP_PERF_STORAGE_KEY);
+        sendResponse({ ok: true });
+      } catch (error) {
+        sendResponse({ ok: false, error: String(error && error.message || error) });
+      }
+    });
+    return true;
+  }
+  const messageStartedAt = performance.now();
+  const messageStartedEpochMs = performance.timeOrigin + messageStartedAt;
+  const lookupTrace = msg && msg.type === 'lookup' ? {
+    id: nextLookupPerfId(),
+    term: String(msg.term || ''),
+    maximumTerms: Number.isInteger(msg.maximumTerms)
+      ? Math.max(1, Math.min(50, msg.maximumTerms))
+      : 10,
+    clientSentEpochMs: typeof msg.clientSentEpochMs === 'number'
+      ? msg.clientSentEpochMs : null,
+    phase: 'handler-enter',
+    pendingTimers: [],
+  } : null;
+  if (lookupTrace) {
+    // 正常的快速查询不在 in-flight 期间触发 storage 写入；若超过 1 秒，下面的
+    // still-pending 记录会持久化 start + pending，崩溃/永久挂起也有证据。
+    recordLookupPerf({
+      id: lookupTrace.id,
+      surface: 'service-worker',
+      stage: 'request-start',
+      term: lookupTrace.term,
+      maximumTerms: lookupTrace.maximumTerms,
+      ...(lookupTrace.clientSentEpochMs != null ? {
+        dispatchToHandlerMs: Number(
+          Math.max(0, messageStartedEpochMs - lookupTrace.clientSentEpochMs).toFixed(1)),
+      } : {}),
+    }, false);
+    for (const thresholdMs of [1000, 3000]) {
+      lookupTrace.pendingTimers.push(setTimeout(() => recordLookupPerf({
+        id: lookupTrace.id,
+        surface: 'service-worker',
+        stage: 'still-pending',
+        term: lookupTrace.term,
+        maximumTerms: lookupTrace.maximumTerms,
+        phase: lookupTrace.phase,
+        pendingElapsedMs: thresholdMs,
+        actualElapsedMs: Number((performance.now() - messageStartedAt).toFixed(1)),
+      }), thresholdMs));
+    }
+  }
+  (async () => {
+    let base = `http://${FUSHI_DEFAULTS.host}:${FUSHI_DEFAULTS.port}`;
+    let token = FUSHI_DEFAULTS.token;
+    let cfgMs = 0;
+    try {
+      if (lookupTrace) lookupTrace.phase = 'config';
+      const cfgStartedAt = performance.now();
+      ({ base, token } = await cfg());
+      cfgMs = performance.now() - cfgStartedAt;
+      if (msg.type === 'dictMediaConfig') {
+        // TODO-1215: content-script dict media image rewrite needs the server
+        // base URL + token to build GET /api/media/dictionary. Same source as
+        // lookup/mine (cfg()): installer-injected defaults or options override.
+        sendResponse({ ok: true, base, token });
+      } else if (msg.type === 'subtitleFonts') {
+        // 字幕外观的字体下拉 + 覆盖层 @font-face：字体真源在 app（自定义字体目录）。
+        // 列表经 POST /api/extension/fonts（Basic 鉴权）；每条附上可直接进 @font-face 的
+        // 文件 URL（GET /api/extension/fonts/file?id=&token=，与 dict-media 图片同款「查询串
+        // 带 token」——content script 的 @font-face 请求发不了鉴权头）。app 没开 → ok:false，
+        // 下拉只剩本机字体栈，覆盖层回落 CSS 默认字体。
+        const r = await fetch(base + '/api/extension/fonts', {
+          method: 'POST',
+          signal: AbortSignal.timeout(8000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: '{}',
+        });
+        const data = r.ok ? await r.json() : null;
+        sendResponse({
+          ok: r.ok,
+          status: r.status,
+          fonts: decorateSubtitleFonts(data && data.fonts, base, token),
+          recommended: data && Array.isArray(data.recommended) ? data.recommended : [],
+          ...(!r.ok ? { connection: await diagnoseConnectionCapped(base) } : {}),
+        });
+      } else if (msg.type === 'subtitleFontDownload') {
+        // 下拉旁「下载」：让 app 走它自己的推荐字体下载（多源回退 + 校验 + 入目录），扩展只等结果。
+        // CJK 字体十几 MB，给足超时；MV3 SW 有在途 fetch 不会被回收。
+        const r = await fetch(base + '/api/extension/fonts/download', {
+          method: 'POST',
+          signal: AbortSignal.timeout(10 * 60 * 1000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ name: String(msg.name || '') }),
+        });
+        let data = null;
+        try { data = await r.json(); } catch (_) {}
+        sendResponse({
+          ok: r.ok && !!(data && data.ok),
+          status: r.status,
+          error: data && data.error ? String(data.error) : (r.ok ? null : 'http_' + r.status),
+          fonts: decorateSubtitleFonts(data && data.fonts, base, token),
+        });
+      } else if (msg.type === 'connectionStatus') {
+        sendResponse({ ok: true, connection: await diagnoseConnection(msg.force === true) });
+      } else if (msg.type === 'popupSize') {
+        // 弹窗尺寸精细化 Phase D：content.js 拖弹窗右下角把手松手后，把最终基准最大宽高经此
+        // 回写 app（POST /api/extension/popup-size，Basic auth 与查词同源）。app 侧 clamp
+        // (250-2000/200-1600) + 「拖即解锁」extensionPopupIndependentSize=true + 写扩展键，
+        // 下次查词以新尺寸下发。lookup 样板同款鉴权头，不新开无鉴权入口。
+        const r = await fetch(base + '/api/extension/popup-size', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ maxWidth: msg.maxWidth, maxHeight: msg.maxHeight }),
+        });
+        sendResponse({ ok: r.ok, status: r.status });
+      } else if (msg.type === 'lookup') {
+        const lookupId = lookupTrace.id;
+        const maximumTerms = lookupTrace.maximumTerms;
+        const colorScheme = await extensionColorScheme();
+        lookupTrace.phase = 'fetch-headers';
+        const fetchStartedAt = performance.now();
+        // 查词 fetch 必须有上限：app 侧一旦长阻塞（词典重载/磁盘 stall），无超时的 await 会让
+        // sendResponse 永不被调——Side Panel 的「正在查词…」就永久停留。超时走下方 catch 分支
+        // 回错误响应，用户看到可重试的失败文案而不是无限转圈。上限 > Side Panel 兜底(8s)，
+        // 正常慢查询不受影响。
+        const r = await fetch(base + '/api/lookup/dictionary', {
+          method: 'POST',
+          signal: AbortSignal.timeout(10000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({
+            term: msg.term,
+            record: msg.record === true,
+            // BUG-871: popup HTML already contains the entries; only bestLength is
+            // consumed from result, so avoid transferring the full duplicate result.
+            popupOnly: true,
+            maximumTerms,
+            lookupTraceId: lookupId,
+            // BUG-1718：已缓存的弹窗 CSS 尾段指纹。字段在 = 本客户端认识该契约；
+            // 与服务端当前指纹一致时服务端只回指纹不回正文（数百 KB 不上路）。
+            stylesRevision: fushiPopupCss.revision,
+            // 扩展主题显式 light/dark：让 app 按这个明暗生成弹窗配色（旧 app 忽略该字段）。
+            ...(colorScheme ? { colorScheme } : {}),
+          }),
+        });
+        const headersAt = performance.now();
+        const serverTiming = parseLookupServerTiming(r.headers.get('server-timing'));
+        const serverCache = r.headers.get('x-fushi-lookup-cache');
+        const reflectedTraceId = r.headers.get('x-fushi-lookup-id');
+        lookupTrace.phase = 'response-body';
+        const raw = r.ok ? await r.text() : '';
+        const bodyAt = performance.now();
+        let data = null;
+        let parseError = null;
+        const parseStartedAt = performance.now();
+        lookupTrace.phase = 'outer-json-parse';
+        if (r.ok) {
+          try {
+            data = JSON.parse(raw);
+            fushiMergePopupCss(data); // BUG-1718：并进/回填词典 CSS 尾段
+            rememberAppLocale(data && data.appLocale);
+            rememberAppTheme(data && data.theme);
+          } catch (error) { parseError = String(error && error.message || error); }
+        }
+        const finishedAt = performance.now();
+        lookupTrace.phase = 'response-ready';
+        for (const timer of lookupTrace.pendingTimers) clearTimeout(timer);
+        lookupTrace.pendingTimers = [];
+        const lookupPerf = {
+          id: lookupId,
+          surface: 'service-worker',
+          stage: 'response',
+          term: String(msg.term || ''),
+          maximumTerms,
+          status: r.status,
+          ok: r.ok && data !== null,
+          ...(lookupTrace.clientSentEpochMs != null ? {
+            dispatchToHandlerMs: Number(
+              Math.max(0, messageStartedEpochMs - lookupTrace.clientSentEpochMs).toFixed(1)),
+          } : {}),
+          cfgMs: Number(cfgMs.toFixed(1)),
+          fetchHeadersMs: Number((headersAt - fetchStartedAt).toFixed(1)),
+          responseBodyMs: Number((bodyAt - headersAt).toFixed(1)),
+          outerJsonParseMs: Number((finishedAt - parseStartedAt).toFixed(1)),
+          totalMs: Number((finishedAt - messageStartedAt).toFixed(1)),
+          slow: finishedAt - messageStartedAt >= 1000,
+          responseChars: raw.length,
+          responseBytes: Number(r.headers.get('content-length')) || null,
+          contentEncoding: r.headers.get('content-encoding') || 'identity',
+          ...(serverCache ? { serverCache } : {}),
+          ...(reflectedTraceId ? { serverTraceMatched: reflectedTraceId === lookupId } : {}),
+          ...serverTiming,
+          ...(parseError ? { parseError } : {}),
+        };
+        let connection = null;
+        if (!r.ok) {
+          // HTTP 失败本身已经终态，先持久化；连接分类另设上限并单独计时，不能让
+          // 一个无 timeout 的诊断把查词回调继续挂住或伪装成 SW/IPC 延迟。
+          recordLookupPerf(lookupPerf);
+          lookupTrace.phase = 'connection-diagnostic';
+          const diagnosticStartedAt = performance.now();
+          connection = await diagnoseConnectionCapped(base);
+          lookupPerf.diagnosticMs = Number(
+            (performance.now() - diagnosticStartedAt).toFixed(1));
+          recordLookupPerf({
+            id: lookupId,
+            surface: 'service-worker',
+            stage: 'connection-diagnostic',
+            term: lookupTrace.term,
+            diagnosticMs: lookupPerf.diagnosticMs,
+            connectionState: connection.state,
+          });
+        }
+        lookupPerf.responseReadyEpochMs = performance.timeOrigin + performance.now();
+        sendResponse({
+          ok: r.ok && data !== null,
+          status: r.status,
+          data,
+          lookupPerf,
+          ...(!r.ok ? { connection } : {}),
+        });
+        // 先把结果交给页面，再异步写环形日志；诊断绝不延长弹框首显。
+        if (r.ok) recordLookupPerf(lookupPerf);
+        // BUG-726：先回结果再检查自更新（reload 杀 SW，绝不能挡在 sendResponse 前面）。
+        maybeSelfReload(data);
+      } else if (msg.type === 'lookupAudio') {
+        // 单词音频：POST /api/lookup/audio {expression,reading}（Basic auth）→ server 用
+        // 与 app 同一 lookupAudio（本地音频库）解析出音频字节，回 {url,contentType}，url 是
+        // 免鉴权短命 /api/lookup/audio/file?id=。content-script 的 HTML5 Audio 直接播该 url。
+        const r = await fetch(base + '/api/lookup/audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ expression: msg.expression || '', reading: msg.reading || '' }),
+        });
+        if (!r.ok) { sendResponse({ ok: false, status: r.status, url: null }); return; }
+        const data = await r.json();
+        sendResponse({ ok: !!(data && data.url), url: (data && data.url) || null, contentType: (data && data.contentType) || null });
+      } else if (msg.type === 'lookupAudioList') {
+        // 「选择音频源」菜单：POST /api/lookup/audio/list {expression,reading}（Basic auth）→
+        // {audioSources:[{name, variant, url}]}，url 同为免鉴权短命 /api/lookup/audio/file?id=。
+        // 旧 app 无该端点 → !r.ok → 空列表（popup.js 按「暂无发音」处理）。
+        const r = await fetch(base + '/api/lookup/audio/list', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ expression: msg.expression || '', reading: msg.reading || '' }),
+        });
+        if (!r.ok) { sendResponse({ ok: false, status: r.status, audioSources: [] }); return; }
+        const data = await r.json();
+        const list = data && Array.isArray(data.audioSources) ? data.audioSources : [];
+        sendResponse({
+          ok: true,
+          audioSources: list.filter((s) => s && typeof s.url === 'string' && s.url).map((s) => ({
+            name: typeof s.name === 'string' ? s.name : '',
+            variant: typeof s.variant === 'string' ? s.variant : '',
+            url: s.url,
+          })),
+        });
+      } else if (msg.type === 'youtubeCaptions') {
+        // A（BUG-783 后续）：扩展抓 YouTube 网页视频**真整集字幕**——POST /api/youtube/captions
+        // {videoId,preferLang} → server 复用 app 内已修的解析器（androidVr getPlayerResponse +
+        // format-3 timedtext），回全部轨（自动/人工）+ cue。Basic auth 与查词同源。best-effort：
+        // 失败/无字幕回 {tracks:[]}，content.js 回退 live 采样。
+        const r = await fetch(base + '/api/youtube/captions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ videoId: msg.videoId || '', preferLang: msg.preferLang || 'ja' }),
+        });
+        sendResponse({
+          ok: r.ok,
+          status: r.status,
+          data: r.ok ? await r.json() : null,
+          ...(!r.ok ? { connection: await diagnoseConnection(true) } : {}),
+        });
+      } else if (msg.type === 'parseSubtitle') {
+        // B（asb 招牌）：给任意网页视频加载用户自己的外挂字幕文件——扩展读本地 srt/ass/vtt 文本
+        // POST /api/subtitle/parse {filename,content} → server 复用 app 内已测 parser 解析成 cue。
+        // BUG-3146：解析是纯 CPU 小活，正常几十毫秒回。此前没有上限——app 不应答时这条消息永远
+        // 挂着，页面「导入了没反应」，直到 app 恢复应答才突然导进去。给上限并走限时诊断：
+        // 超时由下方 catch 回 {ok:false, connection:no-response}，页面如实说「Fushi 没有响应」。
+        const r = await fetch(base + '/api/subtitle/parse', {
+          method: 'POST',
+          signal: AbortSignal.timeout(15000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ filename: msg.filename || '', content: msg.content || '' }),
+        });
+        sendResponse({
+          ok: r.ok,
+          status: r.status,
+          data: r.ok ? await r.json() : null,
+          ...(!r.ok ? { connection: await diagnoseConnectionCapped(base) } : {}),
+        });
+      } else if (msg.type === 'subtitleSearch') {
+        // 查字幕①：Side Panel 搜索框 → server /api/subtitle/search。server 扇出
+        // **用户已配好的全部在线字幕来源**（Jimaku / OpenSubtitles / AJATT，与 app 内
+        // 视频页「找字幕」同一批 provider），一家挂了另几家照样出结果。
+        //
+        // 超时比别的端点长：AJATT 第一次搜索要拉约 9 MB 的静态目录（之后落盘缓存
+        // 24 小时），20 秒会在首次使用时稳定超时，而那正是零配置用户的第一印象。
+        const r = await fetch(base + '/api/subtitle/search', {
+          method: 'POST',
+          signal: AbortSignal.timeout(45000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({
+            query: msg.query || '',
+            ...(Number.isInteger(msg.episode) ? { episode: msg.episode } : {}),
+            ...(typeof msg.anime === 'boolean' ? { anime: msg.anime } : {}),
+          }),
+        });
+        sendResponse({
+          ok: r.ok,
+          status: r.status,
+          data: r.ok ? await r.json() : null,
+          ...(!r.ok ? { connection: await diagnoseConnection(true) } : {}),
+        });
+      } else if (msg.type === 'subtitleFetch') {
+        // 查字幕②：候选 handle → server 按 handle 找回候选、交还给**它自己的来源**下载，
+        // 自动识别编码 + 解析，响应与 /api/subtitle/parse 同形（{format,cues}），
+        // Side Panel 直接走既有 InstallTrack。
+        const r = await fetch(base + '/api/subtitle/fetch', {
+          method: 'POST',
+          signal: AbortSignal.timeout(30000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ handle: msg.handle || '' }),
+        });
+        sendResponse({
+          ok: r.ok,
+          status: r.status,
+          data: r.ok ? await r.json() : null,
+          ...(!r.ok ? { connection: await diagnoseConnection(true) } : {}),
+        });
+      } else if (msg.type === 'mine') {
+        // 立即出卡（不进批量剪辑队列的一切页面：普通网页 + 有字幕轨/有视频但尚无流解析器的
+        // 站点，如 bilibili.com）。**媒体不再恒为空**：
+        //   · screenshotBase64 = 页面 `<video>` 的当前解码帧（`frame-capture.js`；原生分辨率、
+        //     无弹幕/无播放器 UI/无字幕层，取不到就不带，绝不退化成截屏）；
+        //   · cueStartMs / clipStartMs / clipEndMs / mineAtMs = 当前字幕行的视频时间窗，
+        //     服务端据此从原始流裁句子音频/动图（`immediate` 档站点）；
+        //   · clipSourceKind / clipSourceId = 可裁原始流的站点身份（有解析器时才发）；
+        //   · documentTitle = 页面标题 → Anki 视频名字段（不发则服务端回落字面 'Netflix'）。
+        // 全部为可选：一个都不带时行为与改动前逐字等价（纯文本挖词回落）。
+        // B 站番剧（PGC）的音轨由页面主世界解析（见 `fushiResolveBilibiliPgcPlayurl`）。
+        // **解析不到就连 kind 一起不发**：服务端落到通用兜底（解码帧 + 例句、无句子音频），
+        // 与改动前番剧页的行为逐字一致——既不谎报「有音频」去出坏卡，也不新增失败提示。
+        let pgcPlayurlBody = null;
+        if (msg.clipSourceKind === 'bilibili-pgc' && msg.clipSourceId &&
+            _sender && _sender.tab && Number.isInteger(_sender.tab.id)) {
+          pgcPlayurlBody = await fushiResolveBilibiliPgcPlayurl(
+            _sender.tab.id, msg.clipSourceId);
+        }
+        const clipSourceKind = (msg.clipSourceKind === 'bilibili-pgc' && !pgcPlayurlBody)
+          ? null
+          : msg.clipSourceKind;
+        const r = await fetch(base + '/api/mine', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({
+            fields: msg.fields, sentence: msg.sentence || '',
+            ...(msg.screenshotBase64 ? { screenshotBase64: msg.screenshotBase64 } : {}),
+            ...(typeof msg.cueStartMs === 'number' ? { cueStartMs: msg.cueStartMs } : {}),
+            ...(typeof msg.clipStartMs === 'number' ? { clipStartMs: msg.clipStartMs } : {}),
+            ...(typeof msg.clipEndMs === 'number' ? { clipEndMs: msg.clipEndMs } : {}),
+            ...(typeof msg.mineAtMs === 'number' ? { mineAtMs: msg.mineAtMs } : {}),
+            ...(clipSourceKind ? { clipSourceKind: clipSourceKind } : {}),
+            ...(clipSourceKind ? { clipSourceId: msg.clipSourceId } : {}),
+            ...(pgcPlayurlBody ? { clipSourcePlayurlBody: pgcPlayurlBody } : {}),
+            ...(typeof msg.clipSourcePart === 'number'
+              ? { clipSourcePart: msg.clipSourcePart } : {}),
+            ...(msg.documentTitle ? { documentTitle: msg.documentTitle } : {}),
+          }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'duplicate') {
+        // TODO-1176：查词弹窗制卡按钮真查重（+→✓，与 app 一致）。POST {expression,reading}
+        // → server /api/duplicate，经 Anki 后端判断该词是否已存在，返回 {duplicate:bool}。
+        const r = await fetch(base + '/api/duplicate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ expression: msg.expression || '', reading: msg.reading || '' }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'srsTermStatus') {
+        // Fushi 复习词状态：POST {expression,reading} → server /api/srs/term-status，回
+        // {status: null | {...}}。app 的复习模块关着时 404（bridge-shim 据此退避）。
+        const r = await fetch(base + '/api/srs/term-status', {
+          method: 'POST',
+          signal: AbortSignal.timeout(8000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ expression: msg.expression || '', reading: msg.reading || '' }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'srsOpenCard') {
+        // 点复习标记：让 app 打开那张卡。POST {cardId,noteId} → /api/srs/open，回 {opened:bool}。
+        const r = await fetch(base + '/api/srs/open', {
+          method: 'POST',
+          signal: AbortSignal.timeout(8000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ cardId: msg.cardId || '', noteId: msg.noteId || '' }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'favorite') {
+        // BUG-3141：弹窗 ☆/★ 收藏。POST {toggle,expression,reading,glossary,sentence}
+        // → server /api/extension/favorite，与 app 外浮窗 favoriteEntry / favoriteCheck 两个桥
+        // 同一份 overlayToggleOrCheckFavoriteWord（跨源判 / 跨源删 / 单源写），回 {favorite:bool}。
+        // 旧 app 没有这个端点 → 404 → ok:false，带连接诊断让页面说清楚为什么没收藏上。
+        const r = await fetch(base + '/api/extension/favorite', {
+          method: 'POST',
+          signal: AbortSignal.timeout(8000),
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({
+            toggle: msg.toggle === true,
+            expression: msg.expression || '',
+            reading: msg.reading || '',
+            glossary: msg.glossary || '',
+            sentence: msg.sentence || '',
+          }),
+        });
+        const data = r.ok ? await responseJson(r) : null;
+        sendResponse({
+          ok: r.ok && !!data && typeof data.favorite === 'boolean',
+          status: r.status,
+          data,
+          ...(!r.ok && r.status !== 404 ? { connection: await diagnoseConnectionCapped(base) } : {}),
+        });
+      } else if (msg.type === 'openInAnki') {
+        // Issue #1409：弹窗 ↗「在 Anki 中打开这个词的卡」。POST {expression,reading}
+        // → server /api/anki/open，与 app 内 openInAnki 桥同一 repo.openWordInAnki，
+        // 回 {outcome:'opened'|'noMatch'|'failed'}。
+        const r = await fetch(base + '/api/anki/open', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({ expression: msg.expression || '', reading: msg.reading || '' }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'mineClip') {
+        // Netflix 回放录到的整段 webm → 服务端整段裁 [0,时长] 转 GIF+音频（无偏移运算）。
+        // BUG-676（TODO-1361 ③）：带上剧名 documentTitle（服务端映射到 Anki {document-title} 视频名
+        // 字段）；不发时服务端回落字面「Netflix」。空串不发（保持旧行为 → 回落 Netflix）。
+        const r = await fetch(base + '/api/mine', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: authHeader(token) },
+          body: JSON.stringify({
+            fields: msg.fields, sentence: msg.sentence || '',
+            clipBase64: msg.clipBase64, clipDurationMs: msg.clipDurationMs,
+            // BUG-2192：可见画面比例矩形（{x,y,w,h} ∈ [0,1]），服务端抽帧前先 crop 掉黑边。
+            ...(msg.clipCrop && typeof msg.clipCrop === 'object' ? { clipCrop: msg.clipCrop } : {}),
+            // BUG-1416：片段时间基锚点 + 句首 + 制卡那一刻（都是**视频时间**），服务端在静态帧
+            // 模式下据此在片段里定位取帧。null（老队列项/采样失败）就不发 → 服务端退片段起点。
+
+            ...(typeof msg.clipAnchorMs === 'number' ? { clipAnchorMs: msg.clipAnchorMs } : {}),
+            ...(typeof msg.clipAnchorUncertaintyMs === 'number'
+              ? { clipAnchorUncertaintyMs: msg.clipAnchorUncertaintyMs } : {}),
+            ...(typeof msg.cueStartMs === 'number' ? { cueStartMs: msg.cueStartMs } : {}),
+            // BUG-2080：卡面时间窗透传到 /api/mine（与 fushiMineYoutubeItem 同名同语义）。两端都得是
+            // 数字才发——只发一半会让服务端拿到半个窗，`end > start` 判据结果不可预期。
+            ...(typeof msg.clipStartMs === 'number' && typeof msg.clipEndMs === 'number'
+              ? { clipStartMs: msg.clipStartMs, clipEndMs: msg.clipEndMs } : {}),
+            ...(typeof msg.mineAtMs === 'number' ? { mineAtMs: msg.mineAtMs } : {}),
+            ...(msg.documentTitle ? { documentTitle: msg.documentTitle } : {}),
+          }),
+        });
+        sendResponse({ ok: r.ok, status: r.status, data: r.ok ? await r.json() : null });
+      } else if (msg.type === 'nfEnsureCapture') {
+        // 到位后开录：还在录就复用，否则用仍有效的 activeTab 重取 streamId 起录（无需新手势）。
+        const rec = await isOffscreenRecording();
+        if (!rec && _sender.tab && _sender.tab.id != null) await startTabCapture(_sender.tab.id);
+        sendResponse({ ok: true });
+      } else if (msg.type === 'nfStopCapture') {
+        // 切下一集前停录：录屏绝不在「切集重新加载」时活着 → 避开 M7375。
+        await stopTabCapture();
+        sendResponse({ ok: true });
+      } else if (msg.type === 'nfNavigate') {
+        if (_sender.tab && _sender.tab.id != null) await chrome.tabs.update(_sender.tab.id, { url: msg.url });
+        sendResponse({ ok: true });
+      } else if (msg.type === 'nfFinish') {
+        await stopTabCapture();
+        try { await chrome.storage.local.remove(['fushiNfBatch']); } catch (_) {}
+        if (_sender.tab && _sender.tab.id != null && msg.originalUrl && _sender.tab.url !== msg.originalUrl) {
+          try { await chrome.tabs.update(_sender.tab.id, { url: msg.originalUrl }); } catch (_) {}
+        }
+        sendResponse({ ok: true });
+      } else {
+        sendResponse({ ok: false, error: 'unknown' });
+      }
+    } catch (e) {
+      let lookupPerf = null;
+      if (lookupTrace) {
+        for (const timer of lookupTrace.pendingTimers) clearTimeout(timer);
+        lookupTrace.pendingTimers = [];
+        lookupPerf = {
+          id: lookupTrace.id,
+          surface: 'service-worker',
+          stage: 'error',
+          term: lookupTrace.term,
+          maximumTerms: lookupTrace.maximumTerms,
+          cfgMs: Number(cfgMs.toFixed(1)),
+          totalMs: Number((performance.now() - messageStartedAt).toFixed(1)),
+          error: String(e && e.message || e),
+        };
+      }
+      // 错误日志先落内存，连接诊断若本身超时也不会把真正失败阶段吞掉。
+      if (lookupPerf) recordLookupPerf(lookupPerf);
+      const diagnosticStartedAt = performance.now();
+      // 所有消息一律限时诊断：失败的那一刻 app 常常正是不应答的状态，不限时的诊断会把
+      // sendResponse 一起挂住（BUG-3146：页面上表现为「点了没反应」）。
+      const connection = await diagnoseConnectionCapped(base);
+      if (lookupPerf) {
+        lookupPerf.diagnosticMs = Number(
+          (performance.now() - diagnosticStartedAt).toFixed(1));
+        lookupPerf.responseReadyEpochMs = performance.timeOrigin + performance.now();
+        recordLookupPerf({
+          id: lookupTrace.id,
+          surface: 'service-worker',
+          stage: 'connection-diagnostic',
+          term: lookupTrace.term,
+          diagnosticMs: lookupPerf.diagnosticMs,
+          connectionState: connection.state,
+        });
+      }
+      sendResponse({
+        ok: false,
+        error: String(e),
+        ...(lookupPerf ? { lookupPerf } : {}),
+        connection,
+      });
+    }
+  })();
+  return true;
+});

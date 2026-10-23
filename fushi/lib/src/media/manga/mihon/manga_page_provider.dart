@@ -1,0 +1,199 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
+
+import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
+import 'package:fushi_engine/media/manga/import/image_size_probe.dart'
+    show probeOrientedImageSize;
+
+abstract interface class MangaPageProvider {
+  Future<MangaReaderSession> open();
+}
+
+/// 阅读器的页会话契约。
+///
+/// 两个实现：[LocalMangaReaderSession]（本地导入卷 / 已下载的在线章，一份本地
+/// `manga.json + images/`）与 `OnlineMangaReaderSession`（未下载的在线章直读，
+/// 2026-09-26 用户撤回设计稿 §1.1「必须先下载再读」后恢复；页经适配器懒取、
+/// 落在 app 临时目录的会话私有缓存里，不碰章下载目录）。
+abstract interface class MangaReaderSession {
+  int get pageCount;
+
+  Future<MangaPageBytes> page(int index);
+
+  /// Return a local file containing this page.
+  Future<File?> localFile(int index);
+
+  /// Stable identity used by the OCR cache.
+  String cacheIdentity(int index);
+
+  Future<void> close();
+}
+
+class MangaPageBytes {
+  const MangaPageBytes({
+    required this.bytes,
+    required this.contentType,
+    this.width,
+    this.height,
+  });
+
+  final Uint8List bytes;
+  final String contentType;
+  final int? width;
+  final int? height;
+
+  bool get hasDimensions =>
+      width != null && height != null && width! > 0 && height! > 0;
+}
+
+/// Adapter used by the existing managed local-manga reader.
+class LocalMangaPageProvider implements MangaPageProvider {
+  const LocalMangaPageProvider({
+    required this.imagesRoot,
+    required this.relativePaths,
+  });
+
+  final Directory imagesRoot;
+  final List<String> relativePaths;
+
+  @override
+  Future<MangaReaderSession> open() async => LocalMangaReaderSession(
+        imagesRoot: imagesRoot,
+        relativePaths: List<String>.unmodifiable(relativePaths),
+      );
+}
+
+class LocalMangaReaderSession implements MangaReaderSession {
+  LocalMangaReaderSession({
+    required this.imagesRoot,
+    required this.relativePaths,
+  });
+
+  final Directory imagesRoot;
+  final List<String> relativePaths;
+  bool _closed = false;
+
+  @override
+  int get pageCount => relativePaths.length;
+
+  @override
+  Future<MangaPageBytes> page(int index) async {
+    final File file = await _validatedFile(index);
+    final Uint8List bytes = await file.readAsBytes();
+    final ({int width, int height})? dimensions =
+        await mangaImageDimensions(bytes);
+    return MangaPageBytes(
+      bytes: bytes,
+      contentType: mangaImageContentType(bytes),
+      width: dimensions?.width,
+      height: dimensions?.height,
+    );
+  }
+
+  @override
+  Future<File?> localFile(int index) async => _validatedFile(index);
+
+  Future<File> _validatedFile(int index) async {
+    if (_closed) {
+      throw const MihonRuntimeException(
+        'SESSION_CLOSED',
+        'The local manga reader session is closed',
+      );
+    }
+    if (index < 0 || index >= relativePaths.length) {
+      throw RangeError.index(index, relativePaths, 'index');
+    }
+    final String root = p.canonicalize(imagesRoot.path);
+    final String candidate = p.canonicalize(
+      p.join(imagesRoot.path, relativePaths[index]),
+    );
+    if (!p.isWithin(root, candidate)) {
+      throw const MihonRuntimeException(
+        'PATH_TRAVERSAL',
+        'Local manga page escaped the managed image directory',
+      );
+    }
+    final File file = File(
+      p.normalize(p.absolute(p.join(imagesRoot.path, relativePaths[index]))),
+    );
+    if (!await file.exists()) {
+      throw const MihonRuntimeException(
+        'PAGE_MISSING',
+        'Local manga page is missing',
+      );
+    }
+    return file;
+  }
+
+  @override
+  String cacheIdentity(int index) {
+    if (index < 0 || index >= relativePaths.length) {
+      throw RangeError.index(index, relativePaths, 'index');
+    }
+    return relativePaths[index];
+  }
+
+  @override
+  Future<void> close() async {
+    _closed = true;
+  }
+}
+
+/// 页图（按 EXIF 方向摆正后的）宽高。
+///
+/// BUG-3041：阅读器每个页图请求（WebView 拦截 `/img/`、面板检测、在线直读首页）
+/// 都经 [MangaReaderSession.page] 走到这里。以前一律 `img.decodeImage` 整张纯
+/// Dart 解码——2400×3400 的页在桌面要 0.5~0.7 s、几十 MB 堆，iOS 自定义 scheme
+/// 又没有 HTTP 缓存，大图卷每次装窗口 / 翻页都要重付，阅读与查词一起被拖慢。
+/// 宽高只需文件头：先走与导入同一口径的 [probeOrientedImageSize]（JPEG 读到
+/// SOF + EXIF 方向、PNG 读 IHDR、WebP 读 VP8 头，零像素解码），认不出的格式
+/// （GIF / 损坏头）才回退后台 isolate 整张解码，结果与从前一致。
+Future<({int width, int height})?> mangaImageDimensions(
+  Uint8List bytes,
+) async {
+  if (bytes.isEmpty) return null;
+  final ({int width, int height})? probed = probeOrientedImageSize(bytes);
+  if (probed != null) return probed;
+  return Isolate.run<({int width, int height})?>(() {
+    try {
+      final img.Image? decoded = img.decodeImage(bytes);
+      if (decoded == null) return null;
+      final img.Image oriented = img.bakeOrientation(decoded);
+      return (width: oriented.width, height: oriented.height);
+    } on Object {
+      return null;
+    }
+  });
+}
+
+String mangaImageContentType(Uint8List bytes) {
+  if (bytes.length >= 8 &&
+      bytes[0] == 0x89 &&
+      bytes[1] == 0x50 &&
+      bytes[2] == 0x4e &&
+      bytes[3] == 0x47) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 &&
+      bytes[0] == 0xff &&
+      bytes[1] == 0xd8 &&
+      bytes[2] == 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 6 &&
+      (String.fromCharCodes(bytes.take(6)) == 'GIF89a' ||
+          String.fromCharCodes(bytes.take(6)) == 'GIF87a')) {
+    return 'image/gif';
+  }
+  if (bytes.length >= 12 &&
+      String.fromCharCodes(bytes.take(4)) == 'RIFF' &&
+      String.fromCharCodes(bytes.skip(8).take(4)) == 'WEBP') {
+    return 'image/webp';
+  }
+  return 'application/octet-stream';
+}

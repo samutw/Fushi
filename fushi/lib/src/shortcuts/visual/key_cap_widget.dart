@@ -1,0 +1,205 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart' hide ModifierKey;
+import 'package:fushi/src/utils/adaptive/adaptive_platform.dart';
+import 'package:fushi/src/utils/components/fushi_design_tokens.dart';
+import 'package:fushi/src/utils/components/glass/fushi_apple_palette.dart';
+
+/// 单个键帽（TODO-612 阶段 1；TODO-942 立体键帽换皮）。
+///
+/// 纯展示 + 点击入口：渲染键面 label、按 [bound] 高亮（已绑键位 = primary 容器色），
+/// [onTap] 非空时整键可点（InkWell）。`Key('keycap_<keyId>')` 由 [KeyboardLayoutView]
+/// 注入，供 widget 行为测试 tap 定位。本 widget 不持有任何绑定状态，高亮与否完全由
+/// 上层 [ReverseBindingIndex] 决定后传入。
+///
+/// 立体观感（TODO-942）：双层结构——底层「键帽侧壁」用更深的容器色 + 底部偏移，顶层
+/// 「键面」上移露出侧壁台阶，顶面顶部一条淡高光。所有颜色/圆角/字号走 MD3 token
+/// （`FushiDesignTokens` + `colorScheme` 派生），不含任何裸圆角/裸字号/裸容器层级
+/// 字面量（过 md3 静态守卫）。
+class KeyCapWidget extends StatelessWidget {
+  const KeyCapWidget({
+    super.key,
+    required this.logicalKey,
+    required this.label,
+    required this.bound,
+    this.onTap,
+    this.isModifier = false,
+    this.width,
+    this.height = 44,
+  });
+
+  /// 本键帽代表的逻辑键（用于上层判定高亮 / 路由点击；本 widget 不直接读绑定）。
+  final LogicalKeyboardKey logicalKey;
+
+  /// 键面显示文本（如 'A'、'Esc'、'Ctrl'）。
+  final String label;
+
+  /// 是否已绑（已绑高亮）。
+  final bool bound;
+
+  /// 点击回调；null 表示该键不可改（图上只读展示，改绑走列表 dialog 兜底）。
+  final VoidCallback? onTap;
+
+  /// 是否为修饰键（Ctrl/Shift/Alt/Win）：用 secondaryContainer 分区色区分，恒只读。
+  final bool isModifier;
+
+  /// 键帽宽度；null 时由父布局约束（如 Wrap 内按内容自适应）。
+  final double? width;
+
+  /// 键帽整体高度（含立体台阶）。
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final ColorScheme scheme = theme.colorScheme;
+    // Apple：macOS 键盘观感——平顶实色键帽、圆角 6、底部只露 1px 暗边，无渐变
+    // 高光、无描边；已绑键是强调色实底 + onAccent 字（选中态走强调色）。
+    final bool glass = isGlassDesign(context);
+    final FushiAppleColors apple = appleColorsOf(context);
+    final BorderRadius radius = glass
+        ? const BorderRadius.all(Radius.circular(6))
+        : tokens.radii.chipRadius;
+
+    // 立体台阶高度（侧壁露出量）。键面相对侧壁上移 stepHeight。
+    final double stepHeight = glass ? 1 : 3;
+
+    // 三态配色，全走 scheme 派生：
+    // - bound：primaryContainer 顶面 / primary 侧壁 / onPrimaryContainer 字。
+    // - modifier：secondaryContainer 顶面 / 更深侧壁分区。
+    // - normal(unbound)：card 顶面 / group 侧壁。
+    final Color faceColor;
+    final Color sideColor;
+    final Color fg;
+    final Color borderColor;
+    if (glass) {
+      final bool dark = scheme.brightness == Brightness.dark;
+      // 浅色白键压在分组灰底上、深色 #2C2C2E 键压在 #1C1C1E 分组上。
+      final Color keyFace =
+          dark ? apple.tertiaryGroupedBackground : apple.groupedBackground;
+      if (bound) {
+        faceColor = apple.accent;
+        sideColor = Color.alphaBlend(
+          Colors.black.withValues(alpha: 0.28),
+          apple.accent,
+        );
+        fg = apple.onAccent;
+      } else if (isModifier) {
+        faceColor = Color.alphaBlend(apple.fill, keyFace);
+        sideColor = apple.opaqueSeparator;
+        fg = apple.secondaryLabel;
+      } else {
+        faceColor = keyFace;
+        sideColor = apple.opaqueSeparator;
+        fg = apple.label;
+      }
+      borderColor = Colors.transparent;
+    } else if (bound) {
+      faceColor = scheme.primaryContainer;
+      sideColor = scheme.primary;
+      fg = scheme.onPrimaryContainer;
+      borderColor = scheme.primary;
+    } else if (isModifier) {
+      faceColor = scheme.secondaryContainer;
+      sideColor = scheme.outlineVariant;
+      fg = scheme.onSecondaryContainer;
+      borderColor = scheme.outlineVariant;
+    } else {
+      faceColor = tokens.surfaces.card;
+      sideColor = tokens.surfaces.group;
+      fg = scheme.onSurfaceVariant;
+      borderColor = scheme.outlineVariant;
+    }
+
+    // 顶面顶部高光：一条极淡的表面渐变（scheme 派生，不硬编码颜色）。
+    final Color highlightColor = scheme.surface.withValues(alpha: 0.35);
+
+    final Widget face = Container(
+      // [width] 为 null 时按内容收宽（Wrap / Row 里的独立键帽）：
+      // `Align.widthFactor: 1` 让键面宽 = 文字宽 + 内边距，高度仍撑满。以前
+      // 这里是无因子的 center 对齐、侧壁又全是 Positioned，Stack 只能取父约束
+      // 的最大宽——引导页的 ⌃ ⌥ D 三枚键帽各占满一整行（BUG-3203）。
+      constraints:
+          width == null ? BoxConstraints(minWidth: height - stepHeight) : null,
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      decoration: BoxDecoration(
+        borderRadius: radius,
+        border: glass
+            ? null
+            : Border.all(
+                color: borderColor,
+                width: bound ? 1.5 : 1,
+              ),
+        color: glass ? faceColor : null,
+        gradient: glass
+            ? null
+            : LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: <Color>[
+                  Color.alphaBlend(highlightColor, faceColor),
+                  faceColor,
+                ],
+                stops: const <double>[0.0, 0.5],
+              ),
+      ),
+      child: Align(
+        widthFactor: width == null ? 1 : null,
+        child: _label(theme, fg),
+      ),
+    );
+
+    // 双层立体键帽：底层侧壁（占满高，深色），顶层键面（上移露出底部台阶）。
+    final Widget cap = SizedBox(
+      width: width,
+      height: height,
+      child: Stack(
+        children: <Widget>[
+          // 侧壁（底层）：填满，底部露出 stepHeight 的深色台阶。
+          Positioned.fill(
+            child: DecoratedBox(
+              decoration: BoxDecoration(
+                color: sideColor,
+                borderRadius: radius,
+              ),
+            ),
+          ),
+          // 键面（顶层）：顶部对齐、底部留 stepHeight 露台阶。非定位子节点，
+          // Stack 的尺寸由它决定（宽度见 face 的注释）。
+          Padding(
+            padding: EdgeInsets.only(bottom: stepHeight),
+            child: face,
+          ),
+        ],
+      ),
+    );
+
+    if (onTap == null) return cap;
+
+    return Material(
+      type: MaterialType.transparency,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: radius,
+        child: cap,
+      ),
+    );
+  }
+
+  /// 键面文字。Mac 示意图的键印「符号 + 换行 + 名字」（⌘ / command、⌦ / delete），
+  /// 两行在窄键上整体等比缩小而不是截成省略号；其余单行、放不下省略。
+  Widget _label(ThemeData theme, Color fg) {
+    final bool twoLine = label.contains('\n');
+    final Widget text = Text(
+      label,
+      maxLines: twoLine ? 2 : 1,
+      overflow: twoLine ? TextOverflow.visible : TextOverflow.ellipsis,
+      textAlign: TextAlign.center,
+      style: theme.textTheme.labelMedium?.copyWith(
+        color: fg,
+        fontWeight: bound ? FontWeight.w600 : FontWeight.w500,
+      ),
+    );
+    return twoLine ? FittedBox(fit: BoxFit.scaleDown, child: text) : text;
+  }
+}

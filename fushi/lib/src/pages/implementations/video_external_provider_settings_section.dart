@@ -1,0 +1,1640 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:path/path.dart' as p;
+import 'package:fushi/src/media/torrent/builtin_video_resource_sources.dart';
+import 'package:fushi_engine/media/torrent/torznab_client.dart';
+import 'package:fushi_engine/media/torrent/anime_download_config.dart';
+import 'package:fushi_engine/media/video/download/video_download_backend_identity.dart';
+import 'package:fushi_engine/media/video/download/video_download_path_mapping.dart';
+import 'package:fushi_engine/media/video/jimaku_client.dart';
+import 'package:fushi_engine/media/video/subtitle/open_subtitles_client.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/pages/implementations/source_toggle_section.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi/src/settings/settings_schema_widgets.dart'
+    show SettingsSectionFooter;
+import 'package:fushi/src/settings/settings_search.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+@immutable
+class ManagedVideoSourceOption {
+  const ManagedVideoSourceOption({
+    required this.id,
+    required this.label,
+    required this.rootPath,
+  });
+
+  final int id;
+  final String label;
+  final String rootPath;
+}
+
+@immutable
+class VideoExternalSettingsSnapshot {
+  const VideoExternalSettingsSnapshot({
+    this.torznabConfigs = const <TorznabIndexerConfig>[],
+    this.openSubtitlesConfig,
+    this.jimakuApiKey = '',
+    this.jimakuEnabled = true,
+    this.subdlApiKey = '',
+    this.subdlEnabled = true,
+    this.ajattEnabled = true,
+    this.disabledBuiltinSourceIds = const <String>{},
+    this.pathMappings = const <VideoDownloadBackendPathMappingConfig>[],
+    this.managedVideoSources = const <ManagedVideoSourceOption>[],
+    this.targetSourceId,
+    this.preferredSubtitleLanguage = '',
+    this.suggestedBackendProfileId = '',
+  });
+
+  final List<TorznabIndexerConfig> torznabConfigs;
+  final OpenSubtitlesConfig? openSubtitlesConfig;
+
+  /// Jimaku 的 API key。
+  final String jimakuApiKey;
+
+  /// Jimaku 是否参与字幕搜索。与 [jimakuApiKey] 组成 `enabled && key` 双门控，
+  /// 形状与 OpenSubtitles（`enabled` 长在它的 config 里）并列。
+  ///
+  /// **默认 true**：本开关出现之前「填了 key」即启用，默认 false 会让存量用户
+  /// 升级后 Jimaku 无声失效。
+  final bool jimakuEnabled;
+
+  /// SubDL 的 API key（搜索必须带 key，站点 panel 免费生成）。
+  final String subdlApiKey;
+
+  /// SubDL 是否参与字幕搜索。与 [subdlApiKey] 组成 `enabled && key` 双门控，
+  /// 形状与 Jimaku 逐字同形。默认 true：key 为空即不装配。
+  final bool subdlEnabled;
+
+  /// AJATT 日语字幕库（kitsunekko 镜像）是否参与字幕搜索。零配置源，只有开关，
+  /// 默认 true（没填任何 key 的用户唯一能用的源）。
+  final bool ajattEnabled;
+
+  /// 用户停用的内置资源索引器 id（[kBuiltinVideoResourceSources] 的子集）。
+  /// 装的是「停用」而不是「启用」：新内置源上线即默认参与，不需要迁移写入。
+  final Set<String> disabledBuiltinSourceIds;
+  final List<VideoDownloadBackendPathMappingConfig> pathMappings;
+  final List<ManagedVideoSourceOption> managedVideoSources;
+  final int? targetSourceId;
+  final String preferredSubtitleLanguage;
+  final String suggestedBackendProfileId;
+}
+
+abstract interface class VideoExternalSettingsStore {
+  Future<VideoExternalSettingsSnapshot> load();
+
+  Future<void> saveTorznabConfigs(List<TorznabIndexerConfig> configs);
+
+  Future<void> saveOpenSubtitlesConfig(OpenSubtitlesConfig config);
+
+  Future<void> saveJimakuApiKey(String apiKey);
+
+  Future<void> saveJimakuEnabled(bool enabled);
+
+  Future<void> saveSubdlApiKey(String apiKey);
+
+  Future<void> saveSubdlEnabled(bool enabled);
+
+  Future<void> saveAjattEnabled(bool enabled);
+
+  /// 开/关一个内置资源索引器（[kBuiltinVideoResourceSources] 里的 id）。
+  Future<void> saveBuiltinSourceEnabled(String sourceId, bool enabled);
+
+  Future<void> savePathMappings(
+    List<VideoDownloadBackendPathMappingConfig> mappings,
+  );
+
+  Future<void> saveTargetSourceId(int? sourceId);
+
+  Future<void> savePreferredSubtitleLanguage(String language);
+}
+
+class AppVideoExternalSettingsStore implements VideoExternalSettingsStore {
+  const AppVideoExternalSettingsStore(this.appModel);
+
+  final AppModel appModel;
+
+  @override
+  Future<VideoExternalSettingsSnapshot> load() async {
+    final List<MediaSourceRow> rows = await appModel.database
+        .getMediaSourcesByKind('video');
+    final List<ManagedVideoSourceOption> sources = <ManagedVideoSourceOption>[];
+    for (final MediaSourceRow row in rows) {
+      if (row.transport != 'local' || !p.isAbsolute(row.rootPath)) continue;
+      if (!await Directory(row.rootPath).exists()) continue;
+      sources.add(
+        ManagedVideoSourceOption(
+          id: row.id,
+          label: row.label,
+          rootPath: row.rootPath,
+        ),
+      );
+    }
+    final int? storedTarget = appModel.prefsRepo.videoDownloadTargetSourceId;
+    final int? target =
+        sources.any(
+          (ManagedVideoSourceOption source) => source.id == storedTarget,
+        )
+        ? storedTarget
+        : null;
+    final QbConnectionConfig torrentConfig = effectiveTorrentConfig(
+      appModel.qbConnectionConfig,
+    );
+    String suggestedBackendProfileId = '';
+    try {
+      suggestedBackendProfileId = buildVideoDownloadBackendIdentity(
+        config: torrentConfig,
+        resolvedBackend: QbConnectionConfig.backendQbittorrent,
+        embeddedInstallationId: '',
+      ).profileId;
+    } on ArgumentError {
+      // An unconfigured qB endpoint has no stable profile identity yet.
+    }
+    return VideoExternalSettingsSnapshot(
+      torznabConfigs: appModel.prefsRepo.videoResourceTorznabConfigs,
+      openSubtitlesConfig: appModel.prefsRepo.videoSubtitleOpenSubtitlesConfig,
+      jimakuApiKey: appModel.jimakuApiKey,
+      jimakuEnabled: appModel.jimakuEnabled,
+      subdlApiKey: appModel.videoSubtitleSubdlApiKey,
+      subdlEnabled: appModel.videoSubtitleSubdlEnabled,
+      ajattEnabled: appModel.videoSubtitleAjattEnabled,
+      disabledBuiltinSourceIds: appModel.videoResourceDisabledSourceIds,
+      pathMappings: appModel.prefsRepo.videoDownloadBackendPathMappings,
+      managedVideoSources: sources,
+      targetSourceId: target,
+      preferredSubtitleLanguage: appModel.jimakuDefaultLanguage,
+      suggestedBackendProfileId: suggestedBackendProfileId,
+    );
+  }
+
+  @override
+  Future<void> saveTorznabConfigs(List<TorznabIndexerConfig> configs) async {
+    await appModel.prefsRepo.setVideoResourceTorznabConfigs(configs);
+    await appModel.reloadVideoDownloadPipelineRuntime();
+  }
+
+  @override
+  Future<void> saveOpenSubtitlesConfig(OpenSubtitlesConfig config) async {
+    await appModel.prefsRepo.setVideoSubtitleOpenSubtitlesConfig(config);
+    await appModel.reloadVideoDownloadPipelineRuntime();
+  }
+
+  @override
+  // `setJimakuApiKey` 自己会重建下载流水线运行时（字幕 registry 按 key 非空注册），
+  // 所以这里不再补一次 reload。
+  Future<void> saveJimakuApiKey(String apiKey) =>
+      appModel.setJimakuApiKey(apiKey.trim());
+
+  @override
+  // 同上：`setJimakuEnabled` 自己重建下载流水线运行时。
+  Future<void> saveJimakuEnabled(bool enabled) =>
+      appModel.setJimakuEnabled(enabled);
+
+  @override
+  // 同上：`setVideoSubtitleSubdlApiKey` 自己重建下载流水线运行时。
+  Future<void> saveSubdlApiKey(String apiKey) =>
+      appModel.setVideoSubtitleSubdlApiKey(apiKey.trim());
+
+  @override
+  // 同上：`setVideoSubtitleSubdlEnabled` 自己重建下载流水线运行时。
+  Future<void> saveSubdlEnabled(bool enabled) =>
+      appModel.setVideoSubtitleSubdlEnabled(enabled);
+
+  @override
+  // 同上：`setVideoSubtitleAjattEnabled` 自己重建下载流水线运行时。
+  Future<void> saveAjattEnabled(bool enabled) =>
+      appModel.setVideoSubtitleAjattEnabled(enabled);
+
+  @override
+  Future<void> saveBuiltinSourceEnabled(String sourceId, bool enabled) =>
+      appModel.setVideoResourceSourceEnabled(sourceId, enabled);
+
+  @override
+  Future<void> savePathMappings(
+    List<VideoDownloadBackendPathMappingConfig> mappings,
+  ) => appModel.prefsRepo.setVideoDownloadBackendPathMappings(mappings);
+
+  @override
+  Future<void> saveTargetSourceId(int? sourceId) =>
+      appModel.prefsRepo.setVideoDownloadTargetSourceId(sourceId);
+
+  @override
+  Future<void> savePreferredSubtitleLanguage(String language) =>
+      appModel.setJimakuDefaultLanguage(language);
+}
+
+/// [VideoExternalProviderSettingsSection] 渲染哪一段。
+///
+/// 这份组件的 store 快照里混着三种东西，此前用一个 `onlySubtitleSources` 布尔
+/// 把它们切成「字幕来源」与「其余全部」两半——而「其余」又同时装着在线索引器
+/// （第三方 API）和下载落盘的路径映射（纯本机管道）。两者归属不同设置分区
+/// （在线服务 / 下载），布尔切不开，所以按内容命名成三段，各挂各的家。
+enum VideoExternalProviderScope {
+  /// 在线字幕来源：Jimaku + OpenSubtitles + SubDL + AJATT + 默认字幕语言。
+  ///
+  /// 两家 registry 是并列的（`video_subtitle_registry.dart`：动漫搜 Jimaku +
+  /// OpenSubtitles，其余只搜 OpenSubtitles），所以两家必须并列出现在同一节里；
+  /// 只列一家会让用户以为另一家不存在（用户 2026-08-18 反馈，BUG-1712）。
+  subtitleSources,
+  jimaku,
+  openSubtitles,
+  subdl,
+  subtitlePreferences,
+
+  /// 资源索引器：随包内置来源开关 + Torznab 索引器。
+  resourceSources,
+  builtinSources,
+  torznab,
+
+  /// 下载落盘管道：下载后端路径映射 + 下载目标视频来源。不是在线服务，留在
+  /// 「下载」分区。
+  downloadRouting,
+}
+
+/// 发现/下载闭环所依赖的设备本地外部配置。
+///
+/// 密钥字段始终遮罩；端点只有通过 provider 自身的 HTTPS/loopback 安全校验后才写入
+/// Preferences。表单错误只显示稳定的本地化提示，不把含密钥的 URL 或异常正文写进
+/// snack、日志或诊断导出。
+class VideoExternalProviderSettingsSection extends ConsumerStatefulWidget {
+  const VideoExternalProviderSettingsSection({
+    super.key,
+    required this.scope,
+    this.store,
+  });
+
+  /// 测试注入口；生产路径从 [AppModel] 构造设备本地 store。
+  final VideoExternalSettingsStore? store;
+
+  /// 渲染哪一段（见 [VideoExternalProviderScope]）。三段写同一个 store，各自只
+  /// 保存自己那段的字段（`_save*` 按字段落盘，不整份快照回写）。
+  final VideoExternalProviderScope scope;
+
+  @override
+  ConsumerState<VideoExternalProviderSettingsSection> createState() =>
+      _VideoExternalProviderSettingsSectionState();
+}
+
+class _VideoExternalProviderSettingsSectionState
+    extends ConsumerState<VideoExternalProviderSettingsSection> {
+  VideoExternalSettingsStore? _store;
+  bool _loading = true;
+  bool _saveFailed = false;
+  Future<void> _saveTail = Future<void>.value();
+  List<_TorznabDraft> _torznab = <_TorznabDraft>[];
+  late _OpenSubtitlesDraft _openSubtitles;
+  List<_PathMappingDraft> _mappings = <_PathMappingDraft>[];
+  List<ManagedVideoSourceOption> _sources = <ManagedVideoSourceOption>[];
+  int? _targetSourceId;
+  String _preferredLanguage = '';
+  String _jimakuApiKey = '';
+  bool _jimakuEnabled = true;
+  String _subdlApiKey = '';
+  bool _subdlEnabled = true;
+  bool _ajattEnabled = true;
+  Set<String> _disabledBuiltinSources = const <String>{};
+  String _suggestedBackendProfileId = '';
+  Timer? _torznabSaveDebounce;
+  Timer? _openSubtitlesSaveDebounce;
+  Timer? _jimakuSaveDebounce;
+  Timer? _subdlSaveDebounce;
+  Timer? _mappingSaveDebounce;
+
+  @override
+  void initState() {
+    super.initState();
+    _openSubtitles = _OpenSubtitlesDraft.fromConfig(null);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _load());
+  }
+
+  @override
+  void dispose() {
+    final bool flushTorznab = _torznabSaveDebounce?.isActive ?? false;
+    final bool flushOpenSubtitles =
+        _openSubtitlesSaveDebounce?.isActive ?? false;
+    final bool flushJimaku = _jimakuSaveDebounce?.isActive ?? false;
+    final bool flushSubdl = _subdlSaveDebounce?.isActive ?? false;
+    final bool flushMappings = _mappingSaveDebounce?.isActive ?? false;
+    _torznabSaveDebounce?.cancel();
+    _openSubtitlesSaveDebounce?.cancel();
+    _jimakuSaveDebounce?.cancel();
+    _subdlSaveDebounce?.cancel();
+    _mappingSaveDebounce?.cancel();
+    if (flushTorznab) unawaited(_saveTorznabIfValid());
+    if (flushOpenSubtitles) unawaited(_saveOpenSubtitlesIfValid());
+    if (flushJimaku) unawaited(_saveJimakuApiKey());
+    if (flushSubdl) unawaited(_saveSubdlApiKey());
+    if (flushMappings) unawaited(_saveMappingsIfValid());
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final VideoExternalSettingsStore? injected = widget.store;
+    final AppModel? appModel = injected == null ? ref.read(appProvider) : null;
+    final VideoExternalSettingsStore? store =
+        injected ??
+        (appModel!.isPreferencesReady && appModel.isDatabaseReady
+            ? AppVideoExternalSettingsStore(appModel)
+            : null);
+    if (store == null) {
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
+    _store = store;
+    try {
+      final VideoExternalSettingsSnapshot snapshot = await store.load();
+      if (!mounted) return;
+      setState(() {
+        _torznab = snapshot.torznabConfigs
+            .map(_TorznabDraft.fromConfig)
+            .toList(growable: true);
+        _openSubtitles = _OpenSubtitlesDraft.fromConfig(
+          snapshot.openSubtitlesConfig,
+        );
+        _mappings = snapshot.pathMappings
+            .map(_PathMappingDraft.fromConfig)
+            .toList(growable: true);
+        _sources = snapshot.managedVideoSources;
+        _targetSourceId = snapshot.targetSourceId;
+        _preferredLanguage = snapshot.preferredSubtitleLanguage;
+        _jimakuApiKey = snapshot.jimakuApiKey;
+        _jimakuEnabled = snapshot.jimakuEnabled;
+        _subdlApiKey = snapshot.subdlApiKey;
+        _subdlEnabled = snapshot.subdlEnabled;
+        _ajattEnabled = snapshot.ajattEnabled;
+        _disabledBuiltinSources = snapshot.disabledBuiltinSourceIds;
+        _suggestedBackendProfileId = snapshot.suggestedBackendProfileId;
+        _loading = false;
+      });
+    } on Object {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _saveFailed = true;
+        });
+      }
+    }
+  }
+
+  Future<void> _save(Future<void> Function(VideoExternalSettingsStore) task) {
+    final VideoExternalSettingsStore? store = _store;
+    if (store == null) return Future<void>.value();
+    _saveTail = _saveTail.then((_) async {
+      try {
+        await task(store);
+        if (mounted && _saveFailed) setState(() => _saveFailed = false);
+      } on Object {
+        if (mounted) setState(() => _saveFailed = true);
+      }
+    });
+    return _saveTail;
+  }
+
+  Future<void> _saveTorznabIfValid() async {
+    _torznabSaveDebounce?.cancel();
+    _torznabSaveDebounce = null;
+    final List<TorznabIndexerConfig> configs = <TorznabIndexerConfig>[];
+    for (final _TorznabDraft draft in _torznab) {
+      final TorznabIndexerConfig? config = draft.toConfig();
+      if (config == null) return;
+      configs.add(config);
+    }
+    await _save(
+      (VideoExternalSettingsStore store) => store.saveTorznabConfigs(configs),
+    );
+  }
+
+  Future<void> _saveOpenSubtitlesIfValid() async {
+    _openSubtitlesSaveDebounce?.cancel();
+    _openSubtitlesSaveDebounce = null;
+    final OpenSubtitlesConfig? config = _openSubtitles.toConfig();
+    if (config == null) return;
+    await _save(
+      (VideoExternalSettingsStore store) =>
+          store.saveOpenSubtitlesConfig(config),
+    );
+  }
+
+  Future<void> _saveMappingsIfValid() async {
+    _mappingSaveDebounce?.cancel();
+    _mappingSaveDebounce = null;
+    final List<VideoDownloadBackendPathMappingConfig> mappings =
+        <VideoDownloadBackendPathMappingConfig>[];
+    for (final _PathMappingDraft draft in _mappings) {
+      final VideoDownloadBackendPathMappingConfig? mapping = draft.toConfig();
+      if (mapping == null) return;
+      mappings.add(mapping);
+    }
+    await _save(
+      (VideoExternalSettingsStore store) => store.savePathMappings(mappings),
+    );
+  }
+
+  void _updateTorznab(int index, _TorznabDraft value) {
+    setState(() => _torznab[index] = value);
+    _torznabSaveDebounce?.cancel();
+    _torznabSaveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_saveTorznabIfValid()),
+    );
+  }
+
+  void _updateOpenSubtitles(_OpenSubtitlesDraft value) {
+    setState(() => _openSubtitles = value);
+    _openSubtitlesSaveDebounce?.cancel();
+    _openSubtitlesSaveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_saveOpenSubtitlesIfValid()),
+    );
+  }
+
+  void _updateJimakuApiKey(String value) {
+    _jimakuApiKey = value;
+    _jimakuSaveDebounce?.cancel();
+    _jimakuSaveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_saveJimakuApiKey()),
+    );
+  }
+
+  Future<void> _saveJimakuApiKey() {
+    final String apiKey = _jimakuApiKey;
+    return _save(
+      (VideoExternalSettingsStore store) => store.saveJimakuApiKey(apiKey),
+    );
+  }
+
+  void _updateSubdlApiKey(String value) {
+    _subdlApiKey = value;
+    _subdlSaveDebounce?.cancel();
+    _subdlSaveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_saveSubdlApiKey()),
+    );
+  }
+
+  Future<void> _saveSubdlApiKey() {
+    final String apiKey = _subdlApiKey;
+    return _save(
+      (VideoExternalSettingsStore store) => store.saveSubdlApiKey(apiKey),
+    );
+  }
+
+  void _updateMapping(int index, _PathMappingDraft value) {
+    setState(() => _mappings[index] = value);
+    _mappingSaveDebounce?.cancel();
+    _mappingSaveDebounce = Timer(
+      const Duration(milliseconds: 500),
+      () => unawaited(_saveMappingsIfValid()),
+    );
+  }
+
+  /// 小节标题：实现在 [SourceSectionHeading]（发现来源开关区渲染的是同一份）。
+  /// `theme` 参数保留是为了不动本文件里十来个调用点的形状。
+  Widget _sectionHeading(
+    ThemeData theme,
+    String title,
+    String hint, {
+    IconData? icon,
+  }) => SourceSectionHeading(title: title, hint: hint, icon: icon);
+
+  Widget _field({
+    required Key key,
+    required String label,
+    required String initialValue,
+    required ValueChanged<String> onChanged,
+    String? hint,
+    String? helper,
+    String? errorText,
+    bool secret = false,
+    TextInputType? keyboardType,
+  }) {
+    // 宽度由整段的外层容器（[_alignSectionBaseline]）统一承接，字段自己不再加
+    // 一层 maxWidth——那份局部限宽正是几何撕裂的来源：同一个 Column 里输入框缩到
+    // 480、Switch 吃满 stretch 紧约束占满整宽、用户名/密码 Row 又各占一半，
+    // 三种行三套左右边界。这条契约现在写在 [SettingsFormField] 上，下载设置那段
+    // 用的是同一个原语。
+    final Widget field = SettingsFormField(
+      key: key,
+      label: label,
+      initialValue: initialValue,
+      obscureText: secret,
+      keyboardType: keyboardType,
+      hintText: hint,
+      helperText: helper,
+      errorText: errorText,
+      onChanged: onChanged,
+    );
+    final String? target = key is ValueKey<String>
+        ? const <String, String>{
+            'video-jimaku-api-key': 'services.jimaku.api_key',
+            'video-subdl-api-key': 'services.subdl.api_key',
+            'video-opensubtitles-endpoint': 'services.opensubtitles.endpoint',
+            'video-opensubtitles-api-key': 'services.opensubtitles.api_key',
+            'video-opensubtitles-username': 'services.opensubtitles.username',
+            'video-opensubtitles-password': 'services.opensubtitles.password',
+            'video-opensubtitles-user-agent':
+                'services.opensubtitles.user_agent',
+          }[key.value]
+        : null;
+    return target == null
+        ? field
+        : SettingsSearchTarget(id: target, child: field);
+  }
+
+  Widget _torznabCard(ThemeData theme, int index) {
+    final _TorznabDraft draft = _torznab[index];
+    // M3E：每个索引器一张描边卡（卡 20 圆角），卡头 = 形状底图标 + 启用开关 +
+    // 删除；卡间距 8 与分段列表同一节奏。
+    return FushiCard(
+      key: ValueKey<String>('video-torznab-${draft.id}'),
+      variant: FushiCardVariant.outlined,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.fromLTRB(16, 12, 12, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Row(
+            children: <Widget>[
+              FushiListLeadingIcon(
+                FushiIcons.travelExplore,
+                shape: FushiLeadingShape.square,
+                tone: draft.enabled
+                    ? FushiCardTone.primary
+                    : FushiCardTone.secondary,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FushiSwitchListTile.adaptive(
+                  key: ValueKey<String>('video-torznab-$index-enabled'),
+                  contentPadding: EdgeInsets.zero,
+                  dense: true,
+                  title: Text(t.video_external_enabled),
+                  value: draft.enabled,
+                  onChanged: (bool value) =>
+                      _updateTorznab(index, draft.copyWith(enabled: value)),
+                ),
+              ),
+              FushiIconButtonControl(
+                key: ValueKey<String>('video-torznab-$index-remove'),
+                tooltip: t.video_external_remove,
+                onPressed: () {
+                  setState(() => _torznab.removeAt(index));
+                  _saveTorznabIfValid();
+                },
+                icon: const FushiIcon(FushiIcons.delete),
+              ),
+            ],
+          ),
+          _field(
+            key: ValueKey<String>('video-torznab-$index-name'),
+            label: t.video_torznab_name,
+            initialValue: draft.name,
+            errorText: draft.name.trim().isEmpty
+                ? t.video_external_save_error
+                : null,
+            onChanged: (String value) =>
+                _updateTorznab(index, draft.copyWith(name: value)),
+          ),
+          _field(
+            key: ValueKey<String>('video-torznab-$index-endpoint'),
+            label: t.video_torznab_endpoint,
+            initialValue: draft.endpoint,
+            helper: t.video_torznab_endpoint_hint,
+            keyboardType: TextInputType.url,
+            errorText: draft.hasValidEndpoint
+                ? null
+                : t.video_external_endpoint_invalid,
+            onChanged: (String value) =>
+                _updateTorznab(index, draft.copyWith(endpoint: value)),
+          ),
+          _field(
+            key: ValueKey<String>('video-torznab-$index-api-key'),
+            label: t.video_torznab_api_key,
+            initialValue: draft.apiKey,
+            secret: true,
+            onChanged: (String value) =>
+                _updateTorznab(index, draft.copyWith(apiKey: value)),
+          ),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Expanded(
+                child: _field(
+                  key: ValueKey<String>('video-torznab-$index-priority'),
+                  label: t.video_torznab_priority,
+                  initialValue: draft.priority,
+                  keyboardType: TextInputType.number,
+                  errorText: int.tryParse(draft.priority.trim()) == null
+                      ? t.video_external_save_error
+                      : null,
+                  onChanged: (String value) =>
+                      _updateTorznab(index, draft.copyWith(priority: value)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _field(
+                  key: ValueKey<String>('video-torznab-$index-categories'),
+                  label: t.video_torznab_categories,
+                  initialValue: draft.categories,
+                  helper: t.video_torznab_categories_hint,
+                  keyboardType: TextInputType.number,
+                  errorText: draft.categoriesValid
+                      ? null
+                      : t.video_external_categories_invalid,
+                  onChanged: (String value) =>
+                      _updateTorznab(index, draft.copyWith(categories: value)),
+                ),
+              ),
+            ],
+          ),
+          FushiSwitchListTile.adaptive(
+            key: ValueKey<String>('video-torznab-$index-insecure-http'),
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            title: Text(t.video_external_insecure_http),
+            subtitle: Text(t.video_external_insecure_http_hint),
+            value: draft.allowInsecureHttp,
+            onChanged: (bool value) =>
+                _updateTorznab(index, draft.copyWith(allowInsecureHttp: value)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _openSubtitlesFields() {
+    final _OpenSubtitlesDraft draft = _openSubtitles;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        FushiSwitchListTile.adaptive(
+          key: const ValueKey<String>('video-opensubtitles-enabled'),
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: Text(t.video_external_enabled),
+          value: draft.enabled,
+          onChanged: (bool value) =>
+              _updateOpenSubtitles(draft.copyWith(enabled: value)),
+        ),
+        _field(
+          key: const ValueKey<String>('video-opensubtitles-endpoint'),
+          label: t.video_opensubtitles_endpoint,
+          initialValue: draft.endpoint,
+          helper: t.video_torznab_endpoint_hint,
+          keyboardType: TextInputType.url,
+          errorText: draft.hasValidEndpoint
+              ? null
+              : t.video_external_endpoint_invalid,
+          onChanged: (String value) =>
+              _updateOpenSubtitles(draft.copyWith(endpoint: value)),
+        ),
+        _field(
+          key: const ValueKey<String>('video-opensubtitles-api-key'),
+          label: t.video_external_api_key,
+          initialValue: draft.apiKey,
+          secret: true,
+          helper:
+              draft
+                      .copyWith(apiKey: '')
+                      .toConfig()
+                      ?.effectiveApiKey
+                      .isNotEmpty ==
+                  true
+              ? t.video_opensubtitles_app_key_hint
+              : null,
+          onChanged: (String value) =>
+              _updateOpenSubtitles(draft.copyWith(apiKey: value)),
+        ),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Expanded(
+              child: _field(
+                key: const ValueKey<String>('video-opensubtitles-username'),
+                label: t.video_external_username_optional,
+                initialValue: draft.username,
+                onChanged: (String value) =>
+                    _updateOpenSubtitles(draft.copyWith(username: value)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: _field(
+                key: const ValueKey<String>('video-opensubtitles-password'),
+                label: t.video_external_password_optional,
+                initialValue: draft.password,
+                secret: true,
+                onChanged: (String value) =>
+                    _updateOpenSubtitles(draft.copyWith(password: value)),
+              ),
+            ),
+          ],
+        ),
+        _field(
+          key: const ValueKey<String>('video-opensubtitles-user-agent'),
+          label: t.video_opensubtitles_user_agent,
+          initialValue: draft.userAgent,
+          errorText: draft.userAgent.trim().isEmpty
+              ? t.video_external_save_error
+              : null,
+          onChanged: (String value) =>
+              _updateOpenSubtitles(draft.copyWith(userAgent: value)),
+        ),
+        FushiSwitchListTile.adaptive(
+          key: const ValueKey<String>('video-opensubtitles-insecure-http'),
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: Text(t.video_external_insecure_http),
+          subtitle: Text(t.video_external_insecure_http_hint),
+          value: draft.allowInsecureHttp,
+          onChanged: (bool value) =>
+              _updateOpenSubtitles(draft.copyWith(allowInsecureHttp: value)),
+        ),
+      ],
+    );
+  }
+
+  /// Jimaku：启用开关 + 一把 key，`enabled && key` 双门控。
+  ///
+  /// 开关与 OpenSubtitles 那个逐字同形（同一个 `video_external_enabled` 标签、
+  /// 同一种 SwitchListTile），因为两家在 registry 里本来就是并列的来源；一家有
+  /// 开关一家没有，用户只会以为「Jimaku 关不掉」。
+  ///
+  /// key 输入框这里不 setState —— 输入框自己持有文本，重建只会把光标弹回去。
+  Widget _jimakuFields() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        FushiSwitchListTile.adaptive(
+          key: const ValueKey<String>('video-jimaku-enabled'),
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: Text(t.video_external_enabled),
+          subtitle: Text(t.video_jimaku_enabled_hint, maxLines: 3),
+          value: _jimakuEnabled,
+          onChanged: (bool value) {
+            setState(() => _jimakuEnabled = value);
+            _save(
+              (VideoExternalSettingsStore store) =>
+                  store.saveJimakuEnabled(value),
+            );
+          },
+        ),
+        _field(
+          key: const ValueKey<String>('video-jimaku-api-key'),
+          label: t.video_jimaku_api_key,
+          initialValue: _jimakuApiKey,
+          helper: t.video_jimaku_api_key_hint,
+          secret: true,
+          onChanged: _updateJimakuApiKey,
+        ),
+      ],
+    );
+  }
+
+  /// SubDL：开关 + API key，与 [_jimakuFields] 逐字同形（同一种双门控）。
+  Widget _subdlFields() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        FushiSwitchListTile.adaptive(
+          key: const ValueKey<String>('video-subdl-enabled'),
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          title: Text(t.video_external_enabled),
+          subtitle: Text(t.video_subdl_enabled_hint, maxLines: 3),
+          value: _subdlEnabled,
+          onChanged: (bool value) {
+            setState(() => _subdlEnabled = value);
+            _save(
+              (VideoExternalSettingsStore store) =>
+                  store.saveSubdlEnabled(value),
+            );
+          },
+        ),
+        _field(
+          key: const ValueKey<String>('video-subdl-api-key'),
+          label: t.video_external_api_key,
+          initialValue: _subdlApiKey,
+          helper: t.video_subdl_api_key_hint,
+          secret: true,
+          onChanged: _updateSubdlApiKey,
+        ),
+      ],
+    );
+  }
+
+  /// 默认字幕语言：两家 provider 共用的**一个**偏好（存量键名
+  /// `jimaku_default_language` 冻结不追改），所以它属于「字幕来源」这一节，
+  /// 而不是某一家的卡片内字段——此前它长在 OpenSubtitles 块里，读起来像
+  /// 「OpenSubtitles 的首选语言」，实际连 Jimaku 一起管。
+  Widget _subtitleLanguageField() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: SizedBox(
+        width: double.infinity,
+        child: FushiDropdownButtonFormField<String>(
+          key: const ValueKey<String>('video-subtitle-default-language'),
+          initialValue: _preferredLanguage,
+          // `isExpanded` + 逐项省略：不加的话 DropdownButton 按**内容固有宽度**
+          // 排版，长标签在 360px 紧凑布局里直接横向溢出（`compact layout has no
+          // horizontal overflow` 会红）。这里的选项以前全是 `日本語` / `中文`
+          // 这类两三字的短标签，才一直没暴露；`''` 从「全部」改成「跟随视频语言」
+          // 后就撞上了——而且这不是中文特有：17 份 i18n 里未翻译的那些落的是英文
+          // 原串 `Follow video language`，比中文还长。所以修的是约束，不是文案。
+          isExpanded: true,
+          decoration: InputDecoration(
+            labelText: t.video_setting_jimaku_default_language,
+            helperText: t.video_setting_jimaku_default_language_hint,
+            helperMaxLines: 3,
+            isDense: true,
+            border: const OutlineInputBorder(),
+          ),
+          items: <DropdownMenuItem<String>>[
+            DropdownMenuItem<String>(
+              value: '',
+              // 与设置页那份同一语义：`''` = 跟随视频语言，不是「全部」。
+              child: Text(
+                t.video_jimaku_language_follow_video,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            for (final String language in kJimakuLanguageCodes)
+              DropdownMenuItem<String>(
+                value: language,
+                child: Text(
+                  jimakuLanguageLabel(language),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+          ],
+          onChanged: (String? value) {
+            final String language = value ?? '';
+            setState(() => _preferredLanguage = language);
+            _save(
+              (VideoExternalSettingsStore store) =>
+                  store.savePreferredSubtitleLanguage(language),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 两家在线字幕来源 + 共用的默认语言。设置 → 视频 → 字幕与设置 → 下载 →
+  /// 外部资源与字幕来源渲染的是同一份。
+  List<Widget> _subtitleSourceBlocks(ThemeData theme) {
+    return <Widget>[
+      _sectionHeading(
+        theme,
+        // 品牌名，不进 i18n（同设置页 TMDB 的处理）。
+        'Jimaku',
+        t.video_jimaku_scope_hint,
+        icon: FushiIcons.subtitles,
+      ),
+      _jimakuFields(),
+      _sectionHeading(
+        theme,
+        t.video_opensubtitles_settings_title,
+        t.video_opensubtitles_settings_hint,
+        icon: FushiIcons.subtitles,
+      ),
+      _openSubtitlesFields(),
+      _sectionHeading(
+        theme,
+        // 品牌名，不进 i18n（同 Jimaku）。
+        'SubDL',
+        t.video_subdl_settings_hint,
+        icon: FushiIcons.subtitles,
+      ),
+      _subdlFields(),
+      _sectionHeading(
+        theme,
+        // 品牌名，不进 i18n（同 Jimaku）。
+        'AJATT',
+        t.video_ajatt_settings_hint,
+        icon: FushiIcons.subtitles,
+      ),
+      _ajattFields(),
+      _subtitleLanguageField(),
+    ];
+  }
+
+  /// AJATT 只有一个开关：零配置、无 key、无配额（见 `ajatt_catalog.dart` 文件头）。
+  Widget _ajattFields() {
+    return FushiSwitchListTile.adaptive(
+      key: const ValueKey<String>('video-ajatt-enabled'),
+      contentPadding: EdgeInsets.zero,
+      dense: true,
+      title: Text(t.video_external_enabled),
+      subtitle: Text(t.video_ajatt_enabled_hint, maxLines: 3),
+      value: _ajattEnabled,
+      onChanged: (bool value) {
+        setState(() => _ajattEnabled = value);
+        _save(
+          (VideoExternalSettingsStore store) => store.saveAjattEnabled(value),
+        );
+      },
+    );
+  }
+
+  /// 随应用内置、零配置的资源来源，逐个可停用。
+  ///
+  /// 用户打开这一区只看到「Torznab（空）」，合理推论是「这个 app 自己没有任何
+  /// 来源」——但动漫一直在搜内置 Nyaa，电影/剧集一直在搜内置公共索引器。行是从
+  /// [kBuiltinVideoResourceSources] 遍历出来的（同一张表也用来构造 provider），
+  /// 所以「设置里列的」与「真去搜的」不可能对不上。
+  ///
+  /// 开关与「发现来源」区渲染同一个 [SourceToggleList]：两处都是「一组零配置内置
+  /// 源按 id 记停用」，没有第二种形状的理由。
+  Widget _builtinSourcesBlock(ThemeData theme) {
+    return Column(
+      key: const ValueKey<String>('video-builtin-sources'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        _sectionHeading(
+          theme,
+          t.video_builtin_sources_title,
+          t.video_builtin_sources_hint,
+          icon: FushiIcons.verified,
+        ),
+        SourceToggleList(
+          keyPrefix: 'video-builtin-source',
+          rows: <SourceToggleRow>[
+            for (final BuiltinVideoResourceSource source
+                in kBuiltinVideoResourceSources)
+              SourceToggleRow(
+                id: source.id,
+                title: source.displayName,
+                subtitle: source.hint(),
+                enabled: !_disabledBuiltinSources.contains(source.id),
+              ),
+          ],
+          onChanged: (String sourceId, bool enabled) async {
+            setState(() {
+              final Set<String> next = <String>{..._disabledBuiltinSources};
+              if (enabled) {
+                next.remove(sourceId);
+              } else {
+                next.add(sourceId);
+              }
+              _disabledBuiltinSources = next;
+            });
+            await _save(
+              (VideoExternalSettingsStore store) =>
+                  store.saveBuiltinSourceEnabled(sourceId, enabled),
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  /// 把整段落到与普通设置行同一条 16px 左右基线上，正文吃满剩下的宽度。
+  ///
+  /// 这一段此前三种行各有一套左右边界：输入框自己缩到 480；`SwitchListTile`
+  /// 直接吃 `CrossAxisAlignment.stretch` 的紧约束、贴到 pane 最右；用户名/密码
+  /// 的 `Row` 又是全宽再各占一半。宽窗下看起来就是「输入框只占左半边、开关孤零
+  /// 零在最右、中间一大片空白」。
+  ///
+  /// 左右基线由本组件自己承接（`rowHorizontal`，与 `DiscoverySourceSettingsSection`
+  /// / 普通设置行同一条）：设置 schema 的 `SettingsCustomItem` 是裸渲染、不给
+  /// 内边距，此前本段被宿主 [TorrentSettingsSection] 包着才有边距，一旦单独挂进
+  /// 设置分区就整块贴到卡片左沿，标题/输入框比上一行的图标还靠左（用户截图）。
+  ///
+  /// BUG-1858：基线之外此前还收了一层 560 右边界（BUG-1084/BUG-1278 的结论）。
+  /// 但那层只加在本组件和下载设置上，同一个「在线服务」页里下面的元数据刮削行
+  /// （`SettingsTextItem`）照旧撑满 pane——于是一页之内两种输入框宽度。用户
+  /// 2026-08-25 实报并拍板统一成撑满，右边界这层随之删除：全 app 设置输入框只
+  /// 剩「吃满内容区」这一条规则（见 [SettingsFormField] 的宽度契约）。
+  Widget _alignSectionBaseline(BuildContext context, Widget content) {
+    return Padding(
+      padding: EdgeInsets.symmetric(
+        horizontal: FushiDesignTokens.of(context).spacing.rowHorizontal,
+      ),
+      child: SizedBox(width: double.infinity, child: content),
+    );
+  }
+
+  Widget _saveFailedBanner(ThemeData theme) => Padding(
+    padding: const EdgeInsets.only(top: 8, bottom: 8),
+    child: FushiInlineNotice(
+      message: t.video_external_save_error,
+      severity: FushiNoticeSeverity.error,
+      icon: FushiIcons.error,
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const FushiLoadingView();
+    }
+    if (_store == null) return const SizedBox.shrink();
+    final ThemeData theme = Theme.of(context);
+    // 下载落盘管道是「下载设置」里的一页：渲染成真正的设置分组（MD3 分段卡 /
+    // Apple inset grouped），分组自己承接行基线，不再套本组件的表单基线。
+    if (widget.scope == VideoExternalProviderScope.downloadRouting) {
+      return Column(
+        key: ValueKey<VideoExternalProviderScope>(widget.scope),
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          if (_saveFailed)
+            _alignSectionBaseline(context, _saveFailedBanner(theme)),
+          ..._downloadRoutingGroups(theme),
+        ],
+      );
+    }
+    final List<Widget> blocks = switch (widget.scope) {
+      VideoExternalProviderScope.jimaku => <Widget>[_jimakuFields()],
+      VideoExternalProviderScope.openSubtitles => <Widget>[
+        _openSubtitlesFields(),
+      ],
+      VideoExternalProviderScope.subdl => <Widget>[_subdlFields()],
+      VideoExternalProviderScope.subtitlePreferences => <Widget>[
+        _sectionHeading(theme, 'AJATT', t.video_ajatt_settings_hint),
+        _ajattFields(),
+        _subtitleLanguageField(),
+      ],
+      VideoExternalProviderScope.builtinSources => <Widget>[
+        _builtinSourcesBlock(theme),
+      ],
+      VideoExternalProviderScope.torznab => _torznabBlocks(theme),
+      VideoExternalProviderScope.subtitleSources => _subtitleSourceBlocks(
+        theme,
+      ),
+      VideoExternalProviderScope.resourceSources => _resourceSourceBlocks(
+        theme,
+      ),
+      // 上面已提前返回分组形态。
+      VideoExternalProviderScope.downloadRouting => const <Widget>[],
+    };
+    return _alignSectionBaseline(
+      context,
+      Column(
+        key: ValueKey<VideoExternalProviderScope>(widget.scope),
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          if (_saveFailed) _saveFailedBanner(theme),
+          ...blocks,
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+
+  /// 资源索引器：内置来源开关 + Torznab 索引器。
+  List<Widget> _resourceSourceBlocks(ThemeData theme) {
+    return <Widget>[
+      _builtinSourcesBlock(theme),
+      const FushiDividerControl(height: 32),
+      ..._torznabBlocks(theme),
+    ];
+  }
+
+  List<Widget> _torznabBlocks(ThemeData theme) {
+    return <Widget>[
+      _sectionHeading(
+        theme,
+        t.video_torznab_settings_title,
+        t.video_torznab_settings_hint,
+        icon: FushiIcons.travelExplore,
+      ),
+      for (int index = 0; index < _torznab.length; index++)
+        _torznabCard(theme, index),
+      Align(
+        alignment: Alignment.centerLeft,
+        child: FushiFilledButton.tonalIcon(
+          key: const ValueKey<String>('video-torznab-add'),
+          onPressed: () => setState(
+            () => _torznab.add(_TorznabDraft.empty(_newDraftId('torznab'))),
+          ),
+          icon: const FushiIcon(FushiIcons.add),
+          label: Text(t.video_torznab_add),
+        ),
+      ),
+    ];
+  }
+
+  /// 下载落盘管道：路径映射 + 下载目标视频来源，每块都是真正的设置分组。
+  ///
+  /// 每条映射是一个独立分组（三个输入行 + 删除行），「添加映射」是映射分组之后
+  /// 的一个动作分组，分组标题只挂在第一个分组上、说明落在脚注里——不再是卡片
+  /// 套卡片 + 自绘小节标题 + 硬分割线。
+  List<Widget> _downloadRoutingGroups(ThemeData theme) {
+    final String mappingsTitle = t.video_download_path_mappings_title;
+    final List<Widget> mappingGroups = <Widget>[
+      for (int index = 0; index < _mappings.length; index++)
+        _mappingGroup(index, title: index == 0 ? mappingsTitle : null),
+      AdaptiveSettingsSection(
+        key: const ValueKey<String>('video-path-mapping-add-group'),
+        title: _mappings.isEmpty ? mappingsTitle : null,
+        children: <Widget>[
+          AdaptiveSettingsRow(
+            key: const ValueKey<String>('video-path-mapping-add'),
+            title: t.video_download_path_mapping_add,
+            icon: FushiIcons.add,
+            showIcon: true,
+            onTap: () => setState(
+              () => _mappings.add(
+                _PathMappingDraft.empty(
+                  _newDraftId('mapping'),
+                  suggestedBackendProfileId: _suggestedBackendProfileId,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+      SettingsSectionFooter(t.video_download_path_mappings_hint),
+    ];
+    return <Widget>[
+      SettingsSearchTarget(
+        id: 'downloads.path_mappings',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: mappingGroups,
+        ),
+      ),
+      SettingsSearchTarget(
+        id: 'downloads.target_source',
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            AdaptiveSettingsSection(
+              title: t.video_download_target_source_title,
+              children: <Widget>[
+                if (_sources.isEmpty)
+                  AdaptiveSettingsRow(
+                    title: t.video_download_target_source_none,
+                    subtitle: t.video_download_target_source_empty,
+                  )
+                else
+                  Padding(
+                    padding: EdgeInsets.symmetric(
+                      horizontal:
+                          FushiDesignTokens.of(context).spacing.rowHorizontal,
+                      vertical: 10,
+                    ),
+                    child: _targetSourceField(theme),
+                  ),
+              ],
+            ),
+            SettingsSectionFooter(t.video_download_target_source_hint),
+          ],
+        ),
+      ),
+    ];
+  }
+
+  /// 一条路径映射的分组：三个输入行（标题在上、输入框在下撑满行宽）+ 删除行。
+  /// 非法值的提示挂在输入框自己的错误态上。
+  Widget _mappingGroup(int index, {String? title}) {
+    final _PathMappingDraft draft = _mappings[index];
+    Widget input({
+      required String keySuffix,
+      required String label,
+      required String initialValue,
+      required String? errorText,
+      required ValueChanged<String> onChanged,
+    }) {
+      return AdaptiveSettingsRow(
+        title: label,
+        controlBelow: true,
+        trailing: FushiTextFormFieldControl(
+          key: ValueKey<String>('video-path-mapping-$index-$keySuffix'),
+          initialValue: initialValue,
+          decoration: InputDecoration(
+            errorText: errorText,
+            isDense: true,
+            border: const OutlineInputBorder(),
+          ),
+          onChanged: onChanged,
+        ),
+      );
+    }
+
+    return AdaptiveSettingsSection(
+      key: ValueKey<String>('video-path-mapping-${draft.id}'),
+      title: title,
+      children: <Widget>[
+        input(
+          keySuffix: 'profile',
+          label: t.video_download_backend_profile_id,
+          initialValue: draft.backendProfileId,
+          errorText: draft.backendProfileId.trim().isEmpty
+              ? t.video_download_path_mapping_invalid
+              : null,
+          onChanged: (String value) =>
+              _updateMapping(index, draft.copyWith(backendProfileId: value)),
+        ),
+        input(
+          keySuffix: 'remote',
+          label: t.video_download_remote_root,
+          initialValue: draft.remoteRoot,
+          errorText: draft.remoteRoot.trim().isEmpty
+              ? t.video_download_path_mapping_invalid
+              : null,
+          onChanged: (String value) =>
+              _updateMapping(index, draft.copyWith(remoteRoot: value)),
+        ),
+        input(
+          keySuffix: 'local',
+          label: t.video_download_local_root,
+          initialValue: draft.localRoot,
+          errorText: p.isAbsolute(draft.localRoot.trim())
+              ? null
+              : t.video_download_path_mapping_invalid,
+          onChanged: (String value) =>
+              _updateMapping(index, draft.copyWith(localRoot: value)),
+        ),
+        AdaptiveSettingsRow(
+          key: ValueKey<String>('video-path-mapping-$index-remove'),
+          title: t.video_external_remove,
+          icon: FushiIcons.delete,
+          showIcon: true,
+
+          onTap: () {
+            setState(() => _mappings.removeAt(index));
+            _saveMappingsIfValid();
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _targetSourceField(ThemeData theme) {
+    return FushiDropdownButtonFormField<int>(
+      key: ValueKey<String>('video-target-source-${_targetSourceId ?? 'none'}'),
+      initialValue: _targetSourceId ?? 0,
+      // 分组标题已经说明这是什么，下拉框自己不再挂浮动标签。
+      decoration: const InputDecoration(
+        isDense: true,
+        border: OutlineInputBorder(),
+      ),
+      isExpanded: true,
+      items: <DropdownMenuItem<int>>[
+        DropdownMenuItem<int>(
+          value: 0,
+          child: Text(t.video_download_target_source_none),
+        ),
+        for (final ManagedVideoSourceOption source in _sources)
+          DropdownMenuItem<int>(
+            value: source.id,
+            child: Text(
+              '${source.label} — ${source.rootPath}',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+      ],
+      onChanged: (int? sourceId) {
+        final int? selected = sourceId == 0 ? null : sourceId;
+        setState(() => _targetSourceId = selected);
+        _save(
+          (VideoExternalSettingsStore store) =>
+              store.saveTargetSourceId(selected),
+        );
+      },
+    );
+  }
+}
+
+String _newDraftId(String prefix) => newVideoExternalRecordId(prefix);
+
+/// 新 Torznab 索引器 / 路径映射草稿的 id。设置页与控制通道共用。
+String newVideoExternalRecordId(String prefix) =>
+    '$prefix-${DateTime.now().microsecondsSinceEpoch}';
+
+/// 表单字段 → Torznab 索引器配置；任一字段不合法返回 null（端点须过 provider
+/// 自身的 HTTPS/loopback 校验、不带 query / userinfo / fragment；优先级整数；
+/// 分类逗号分隔的非负整数）。设置页与控制通道共用同一份校验。
+TorznabIndexerConfig? torznabConfigFromFields({
+  required String id,
+  required String name,
+  required String endpoint,
+  required String apiKey,
+  required bool enabled,
+  required String priority,
+  required String categories,
+  required bool allowInsecureHttp,
+}) => _TorznabDraft(
+  id: id,
+  name: name,
+  endpoint: endpoint,
+  apiKey: apiKey,
+  enabled: enabled,
+  priority: priority,
+  categories: categories,
+  allowInsecureHttp: allowInsecureHttp,
+).toConfig();
+
+/// 表单字段 → OpenSubtitles 配置；端点不合法或 User-Agent 为空返回 null。
+/// 用户名 / 密码空串 = 不登录。设置页与控制通道共用同一份校验。
+OpenSubtitlesConfig? openSubtitlesConfigFromFields({
+  required String endpoint,
+  required String apiKey,
+  required String username,
+  required String password,
+  required String userAgent,
+  required bool enabled,
+  required bool allowInsecureHttp,
+}) => _OpenSubtitlesDraft(
+  endpoint: endpoint,
+  apiKey: apiKey,
+  username: username,
+  password: password,
+  userAgent: userAgent,
+  enabled: enabled,
+  allowInsecureHttp: allowInsecureHttp,
+).toConfig();
+
+/// 表单字段 → 下载后端路径映射；三项任一为空或本机根不是绝对路径返回 null。
+/// 设置页与控制通道共用同一份校验。
+VideoDownloadBackendPathMappingConfig? videoDownloadPathMappingFromFields({
+  required String backendProfileId,
+  required String remoteRoot,
+  required String localRoot,
+}) => _PathMappingDraft(
+  id: '',
+  backendProfileId: backendProfileId,
+  remoteRoot: remoteRoot,
+  localRoot: localRoot,
+).toConfig();
+
+/// 路径映射记录的稳定 id（设置页草稿与控制通道同一写法）。
+String videoDownloadPathMappingId(VideoDownloadBackendPathMappingConfig m) =>
+    '${m.backendProfileId}:${m.remoteRoot}';
+
+@immutable
+class _TorznabDraft {
+  const _TorznabDraft({
+    required this.id,
+    required this.name,
+    required this.endpoint,
+    required this.apiKey,
+    required this.enabled,
+    required this.priority,
+    required this.categories,
+    required this.allowInsecureHttp,
+  });
+
+  factory _TorznabDraft.empty(String id) => _TorznabDraft(
+    id: id,
+    name: '',
+    endpoint: '',
+    apiKey: '',
+    enabled: true,
+    priority: '100',
+    categories: '',
+    allowInsecureHttp: false,
+  );
+
+  factory _TorznabDraft.fromConfig(TorznabIndexerConfig config) =>
+      _TorznabDraft(
+        id: config.id,
+        name: config.name,
+        endpoint: config.endpoint.toString(),
+        apiKey: config.apiKey,
+        enabled: config.enabled,
+        priority: '${config.priority}',
+        categories: config.categories.join(','),
+        allowInsecureHttp: config.allowInsecureHttp,
+      );
+
+  final String id;
+  final String name;
+  final String endpoint;
+  final String apiKey;
+  final bool enabled;
+  final String priority;
+  final String categories;
+  final bool allowInsecureHttp;
+
+  List<int>? get parsedCategories {
+    if (categories.trim().isEmpty) return const <int>[];
+    final List<int> values = <int>[];
+    for (final String raw in categories.split(',')) {
+      final int? value = int.tryParse(raw.trim());
+      if (value == null || value < 0) return null;
+      values.add(value);
+    }
+    return values;
+  }
+
+  bool get categoriesValid => parsedCategories != null;
+
+  bool get hasValidEndpoint => _parseEndpoint() != null;
+
+  TorznabEndpointParts? _parseEndpoint() {
+    try {
+      final Uri raw = Uri.parse(endpoint.trim());
+      if (raw.hasQuery || raw.userInfo.isNotEmpty || raw.hasFragment) {
+        return null;
+      }
+      final TorznabEndpointParts parts = splitTorznabEndpointCredentials(
+        endpoint,
+        apiKey: apiKey,
+      );
+      TorznabIndexerConfig(
+        id: id,
+        name: name,
+        endpoint: parts.endpoint,
+        apiKey: parts.apiKey,
+        allowInsecureHttp: allowInsecureHttp,
+      );
+      return parts;
+    } on Object {
+      return null;
+    }
+  }
+
+  TorznabIndexerConfig? toConfig() {
+    final TorznabEndpointParts? parts = _parseEndpoint();
+    final int? parsedPriority = int.tryParse(priority.trim());
+    final List<int>? parsed = parsedCategories;
+    if (name.trim().isEmpty ||
+        parts == null ||
+        parsedPriority == null ||
+        parsed == null) {
+      return null;
+    }
+    try {
+      return TorznabIndexerConfig(
+        id: id,
+        name: name.trim(),
+        endpoint: parts.endpoint,
+        apiKey: parts.apiKey,
+        enabled: enabled,
+        priority: parsedPriority,
+        categories: parsed,
+        allowInsecureHttp: allowInsecureHttp,
+      );
+    } on Object {
+      return null;
+    }
+  }
+
+  _TorznabDraft copyWith({
+    String? name,
+    String? endpoint,
+    String? apiKey,
+    bool? enabled,
+    String? priority,
+    String? categories,
+    bool? allowInsecureHttp,
+  }) => _TorznabDraft(
+    id: id,
+    name: name ?? this.name,
+    endpoint: endpoint ?? this.endpoint,
+    apiKey: apiKey ?? this.apiKey,
+    enabled: enabled ?? this.enabled,
+    priority: priority ?? this.priority,
+    categories: categories ?? this.categories,
+    allowInsecureHttp: allowInsecureHttp ?? this.allowInsecureHttp,
+  );
+}
+
+@immutable
+class _OpenSubtitlesDraft {
+  const _OpenSubtitlesDraft({
+    required this.endpoint,
+    required this.apiKey,
+    required this.username,
+    required this.password,
+    required this.userAgent,
+    required this.enabled,
+    required this.allowInsecureHttp,
+  });
+
+  /// 未配置态同样走 [OpenSubtitlesConfig.unconfigured]，不再另写一份默认。
+  ///
+  /// BUG-2429：这里曾有一个 `empty()` 把 `enabled` 硬写成 false（与 config 的构造
+  /// 默认相反），于是用户一进本页、随便碰一个字段，debounce 保存就把这个没人选过的
+  /// false 落盘，内置应用密钥从此失效。
+  factory _OpenSubtitlesDraft.fromConfig(OpenSubtitlesConfig? config) {
+    final OpenSubtitlesConfig source =
+        config ?? OpenSubtitlesConfig.unconfigured();
+    return _OpenSubtitlesDraft(
+      endpoint: source.baseUrl.toString(),
+      apiKey: source.apiKey,
+      username: source.username ?? '',
+      password: source.password ?? '',
+      userAgent: source.userAgent,
+      enabled: source.enabled,
+      allowInsecureHttp: source.allowInsecureHttp,
+    );
+  }
+
+  final String endpoint;
+  final String apiKey;
+  final String username;
+  final String password;
+  final String userAgent;
+  final bool enabled;
+  final bool allowInsecureHttp;
+
+  bool get hasValidEndpoint => toConfig() != null;
+
+  OpenSubtitlesConfig? toConfig() {
+    final Uri? parsed = Uri.tryParse(endpoint.trim());
+    if (parsed == null || userAgent.trim().isEmpty) return null;
+    try {
+      return OpenSubtitlesConfig(
+        apiKey: apiKey,
+        username: username.trim().isEmpty ? null : username.trim(),
+        password: password.isEmpty ? null : password,
+        userAgent: userAgent.trim(),
+        baseUrl: parsed,
+        enabled: enabled,
+        allowInsecureHttp: allowInsecureHttp,
+      );
+    } on Object {
+      return null;
+    }
+  }
+
+  _OpenSubtitlesDraft copyWith({
+    String? endpoint,
+    String? apiKey,
+    String? username,
+    String? password,
+    String? userAgent,
+    bool? enabled,
+    bool? allowInsecureHttp,
+  }) => _OpenSubtitlesDraft(
+    endpoint: endpoint ?? this.endpoint,
+    apiKey: apiKey ?? this.apiKey,
+    username: username ?? this.username,
+    password: password ?? this.password,
+    userAgent: userAgent ?? this.userAgent,
+    enabled: enabled ?? this.enabled,
+    allowInsecureHttp: allowInsecureHttp ?? this.allowInsecureHttp,
+  );
+}
+
+@immutable
+class _PathMappingDraft {
+  const _PathMappingDraft({
+    required this.id,
+    required this.backendProfileId,
+    required this.remoteRoot,
+    required this.localRoot,
+  });
+
+  factory _PathMappingDraft.empty(
+    String id, {
+    String suggestedBackendProfileId = '',
+  }) => _PathMappingDraft(
+    id: id,
+    backendProfileId: suggestedBackendProfileId,
+    remoteRoot: '',
+    localRoot: '',
+  );
+
+  factory _PathMappingDraft.fromConfig(
+    VideoDownloadBackendPathMappingConfig config,
+  ) => _PathMappingDraft(
+    id: videoDownloadPathMappingId(config),
+    backendProfileId: config.backendProfileId,
+    remoteRoot: config.remoteRoot,
+    localRoot: config.localRoot,
+  );
+
+  final String id;
+  final String backendProfileId;
+  final String remoteRoot;
+  final String localRoot;
+
+  VideoDownloadBackendPathMappingConfig? toConfig() {
+    final VideoDownloadBackendPathMappingConfig value =
+        VideoDownloadBackendPathMappingConfig(
+          backendProfileId: backendProfileId.trim(),
+          remoteRoot: remoteRoot.trim(),
+          localRoot: localRoot.trim(),
+        );
+    return value.isValid && p.isAbsolute(value.localRoot) ? value : null;
+  }
+
+  _PathMappingDraft copyWith({
+    String? backendProfileId,
+    String? remoteRoot,
+    String? localRoot,
+  }) => _PathMappingDraft(
+    id: id,
+    backendProfileId: backendProfileId ?? this.backendProfileId,
+    remoteRoot: remoteRoot ?? this.remoteRoot,
+    localRoot: localRoot ?? this.localRoot,
+  );
+}

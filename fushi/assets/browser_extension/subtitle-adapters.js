@@ -1,0 +1,470 @@
+// TODO-1000 per-site 字幕 + 时间戳读取。Netflix 字幕是明文 DOM（非 DRM），可直接读；
+// 只有视频帧/音频受 DRM。与 bridge-shim.js 同 content-script isolated world，顶层 function
+// 互相可见（挖词时由 bridge-shim.js 的 mineEntry 分支调用）。
+
+function extractNetflixCueText(container) {
+  if (!container) return '';
+  const spans = container.querySelectorAll('.player-timedtext-text-container span, span');
+  // TODO-1270 Bug A：Netflix 把每行字幕包成「外层定位 span > 内层样式 span」的嵌套结构，
+  // 父 span 的 textContent 已含子 span 全文。若把每一层 span 的 textContent 都拼进来，同一句
+  // 字幕会按嵌套层数重复（用户报「卡里字幕重复两次」）。只取**叶子** span（无后代 span），
+  // 每段文本恰好一次；扁平（无嵌套）时行为不变。
+  const leaves = Array.from(spans).filter(
+    (s) => !(s.querySelector && s.querySelector('span')));
+  return leaves
+    .map((s) => s.textContent || '')
+    .join('')
+    .trim();
+}
+
+function currentVideoTimeMs(video) {
+  if (!video || typeof video.currentTime !== 'number') return null;
+  return Math.round(video.currentTime * 1000);
+}
+
+function netflixVideoIdFromPath(pathname) {
+  const m = (pathname || '').match(/\/watch\/(\d+)/);
+  return m ? m[1] : null;
+}
+
+// 浏览器运行时入口（非测试）：定位 Netflix 字幕容器 + 播放器 video 元素。
+function netflixSubtitleContainer() {
+  return typeof document !== 'undefined' ? document.querySelector('.player-timedtext') : null;
+}
+function netflixVideoEl() {
+  return typeof document !== 'undefined' ? document.querySelector('video') : null;
+}
+
+// BUG-676（TODO-1361 ③）：网飞制卡的「视频名」= Anki `{document-title}` 字段。扩展 mineClip 此前
+// 不发 documentTitle → 服务端 buildImmersionRequest 回落成字面「Netflix」(immersion_capture_channel.dart:90)，
+// 卡片视频名全是「Netflix」而非剧名（YouTube 由服务端解析真实标题，故有剧名 → 二者不一致）。
+// 这里从播放器标题栏 [data-uia="video-title"] 抽「系列名 - 集信息」(语言无关)，回落 document.title
+// 去掉尾部「- Netflix」。传 [doc] 便于 node 单测（缺省用全局 document）。
+function netflixDocumentTitle(doc) {
+  const d = doc || (typeof document !== 'undefined' ? document : null);
+  if (!d || typeof d.querySelector !== 'function') return '';
+  let el = null;
+  try { el = d.querySelector('[data-uia="video-title"]'); } catch (_) { el = null; }
+  if (el) {
+    const h4 = typeof el.querySelector === 'function' ? el.querySelector('h4') : null;
+    const series = h4 ? String(h4.textContent || '').trim() : '';
+    const spans = typeof el.querySelectorAll === 'function' ? el.querySelectorAll('span') : [];
+    const parts = [];
+    for (const s of spans) {
+      const t = String((s && s.textContent) || '').trim();
+      if (t && parts.indexOf(t) < 0) parts.push(t);
+    }
+    const episode = parts.join(' ').trim();
+    const combined = [series, episode].filter(Boolean).join(' - ');
+    if (combined) return combined;
+    const whole = String(el.textContent || '').trim();
+    if (whole) return whole;
+  }
+  return String((d.title) || '').replace(/\s*[-–—|]\s*Netflix\s*$/i, '').trim();
+}
+
+
+// ── TODO-1219 P1：整集字幕纯函数解析器 ──
+// 主世界 netflix-bridge.js 抓来 timedtext 原文（WebVTT / TTML），交给隔离世界这里解析。
+// 纯函数、正则实现，绝不依赖 DOMParser（node 测试环境无 DOMParser，隔离世界也保持一致）。
+// 统一输出 [{ startMs:number, endMs:number, text:string }]。
+
+// 解析单个时间戳为毫秒。支持：
+//   WebVTT/SRT 时钟：HH:MM:SS.mmm / HH:MM:SS,mmm / MM:SS.mmm
+//   TTML 偏移：<num>s（秒） / <num>ms / <num>t（tick，需 tickRate，TTML 默认 1e7）
+function parseSubtitleTimestamp(raw, tickRate) {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  const off = s.match(/^([0-9]+(?:\.[0-9]+)?)(ms|s|t)$/);
+  if (off) {
+    const n = parseFloat(off[1]);
+    const unit = off[2];
+    if (unit === 'ms') return Math.round(n);
+    if (unit === 's') return Math.round(n * 1000);
+    // 't'（tick）：ms = n / tickRate * 1000；TTML 默认 tickRate 常见为 1e7。
+    const rate = tickRate && tickRate > 0 ? tickRate : 10000000;
+    return Math.round((n / rate) * 1000);
+  }
+  const clock = s.match(/^(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:[.,](\d{1,3}))?$/);
+  if (clock) {
+    const h = clock[1] ? parseInt(clock[1], 10) : 0;
+    const m = parseInt(clock[2], 10);
+    const sec = parseInt(clock[3], 10);
+    const frac = clock[4] ? parseInt((clock[4] + '000').slice(0, 3), 10) : 0;
+    return (h * 3600 + m * 60 + sec) * 1000 + frac;
+  }
+  return null;
+}
+
+// 注音（振假名）标注元素：`<rt>` 是读音本身，`<rp>` 是给不支持 ruby 的渲染器看的回退括号，
+// `<rtc>` 是读音容器。三者的内容**都不是正文**——只有 ruby base 是。光删标签保留内容会把读音
+// 拼进正文（`<ruby>震<rt>ふる</rt></ruby>` → `震ふる`），于是列表里读音与正文并排成同级文字，
+// 查词、制卡 sentence、字幕匹配一起被污染。app 侧 strip_html_tags.dart 早为此收过口
+// （BUG-1161），这里是它在扩展侧的孪生实现，判据逐条对齐：
+//  - 一条规则同时吃「显式闭合 <rt>ふる</rt>」与「隐式闭合 <ruby>震<rt>ふる</ruby>」；
+//  - 开标签属性段写成 (?:[^<>/]|/(?!>))* 而不是 [^>]*：不许跨越 `<`（缺 `>` 的畸形开标签不能
+//    借后面的 `>` 凑合法，否则会把正文一路吃光），也不许把自闭合 `<rt/>` 当成有内容的开标签。
+//    认不出的形态整体不匹配 → 退回「只删标签」的旧行为，宁可多留一个假名也不吃掉正文。
+const RUBY_ANNOTATION = '<(?:rt|rp|rtc)\\b(?:[^<>/]|/(?!>))*>' +
+  '(?:(?!</?(?:ruby|rt|rp|rtc)\\b)[\\s\\S])*(?:</(?:rt|rp|rtc)\\s*>)?';
+
+// 方向/零宽控制字符与最小实体解码（不碰标签）。分号可选：YouTube 等的字幕流大量输出
+// 无分号形态（&#39 而非 &#39;），HTML 规范里文本上下文的字符引用本就允许省分号——
+// 只认带分号就是用户报的「字幕里出现 &#39」。十进制/十六进制/命名都补齐。
+function decodeCueEntities(text) {
+  return String(text || '')
+    .replace(/[‎‏]/g, '')
+    .replace(/&#(\d+);?/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+    .replace(/&#x([0-9a-f]+);?/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    // 命名实体：要么带分号整口吃掉，要么无分号但后不跟字母/数字/分号（HTML5 同款
+    // 边界判据；漏了这条会吐 "&lt;b&gt;"→"<;b>"、"&amphibian" 被咬这类反向事故）。
+    .replace(/&(?:lrm|rlm)(?:;|(?![0-9A-Za-z;]))/gi, '')
+    .replace(/&nbsp(?:;|(?![0-9A-Za-z;]))/gi, ' ')
+    .replace(/&lt(?:;|(?![0-9A-Za-z;]))/gi, '<')
+    .replace(/&gt(?:;|(?![0-9A-Za-z;]))/gi, '>')
+    .replace(/&quot(?:;|(?![0-9A-Za-z;]))/gi, '"')
+    .replace(/&amp(?:;|(?![0-9A-Za-z;]))/gi, '&');
+}
+
+// 去掉行内标签（<c>、<i>、<b.bg_transparent> …）并解码实体；注音内容已在上游剔除。
+function stripInlineTags(text) {
+  return decodeCueEntities(String(text || '').replace(/<[^>]*>/g, ''));
+}
+
+// 把一行字幕切成「正文段 + 可选读音」的序列：`<ruby>震<rt>ふる</rt></ruby>える` →
+// [{text:'震', reading:'ふる'}, {text:'える', reading:''}]。读音单独留着是为了让字幕列表/覆盖层
+// 能画出真正的 <ruby>（振假名在正文上方），而 cue.text 仍然只有正文——两个用途各取所需，
+// 不再让读音以同级文字的身份混进正文。没有注音时返回单段（reading 为空）。
+function splitCueRuby(text) {
+  const source = String(text || '');
+  const segments = [];
+  const rubyBlock = /<ruby\b(?:[^<>/]|\/(?!>))*>([\s\S]*?)<\/ruby\s*>/gi;
+  let cursor = 0;
+  let match;
+  const pushPlain = (raw) => {
+    const plain = stripInlineTags(raw);
+    if (plain) segments.push({ text: plain, reading: '' });
+  };
+  while ((match = rubyBlock.exec(source)) !== null) {
+    pushPlain(source.slice(cursor, match.index));
+    const inner = match[1];
+    // base = 注音整段剔除后剩下的内容；reading = 各 <rt> 的内容按序拼接（<rp> 的回退括号
+    // 不是读音，丢掉）。
+    const base = stripInlineTags(inner.replace(new RegExp(RUBY_ANNOTATION, 'gi'), ''));
+    let reading = '';
+    const rt = /<rt\b(?:[^<>/]|\/(?!>))*>((?:(?!<\/?(?:ruby|rt|rp|rtc)\b)[\s\S])*)/gi;
+    let rtMatch;
+    while ((rtMatch = rt.exec(inner)) !== null) reading += stripInlineTags(rtMatch[1]);
+    if (base) segments.push({ text: base, reading: reading });
+    else pushPlain(inner);
+    cursor = match.index + match[0].length;
+  }
+  pushPlain(source.slice(cursor));
+  // 不变式：段拼接 === stripCueTags 的正文。渲染端画的是段、查词/制卡吃的是 cue.text，两者
+  // 一旦漂开就会出现「列表上看到的字和查到的词对不上」。畸形注音（`<ruby>漢<rt かん</ruby>`
+  // 这类缺 `>` 的输入）会让上面的分段留下标签字面量——那时整行退回单段，宁可不画振假名也
+  // 不让两端分岔。
+  const joined = segments.map((seg) => seg.text).join('');
+  const plain = stripCueTags(source);
+  if (joined.trim() !== plain) {
+    return plain ? [{ text: plain, reading: '' }] : [];
+  }
+  return segments;
+}
+
+// 行内标签剥离后的**正文**（读音不在其中）。旧签名不变，调用方无需改。
+function stripCueTags(text) {
+  const withoutAnnotations = String(text || '')
+    .replace(new RegExp(RUBY_ANNOTATION, 'gi'), '');
+  return stripInlineTags(withoutAnnotations).trim();
+}
+
+// WebVTT（Netflix webvtt-lssdh-ios8）→ cues。按空行切块，含 '-->' 的块才是 cue，
+// 忽略 WEBVTT / NOTE / STYLE 头块，时间戳行尾部的 align/position 设置一并忽略。
+function parseWebVtt(text) {
+  const out = [];
+  if (!text) return out;
+  const blocks = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split(/\n\s*\n/);
+  for (const block of blocks) {
+    const lines = block.split('\n');
+    let idx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].indexOf('-->') >= 0) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) continue;
+    const m = lines[idx].match(/([0-9:.,]+)\s*-->\s*([0-9:.,]+)/);
+    if (!m) continue;
+    const startMs = parseSubtitleTimestamp(m[1]);
+    const endMs = parseSubtitleTimestamp(m[2]);
+    if (startMs == null || endMs == null) continue;
+    const body = lines
+      .slice(idx + 1)
+      .map(stripCueTags)
+      .filter((s) => s.length)
+      .join('\n')
+      .trim();
+    if (!body) continue;
+    out.push({ startMs, endMs, text: body });
+  }
+  return out;
+}
+
+// BUG-2191：IMSC 1.1 的注音不是 HTML `<ruby>/<rt>`，而是带 `tts:ruby` 属性的 `<span>`：
+//   <span tts:ruby="container"><span tts:ruby="base">地下牢</span><span tts:ruby="text">ちかろう</span></span>
+// Netflix 日文轨（dfxp-ls-sdh / imsc1.1）就是这种。上游 `stripCueTags` 只认 `<rt>`，于是
+// 读音 span 只被剥掉标签、内容留下 → 「地下牢ちかろう」拼进 cue.text，查词/制卡句子/字幕匹配
+// 一起被污染（用户卡片 Sentence 字段实录「雛宮の地下牢ちかろう は…這は い回って」）。
+// 这里先把 IMSC 形态翻译成 HTML 形态（text → <rt>，delimiter 是给不支持 ruby 的渲染器
+// 看的回退括号 → <rp>，container → <ruby>，base 解包），后面 `stripCueTags` / `splitCueRuby` 就都按
+// 同一套规则吃。注音单元收尾后紧跟的行内空白一并吃掉：Netflix 在注音 span 之间用空格
+// 断词，那个空格属于注音排版，不是正文。
+const TTML_RUBY_OPEN = /^<span\b(?:[^<>/]|\/(?!>))*?\btts:ruby\s*=\s*"(container|base|text|delimiter)"(?:[^<>/]|\/(?!>))*>$/i;
+function ttmlRubyToHtml(body) {
+  const src = String(body || '');
+  if (src.indexOf('tts:ruby') < 0) return src;
+  // 按标签流线性扫描：遇到 tts:ruby span 记住角色，其匹配的 </span> 按角色收尾。嵌套
+  // （container 包 base/text）靠栈；普通 <span>（无 tts:ruby）原样保留给 stripInlineTags。
+  const tagRe = /<\/?span\b(?:[^<>/]|\/(?!>))*\/?>/gi;
+  const stack = [];
+  let out = '';
+  let cursor = 0;
+  let m;
+  while ((m = tagRe.exec(src)) !== null) {
+    out += src.slice(cursor, m.index);
+    cursor = m.index + m[0].length;
+    const tag = m[0];
+    if (tag[1] === '/') {
+      const role = stack.pop();
+      if (role === undefined) { out += tag; continue; }
+      if (role === 'text') out += '</rt>';
+      else if (role === 'delimiter') out += '</rp>';
+      else if (role === 'container') out += '</ruby>';
+      // 注音单元（text/delimiter/container）收尾后紧跟的行内空白属于注音排版（Netflix 用它
+      // 断词），不是正文；base 收尾后的空白留给后面的 text/delimiter 收尾时一并处理。
+      if (role !== null && role !== 'base') {
+        cursor += (src.slice(cursor).match(/^[ \t　]+/) || [''])[0].length;
+      }
+      continue;
+    }
+    if (/\/>$/.test(tag)) { out += tag; continue; } // 自闭合：无内容，原样
+    const open = tag.match(TTML_RUBY_OPEN);
+    if (!open) { stack.push(null); out += tag; continue; }
+    const role = open[1].toLowerCase();
+    stack.push(role);
+    if (role === 'text') out += '<rt>';
+    else if (role === 'delimiter') out += '<rp>';
+    else if (role === 'container') out += '<ruby>';
+  }
+  return out + src.slice(cursor);
+}
+
+// TTML（Netflix dfxp-ls-sdh / imsc1.1）→ cues。正则抽 <p begin end>…</p>，<br/> 转换行。
+// 带注音的行同时挂 `cue.ruby`（分段，同 textTracks 收割路径），面板/覆盖层能画真 <ruby>。
+function parseTtml(xml) {
+  const out = [];
+  if (!xml) return out;
+  const s = String(xml);
+  const rateM = s.match(/ttp:tickRate\s*=\s*"(\d+)"/);
+  const tickRate = rateM ? parseInt(rateM[1], 10) : 0;
+  const pRe = /<p\b([^>]*)>([\s\S]*?)<\/p>/g;
+  let m;
+  while ((m = pRe.exec(s)) !== null) {
+    const attrs = m[1];
+    const beginM = attrs.match(/\bbegin\s*=\s*"([^"]*)"/);
+    const endM = attrs.match(/\bend\s*=\s*"([^"]*)"/);
+    if (!beginM || !endM) continue;
+    const startMs = parseSubtitleTimestamp(beginM[1], tickRate);
+    const endMs = parseSubtitleTimestamp(endM[1], tickRate);
+    if (startMs == null || endMs == null) continue;
+    const raw = ttmlRubyToHtml(m[2].replace(/<br\s*\/?>/gi, '\n'));
+    const body = stripCueTags(raw).trim();
+    if (!body) continue;
+    const cue = { startMs, endMs, text: body };
+    if (raw.indexOf('<rt>') >= 0) {
+      // 分段拼接必须等于正文（同 fushiAttachCueRuby 的不变式），否则宁可不画振假名。
+      const segments = splitCueRuby(raw);
+      if (segments.some((seg) => seg.reading) &&
+          segments.map((seg) => seg.text).join('').trim() === body) {
+        cue.ruby = segments;
+      }
+    }
+    out.push(cue);
+  }
+  return out;
+}
+
+// 多句合一制卡的纯函数（与 app 内 `MiningSentenceDraft` 逐字对齐——
+// `joinMinedSentences`：逐句 trim、丢空、'\n' 连接；`mergeMiningAudioRanges`：min start /
+// max end）。cues 是整轨（按 startMs 升序），idx 是当前句下标，prevN/nextN 是用户要的前/后
+// 句数；越过轨首/轨尾按真句封顶（返回的 prev/next 长度就是实际拿到的）。
+// idx 越界 → null（没有当前句就没有上下文可言）。
+function fushiComposeCueContext(cues, idx, prevN, nextN) {
+  if (!Array.isArray(cues) || typeof idx !== 'number' || idx < 0 || idx >= cues.length) return null;
+  const p = Math.max(0, Math.floor(Number(prevN) || 0));
+  const n = Math.max(0, Math.floor(Number(nextN) || 0));
+  const from = Math.max(0, idx - p);
+  const to = Math.min(cues.length - 1, idx + n);
+  const prev = [];
+  for (let i = from; i < idx; i++) prev.push(String(cues[i].text || ''));
+  const next = [];
+  for (let i = idx + 1; i <= to; i++) next.push(String(cues[i].text || ''));
+  const current = String(cues[idx].text || '');
+  const sentence = [...prev, current, ...next]
+    .map((t) => t.trim())
+    .filter((t) => t.length)
+    .join('\n');
+  let startV = cues[idx].startMs;
+  let endV = cues[idx].endMs;
+  for (let i = from; i <= to; i++) {
+    if (cues[i].startMs < startV) startV = cues[i].startMs;
+    if (cues[i].endMs > endV) endV = cues[i].endMs;
+  }
+  return {
+    prev, current, next, sentence, startV, endV,
+    prevAtMax: from === 0,
+    nextAtMax: to === cues.length - 1,
+  };
+}
+
+// BUG-2192：网飞录屏制卡的动图/静帧四周带播放器黑边——tabCapture 录的是**整个标签页视口**，
+// 视频四周的播放器黑底一起进了片段。录制那一刻按 <video> 的几何算出「可见视频画面」占视口的
+// 比例矩形，随 mineClip 发给服务端在 ffmpeg 抽帧前先 crop。
+//  - `<video>` 默认 object-fit: contain：内容矩形 = 元素框内按原始宽高比缩放后居中的那块；
+//    videoWidth/videoHeight 拿不到（DRM 有时给 0）就退回整个元素框。
+//  - 与视口求交：元素可能伸出视口，捕获帧只有视口那部分。
+//  - 用比例不用像素：tabCapture 会把视口等比缩到 ≤1920×1080，两边只有比例是同一套坐标。
+//  - 画面已铺满视口（全屏正好 16:9）→ null，服务端不裁（老路径逐字不变）。
+function fushiVideoCropFraction(video, viewportW, viewportH) {
+  if (!video || typeof video.getBoundingClientRect !== 'function') return null;
+  const vw = Number(viewportW);
+  const vh = Number(viewportH);
+  if (!(vw > 0) || !(vh > 0)) return null;
+  const r = video.getBoundingClientRect();
+  if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+  const iw = Number(video.videoWidth);
+  const ih = Number(video.videoHeight);
+  let x = r.left;
+  let y = r.top;
+  let w = r.width;
+  let h = r.height;
+  if (iw > 0 && ih > 0) {
+    const s = Math.min(r.width / iw, r.height / ih);
+    w = iw * s;
+    h = ih * s;
+    x = r.left + (r.width - w) / 2;
+    y = r.top + (r.height - h) / 2;
+  }
+  const x0 = Math.max(0, x);
+  const y0 = Math.max(0, y);
+  const x1 = Math.min(vw, x + w);
+  const y1 = Math.min(vh, y + h);
+  if (x1 - x0 < 16 || y1 - y0 < 16) return null;
+  const f = { x: x0 / vw, y: y0 / vh, w: (x1 - x0) / vw, h: (y1 - y0) / vh };
+  if (f.x <= 0.005 && f.y <= 0.005 && f.w >= 0.99 && f.h >= 0.99) return null;
+  const r4 = (n) => Math.round(n * 10000) / 10000;
+  return { x: r4(f.x), y: r4(f.y), w: r4(f.w), h: r4(f.h) };
+}
+
+// Bilibili.tv 字幕 JSON（asb 伪扩展名 bbjson）→ cues。形状：{body:[{from,to,content}]}，
+// from/to 是秒（浮点）。与其它解析器同约：纯函数、坏输入回空数组。
+function parseBilibiliJson(text) {
+  const out = [];
+  let data = null;
+  try { data = JSON.parse(String(text || '')); } catch (_) { return out; }
+  const body = data && Array.isArray(data.body) ? data.body : [];
+  for (const item of body) {
+    if (!item || typeof item.from !== 'number' || typeof item.to !== 'number') continue;
+    const t = String(item.content || '').trim();
+    if (!t) continue;
+    out.push({ startMs: Math.round(item.from * 1000), endMs: Math.round(item.to * 1000), text: t });
+  }
+  return out;
+}
+
+// ── 整轨优先仲裁的共享纯函数（TODO-1219 收口）──
+// 面板（subtitle-panel.js）与制卡链路（content.js）共用同一份判据：整集拦截轨是主路径，
+// DOM 实时采样（`|live` 伪轨）只在没有整轨时兜底。此前二分查找只存在于面板
+// IIFE 闭包内，content.js 够不着 → 画面上直接查词永远退到抖动的 DOM 采样窗，
+// 而整轨明明已在内存里。
+
+/**
+ * 二分查找覆盖 timeMs 的 cue 下标。cues 须按 startMs 升序（store 里的轨都满足）。
+ * 时间落在两句之间的间隙时返回 -1——静音段没有台词是真实结果，不能就近
+ * 吸附到邻句，否则制卡会录到一段与所查词无关的画面。
+ * @param {Array<{startMs:number,endMs:number,text:string}>} cues
+ * @param {number} timeMs
+ * @returns {number} 命中下标，未命中为 -1
+ */
+function findCueIndexAt(cues, timeMs) {
+  if (!Array.isArray(cues) || !cues.length || typeof timeMs !== 'number') return -1;
+  let lo = 0;
+  let hi = cues.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (cues[mid].startMs <= timeMs) { ans = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (ans < 0) return -1;
+  return timeMs < cues[ans].endMs ? ans : -1;
+}
+
+/**
+ * 从 fushiEpisodeCues store 中挑当前视频的「整轨」（整集拦截 / textTracks 收割得到的
+ * 真语言轨），排除 DOM 采样的 live 伪轨。preferredLang 用于跟随面板当前选中的语言，
+ * 缺省或不存在时取字典序第一条非 live 轨（与面板 tracksForVideo 的排序一致）。
+ * @param {Object|null} store
+ * @param {string} videoKey
+ * @param {string} liveLang
+ * @param {string=} preferredLang
+ * @returns {{lang:string,key:string,cues:Array}|null} 无整轨时返回 null
+ */
+function pickPrimaryCueTrack(store, videoKey, liveLang, preferredLang) {
+  if (!store || !videoKey) return null;
+  const prefix = String(videoKey) + '|';
+  const candidates = [];
+  for (const key in store) {
+    if (key.indexOf(prefix) !== 0) continue;
+    const lang = key.slice(prefix.length);
+    if (lang === liveLang) continue; // live 是降级轨，永远不当主路径
+    const cues = store[key];
+    if (!cues || !cues.length) continue;
+    candidates.push({ lang: lang, key: key, cues: cues });
+  }
+  if (!candidates.length) return null;
+  if (preferredLang) {
+    for (const c of candidates) {
+      if (c.lang === preferredLang) return c;
+    }
+  }
+  candidates.sort((a, b) => (a.lang < b.lang ? -1 : (a.lang > b.lang ? 1 : 0)));
+  return candidates[0];
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    extractNetflixCueText,
+    currentVideoTimeMs,
+    netflixVideoIdFromPath,
+    netflixSubtitleContainer,
+    netflixVideoEl,
+    parseSubtitleTimestamp,
+    stripCueTags,
+    splitCueRuby,
+    ttmlRubyToHtml,
+    fushiComposeCueContext,
+    fushiVideoCropFraction,
+    parseWebVtt,
+    parseTtml,
+    parseBilibiliJson,
+    netflixDocumentTitle,
+    findCueIndexAt,
+    pickPrimaryCueTrack,
+  };
+}

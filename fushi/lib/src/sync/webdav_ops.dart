@@ -1,0 +1,597 @@
+import 'dart:async' show TimeoutException;
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:fushi/src/sync/sync_backend.dart';
+import 'package:fushi_engine/sync/tls/fushi_pinning_http.dart';
+import 'package:fushi/src/sync/sync_utils.dart';
+import 'package:fushi_engine/utils/net/app_http.dart';
+
+/// 服务端错误响应体里读出来的拒绝原因（BUG-1323 / BUG-2631）。
+///
+/// [reason] 是要给用户看的那句话：纯文本响应就是截断后的原文；HTML 网页只取
+/// `<title>`（读不出就为 null），整页标记永远不会出现在这里。[isHtmlPage] 标记
+/// 「服务端回的是网页而不是协议响应」——这决定 403 落成哪一种
+/// [SyncAuthFailureKind]（见 [WebDavOps.checkStatus]）。
+class SyncErrorBody {
+  const SyncErrorBody({required this.reason, required this.isHtmlPage});
+
+  /// 纯文本原因（既有调用面：测试与「服务端就说了一句话」的场景）。
+  const SyncErrorBody.text(String this.reason) : isHtmlPage = false;
+
+  final String? reason;
+  final bool isHtmlPage;
+
+  /// 403 应落成的种类：网页 → [SyncAuthFailureKind.htmlPage]；否则按策略拒绝算。
+  SyncAuthFailureKind get forbiddenKind =>
+      isHtmlPage ? SyncAuthFailureKind.htmlPage : SyncAuthFailureKind.forbidden;
+}
+
+/// 服务端在错误响应体里给出的拒绝原因，读不出来就返回 null。
+///
+/// BUG-1323：以前所有 4xx 响应体都被 `drain()` 丢掉，403 的「HTTPS required for
+/// service config」这种**唯一可操作的信息**从来没到过用户面前。
+///
+/// BUG-2631：响应体是一份 HTML 文档（Cloudflare 挑战页 / 反代错误页 / URL 压根是个
+/// 网站）时，「截 300 字」截出来的是 `<!DOCTYPE html><html lang="en-US"><head>...`
+/// 一串标记——对用户零信息，还把 SnackBar 撑成半屏。这种体只取 `<title>` 当原因，
+/// 并标记 [SyncErrorBody.isHtmlPage] 让上层换一套可操作文案。
+///
+/// 三条纪律：
+/// - **永不抛**。读原因失败绝不能盖掉原本要报的那个错——那才是用户要看的。
+/// - **有上限**。纯文本原因截到 [_kMaxServerReasonChars] 字符，免得把 SnackBar /
+///   日志行撑爆。
+/// - **有超时**。挂死的响应流不能把同步整轮拖住。
+Future<SyncErrorBody?> readSyncErrorBody(HttpClientResponse response) async {
+  try {
+    final bool declaredHtml =
+        response.headers.contentType?.mimeType.toLowerCase() == 'text/html';
+    final String body = await response
+        .transform(utf8.decoder)
+        .join()
+        .timeout(const Duration(seconds: 5));
+    return parseSyncErrorBody(body, declaredHtml: declaredHtml);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// [readSyncErrorBody] 的纯函数部分：把响应体文本归成 [SyncErrorBody]。
+/// [declaredHtml] = 响应头 `Content-Type: text/html`；没有它也能凭正文形状识别
+/// （Cloudflare 的挑战页两者都有，反代错误页有时只有正文）。
+SyncErrorBody? parseSyncErrorBody(String body, {bool declaredHtml = false}) {
+  final String trimmed = body.trim();
+  if (declaredHtml || looksLikeHtmlDocument(trimmed)) {
+    final String? title = htmlDocumentTitle(trimmed);
+    // nginx / Apache 默认错误页的标题恒为「NNN 状态语」（`403 Forbidden`）：那是真
+    // WebDAV 服务端经反代给出的拒绝（ACL / 目录无 DAV 权限），不是「地址填成了网站」
+    // ——归成网页会让用户去核对一个本来就对的地址。这种按拒绝算、原因取标题；
+    // Cloudflare 的「Just a moment...」与网站首页标题都不是这个形状（PR #1602 审查）。
+    if (title != null && _kHttpStatusTitle.hasMatch(title)) {
+      return SyncErrorBody.text(title);
+    }
+    return SyncErrorBody(reason: title, isHtmlPage: true);
+  }
+  if (trimmed.isEmpty) return null;
+  if (trimmed.length <= _kMaxServerReasonChars) {
+    return SyncErrorBody.text(trimmed);
+  }
+  return SyncErrorBody.text(
+    '${trimmed.substring(0, _kMaxServerReasonChars)}...',
+  );
+}
+
+/// 正文开头是不是一份 HTML 文档（`<!DOCTYPE html` / 前 512 字内出现 `<html`）。
+/// 只看开头：WebDAV 的 207 multistatus 是 XML，`<D:multistatus` 不会命中。
+bool looksLikeHtmlDocument(String trimmed) {
+  final String head = trimmed.length > 512
+      ? trimmed.substring(0, 512)
+      : trimmed;
+  final String lower = head.toLowerCase();
+  return lower.startsWith('<!doctype html') || lower.contains('<html');
+}
+
+/// HTML 文档的 `<title>` 文本（空白折叠、基本实体解码、截到 120 字）；没有就 null。
+String? htmlDocumentTitle(String html) {
+  final RegExpMatch? match = RegExp(
+    r'<title[^>]*>(.*?)</title>',
+    caseSensitive: false,
+    dotAll: true,
+  ).firstMatch(html);
+  if (match == null) return null;
+  final String title = _decodeBasicHtmlEntities(
+    match.group(1)!,
+  ).replaceAll(RegExp(r'\s+'), ' ').trim();
+  if (title.isEmpty) return null;
+  if (title.length <= _kMaxHtmlTitleChars) return title;
+  return '${title.substring(0, _kMaxHtmlTitleChars)}...';
+}
+
+String _decodeBasicHtmlEntities(String s) => s
+    .replaceAll('&lt;', '<')
+    .replaceAll('&gt;', '>')
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&nbsp;', ' ')
+    .replaceAll('&amp;', '&');
+
+const int _kMaxServerReasonChars = 300;
+const int _kMaxHtmlTitleChars = 120;
+
+/// HTTP 服务器默认错误页的标题形状：三位状态码开头（`403 Forbidden`、`404 Not Found`）。
+final RegExp _kHttpStatusTitle = RegExp(r'^\d{3}(?:\s|$)');
+
+class DavEntry {
+  const DavEntry({
+    required this.href,
+    required this.displayName,
+    required this.isCollection,
+    this.etag,
+    this.modifiedAt,
+  });
+
+  final String href;
+  final String displayName;
+  final bool isCollection;
+
+  /// `DAV:getetag`（RFC 4918 §15.6：资源内容一变就必须变）；服务端不报时为 null。
+  final String? etag;
+
+  /// `getlastmodified`（RFC 1123 HTTP 日期）换成的 UTC 毫秒；服务器没给或解析不了为 null。
+  final int? modifiedAt;
+}
+
+/// 把 WebDAV `getlastmodified` 的值（RFC 1123，如 `Wed, 14 Oct 2026 08:15:30 GMT`；
+/// [HttpDate.parse] 也接受 RFC 850 / asctime 两种旧格式）换成 UTC 毫秒。解析不了返回 null，
+/// 不拿本机墙钟兜底（SRS 同步要的是服务器时间，拿不到就该如实为空）。
+int? parseDavLastModified(String? raw) {
+  if (raw == null) return null;
+  final String v = raw.trim();
+  if (v.isEmpty) return null;
+  try {
+    DateTime t = HttpDate.parse(v).toUtc();
+    // RFC 850 只有两位年份，HttpDate.parse 原样当成公元 00xx 年。按 RFC 7231 §7.1.1.1 的
+    // 习惯折回最近的世纪（<70 → 20xx，否则 19xx）。
+    if (t.year < 100) {
+      t = DateTime.utc(
+        t.year + (t.year < 70 ? 2000 : 1900),
+        t.month,
+        t.day,
+        t.hour,
+        t.minute,
+        t.second,
+      );
+    }
+    return t.millisecondsSinceEpoch;
+  } on HttpException {
+    return null;
+  } on FormatException {
+    return null;
+  }
+}
+
+class WebDavOps {
+  WebDavOps({
+    required String baseUrl,
+    required String username,
+    required String password,
+    Duration connectionTimeout = const Duration(seconds: 60),
+    String? pinnedFingerprint,
+    void Function()? onConnectivityError,
+    SyncAuthFailureKind unauthorizedKind = SyncAuthFailureKind.credentials,
+  }) : _baseUrl = baseUrl,
+       _connectionTimeout = connectionTimeout,
+       _pinnedFingerprint = pinnedFingerprint,
+       _onConnectivityError = onConnectivityError,
+       _unauthorizedKind = unauthorizedKind,
+       // 用户名和密码都空 = 匿名 / 无鉴权 WebDAV：根本不带 Authorization 头，
+       // 而不是发 `Basic base64(':')`（很多匿名服务器仍会因此回 401）。任一凭据
+       // 非空时行为完全不变（BUG-1016）。
+       _authHeader = (username.isEmpty && password.isEmpty)
+           ? null
+           : 'Basic ${base64Encode(utf8.encode('$username:$password'))}';
+
+  final String _baseUrl;
+  final String? _authHeader;
+  final Duration _connectionTimeout;
+
+  /// BUG-1693（审计项：故障切换失效）：连接类失败（拒连/握手失败/超时/断流）的
+  /// 通知回调。互联 backend 用它把 `_sessionResolved` 置脏——已解析地址一掉线，
+  /// 下一次操作自动重探全部候选（否则页面级读取失败后永远钉死在死地址上，
+  /// 第二条候选到手动同步/重启前不会被尝试）。HTTP 状态码错误（4xx/5xx）**不算**
+  /// ——服务器能回状态码说明连接是好的。null = 不通知（云 WebDAV 等无候选概念）。
+  final void Function()? _onConnectivityError;
+
+  /// TODO-961 M1: https 端点的证书 SHA-256 钉扎指纹（aa:bb:.. 形式）。null = 明文
+  /// 普通 WebDAV，遵循应用出站代理与局域网绕过；非 null = 用 pinned client，仅
+  /// 接受指纹相等的自签证书。由数据（URL 是否带指纹）决定，不靠平台分支。
+  final String? _pinnedFingerprint;
+
+  /// BUG-2377：本传输层收到 401 时该抛哪一种鉴权失败语义。
+  ///
+  /// [WebDavOps] 是**传输层**，它只知道「服务端说凭据不行」，不知道这份凭据是什么
+  /// 模型——WebDAV 是用户名/密码，互联是配对时对端发的 per-peer token。以前它对
+  /// 两者一律抛默认的 [SyncAuthFailureKind.credentials]，于是互联对端把本机从已配对
+  /// 列表里删掉之后，用户看到的是「登录已过期，请重新登录」——而互联根本没有登录
+  /// 这个操作。凭据语义归**后端拥有者**声明，传输层只转达。
+  ///
+  /// 默认 [SyncAuthFailureKind.credentials] 让 WebDAV / 网络媒体源库等既有调用点
+  /// 行为逐字不变。
+  final SyncAuthFailureKind _unauthorizedKind;
+
+  HttpClient? _httpClient;
+
+  String get baseUrl => _baseUrl;
+
+  /// [force] aborts in-flight connections (used by short-timeout reachability
+  /// probes so a hung connect doesn't linger; plain close only stops accepting
+  /// new requests and won't cancel a socket stuck on connect).
+  void close({bool force = false}) {
+    _httpClient?.close(force: force);
+    _httpClient = null;
+  }
+
+  HttpClient _client() {
+    final HttpClient? existing = _httpClient;
+    if (existing != null) return existing;
+    final String? fp = _pinnedFingerprint;
+    // 配对端保留证书钉扎；普通 WebDAV 也可能部署在公网，统一选择出站代理。
+    // 连接超时只约束 connect，不约束正文传输。
+    final HttpClient client = fp != null && fp.isNotEmpty
+        ? createPinnedHttpClient(
+            expectedFingerprint: fp,
+            connectionTimeout: _connectionTimeout,
+          )
+        : createAppHttpClient(connectionTimeout: _connectionTimeout);
+    return _httpClient = client;
+  }
+
+  Future<HttpClientRequest> buildRequest(String method, String url) async {
+    try {
+      final request = await _client().openUrl(method, Uri.parse(url));
+      request.followRedirects = false;
+      final String? auth = _authHeader;
+      if (auth != null) request.headers.set('Authorization', auth);
+      return request;
+    } on Object catch (e) {
+      _notifyIfConnectivity(e);
+      rethrow;
+    }
+  }
+
+  /// 统一的响应获取漏斗：全部 `request.close()` 走这里，连接类失败（拒连/超时/
+  /// 握手失败/传输中断流）先通知 [_onConnectivityError] 再原样 rethrow。
+  Future<HttpClientResponse> closeRequest(HttpClientRequest request) async {
+    try {
+      return await request.close();
+    } on Object catch (e) {
+      _notifyIfConnectivity(e);
+      rethrow;
+    }
+  }
+
+  void _notifyIfConnectivity(Object e) {
+    if (e is SocketException ||
+        e is HandshakeException ||
+        e is TimeoutException ||
+        e is HttpException) {
+      _onConnectivityError?.call();
+    }
+  }
+
+  Future<void> testConnection() async {
+    try {
+      final request = await buildRequest('PROPFIND', _baseUrl);
+      request.headers.set('Depth', '0');
+      request.headers.set('Content-Type', 'application/xml; charset=utf-8');
+      request.add(utf8.encode(propfindBody));
+      final response = await closeRequest(request);
+
+      if (response.statusCode == 401) {
+        await response.drain<void>();
+        throw SyncAuthError('Authentication failed', kind: _unauthorizedKind);
+      }
+      // BUG-1323：403 是服务端的策略拒绝，用户要看到的是**服务端说了什么**，而不是
+      // 「登录已过期，请重新登录」。「测试连接」正是最该把原文摆出来的地方，故这条
+      // 分支不 drain，先把响应体读成拒绝原因；体是网页时由 [checkStatus] 落成
+      // [SyncAuthFailureKind.htmlPage]（BUG-2631）。
+      if (response.statusCode == 403) {
+        checkStatus(
+          403,
+          'PROPFIND $_baseUrl',
+          serverReason: await readSyncErrorBody(response),
+        );
+      }
+      await response.drain<void>();
+      if (response.statusCode >= 400) {
+        throw SyncBackendError('Server returned ${response.statusCode}');
+      }
+    } on SyncAuthError {
+      rethrow;
+    } on SyncBackendError {
+      rethrow;
+    } catch (e) {
+      throw SyncBackendError('Connection failed: $e');
+    }
+  }
+
+  Future<void> ensureCollection(String path) async {
+    final checkReq = await buildRequest('PROPFIND', path);
+    checkReq.headers.set('Depth', '0');
+    checkReq.headers.set('Content-Type', 'application/xml; charset=utf-8');
+    checkReq.add(utf8.encode(propfindBody));
+    final checkResp = await closeRequest(checkReq);
+    await checkResp.drain<void>();
+    if (checkResp.statusCode == 207) return;
+
+    final mkcolReq = await buildRequest('MKCOL', path);
+    final mkcolResp = await closeRequest(mkcolReq);
+    await mkcolResp.drain<void>();
+    if (mkcolResp.statusCode >= 400 && mkcolResp.statusCode != 405) {
+      throw SyncBackendError(
+        'Failed to create folder: ${mkcolResp.statusCode}',
+      );
+    }
+  }
+
+  /// PROPFIND depth-0 探测 collection 是否存在（207 = 在）。与 [ensureCollection]
+  /// 的探测同一形状：401/403 等非 207 状态一律按「不存在」处理，让调用方走
+  /// 创建/迁移路径时再由写操作抛出真实错误。
+  Future<bool> collectionExists(String path) async {
+    final request = await buildRequest('PROPFIND', path);
+    request.headers.set('Depth', '0');
+    request.headers.set('Content-Type', 'application/xml; charset=utf-8');
+    request.add(utf8.encode(propfindBody));
+    final response = await closeRequest(request);
+    await response.drain<void>();
+    return response.statusCode == 207;
+  }
+
+  /// WebDAV MOVE（RFC 4918）：把 [fromPath] 整树改名/移动到 [toPath]。
+  /// `Overwrite: F`——目标已存在时服务端答 412，绝不覆盖既有数据。
+  /// 成功为 201（Created）/ 204（No Content）；其余状态抛 [SyncBackendError]。
+  Future<void> movePath(String fromPath, String toPath) async {
+    final request = await buildRequest('MOVE', fromPath);
+    request.headers.set('Destination', toPath);
+    request.headers.set('Overwrite', 'F');
+    final response = await closeRequest(request);
+    await response.drain<void>();
+    checkStatus(response.statusCode, 'MOVE $fromPath -> $toPath');
+  }
+
+  Future<List<DavEntry>> propfindChildren(String path) async {
+    final request = await buildRequest('PROPFIND', path);
+    request.headers.set('Depth', '1');
+    request.headers.set('Content-Type', 'application/xml; charset=utf-8');
+    request.add(utf8.encode(propfindBody));
+    final response = await closeRequest(request);
+
+    if (response.statusCode == 401) {
+      throw SyncAuthError('Authentication failed', kind: _unauthorizedKind);
+    }
+    // BUG-1323：403 带上服务端原文。读响应体放在这条分支里而不是提前统一读——
+    // 401 的判定必须先于任何可能抛异常的流读取，否则一个畸形错误体就能把鉴权
+    // 失败盖成 FormatException。
+    if (response.statusCode == 403) {
+      checkStatus(
+        403,
+        'PROPFIND $path',
+        serverReason: await readSyncErrorBody(response),
+      );
+    }
+
+    final body = await response.transform(utf8.decoder).join();
+    if (response.statusCode != 207) {
+      throw SyncBackendError(
+        'PROPFIND failed: ${response.statusCode}',
+        isRetryable: response.statusCode == 404,
+      );
+    }
+    return parsePropfindResponse(body, path);
+  }
+
+  List<DavEntry> parsePropfindResponse(String xml, String basePath) {
+    final entries = <DavEntry>[];
+    final responsePattern = RegExp(
+      r'<(?:[a-zA-Z0-9]+:)?response[>\s](.*?)</(?:[a-zA-Z0-9]+:)?response>',
+      dotAll: true,
+    );
+    final hrefPattern = RegExp(
+      r'<(?:[a-zA-Z0-9]+:)?href>(.*?)</(?:[a-zA-Z0-9]+:)?href>',
+    );
+    final collectionPattern = RegExp(r'<(?:[a-zA-Z0-9]+:)?collection\s*/?>');
+    final displayNamePattern = RegExp(
+      r'<(?:[a-zA-Z0-9]+:)?displayname>(.*?)</(?:[a-zA-Z0-9]+:)?displayname>',
+    );
+    final etagPattern = RegExp(
+      r'<(?:[a-zA-Z0-9]+:)?getetag>(.*?)</(?:[a-zA-Z0-9]+:)?getetag>',
+      dotAll: true,
+    );
+    // 允许带属性（IIS / SabreDAV 会写 `<d:getlastmodified ns0:dt="dateTime.rfc1123">`）。
+    final lastModifiedPattern = RegExp(
+      r'<(?:[a-zA-Z0-9]+:)?getlastmodified(?:\s[^>]*)?>(.*?)</(?:[a-zA-Z0-9]+:)?getlastmodified>',
+      dotAll: true,
+    );
+
+    for (final match in responsePattern.allMatches(xml)) {
+      final block = match.group(1)!;
+      final hrefMatch = hrefPattern.firstMatch(block);
+      if (hrefMatch == null) continue;
+
+      final href = Uri.decodeFull(hrefMatch.group(1)!.trim());
+      final isCollection = collectionPattern.hasMatch(block);
+      final displayMatch = displayNamePattern.firstMatch(block);
+
+      String displayName;
+      if (displayMatch != null && displayMatch.group(1)!.trim().isNotEmpty) {
+        displayName = displayMatch.group(1)!.trim();
+      } else {
+        var cleaned = href;
+        if (cleaned.endsWith('/')) {
+          cleaned = cleaned.substring(0, cleaned.length - 1);
+        }
+        displayName = Uri.decodeFull(cleaned.split('/').last);
+      }
+
+      final String? etag = etagPattern.firstMatch(block)?.group(1)?.trim();
+
+      final resolvedHref = resolveHref(href, basePath);
+      entries.add(
+        DavEntry(
+          href: resolvedHref,
+          displayName: displayName,
+          isCollection: isCollection,
+          etag: etag == null || etag.isEmpty ? null : etag,
+          modifiedAt: parseDavLastModified(
+            lastModifiedPattern.firstMatch(block)?.group(1),
+          ),
+        ),
+      );
+    }
+    return entries;
+  }
+
+  String resolveHref(String href, String basePath) {
+    final baseUri = Uri.parse(basePath);
+    if (href.startsWith('http://') || href.startsWith('https://')) {
+      final hrefUri = Uri.parse(href);
+      // Port is part of the origin: a server on :8080 that returns a
+      // default-port (implicit :80) href must not be treated as same-origin,
+      // else the reconstructed URL would target the wrong port (HBK-AUDIT-160).
+      // Uri.port fills in the scheme default, so this compares effective ports.
+      if (hrefUri.host != baseUri.host ||
+          hrefUri.scheme != baseUri.scheme ||
+          hrefUri.port != baseUri.port) {
+        throw SyncBackendError('Server returned cross-origin href: $href');
+      }
+      return href;
+    }
+    final isDefaultPort =
+        (baseUri.scheme == 'http' && baseUri.port == 80) ||
+        (baseUri.scheme == 'https' && baseUri.port == 443);
+    final portSuffix = isDefaultPort ? '' : ':${baseUri.port}';
+    return '${baseUri.scheme}://${baseUri.host}$portSuffix$href';
+  }
+
+  // Metadata JSON files (progress/stats/audiobook) are tiny by spec; cap the
+  // download so a hostile/buggy remote can't OOM the app by streaming a giant
+  // body before jsonDecode. Mirrors GoogleDriveHandler._downloadJson.
+  // HBK-AUDIT-139.
+  static const int maxJsonDownloadSize = 10 * 1024 * 1024; // 10 MB
+
+  Future<dynamic> downloadJson(String fileId) async {
+    final request = await buildRequest('GET', fileId);
+    final response = await closeRequest(request);
+    checkStatus(response.statusCode, 'GET $fileId');
+    final BytesBuilder builder = BytesBuilder(copy: false);
+    await for (final List<int> chunk in response) {
+      builder.add(chunk);
+      if (builder.length > maxJsonDownloadSize) {
+        throw SyncBackendError('GET $fileId failed: response too large');
+      }
+    }
+    return jsonDecode(utf8.decode(builder.takeBytes()));
+  }
+
+  Future<void> uploadJson(
+    String folderId,
+    String fileName,
+    dynamic data,
+  ) async {
+    final path = '$folderId${Uri.encodeComponent(fileName)}';
+    final bytes = utf8.encode(jsonEncode(data));
+    await putBytes(path, bytes, 'application/json');
+  }
+
+  Future<void> putBytes(
+    String path,
+    List<int> bytes,
+    String contentType,
+  ) async {
+    final request = await buildRequest('PUT', path);
+    request.headers.set('Content-Type', contentType);
+    request.headers.set('Content-Length', '${bytes.length}');
+    request.add(bytes);
+    final response = await closeRequest(request);
+    await response.drain<void>();
+    checkStatus(response.statusCode, 'PUT $path');
+  }
+
+  Future<bool> headFile(String path) async {
+    final request = await buildRequest('HEAD', path);
+    final response = await closeRequest(request);
+    await response.drain<void>();
+    return response.statusCode >= 200 && response.statusCode < 300;
+  }
+
+  Future<void> deleteFile(String path) async {
+    final request = await buildRequest('DELETE', path);
+    final response = await closeRequest(request);
+    await response.drain<void>();
+    if (response.statusCode >= 400 && response.statusCode != 404) {
+      throw SyncBackendError('DELETE failed: ${response.statusCode}');
+    }
+  }
+
+  /// HTTP 状态码 → 同步层异常契约。webdav / interconnect / source_library 共用。
+  ///
+  /// [serverReason] 是服务端在响应体里给出的拒绝原因（调用方读得到就传，读不到就
+  /// 不传）。本方法是同步的、拿不到响应流，故不能自己读；已有的三十余处调用点
+  /// 一行都不用改。体是 HTML 网页时（BUG-2631）403 落成
+  /// [SyncAuthFailureKind.htmlPage]，原因只带网页标题。
+  void checkStatus(
+    int statusCode,
+    String context, {
+    SyncErrorBody? serverReason,
+  }) {
+    if (statusCode == 401) {
+      throw SyncAuthError('Authentication failed', kind: _unauthorizedKind);
+    }
+    // BUG-1323：403 ≠ 401。403 是「凭据已被接受，但服务端按策略拒绝了这一次请求」
+    // （host 对明文会话返回 `HTTPS required for service config` 就是有意拒绝，不是
+    // 故障）。压成同一条 'Authentication failed' 有两个后果：文案把用户引去重配一个
+    // 根本没问题的凭据；上层 manual_sync_ui 还会把好端端的会话 signOut 掉。
+    // 顺带把 [context] 带上——以前这条分支连它一起丢了。
+    if (statusCode == 403) {
+      throw SyncAuthError(
+        'Server refused (403): $context',
+        kind: serverReason?.forbiddenKind ?? SyncAuthFailureKind.forbidden,
+        serverReason: serverReason?.reason,
+      );
+    }
+    if (statusCode == 404) {
+      throw SyncBackendError('Not found: $context', isRetryable: true);
+    }
+    if (statusCode >= 400) {
+      throw SyncBackendError('$context failed: HTTP $statusCode');
+    }
+  }
+
+  static const propfindBody =
+      '<?xml version="1.0" encoding="utf-8"?>'
+      '<d:propfind xmlns:d="DAV:">'
+      '<d:prop>'
+      '<d:resourcetype/>'
+      '<d:displayname/>'
+      '<d:getetag/>'
+      '<d:getlastmodified/>'
+      '</d:prop>'
+      '</d:propfind>';
+
+  // MIME 猜测收敛到 sync_utils.guessSyncContentType；保留薄 shim 供既有调用方。
+  static String guessContentType(String fileName) =>
+      guessSyncContentType(fileName);
+
+  static String normalizeUrl(String url) {
+    var normalized = url.trim();
+    if (normalized.endsWith('/')) {
+      normalized = normalized.substring(0, normalized.length - 1);
+    }
+    final scheme = Uri.parse(normalized).scheme;
+    if (scheme != 'http' && scheme != 'https') {
+      throw SyncBackendError('WebDAV URL must use http:// or https://');
+    }
+    return normalized;
+  }
+}

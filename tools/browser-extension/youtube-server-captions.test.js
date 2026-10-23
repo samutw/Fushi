@@ -1,0 +1,202 @@
+const { test } = require('node:test');
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+// A（BUG-783 后续）行为守卫：content.js 的「YouTube 真整集字幕」provider。
+// 在受控 vm 里真加载 subtitle-adapters.js + content.js，桩掉 chrome.runtime.sendMessage 捕获
+// {type:'youtubeCaptions'} 请求并回罐装 server 响应，断言：
+//   1) YouTube 页触发请求，把 server 返回的多轨（人工/自动）写进 fushiEpisodeCues 并通知面板；
+//   2) 同语言人工/自动轨标签去重（不互相覆盖）；
+//   3) 空 tracks（无字幕/失败）不写轨、允许重试（回退 DOM live 采样）。
+// PR #804 起 server 是兜底而非首选：MAIN world 的 youtube-bridge.js 先直取整轨，本地
+// server 只在 bridge 8 秒仍没拿到时才请求（免得两条路同时请求造出重复语言轨）。上面
+// 三条守的都是兜底路径，所以用可控时钟走完这 8 秒；"窗口内不抢先请求" 单独断言。
+
+const ADAPTERS = path.join(__dirname, 'subtitle-adapters.js');
+const CONTENT = path.join(__dirname, 'content.js');
+
+// bridge 优先窗口，与 content.js fushiMaybeFetchYoutubeCaptions 里的 8000 对齐。
+const BRIDGE_GRACE_MS = 8000;
+
+// BUG-1718：真实运行时（manifest content_scripts / side-panel.html）里 vendor/dict-media.js
+// 恒在 content.js / side-panel.js 之前加载，后者依赖它导出的 applyFushiPopupCss 与
+// installDictMediaPlaceholderResolver。测试沙箱必须照同样顺序装，否则跑的是一个真实
+// 世界里不存在的、缺半个脚本集的环境。
+const FUSHI_DICT_MEDIA = require('node:path').join(__dirname, 'vendor', 'dict-media.js');
+function loadFushiDictMedia(ctx) {
+  require('node:vm').runInContext(
+    require('node:fs').readFileSync(FUSHI_DICT_MEDIA, 'utf8'), ctx,
+    { filename: 'vendor/dict-media.js' });
+}
+
+
+// 先跑一轮让 content.js 给本 videoId 记下 bridge 起点（这一轮按契约不该请求 server），
+// 再把虚拟时钟推过宽限期，后续 fetcher.fn() 就走 server 兜底路径。
+function passBridgeGraceWindow(h) {
+  h.fetcher.fn();
+  assert.strictEqual(h.sent.filter((m) => m && m.type === 'youtubeCaptions').length, 0,
+    'bridge 宽限窗口内不得抢先请求 server 字幕（会与 bridge 直取撞出重复语言轨）');
+  h.advance(BRIDGE_GRACE_MS + 1);
+}
+
+function loadYoutube(opts) {
+  opts = opts || {};
+  const intervals = [];
+  const sent = []; // 捕获的 sendMessage 调用
+  let captionResponse = opts.response || null;
+  const video = { currentTime: 0, paused: true, textTracks: [] };
+  const windowObj = {
+    addEventListener() {},
+    postMessage() {},
+    innerWidth: 1200,
+    innerHeight: 800,
+  };
+  // 可控时钟：server 兜底要等过 bridge 优先窗口，测试不能真睡 8 秒。
+  const nowRef = { value: 1000000 };
+  const RealDate = Date;
+  function FakeDate(...args) {
+    return new RealDate(...args);
+  }
+  FakeDate.now = () => nowRef.value;
+  FakeDate.prototype = RealDate.prototype;
+
+  const sandbox = {
+    Date: FakeDate,
+    console: { log() {}, warn() {}, error() {} },
+    setTimeout: () => 0,
+    clearTimeout() {},
+    setInterval: (fn, ms) => { intervals.push({ fn, ms }); return intervals.length; },
+    clearInterval() {},
+    URL,
+    Set,
+    Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+    location: {
+      hostname: 'www.youtube.com',
+      href: 'https://www.youtube.com/watch?v=' + (opts.videoId || 'abc123'),
+      pathname: '/watch',
+      origin: 'https://www.youtube.com',
+      search: '?v=' + (opts.videoId || 'abc123'),
+    },
+    window: windowObj,
+    document: {
+      documentElement: { dataset: {}, setAttribute() {} },
+      head: { appendChild() {} },
+      body: { appendChild() {}, style: {} },
+      fullscreenElement: null,
+      addEventListener() {},
+      getElementById: () => null,
+      querySelector: (sel) => (sel === 'video' ? video : null),
+      querySelectorAll: () => [],
+      createElement: () => ({
+        style: {}, addEventListener() {}, appendChild() {},
+        setAttribute() {}, remove() {}, classList: { add() {} },
+      }),
+    },
+    chrome: {
+      runtime: {
+        id: 'test-ext-id',
+        lastError: null,
+        onMessage: { addListener() {} },
+        sendMessage: (msg, cb) => {
+          sent.push(msg);
+          if (typeof cb === 'function') cb(captionResponse);
+        },
+      },
+      storage: {
+        local: { get: () => {}, set() {} },
+        onChanged: { addListener() {} },
+      },
+    },
+  };
+  const ctx = vm.createContext(sandbox);
+  vm.runInContext(fs.readFileSync(ADAPTERS, 'utf8'), ctx, { filename: 'subtitle-adapters.js' });
+  loadFushiDictMedia(ctx);
+  // manifest 里 popup-size.js 排在 content.js 之前（同隔离世界的顶层函数），
+  // content.js 的 fushiApplyTheme 直接调它的 fushiResolvePopupBox。
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'popup-size.js'), 'utf8'), sandbox,
+    { filename: 'popup-size.js' });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'subtitle-providers.js'), 'utf8'), ctx,
+    { filename: 'subtitle-providers.js' }); // manifest 顺序：先于 content.js
+  vm.runInContext(fs.readFileSync(CONTENT, 'utf8'), ctx, { filename: 'content.js' });
+  const fetcher = intervals.find((i) => i.ms === 1500);
+  return {
+    intervals, sent, windowObj, fetcher,
+    advance: (ms) => { nowRef.value += ms; },
+    setResponse: (r) => { captionResponse = r; },
+  };
+}
+
+function okTracks(tracks) {
+  return { ok: true, status: 200, data: { tracks } };
+}
+
+test('YouTube 页拉取 server 字幕并写入 store + 通知面板', () => {
+  const h = loadYoutube({
+    videoId: 'abc123',
+    response: okTracks([
+      { languageCode: 'ja', languageName: '日本語', isAutoGenerated: false, isTranslated: false,
+        cues: [{ text: '走り出した', startMs: 1500, endMs: 3500 }] },
+    ]),
+  });
+  assert.ok(h.fetcher, '缺 1500ms YouTube 字幕拉取器');
+  const notified = [];
+  h.windowObj.fushiSubtitlePanelOnCues = (key) => notified.push(key);
+
+  passBridgeGraceWindow(h);
+  h.fetcher.fn();
+
+  const req = h.sent.find((m) => m && m.type === 'youtubeCaptions');
+  assert.ok(req, '必须发出 youtubeCaptions 请求');
+  assert.strictEqual(req.videoId, 'abc123');
+
+  const store = h.windowObj.fushiEpisodeCues;
+  const key = 'yt-abc123|日本語';
+  assert.ok(store[key], 'server 字幕轨必须进 store');
+  assert.strictEqual(store[key].length, 1);
+  assert.strictEqual(store[key][0].startMs, 1500);
+  assert.strictEqual(store[key][0].endMs, 3500);
+  assert.strictEqual(store[key][0].text, '走り出した');
+  assert.deepStrictEqual(notified, [key], '新轨必须通知面板');
+
+  // 同 videoId 再触发：已请求过 → 不重复请求。
+  h.fetcher.fn();
+  assert.strictEqual(h.sent.filter((m) => m.type === 'youtubeCaptions').length, 1,
+    '同 videoId 不得重复请求 server');
+});
+
+test('同语言人工/自动轨标签去重（不互相覆盖）', () => {
+  const h = loadYoutube({
+    response: okTracks([
+      { languageCode: 'en', languageName: 'English', isAutoGenerated: false, isTranslated: false,
+        cues: [{ text: 'manual', startMs: 0, endMs: 1000 }] },
+      { languageCode: 'en', languageName: 'English', isAutoGenerated: true, isTranslated: false,
+        cues: [{ text: 'asr', startMs: 0, endMs: 1000 }] },
+    ]),
+  });
+  passBridgeGraceWindow(h);
+  h.fetcher.fn();
+  const store = h.windowObj.fushiEpisodeCues;
+  assert.ok(store['yt-abc123|English'], '人工轨');
+  assert.ok(store['yt-abc123|English (自动)'], '自动轨标签加 (自动) 后缀，不覆盖人工轨');
+  assert.strictEqual(store['yt-abc123|English'][0].text, 'manual');
+  assert.strictEqual(store['yt-abc123|English (自动)'][0].text, 'asr');
+});
+
+test('空 tracks（无字幕/失败）不写轨且允许重试', () => {
+  const h = loadYoutube({ response: okTracks([]) });
+  passBridgeGraceWindow(h);
+  h.fetcher.fn();
+  const store = h.windowObj.fushiEpisodeCues || {};
+  assert.strictEqual(Object.keys(store).length, 0, '无字幕不得凭空造轨');
+  // 空响应 → fetchedFor 复位 → 下轮可重试（server 稍后就绪）。
+  h.setResponse(okTracks([
+    { languageCode: 'ja', languageName: '日本語', isAutoGenerated: false, isTranslated: false,
+      cues: [{ text: 'あ', startMs: 0, endMs: 500 }] },
+  ]));
+  h.fetcher.fn();
+  assert.strictEqual(h.sent.filter((m) => m.type === 'youtubeCaptions').length, 2,
+    '空响应后必须允许重试');
+  assert.ok(h.windowObj.fushiEpisodeCues['yt-abc123|日本語'], '重试成功后写入轨');
+});

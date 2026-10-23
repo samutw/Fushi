@@ -1,0 +1,416 @@
+name: Build Android APK
+# TODO-1208: this workflow no longer runs on push to main/develop. On push it
+# never built an APK anyway (the R8/proguard/native "Verify release build" steps
+# below are all `if: pull_request`), so its analyze + unit/package tests were a
+# byte-for-byte duplicate of release.yml's early analyze+test stage that already
+# runs on every push (release.yml then goes on to build+publish the debug-channel
+# APK). Dropping the push trigger removes that ~41m duplicate job per push while
+# keeping main.yml as the SOLE R8/proguard/native gate on PRs (release.yml has no
+# pull_request trigger). workflow_dispatch stays for manual re-runs.
+on:
+  pull_request:
+    branches: ['main', 'develop']
+    # 路径清单 = 本 workflow 真正读到的东西，不多不少（2026-09-30 精简 CI）：
+    # * 只列**自己**的 workflow 文件和自己 `uses:` / `bash` 到的共享件。以前挂整个
+    #   `.github/workflows/**`，改任何一条别的 workflow 都会白跑这 ~90 分钟；workflow
+    #   与发布脚本的守卫测试改由轻量的 ci-config-gate.yml 专门跑。
+    # * 无头服务端 packages/fushi_server/** 不进 app：app 不依赖它，它的
+    #   analyze / 包测试 / `dart build cli` 冒烟由 server-gate.yml 负责。负向模式必须
+    #   排在 `packages/**` 之后才生效。
+    # * **故意不排除 `*.md`**：本 workflow 是 PR 上唯一跑 fushi/test 全量的门，而
+    #   fushi_rename_guard（扫 CLAUDE.md / docs/agent / native 下的 .md）、
+    #   onnxruntime_*_guard（读 third_party/flutter_onnxruntime/PATCHES.md）、
+    #   popup_mine_key_binding（读浏览器扩展 README）等守卫把 .md 当语料；排掉 .md
+    #   等于让只改 .md 的 PR 绕过这些守卫。docs/ 与仓库根的 .md 本就不在清单里。
+    paths:
+      - 'fushi/**'
+      - 'packages/**'
+      # C ABI bridge 源码：只改 native/ 的 PR 以前触发不了任何构建，
+      # 编译挂了要等下一个不相关改动才暴露。
+      - 'native/**'
+      - 'ci/**'
+      # 根 pubspec.yaml 的 dependency_overrides 把一批插件 path 指向 third_party/
+      # （ffmpeg_kit_flutter / flutter_inappwebview_android / media_kit_* /
+      # flutter_onnxruntime …），改它们直接改变 Android 构建产物，以前却不触发本门。
+      - 'third_party/**'
+      - 'tool/release_sequence.sh'
+      - '.github/workflows/main.yml'
+      - '.github/actions/provide-baked-secrets/**'
+      - '.github/actions/pdfium-hook-cache/**'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '!packages/fushi_server/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel a superseded PR run when the PR is force-pushed. (This workflow only
+# runs on pull_request / workflow_dispatch now -- see the TODO-1208 note above --
+# so there is no push-to-main/develop run to protect from cancellation.)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # TODO-414: versionCode derives from the commit count, so the validation
+        # builds below need the FULL history. A shallow checkout would make
+        # `git rev-list --count HEAD` report a truncated (smaller) sequence,
+        # producing a versionCode that disagrees with release.yml's. Keep this in
+        # lockstep with release.yml's `fetch-depth: 0`.
+        # 2026-08-12: 序号统一由 tool/release_sequence.sh 算（计数 + 一次性地板）。
+        # 地板只补「历史重写导致计数倒退」，补不了「浅克隆导致计数截断」——
+        # 后者每次 checkout 都可能不同，仍然只能靠 fetch-depth: 0 兜住。
+        fetch-depth: 0
+
+    - name: Resolve shared release sequence
+      shell: bash
+      run: |
+        set -euo pipefail
+        RELEASE_SEQUENCE=$(bash tool/release_sequence.sh)
+        if ! [[ "$RELEASE_SEQUENCE" =~ ^[0-9]+$ ]] || [ "$RELEASE_SEQUENCE" -le 0 ]; then
+          echo "::error title=Invalid release sequence::Expected positive git rev-list count, got $RELEASE_SEQUENCE"
+          exit 1
+        fi
+        # Same monotonic commit-count build number release.yml feeds Android, so
+        # main.yml's validation APKs carry the identical versionCode formula.
+        echo "RELEASE_SEQUENCE=$RELEASE_SEQUENCE" >> "$GITHUB_ENV"
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.47.6'
+        cache: true
+    # pdfium_dart's build hook downloads PDFium from GitHub on every fresh
+    # runner; restore it so a release-asset hiccup cannot fail the build.
+    - uses: ./.github/actions/pdfium-hook-cache
+      with:
+        purpose: android
+
+    - name: Remove local proxy from gradle.properties
+      working-directory: fushi/android
+      run: |
+        sed -i '/systemProp\.http\.proxyHost/d' gradle.properties
+        sed -i '/systemProp\.http\.proxyPort/d' gradle.properties
+        sed -i '/systemProp\.https\.proxyHost/d' gradle.properties
+        sed -i '/systemProp\.https\.proxyPort/d' gradle.properties
+        sed -i '/systemProp\.http\.nonProxyHosts/d' gradle.properties
+
+    # 烘进包里的密钥统一由 composite action 注入 —— 这批注入曾被逐字抄进 11 个
+    # job，抄到最后 TMDB 有 3 个变体、两条发布 workflow 一处都没有，导致发出去
+    # 的包里 TMDB 恒「未配置」而 CI 全绿（BUG-1588）。真相源只留一份。
+    - name: Provide baked-in secret stubs
+      uses: ./.github/actions/provide-baked-secrets
+      with:
+        google-oauth-client-secret: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        log-upload-endpoint: ${{ secrets.LOG_UPLOAD_ENDPOINT }}
+        log-upload-token: ${{ secrets.LOG_UPLOAD_TOKEN }}
+        dandanplay-app-id: ${{ secrets.DANDANPLAY_APP_ID }}
+        dandanplay-app-secret: ${{ secrets.DANDANPLAY_APP_SECRET }}
+        tmdb-api-key: ${{ secrets.TMDB_API_KEY }}
+        opensubtitles-api-key: ${{ secrets.OPENSUBTITLES_API_KEY }}
+    # TODO-2721: 只缓存 Gradle 的下载物（modules-2 / wrapper dists），不缓存
+    # <ver>/transforms 这类可从 modules-2 重算的派生产物。三个 workflow
+    # （main / release / build-multiplatform）的 path + key 必须逐字相同，且此步
+    # 之前不得 sed 改 build.gradle / settings.gradle —— 否则同一份内容会被存成
+    # 两条各 2.7 GB 的缓存。理由见 docs/agent/build.md 的「CI 缓存配额」，守卫见
+    # fushi/test/build/workflow_cache_quota_guard_test.dart。
+    # 只读（2026-09-30）：只有 release.yml 的 push 写 Gradle 缓存，见 workflow_cache_quota_guard_test。
+    - name: Cache Gradle caches
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.gradle/caches/modules-2
+          ~/.gradle/caches/journal-1
+          ~/.gradle/wrapper/dists
+        key: ${{ runner.os }}-gradle-v2-${{ hashFiles('fushi/android/**/*.gradle*', 'fushi/android/gradle/wrapper/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-v2-
+
+    - name: Remove aliyun mirrors from gradle files
+      working-directory: fushi/android
+      run: |
+        sed -i "/maven.*aliyun/d" build.gradle
+        sed -i "/maven.*aliyun/d" settings.gradle
+
+    - name: Flutter pub get
+      working-directory: fushi
+      run: flutter pub get
+
+    - name: Apply pub cache patches
+      run: |
+        chmod +x ci/apply-patches.sh
+        bash ci/apply-patches.sh
+
+    - name: Run dart analyze
+      working-directory: fushi
+      run: flutter analyze
+
+    # 主应用单测不在这个 job 里跑了：见下面的 unit-tests 矩阵（按文件分 4 片并行）。
+
+    - name: Run package tests
+      run: |
+        # 扫描面按磁盘枚举，不写死包清单：这里是 packages/*/test 的**唯一** runner，
+        # 上一版把五个包名写成字面量，于是任何新加的自有包连同它的测试在 CI 里
+        # 一次都不会跑，而且表现为绿。排除项只有两类，都有明确归属：
+        #   * vendored / fork / stub —— 上游产物，不归本仓测；
+        #   * fushi_torrent —— 测试要 dlopen 真 DLL，Linux 上整组 skip，由
+        #     build-multiplatform.yml 里那个带 FUSHI_TORRENT_LIB 的 job 专门跑。
+        skip="flutter_inappwebview_windows gamepads_windows gamepads_android_stub fushi_torrent"
+        ran=0
+        for pkg in packages/*/; do
+          name=$(basename "$pkg")
+          case " $skip " in
+            *" $name "*) echo "::notice title=Skipped package::$name（vendored 或有专用 job）"; continue;;
+          esac
+          if [ -d "$pkg/test" ]; then
+            echo "::group::Testing $name"
+            (cd "$pkg" && dart ../../fushi/tool/flutter_test_failures.dart --output-dir=../../.codex-test/flutter-test/$name)
+            echo "::endgroup::"
+            ran=$((ran + 1))
+          else
+            echo "::warning title=No package tests::$name has no test/ dir — its code is only covered transitively by the main-app suite"
+          fi
+        done
+        # 规模哨兵：枚举写错或 packages/ 布局变动会让循环一个包都不跑，而「零个包跑过」
+        # 与「所有包都绿」在退出码上完全一样。实测 4 个（core/anki/audio/platform）。
+        if [ "$ran" -lt 3 ]; then
+          echo "::error title=Package test enumeration collapsed::只跑了 $ran 个包的测试，实测应有 4 个。去修枚举逻辑，不要调低这个下界。"
+          exit 1
+        fi
+
+    # JS behavior tests (jsdom) for the reader/audiobook WebView bridge. The Dart
+    # source-scan guards can't execute compareDocumentPosition semantics; this runs
+    # the real bridge functions against a real DOM (BUG-724). Ubuntu runners ship
+    # Node; jsdom is pinned exactly in test/js/package.json so `npm install` is
+    # reproducible (package-lock is gitignored).
+    - name: Run JS behavior tests (jsdom)
+      working-directory: test/js
+      run: |
+        npm install
+        npm test
+
+    # 浏览器扩展的 JS 行为测试（node:test + vm，零依赖，真加载 content.js / popup.js
+    # 跑断言）。这些测试一直存在但**从来没有人执行过**：上面那步的 working-directory 是
+    # test/js，`node --test` 只会跑那个目录下的 .test.mjs，tools/browser-extension/*.test.js
+    # 全部落在门外。于是「隐藏字幕不得用 display:none」「IME 组字中不得制卡」这类真行为
+    # 守卫写了也白写，改坏了 CI 照样绿。接进来时本地实测 171 个用例全绿，故不会把既有
+    # PR 的 CI 变红。
+    - name: Run browser-extension JS behavior tests
+      working-directory: tools/browser-extension
+      run: node --test *.test.js
+
+    # The release build (minify/R8/proguard + C++23 native) is the variant that
+    # ships; without a keystore it was never exercised on PRs, so R8/keep-rule
+    # regressions stayed invisible until a tagged release (HBK-AUDIT-026).
+    # build.gradle refuses debug-signed release APKs, so we mint a throwaway
+    # keystore to run the full release pipeline (artifact is NOT distributable).
+    #
+    # TODO-950: this verification APK only runs on PULL REQUESTS. On push to
+    # main/develop, release.yml already does the real release-signed arm64 build
+    # (debug channel) and publishes it -- so a second release build here was a
+    # redundant duplicate APK ("why two APKs on push"). PRs do NOT trigger
+    # release.yml (no pull_request trigger there), so the PR-only verification
+    # below stays the sole R8/proguard/native gate for PRs (HBK-AUDIT-026). It is
+    # also arm64-only now (matches the shipped debug-channel slice; no need to
+    # raster the unshipped armv7/x86_64 slices just to exercise R8 keep-rules).
+    # R8 / proguard / the Android native build only see Java/Kotlin (app +
+    # plugins), Gradle config, native sources and the plugin set pinned by
+    # pubspec. A Dart-only PR cannot change what they do: upstream 09-20..30
+    # ran this verify 48 times with 0 failures while it cost ~14 min per PR run
+    # (build job ~20 -> ~6 min without it). develop pushes still build the
+    # release-signed APK through R8 in release.yml, so nothing ships unverified.
+    # If the diff cannot be computed, the verify runs (fail safe).
+    - name: Decide whether the Android release verify build is needed
+      id: r8
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        if ! changed="$(git diff --name-only "$BASE_SHA"...HEAD)"; then
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          echo "::warning title=R8 verify gate::could not diff against $BASE_SHA; running the verify build"
+          exit 0
+        fi
+        pattern='^(fushi/android/|native/|third_party/|ci/|packages/[^/]+/android/|packages/[^/]+/pubspec\.yaml$|fushi/pubspec\.yaml$|pubspec\.yaml$|pubspec\.lock$|\.github/workflows/main\.yml$|\.github/actions/)'
+        if grep -qE "$pattern" <<< "$changed"; then
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "needed=false" >> "$GITHUB_OUTPUT"
+          echo "::notice title=R8 verify skipped::no Android / native / plugin / pubspec change in this PR"
+        fi
+
+    - name: Generate throwaway keystore (no signing secret present)
+      if: github.event_name == 'pull_request' && steps.r8.outputs.needed == 'true' && env.HAS_KEYSTORE != 'true'
+      working-directory: fushi/android
+      run: |
+        keytool -genkeypair -v -keystore fushi-release.jks \
+          -storepass ci_throwaway -keypass ci_throwaway -alias ci \
+          -keyalg RSA -keysize 2048 -validity 1 \
+          -dname "CN=Fushi CI, O=CI, C=US"
+        cat > key.properties <<EOF
+        storePassword=ci_throwaway
+        keyPassword=ci_throwaway
+        keyAlias=ci
+        storeFile=fushi-release.jks
+        EOF
+      env:
+        HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    - name: Verify release build (minify/R8/proguard/native)
+      if: github.event_name == 'pull_request' && steps.r8.outputs.needed == 'true' && env.HAS_KEYSTORE != 'true'
+      working-directory: fushi
+      run: >-
+        flutter build apk --release --target-platform android-arm64
+        --build-number "$RELEASE_SEQUENCE"
+      env:
+        HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    - name: Decode keystore
+      if: github.event_name == 'pull_request' && steps.r8.outputs.needed == 'true' && env.HAS_KEYSTORE == 'true'
+      run: |
+        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > fushi/android/fushi-release.jks
+      env:
+        HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    - name: Create key.properties
+      if: github.event_name == 'pull_request' && steps.r8.outputs.needed == 'true' && env.HAS_KEYSTORE == 'true'
+      working-directory: fushi/android
+      run: |
+        cat > key.properties <<EOF
+        storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+        keyPassword=${{ secrets.KEY_PASSWORD }}
+        keyAlias=${{ secrets.KEY_ALIAS }}
+        storeFile=fushi-release.jks
+        EOF
+      env:
+        HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    # TODO-950: arm64-only + PR-only (see the keystore-gen comment above). This
+    # is the keystore-present twin of "Verify release build"; on push it would
+    # otherwise duplicate release.yml's published arm64 APK.
+    - name: Verify release build (signed, minify/R8/proguard/native)
+      if: github.event_name == 'pull_request' && steps.r8.outputs.needed == 'true' && env.HAS_KEYSTORE == 'true'
+      working-directory: fushi
+      run: >-
+        flutter build apk --release --target-platform android-arm64
+        --build-number "$RELEASE_SEQUENCE"
+      env:
+        HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
+
+    - name: Check dependency health
+      working-directory: fushi
+      run: |
+        flutter pub outdated || true
+
+  # 主应用单测按**文件**分 4 片并行（2026-09-30）。原来它是 build job 里的一步，
+  # 带 coverage 单机串行跑完 3.5k 个 suite，实测 130~175 分钟，平均一直占 6 个
+  # runner，而 coverage 产物从没被任何步骤上传或读取；release.yml 同一套不带
+  # coverage 的测试是 73 分钟。不用 flutter test 自带的 --total-shards：它交给
+  # package:test 在**每个 suite 内部**切用例，每片仍要编译加载全部 suite，编译加载
+  # 正是大头。--file-shard 由 tool/flutter_test_failures.dart 按文件大小 LPT 分配，
+  # 各片只把自己的 suite 路径交给 flutter test，并集恰好是整个 test/（契约测试
+  # fushi/test/tools/test_file_shards_test.dart）。分片数改这里的 matrix 和下面
+  # 的 --file-shard 分母，两处一起改。
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    name: unit-tests (${{ matrix.shard }}/4)
+    steps:
+    - uses: actions/checkout@v6
+
+    # 钉 commit（v2 = v2.23.0）：第三方 action 按 tag 引用时，tag 可被改指任意提交。
+    - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+      with:
+        flutter-version: '3.47.6'
+        cache: true
+    # pdfium_dart's build hook downloads PDFium from GitHub on every fresh
+    # runner; restore it so a release-asset hiccup cannot fail the build.
+    - uses: ./.github/actions/pdfium-hook-cache
+      with:
+        purpose: test
+
+    - name: Provide baked-in secret stubs
+      uses: ./.github/actions/provide-baked-secrets
+      with:
+        google-oauth-client-secret: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        log-upload-endpoint: ${{ secrets.LOG_UPLOAD_ENDPOINT }}
+        log-upload-token: ${{ secrets.LOG_UPLOAD_TOKEN }}
+        dandanplay-app-id: ${{ secrets.DANDANPLAY_APP_ID }}
+        dandanplay-app-secret: ${{ secrets.DANDANPLAY_APP_SECRET }}
+        tmdb-api-key: ${{ secrets.TMDB_API_KEY }}
+        opensubtitles-api-key: ${{ secrets.OPENSUBTITLES_API_KEY }}
+
+    - name: Flutter pub get
+      working-directory: fushi
+      run: flutter pub get --enforce-lockfile
+
+    - name: Apply pub cache patches
+      run: |
+        chmod +x ci/apply-patches.sh
+        bash ci/apply-patches.sh
+
+    # Golden image tests are gated to the reference platform (the dev host where
+    # goldens were generated); Linux CI font/raster rendering differs and would
+    # always mismatch, so exclude them here. They still run on a plain local
+    # `flutter test`. See fushi/dart_test.yaml.
+    - name: Run unit tests (main app, file shard ${{ matrix.shard }}/4)
+      working-directory: fushi
+      run: dart run tool/flutter_test_failures.dart --file-shard=${{ matrix.shard }}/4 --exclude-tags golden
+
+    # The compact summary omits RenderFlex creation sites. Print complete
+    # diagnostics for failed tests into the job log (GitHub masks secrets here),
+    # keeping the original test step's failure and avoiding another test run.
+    - name: Show complete failed-test diagnostics
+      if: failure()
+      shell: bash
+      run: |
+        python3 - <<'PY'
+        import json
+        from pathlib import Path
+
+        path = Path('.codex-test/flutter-test/flutter_test.jsonl')
+        if not path.is_file():
+            print('No test event log was produced.')
+            raise SystemExit(0)
+        events = []
+        for line in path.read_text(encoding='utf-8').splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        failed = {
+            event.get('testID') for event in events
+            if event.get('type') == 'error' or (
+                event.get('type') == 'testDone'
+                and event.get('result') in ('failure', 'error')
+            )
+        }
+        for event in events:
+            if event.get('type') == 'testStart' and event['test']['id'] in failed:
+                print('\nFAILED TEST:', event['test']['name'])
+            elif event.get('testID') in failed:
+                if event.get('type') == 'print':
+                    print(event.get('message', ''))
+                elif event.get('type') == 'error':
+                    print(event.get('error', ''))
+                    print(event.get('stackTrace', ''))
+        PY

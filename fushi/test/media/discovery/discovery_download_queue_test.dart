@@ -1,0 +1,420 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:fushi_engine/media/discovery/discovery_download_queue.dart';
+import 'package:fushi_engine/media/discovery/discovery_models.dart';
+import 'package:fushi_engine/utils/misc/resumable_downloader.dart';
+
+DiscoveryResourceItem _item(
+  String id, {
+  String url = 'https://example.com/files/book.epub',
+  String? fileName,
+  int? sizeBytes,
+}) {
+  return DiscoveryResourceItem(
+    sourceId: 'src',
+    title: 'title-$id',
+    id: id,
+    kind: DiscoveryMediaKind.novel,
+    payloadKind: DiscoveryPayloadKind.httpFile,
+    payload: DiscoveryHttpPayload(
+      url: url,
+      fileName: fileName,
+      sizeBytes: sizeBytes,
+    ),
+  );
+}
+
+Future<DiscoveryPayload> _defaultResolver(DiscoveryResourceItem item) async =>
+    item.payload!;
+
+Future<void> _waitFor(bool Function() condition) async {
+  for (int i = 0; i < 500 && !condition(); i++) {
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+  }
+  expect(condition(), isTrue);
+}
+
+void main() {
+  late Directory tempDir;
+
+  setUp(() async {
+    tempDir = await Directory.systemTemp.createTemp('discovery_queue_test');
+  });
+
+  tearDown(() async {
+    try {
+      await tempDir.delete(recursive: true);
+    } catch (_) {
+      // Windows 上偶发句柄未释放，不让清理失败弄红测试。
+    }
+  });
+
+  ResumableDownloadResponse okBytes(List<int> body) =>
+      ResumableDownloadResponse.bytes(
+        statusCode: 200,
+        body: body,
+        headers: <String, String>{'content-length': '${body.length}'},
+      );
+
+  test('成功路径：下载落盘 → 自动导入 → done，importedCount 累计', () async {
+    final List<int> body = utf8.encode('epub-bytes');
+    final List<String> importedFiles = <String>[];
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask task, File file) async {
+        importedFiles.add(file.path);
+        return const DiscoveryImportOutcome(importedCount: 1, summary: 'ok');
+      },
+      openOverride: (Uri uri, Map<String, String> headers) async =>
+          okBytes(body),
+    );
+    addTearDown(queue.dispose);
+
+    expect(
+      queue.enqueue(_item('1'), destinationDir: tempDir.path),
+      isTrue,
+    );
+    await _waitFor(() => queue.tasks.single.isFinished);
+
+    final DiscoveryDownloadTask task = queue.tasks.single;
+    expect(task.status, DiscoveryDownloadStatus.done);
+    expect(task.filePath, endsWith('book.epub'));
+    expect(await File(task.filePath!).readAsBytes(), body);
+    expect(importedFiles.single, task.filePath);
+    expect(task.importOutcome?.summary, 'ok');
+    expect(queue.importedCount, 1);
+  });
+
+  // BUG-2649：Calibre OPDS 的 `<link length>` 是库里原文件体积，下载时服务端
+  // 把元数据写回 EPUB，实际字节数不同。目录体积只是提示，不能判 size mismatch。
+  test('目录声称体积与实际不符：照常下完导入，不判完整性失败', () async {
+    final List<int> body = utf8.encode('calibre-rewrote-this-epub');
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask task, File file) async =>
+          const DiscoveryImportOutcome(importedCount: 1, summary: 'ok'),
+      openOverride: (Uri uri, Map<String, String> headers) async =>
+          okBytes(body),
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(
+      _item('1', sizeBytes: body.length - 7),
+      destinationDir: tempDir.path,
+    );
+    await _waitFor(() => queue.tasks.single.isFinished);
+
+    final DiscoveryDownloadTask task = queue.tasks.single;
+    expect(task.error, isNull);
+    expect(task.status, DiscoveryDownloadStatus.done);
+    expect(await File(task.filePath!).readAsBytes(), body);
+  });
+
+  test('同源同 id 未完成任务去重；顺序一次一个', () async {
+    final Completer<void> gate = Completer<void>();
+    final List<String> started = <String>[];
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        started.add(uri.toString());
+        await gate.future;
+        return okBytes(utf8.encode('x'));
+      },
+    );
+    addTearDown(queue.dispose);
+
+    expect(
+      queue.enqueue(_item('1'), destinationDir: tempDir.path),
+      isTrue,
+    );
+    expect(
+      queue.enqueue(_item('1'), destinationDir: tempDir.path),
+      isFalse,
+      reason: '同条目未完成时重复入队应被拒',
+    );
+    expect(
+      queue.enqueue(
+        _item('2', url: 'https://example.com/files/two.epub'),
+        destinationDir: tempDir.path,
+      ),
+      isTrue,
+    );
+    expect(queue.totalCount, 2);
+
+    await _waitFor(() => started.length == 1);
+    expect(
+      queue.tasks[1].status,
+      DiscoveryDownloadStatus.queued,
+      reason: '单飞：第一个没完，第二个不该开跑',
+    );
+
+    gate.complete();
+    await _waitFor(
+        () => queue.tasks.every((DiscoveryDownloadTask t) => t.isFinished));
+    expect(started.length, 2);
+  });
+
+  test('瞬时网络错误自动退避重试后成功', () async {
+    int calls = 0;
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(importedCount: 1),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        calls++;
+        if (calls == 1) throw const SocketException('flaky');
+        return okBytes(utf8.encode('x'));
+      },
+      retryBackoffOverride: const <Duration>[Duration(milliseconds: 20)],
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(
+      () => queue.tasks.single.status == DiscoveryDownloadStatus.done,
+    );
+    expect(calls, 2);
+    expect(queue.tasks.single.autoRetries, 1);
+  });
+
+  test('HTTP 404 是稳定结论：直接 failed，不自动重试', () async {
+    int calls = 0;
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        calls++;
+        return ResumableDownloadResponse.bytes(statusCode: 404, body: <int>[]);
+      },
+      retryBackoffOverride: const <Duration>[Duration(milliseconds: 20)],
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(() => queue.tasks.single.isFinished);
+    expect(queue.tasks.single.status, DiscoveryDownloadStatus.failed);
+    expect(calls, 1);
+    expect(queue.tasks.single.autoRetries, 0);
+  });
+
+  test('HTTP 503 属瞬时：进入退避重试', () async {
+    int calls = 0;
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        calls++;
+        if (calls == 1) {
+          return ResumableDownloadResponse.bytes(
+            statusCode: 503,
+            body: <int>[],
+          );
+        }
+        return okBytes(utf8.encode('x'));
+      },
+      retryBackoffOverride: const <Duration>[Duration(milliseconds: 20)],
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(
+      () => queue.tasks.single.status == DiscoveryDownloadStatus.done,
+    );
+    expect(calls, 2);
+  });
+
+  test('导入失败不自动重试；手动重试跳过下载直接重导', () async {
+    int opens = 0;
+    int imports = 0;
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async {
+        imports++;
+        if (imports == 1) throw const SocketException('db down');
+        return const DiscoveryImportOutcome(importedCount: 1);
+      },
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        opens++;
+        return okBytes(utf8.encode('x'));
+      },
+      retryBackoffOverride: const <Duration>[Duration(milliseconds: 20)],
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(() => queue.tasks.single.isFinished);
+    expect(
+      queue.tasks.single.status,
+      DiscoveryDownloadStatus.failed,
+      reason: '导入失败即使是网络型异常也不该吃下载重试预算',
+    );
+    expect(opens, 1);
+
+    queue.retry(queue.tasks.single);
+    await _waitFor(
+      () => queue.tasks.single.status == DiscoveryDownloadStatus.done,
+    );
+    expect(opens, 1, reason: '目标文件已在，重试不重下');
+    expect(queue.tasks.single.skippedDownload, isTrue);
+    expect(imports, 2);
+    expect(queue.importedCount, 1);
+  });
+
+  test('源 resolve 出 torrent payload 属实现 bug：failed 不重试', () async {
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: (DiscoveryResourceItem _) async =>
+          const DiscoveryTorrentPayload(magnetUri: 'magnet:?xt=x'),
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async =>
+          okBytes(<int>[]),
+      retryBackoffOverride: const <Duration>[Duration(milliseconds: 20)],
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(() => queue.tasks.single.isFinished);
+    expect(queue.tasks.single.status, DiscoveryDownloadStatus.failed);
+    expect(queue.tasks.single.autoRetries, 0);
+  });
+
+  test('取消排队中的任务直接移除；取消执行中的任务归 cancelled', () async {
+    final Completer<void> gate = Completer<void>();
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        await gate.future;
+        return okBytes(utf8.encode('x'));
+      },
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    queue.enqueue(
+      _item('2', url: 'https://example.com/files/two.epub'),
+      destinationDir: tempDir.path,
+    );
+    await _waitFor(
+      () => queue.tasks.first.status == DiscoveryDownloadStatus.running,
+    );
+
+    // 排队中的：直接移除。
+    queue.cancel(queue.tasks[1]);
+    expect(queue.totalCount, 1);
+
+    // 执行中的：置取消标记，流收尾后归 cancelled。
+    queue.cancel(queue.tasks.single);
+    gate.complete();
+    await _waitFor(() => queue.tasks.single.isFinished);
+    expect(queue.tasks.single.status, DiscoveryDownloadStatus.cancelled);
+  });
+
+  test('clearFinished 只清终态任务', () async {
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async =>
+          okBytes(utf8.encode('x')),
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(() => queue.tasks.single.isFinished);
+    queue.clearFinished();
+    expect(queue.totalCount, 0);
+  });
+
+  test('remove 摘掉任意状态的一行：终态也受理，落盘文件不动', () async {
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async =>
+          okBytes(utf8.encode('x')),
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    await _waitFor(() => queue.tasks.single.isFinished);
+    final DiscoveryDownloadTask done = queue.tasks.single;
+    expect(done.status, DiscoveryDownloadStatus.done);
+
+    // cancel 对终态 no-op（那是「中止下载」）；remove 是「这行消失」。
+    queue.cancel(done);
+    expect(queue.totalCount, 1);
+    queue.remove(done);
+    expect(queue.totalCount, 0);
+    expect(
+      File(done.filePath!).existsSync(),
+      isTrue,
+      reason: '删的是任务不是文件——它已经入库了',
+    );
+    queue.remove(done); // 已不在队列：二次删除 no-op，不抛。
+    expect(queue.totalCount, 0);
+  });
+
+  // 注入的 openOverride 路径不建真 HttpClient，所以这里断言的是「摘行 + 让出
+  // 执行位」这半（强关连接那半与 cancel 共用同一行代码，由取消用例覆盖）。
+  test('remove 执行中的任务：立刻摘行，收尾照常放行下一个', () async {
+    final Completer<void> gate = Completer<void>();
+    final DiscoveryDownloadQueue queue = DiscoveryDownloadQueue(
+      resolvePayload: _defaultResolver,
+      importer: (DiscoveryDownloadTask _, File __) async =>
+          const DiscoveryImportOutcome(),
+      openOverride: (Uri uri, Map<String, String> headers) async {
+        if (uri.path.endsWith('book.epub')) await gate.future;
+        return okBytes(utf8.encode('x'));
+      },
+    );
+    addTearDown(queue.dispose);
+
+    queue.enqueue(_item('1'), destinationDir: tempDir.path);
+    queue.enqueue(
+      _item('2', url: 'https://example.com/files/two.epub'),
+      destinationDir: tempDir.path,
+    );
+    await _waitFor(
+      () => queue.tasks.first.status == DiscoveryDownloadStatus.running,
+    );
+
+    final DiscoveryDownloadTask running = queue.tasks.first;
+    queue.remove(running);
+    expect(queue.tasks.contains(running), isFalse);
+    expect(queue.totalCount, 1);
+
+    // 收尾仍以 `_running` 身份认领这次执行 → 执行位释放，第二个任务跑完。
+    gate.complete();
+    await _waitFor(() => queue.tasks.single.status ==
+        DiscoveryDownloadStatus.done);
+    expect(queue.runningTask, isNull);
+  });
+
+  group('sanitizeDiscoveryFileName', () {
+    test('剥路径分隔与 Windows 非法字符', () {
+      expect(
+        sanitizeDiscoveryFileName(r'a/b\c:d*e?"f"<g>|h.epub'),
+        'a b c d e f g h.epub',
+      );
+    });
+
+    test('压缩空白并去尾点/空格', () {
+      expect(sanitizeDiscoveryFileName('  a   b.txt.  '), 'a b.txt');
+    });
+
+    test('空/纯点回退 download', () {
+      expect(sanitizeDiscoveryFileName('   '), 'download');
+      expect(sanitizeDiscoveryFileName('..'), 'download');
+    });
+  });
+}

@@ -1,0 +1,14 @@
+{
+  "name": "fushi-leaderboard-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "jpeg-js": "0.4.4",
+    "vitest": "^2.1.8",
+    "wrangler": "^3.90.0"
+  }
+}

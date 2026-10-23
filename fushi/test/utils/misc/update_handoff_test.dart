@@ -1,0 +1,1493 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/utils/misc/platform_updater.dart';
+import 'package:fushi/src/utils/misc/update_handoff.dart';
+
+Future<File> _markerFile() async {
+  final Directory dir =
+      await Directory.systemTemp.createTemp('fushi-update-handoff-test');
+  addTearDown(() async {
+    if (dir.existsSync()) await dir.delete(recursive: true);
+  });
+  return WindowsUpdateHandoff.markerFile(dir);
+}
+
+/// 一份「安装真的装完了」的 Inno 日志，放在 [marker] 同目录，返回其路径。
+///
+/// BUG-1786：`reconcile` 判成功现在要求**正面证据**——Inno 日志明确写了
+/// `Installation process succeeded.`。在此之前唯一的判据是
+/// `currentVersion >= targetVersion`，而它在 debug/beta 通道恒为真（SemVer 里
+/// 正式版 `2.2.1` > 同号预发布版 `2.2.1-debug.12067`），于是整包回滚要报成功、
+/// 安装器压根没跑起来也报成功——用户连着几天收到「更新成功」却一直跑旧代码。
+///
+/// 下面几条成功路径用例原本把 `innoLogPath` 填成一个**不存在**的 `C:\tmp\...` 占位，
+/// 它们真正要钉的是 marker 生命周期（清理 / 幂等 / prompted 版本），不是「没有日志也算
+/// 成功」。所以这里补上真日志，让它们继续钉住原本的东西。
+Future<String> _succeededInnoLog(File marker) async {
+  final File log = File(
+    '${marker.parent.path}${Platform.pathSeparator}install.log',
+  );
+  await log.writeAsString(
+    '2026-06-17 10:31:00.000   Successfully installed the file.\n'
+    '2026-06-17 10:31:02.000   Installation process succeeded.\n',
+  );
+  return log.path;
+}
+
+void main() {
+  group('WindowsUpdateHandoff marker', () {
+    test('writes the target version, installer, Inno log, and launch result',
+        () async {
+      final File marker = await _markerFile();
+      final DateTime startedAt = DateTime.utc(2026, 6, 17, 10, 30);
+
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: r'C:\tmp\hibiki-1.2.3.install.log',
+        startedAt: startedAt,
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 4242,
+        launchedAt: startedAt.add(const Duration(seconds: 1)),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record, isNotNull);
+      expect(record!.targetVersion, '1.2.3');
+      expect(record.installerPath, r'C:\tmp\hibiki-1.2.3-windows-setup.exe');
+      expect(record.innoLogPath, r'C:\tmp\hibiki-1.2.3.install.log');
+      expect(record.startedAt, startedAt);
+      expect(record.installerLaunchSucceeded, isTrue);
+      expect(record.installerLaunchedAt,
+          startedAt.add(const Duration(seconds: 1)));
+      expect(record.installerPid, 4242);
+    });
+
+    test(
+        'writePending starts a fresh marker so a previous launch attempt '
+        'does not leak into the next', () async {
+      final File marker = await _markerFile();
+
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.0',
+        installerPath: r'C:\tmp\hibiki-1.0.0-windows-setup.exe',
+        innoLogPath: r'C:\tmp\hibiki-1.0.0.install.log',
+        startedAt: DateTime.utc(2026, 6, 17, 10, 0),
+      );
+      await WindowsUpdateHandoff.markLauncherStarted(
+        markerFile: marker,
+        startedAt: DateTime.utc(2026, 6, 17, 10, 0, 1),
+        parentProcessId: 1111,
+        launcherPid: 2222,
+      );
+      await WindowsUpdateHandoff.markParentExitObserved(
+        markerFile: marker,
+        observedAt: DateTime.utc(2026, 6, 17, 10, 0, 2),
+        observed: true,
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 3333,
+        launchedAt: DateTime.utc(2026, 6, 17, 10, 0, 3),
+      );
+
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '2.0.0',
+        installerPath: r'C:\tmp\hibiki-2.0.0-windows-setup.exe',
+        innoLogPath: r'C:\tmp\hibiki-2.0.0.install.log',
+        startedAt: DateTime.utc(2026, 6, 17, 11, 0),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record!.targetVersion, '2.0.0');
+      expect(record.launcherPid, isNull);
+      expect(record.parentProcessId, isNull);
+      expect(record.parentExitObserved, isNull);
+      expect(record.installerPid, isNull);
+      expect(record.installerLaunchSucceeded, isNull);
+    });
+
+    test('installer args use the exact log path persisted in the marker', () {
+      final List<String> args = windowsInstallerArgs(
+        r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        logPath: r'C:\logs\hibiki-update.install.log',
+      );
+
+      expect(args, contains(r'/LOG=C:\logs\hibiki-update.install.log'));
+      expect(args.where((String arg) => arg.startsWith('/LOG=')), hasLength(1));
+    });
+
+    test('preserves Windows install diagnostics in marker JSON', () {
+      final WindowsUpdateHandoffRecord record =
+          WindowsUpdateHandoffRecord.fromJson(<String, dynamic>{
+        'targetVersion': '1.2.3',
+        'installerPath': r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        'innoLogPath': r'C:\tmp\hibiki-1.2.3.install.log',
+        'startedAt': '2026-06-17T10:30:00Z',
+        'currentExecutablePath': r'D:\Portable\Hibiki\hibiki.exe',
+        'currentInstallDir': r'D:\Portable\Hibiki',
+        'targetInstallDir': r'D:\Portable\Hibiki',
+        'detectedInstallLocations': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'source': 'registered',
+            'path': r'D:\Program\Hibiki',
+          },
+          <String, dynamic>{
+            'source': 'current',
+            'path': r'D:\Portable\Hibiki',
+          },
+        ],
+        'pathMismatchWarning':
+            r'Registered install location D:\Program\Hibiki differs from current D:\Portable\Hibiki.',
+        'runningFushiProcesses': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'pid': 4321,
+            'path': r'D:\Portable\Hibiki\hibiki.exe',
+          },
+        ],
+        'libmpvModuleHolders': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'pid': 4321,
+            'path': r'D:\Portable\Hibiki\hibiki.exe',
+          },
+        ],
+        'innoLogDeleteFileFailures': <Map<String, dynamic>>[
+          <String, dynamic>{
+            'path': r'D:\Portable\Hibiki\libmpv-2.dll',
+            'code': 5,
+          },
+        ],
+      });
+
+      final Map<String, dynamic> json = record.toJson();
+      expect(json['currentExecutablePath'], r'D:\Portable\Hibiki\hibiki.exe');
+      expect(json['currentInstallDir'], r'D:\Portable\Hibiki');
+      expect(json['targetInstallDir'], r'D:\Portable\Hibiki');
+      expect(json['detectedInstallLocations'], isA<List<dynamic>>());
+      expect(json['pathMismatchWarning'], contains(r'D:\Program\Hibiki'));
+      expect(json['runningFushiProcesses'], isA<List<dynamic>>());
+      expect(json['libmpvModuleHolders'], isA<List<dynamic>>());
+      expect(json['innoLogDeleteFileFailures'], isA<List<dynamic>>());
+    });
+
+    test(
+        'W2-6 wire 兼容：旧 Hibiki 过渡版写的 runningHibikiProcesses 键读侧仍认，'
+        '写侧只写新键', () {
+      final WindowsUpdateHandoffRecord record =
+          WindowsUpdateHandoffRecord.fromJson(<String, dynamic>{
+        'targetVersion': '1.2.3',
+        'installerPath': r'C:\tmp\fushi-1.2.3-windows-setup.exe',
+        'innoLogPath': r'C:\tmp\fushi-1.2.3.install.log',
+        'startedAt': '2026-08-07T10:30:00Z',
+        // 旧键：hibiki→fushi 更新桥时代的旧二进制写下的 marker。
+        'runningHibikiProcesses': <Map<String, dynamic>>[
+          <String, dynamic>{'pid': 777, 'name': 'hibiki.exe'},
+        ],
+      });
+      expect(record.runningFushiProcesses.single.pid, 777,
+          reason: '旧键必须被读侧回退解析');
+
+      final Map<String, dynamic> json = record.toJson();
+      expect(json['runningFushiProcesses'], isA<List<dynamic>>(),
+          reason: '写侧只写新键');
+      expect(json.containsKey('runningHibikiProcesses'), isFalse,
+          reason: '写侧绝不再写旧键');
+
+      // 新旧并存时新键胜出（新键是本代写入，旧键只是残影）。
+      final WindowsUpdateHandoffRecord both =
+          WindowsUpdateHandoffRecord.fromJson(<String, dynamic>{
+        'targetVersion': '1.2.3',
+        'installerPath': 'x',
+        'innoLogPath': 'y',
+        'startedAt': '2026-08-07T10:30:00Z',
+        'runningFushiProcesses': <Map<String, dynamic>>[
+          <String, dynamic>{'pid': 111},
+        ],
+        'runningHibikiProcesses': <Map<String, dynamic>>[
+          <String, dynamic>{'pid': 222},
+        ],
+      });
+      expect(both.runningFushiProcesses.single.pid, 111);
+    });
+  });
+
+  group('WindowsUpdateHandoff reconcile', () {
+    test('reports success and clears the marker when current version reached',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: await _succeededInnoLog(marker),
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 4242,
+        launchedAt: DateTime.utc(2026, 6, 17, 10, 31),
+      );
+
+      final WindowsUpdateHandoffResult? result =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.3',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+
+      expect(result?.status, WindowsUpdateHandoffStatus.installed);
+      expect(result?.record.targetVersion, '1.2.3');
+      expect(await marker.exists(), isFalse);
+    });
+
+    test('a successful reconcile records the prompted app version', () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: await _succeededInnoLog(marker),
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 4242,
+        launchedAt: DateTime.utc(2026, 6, 17, 10, 31),
+      );
+
+      final WindowsUpdateHandoffResult? result =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.3',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+
+      expect(result?.status, WindowsUpdateHandoffStatus.installed);
+      expect(result?.record.lastPromptedAppVersion, '1.2.3');
+    });
+
+    test(
+        'does not pop the success dialog on every startup when the marker '
+        'survives (delete failed last time)', () async {
+      // Reproduces TODO-1035 / BUG-483: on real machines the updates dir marker
+      // can fail to delete (antivirus/indexer lock, permission error) and that
+      // failure is swallowed. The marker then persists with lastPromptedAppVersion
+      // already set to the current version, and reconcile must stay silent.
+      final File marker = await _markerFile();
+      final WindowsUpdateHandoffRecord persisted =
+          WindowsUpdateHandoffRecord.fromJson(<String, dynamic>{
+        'targetVersion': '1.2.3',
+        'installerPath': r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        'innoLogPath': await _succeededInnoLog(marker),
+        'startedAt': '2026-06-17T10:30:00Z',
+        'installerLaunchSucceeded': true,
+        'lastPromptedAppVersion': '1.2.3',
+      });
+      await marker.parent.create(recursive: true);
+      await marker.writeAsString(
+        const JsonEncoder.withIndent('  ').convert(persisted.toJson()),
+        flush: true,
+      );
+
+      final WindowsUpdateHandoffResult? result =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.3',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+
+      expect(result, isNull, reason: 'do not pop on every startup');
+    });
+
+    test('reports an incomplete install once and keeps the log marker',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: r'C:\tmp\hibiki-1.2.3.install.log',
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 4242,
+        launchedAt: DateTime.utc(2026, 6, 17, 10, 31),
+      );
+
+      final WindowsUpdateHandoffResult? first =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+      final WindowsUpdateHandoffResult? second =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 33),
+      );
+      final WindowsUpdateHandoffRecord? retained =
+          await WindowsUpdateHandoff.read(marker);
+
+      expect(first?.status, WindowsUpdateHandoffStatus.incomplete);
+      expect(first?.record.innoLogPath, r'C:\tmp\hibiki-1.2.3.install.log');
+      expect(first?.record.installerPid, 4242);
+      expect(second, isNull, reason: 'do not pop on every startup');
+      expect(retained, isNotNull);
+      expect(retained!.lastPromptedAppVersion, '1.2.2');
+    });
+
+    test('reports launch failure once and keeps the marker for diagnostics',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: r'C:\tmp\hibiki-1.2.3.install.log',
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+      await WindowsUpdateHandoff.markLaunchFailed(
+        markerFile: marker,
+        error: 'access denied',
+        failedAt: DateTime.utc(2026, 6, 17, 10, 31),
+      );
+
+      final WindowsUpdateHandoffResult? result =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+
+      expect(result?.status, WindowsUpdateHandoffStatus.launchFailed);
+      expect(result?.record.launchError, contains('access denied'));
+      expect(await marker.exists(), isTrue);
+    });
+
+    test('reports the same app version again when failure fingerprint changes',
+        () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File log = File('${dir.path}${Platform.pathSeparator}inno.log');
+      await log.writeAsString('Got EAbort exception.');
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\hibiki-1.2.3-windows-setup.exe',
+        innoLogPath: log.path,
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+      await WindowsUpdateHandoff.markLaunchSucceeded(
+        markerFile: marker,
+        installerPid: 4242,
+        launchedAt: DateTime.utc(2026, 6, 17, 10, 31),
+      );
+
+      final WindowsUpdateHandoffResult? first =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 32),
+      );
+      final WindowsUpdateHandoffResult? second =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 33),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      await log.writeAsString(
+        [
+          r'2026-06-18 10:00:00.000   DeleteFile failed; code 5.',
+          r'2026-06-18 10:00:00.001   C:\Program Files\Hibiki\libmpv-2.dll',
+        ].join('\n'),
+      );
+      final WindowsUpdateHandoffResult? third =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '1.2.2',
+        now: DateTime.utc(2026, 6, 17, 10, 34),
+      );
+
+      expect(first?.record.installerFailureType, 'silent_cancel');
+      expect(second, isNull);
+      expect(third?.record.installerFailureType, 'deletefile_code_5');
+      expect(
+        third?.record.failureFingerprint,
+        isNot(equals(first?.record.failureFingerprint)),
+      );
+    });
+
+    test('debug versions reconcile as installed when current debug is newer',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '0.5.1-debug.19',
+        installerPath: r'C:\tmp\hibiki-0.5.1-debug.19-windows-setup.exe',
+        innoLogPath: await _succeededInnoLog(marker),
+        startedAt: DateTime.utc(2026, 6, 17, 10, 30),
+      );
+
+      final WindowsUpdateHandoffResult? result =
+          await WindowsUpdateHandoff.reconcile(
+        markerFile: marker,
+        currentVersion: '0.5.1-debug.20',
+      );
+
+      expect(result?.status, WindowsUpdateHandoffStatus.installed);
+      expect(await marker.exists(), isFalse);
+    });
+
+    test('summarizes Inno currently-running and missing-log failures', () {
+      final WindowsInstallerFailureSummary running =
+          summarizeWindowsInstallerFailure(
+        record: WindowsUpdateHandoffRecord(
+          targetVersion: '1.2.3',
+          installerPath: r'C:\tmp\setup.exe',
+          innoLogPath: r'C:\tmp\setup.log',
+          startedAt: DateTime.utc(2026, 6, 17),
+          innoLogExists: true,
+        ),
+        innoLogContents: 'Setup detected that Hibiki is currently running.\n'
+            'Got EAbort exception.',
+      );
+      final WindowsInstallerFailureSummary missing =
+          summarizeWindowsInstallerFailure(
+        record: WindowsUpdateHandoffRecord(
+          targetVersion: '1.2.3',
+          installerPath: r'C:\tmp\setup.exe',
+          innoLogPath: r'C:\tmp\missing.log',
+          startedAt: DateTime.utc(2026, 6, 17),
+          innoLogExists: false,
+        ),
+      );
+
+      expect(running.type, 'app_mutex_running');
+      expect(running.message, contains('FushiSingleInstanceMutex'));
+      expect(missing.type, 'missing_log');
+    });
+  });
+
+  group('WindowsInstaller.runAndExit handoff', () {
+    test(
+        'writes marker, starts delayed launcher with marker log path, then exits',
+        () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      String? startedExecutable;
+      List<String>? startedArgs;
+      int? exitCode;
+      await WindowsInstaller.runAndExit(
+        installer.path,
+        targetVersion: '1.2.3',
+        handoffMarkerFile: marker,
+        now: () => DateTime.utc(2026, 6, 17, 10, 30),
+        collectDiagnostics: () async => WindowsInstallerDiagnostics(
+          currentExecutablePath:
+              '${dir.path}${Platform.pathSeparator}hibiki.exe',
+          currentInstallDir: dir.path,
+          targetInstallDir: dir.path,
+        ),
+        startProcess: (String executable, List<String> args) async {
+          startedExecutable = executable;
+          startedArgs = args;
+          return const WindowsInstallerStartedProcess(pid: 4242);
+        },
+        exitProcess: (int code) {
+          exitCode = code;
+        },
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.targetVersion, '1.2.3');
+      expect(record?.installerLaunchSucceeded, isNull,
+          reason:
+              'the helper writes installer launch outcome after parent exit');
+      expect(startedExecutable, endsWith('fushi_update_launcher.exe'));
+      expect(
+          startedArgs,
+          containsAllInOrder(<String>[
+            '--marker',
+            marker.path,
+            '--parent-pid',
+            '$pid',
+            '--installer',
+            installer.path,
+            '--',
+          ]));
+      expect(startedArgs, contains('/LOG=${record!.innoLogPath}'));
+      expect(exitCode, 0);
+    });
+
+    test('records launch failure before surfacing the installer exception',
+        () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      await expectLater(
+        WindowsInstaller.runAndExit(
+          installer.path,
+          targetVersion: '1.2.3',
+          handoffMarkerFile: marker,
+          collectDiagnostics: () async => WindowsInstallerDiagnostics(
+            currentExecutablePath:
+                '${dir.path}${Platform.pathSeparator}hibiki.exe',
+            currentInstallDir: dir.path,
+            targetInstallDir: dir.path,
+          ),
+          startProcess: (String executable, List<String> args) async {
+            throw const ProcessException(
+              'fushi_update_launcher.exe',
+              <String>[],
+              'boom',
+            );
+          },
+          exitProcess: (_) {},
+        ),
+        throwsA(isA<UpdateInstallerException>()),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.installerLaunchSucceeded, isFalse);
+      expect(record?.launchError, contains('boom'));
+    });
+
+    test(
+        'blocks when a non-Hibiki external process holds libmpv in the target '
+        'directory (installer cannot close it by image name)', () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await expectLater(
+        WindowsInstaller.runAndExit(
+          installer.path,
+          targetVersion: '1.2.3',
+          handoffMarkerFile: marker,
+          collectDiagnostics: () async => WindowsInstallerDiagnostics(
+            currentExecutablePath:
+                '${dir.path}${Platform.pathSeparator}hibiki.exe',
+            currentInstallDir: dir.path,
+            targetInstallDir: dir.path,
+            // BUG-2055 —— 占用者的镜像必须在**安装目录之外**，这条用例才名副其实：
+            // `fushi.iss` 的 `PrepareToInstall` 第一步就是
+            // `KillProcessesUnderDir({app})`，按镜像路径清掉安装目录树内的任何进程。
+            // 把「外部程序」摆进安装目录里，断言的其实是一个安装器自己就能解决的情形。
+            libmpvModuleHolders: const <WindowsProcessInfo>[
+              WindowsProcessInfo(
+                pid: 9001,
+                name: 'someplayer.exe',
+                path: r'D:\Media\Player\someplayer.exe',
+              ),
+            ],
+          ),
+          startProcess: (String executable, List<String> args) async {
+            startCalled = true;
+            return const WindowsInstallerStartedProcess(pid: 4242);
+          },
+          exitProcess: (_) {},
+        ),
+        throwsA(isA<UpdateInstallerException>()),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(startCalled, isFalse);
+      expect(record?.installerLaunchSucceeded, isFalse);
+      expect(record?.libmpvModuleHolders.single.pid, 9001);
+      expect(record?.launchError, contains('non-Fushi process'));
+      expect(record?.launchError, contains('Close them manually'));
+    });
+
+    test(
+        'BUG-1675 更新前拦下正占用 galgame helper 组件的游戏进程'
+        '（否则 Inno 静默换不掉 voice_hook/，落地成新本体+旧 helper）', () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}fushi-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await expectLater(
+        WindowsInstaller.runAndExit(
+          installer.path,
+          targetVersion: '1.2.3',
+          handoffMarkerFile: marker,
+          collectDiagnostics: () async => WindowsInstallerDiagnostics(
+            currentExecutablePath:
+                '${dir.path}${Platform.pathSeparator}fushi.exe',
+            currentInstallDir: dir.path,
+            targetInstallDir: dir.path,
+            // 被 hook 的游戏：安装器按 image 名杀不掉它（不是 fushi.exe /
+            // msedgewebview2.exe），所以必须硬中止而不是「交给安装器处理」。
+            galHookModuleHolders: <WindowsProcessInfo>[
+              WindowsProcessInfo(
+                pid: 7777,
+                name: 'SiglusEngine.exe',
+                path: r'D:\Games\SomeGal\SiglusEngine.exe',
+              ),
+            ],
+          ),
+          startProcess: (String executable, List<String> args) async {
+            startCalled = true;
+            return const WindowsInstallerStartedProcess(pid: 4242);
+          },
+          exitProcess: (_) {},
+        ),
+        throwsA(isA<UpdateInstallerException>()),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      // 关键断言：安装器**根本没被启动**。这一条就是根因修复本身——旧行为是照常
+      // 静默启动安装器，Inno 换不掉被游戏持有的 fushi_voice_hook.dll /
+      // fushi_voice_injector.exe，失败被 /SUPPRESSMSGBOXES 吞掉，用户下次开游戏
+      // 才在 `voice_hook open protocol_mismatch shm=13/want 15` 里看到后果。
+      expect(startCalled, isFalse);
+      expect(record?.installerLaunchSucceeded, isFalse);
+      expect(record?.galHookModuleHolders.single.pid, 7777);
+      expect(record?.galHookModuleHolders.single.name, 'SiglusEngine.exe');
+      // BUG-2055 —— 报错必须说清成因：占用者不是「某个非 Fushi 程序」，而是被 Fushi
+      // 自己的语音捕获组件注入的程序。旧文案把所有占用者统称 non-Fushi process，
+      // 等于把用户指向一个与 Fushi 无关的第三方，照着这句话永远找不到占用者。
+      expect(
+        record?.launchError,
+        contains("Fushi's voice capture component is injected"),
+      );
+      expect(
+        record?.launchError,
+        contains('Save your progress and close them'),
+      );
+      expect(record?.launchError, isNot(contains('non-Fushi process')));
+      // 报错不得把占用者说成 libmpv：这次占用的是 helper 组件，指名错组件会把
+      // 用户引到完全无关的排查方向。
+      expect(record?.launchError, isNot(contains('libmpv')));
+    });
+
+    test(
+        'BUG-2055 镜像在安装目录树内的自有子进程交给安装器，不再硬中止'
+        '（KillProcessesUnderDir 按镜像路径清扫，Dart 侧不该比它更严）', () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}fushi-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await WindowsInstaller.runAndExit(
+        installer.path,
+        targetVersion: '1.2.3',
+        handoffMarkerFile: marker,
+        collectDiagnostics: () async => WindowsInstallerDiagnostics(
+          currentExecutablePath:
+              '${dir.path}${Platform.pathSeparator}fushi.exe',
+          currentInstallDir: dir.path,
+          targetInstallDir: dir.path,
+          // 以 `--hold` 常驻的自有 injector：镜像在安装目录树内，安装器
+          // `KillProcessesUnderDir` 一步就清得掉。旧判据只认三个 image 名，把它
+          // 当成「安装器杀不掉的外部锁」硬中止，用户这次更新就永远做不下去，而
+          // 关掉它根本不需要用户插手。
+          galHookModuleHolders: <WindowsProcessInfo>[
+            WindowsProcessInfo(
+              pid: 4321,
+              name: 'fushi_voice_injector.exe',
+              path: '${dir.path}${Platform.pathSeparator}voice_hook'
+                  '${Platform.pathSeparator}x86'
+                  '${Platform.pathSeparator}fushi_voice_injector.exe',
+            ),
+          ],
+        ),
+        startProcess: (String executable, List<String> args) async {
+          startCalled = true;
+          return const WindowsInstallerStartedProcess(pid: 4242);
+        },
+        exitProcess: (_) {},
+      );
+
+      expect(startCalled, isTrue,
+          reason: '镜像在安装目录树内的进程由安装器清掉，Dart 不该抢先中止更新');
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.galHookModuleHolders.single.pid, 4321);
+      expect(record?.launchError, isNull);
+    });
+
+    test(
+        'BUG-2055 同前缀的兄弟目录不算「安装目录树内」，仍按外部锁硬中止', () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}fushi-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await expectLater(
+        WindowsInstaller.runAndExit(
+          installer.path,
+          targetVersion: '1.2.3',
+          handoffMarkerFile: marker,
+          collectDiagnostics: () async => WindowsInstallerDiagnostics(
+            currentExecutablePath:
+                '${dir.path}${Platform.pathSeparator}fushi.exe',
+            currentInstallDir: dir.path,
+            targetInstallDir: dir.path,
+            // 目录名以安装目录为前缀、但**不是**它的子目录。裸 startsWith 会把它
+            // 误判成安装器清得掉，于是照常交接、随后在复制阶段静默失败
+            // （BUG-1675 的失败形状）。判据必须比到路径分隔符。
+            libmpvModuleHolders: <WindowsProcessInfo>[
+              WindowsProcessInfo(
+                pid: 9100,
+                name: 'someplayer.exe',
+                path: '${dir.path}-sibling'
+                    '${Platform.pathSeparator}someplayer.exe',
+              ),
+            ],
+          ),
+          startProcess: (String executable, List<String> args) async {
+            startCalled = true;
+            return const WindowsInstallerStartedProcess(pid: 4242);
+          },
+          exitProcess: (_) {},
+        ),
+        throwsA(isA<UpdateInstallerException>()),
+      );
+
+      expect(startCalled, isFalse);
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.launchError, contains('non-Fushi process'));
+    });
+
+    test('BUG-1675 galHookModuleHolders 计入锁证据，且 wire 键可往返', () async {
+      const WindowsInstallerDiagnostics diagnostics =
+          WindowsInstallerDiagnostics(
+        galHookModuleHolders: <WindowsProcessInfo>[
+          WindowsProcessInfo(pid: 7777, name: 'SiglusEngine.exe'),
+        ],
+      );
+      expect(diagnostics.hasLockEvidence, isTrue);
+
+      // Inno 日志侧：helper 换不掉时报的是 voice_hook\ 下的路径，只认 libmpv 会让
+      // 这半边锁证据整个看不见（重启 Windows 的提示也就不会出现）。
+      const WindowsInstallerDiagnostics fromInnoLog =
+          WindowsInstallerDiagnostics(
+        innoLogDeleteFileFailures: <WindowsInnoDeleteFileFailure>[
+          WindowsInnoDeleteFileFailure(
+            path: r'C:\Users\u\AppData\Local\Fushi\voice_hook\x86'
+                r'\fushi_voice_hook.dll',
+            code: 5,
+          ),
+        ],
+      );
+      expect(fromInnoLog.hasLockEvidence, isTrue);
+
+      // 无关路径的删除失败仍不算锁证据（别把这条守卫放宽成「有失败就算」）。
+      const WindowsInstallerDiagnostics unrelated = WindowsInstallerDiagnostics(
+        innoLogDeleteFileFailures: <WindowsInnoDeleteFileFailure>[
+          WindowsInnoDeleteFileFailure(path: r'C:\x\readme.txt', code: 5),
+        ],
+      );
+      expect(unrelated.hasLockEvidence, isFalse);
+
+      final WindowsUpdateHandoffRecord record = WindowsUpdateHandoffRecord(
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\setup.exe',
+        innoLogPath: r'C:\tmp\setup.install.log',
+        startedAt: DateTime.utc(2026, 8, 15),
+        galHookModuleHolders: const <WindowsProcessInfo>[
+          WindowsProcessInfo(pid: 7777, name: 'SiglusEngine.exe'),
+        ],
+      );
+      final WindowsUpdateHandoffRecord roundTripped =
+          WindowsUpdateHandoffRecord.fromJson(
+        jsonDecode(jsonEncode(record.toJson())) as Map<String, dynamic>,
+      );
+      expect(roundTripped.galHookModuleHolders.single.pid, 7777);
+
+      // 旧版本写的标记里没有这个键：必须读成空列表，不能抛。
+      final WindowsUpdateHandoffRecord legacy =
+          WindowsUpdateHandoffRecord.fromJson(<String, dynamic>{
+        'targetVersion': '1.2.3',
+        'installerPath': r'C:\tmp\setup.exe',
+        'innoLogPath': r'C:\tmp\setup.install.log',
+        'startedAt': '2026-08-15T00:00:00.000Z',
+      });
+      expect(legacy.galHookModuleHolders, isEmpty);
+    });
+
+    test(
+        'defers a hibiki.exe libmpv holder to the installer instead of '
+        'aborting (TODO-1181)', () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await WindowsInstaller.runAndExit(
+        installer.path,
+        targetVersion: '1.2.3',
+        handoffMarkerFile: marker,
+        collectDiagnostics: () async => WindowsInstallerDiagnostics(
+          currentExecutablePath:
+              '${dir.path}${Platform.pathSeparator}hibiki.exe',
+          currentInstallDir: dir.path,
+          targetInstallDir: dir.path,
+          runningFushiProcesses: <WindowsProcessInfo>[
+            WindowsProcessInfo(
+              pid: 5678,
+              name: 'hibiki.exe',
+              path: '${dir.path}${Platform.pathSeparator}hibiki.exe',
+            ),
+          ],
+          libmpvModuleHolders: <WindowsProcessInfo>[
+            WindowsProcessInfo(
+              pid: 5678,
+              name: 'hibiki.exe',
+              path: '${dir.path}${Platform.pathSeparator}hibiki.exe',
+            ),
+          ],
+        ),
+        startProcess: (String executable, List<String> args) async {
+          startCalled = true;
+          return const WindowsInstallerStartedProcess(pid: 4242);
+        },
+        exitProcess: (_) {},
+      );
+
+      expect(startCalled, isTrue,
+          reason: 'hibiki.exe (even holding libmpv) is closed by hibiki.iss '
+              'InitializeSetup; Dart must not hard-abort the update');
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      // Diagnostics still record the deferred holders, but the launch is not
+      // marked failed and no manual-close error is surfaced.
+      expect(record?.libmpvModuleHolders.single.pid, 5678);
+      expect(record?.installerLaunchSucceeded, isNull);
+      expect(record?.launchError, isNull);
+    });
+
+    test(
+        'defers other active hibiki.exe instances (even outside the target '
+        'directory) to the installer instead of aborting (TODO-1181)',
+        () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await WindowsInstaller.runAndExit(
+        installer.path,
+        targetVersion: '1.2.3',
+        handoffMarkerFile: marker,
+        collectDiagnostics: () async => WindowsInstallerDiagnostics(
+          currentExecutablePath:
+              '${dir.path}${Platform.pathSeparator}hibiki.exe',
+          currentInstallDir: dir.path,
+          targetInstallDir: dir.path,
+          runningFushiProcesses: const <WindowsProcessInfo>[
+            WindowsProcessInfo(
+              pid: 6789,
+              name: 'hibiki.exe',
+              path: r'C:\Users\wrds\AppData\Local\Hibiki\hibiki.exe',
+            ),
+          ],
+        ),
+        startProcess: (String executable, List<String> args) async {
+          startCalled = true;
+          return const WindowsInstallerStartedProcess(pid: 4242);
+        },
+        exitProcess: (_) {},
+      );
+
+      expect(startCalled, isTrue,
+          reason: 'the installer (hibiki.iss) force-kills other hibiki.exe by '
+              'image name; Dart must not hard-abort the update');
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.runningFushiProcesses.single.pid, 6789);
+      expect(record?.installerLaunchSucceeded, isNull);
+      expect(record?.launchError, isNull);
+    });
+
+    test('does not block on historical install locations without a process',
+        () async {
+      final File marker = await _markerFile();
+      final Directory dir = marker.parent;
+      final File installer = File(
+          '${dir.path}${Platform.pathSeparator}hibiki-1.2.3-windows-setup.exe');
+      await installer.writeAsBytes(<int>[0x4D, 0x5A, 0x90, 0x00]);
+
+      var startCalled = false;
+      await WindowsInstaller.runAndExit(
+        installer.path,
+        targetVersion: '1.2.3',
+        handoffMarkerFile: marker,
+        collectDiagnostics: () async => WindowsInstallerDiagnostics(
+          currentExecutablePath:
+              '${dir.path}${Platform.pathSeparator}hibiki.exe',
+          currentInstallDir: dir.path,
+          targetInstallDir: dir.path,
+          detectedInstallLocations: const <WindowsDetectedInstallLocation>[
+            WindowsDetectedInstallLocation(
+                source: 'current', path: r'D:\APP\Hibiki'),
+            WindowsDetectedInstallLocation(
+              source: 'historical',
+              path: r'C:\Users\wrds\AppData\Local\Hibiki',
+            ),
+          ],
+          pathMismatchWarning: 'historical location differs',
+        ),
+        startProcess: (String executable, List<String> args) async {
+          startCalled = true;
+          return const WindowsInstallerStartedProcess(pid: 4242);
+        },
+        exitProcess: (_) {},
+      );
+
+      expect(startCalled, isTrue);
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record?.pathMismatchWarning, contains('historical'));
+      expect(record?.installerLaunchSucceeded, isNull);
+    });
+  });
+
+  group('startup reconcile guard', () {
+    test('main schedules Windows update handoff through navigatorKey context',
+        () {
+      final String source = File('lib/main.dart').readAsStringSync();
+      final int navigatorContext =
+          source.indexOf('appModel.navigatorKey.currentContext');
+      final int contextGuard =
+          source.indexOf('UpdateChecker.canShowDialogFromContext');
+      final int reconcile = source
+          .indexOf('UpdateChecker.reconcilePendingWindowsInstallerHandoff');
+
+      expect(source, contains('_windowsUpdateHandoffChecked'));
+      expect(source, contains('_windowsUpdateHandoffScheduled'));
+      expect(source, contains('_scheduleWindowsUpdateHandoffReconcile();'));
+      expect(
+        source,
+        isNot(contains('_scheduleWindowsUpdateHandoffReconcile(context)')),
+      );
+      expect(navigatorContext, isNonNegative);
+      expect(contextGuard, isNonNegative);
+      expect(reconcile, isNonNegative);
+      expect(
+        navigatorContext,
+        lessThan(reconcile),
+        reason: 'Do not pass MaterialApp.builder context into handoff '
+            'reconcile; it is outside the Navigator host.',
+      );
+      expect(
+        contextGuard,
+        lessThan(reconcile),
+        reason: 'The handoff marker must not be read or consumed until a real '
+            'Navigator context is available.',
+      );
+    });
+
+    test(
+        'source guard: UpdateChecker validates Navigator before handoff '
+        'marker reconcile', () {
+      final String source =
+          File('lib/src/utils/misc/update_checker_release.dart')
+              .readAsStringSync();
+      final int method = source.indexOf(
+          'static Future<void> reconcilePendingWindowsInstallerHandoff');
+      final int guard =
+          source.indexOf('canShowDialogFromContext(context)', method);
+      final int markerRead =
+          source.indexOf('WindowsUpdateHandoff.reconcile', method);
+
+      expect(method, isNonNegative);
+      expect(guard, isNonNegative);
+      expect(markerRead, isNonNegative);
+      expect(
+        guard,
+        lessThan(markerRead),
+        reason: 'A bad startup BuildContext must not consume the handoff '
+            'marker before a later Navigator-backed retry can show the dialog.',
+      );
+    });
+
+    test('source guard: dialog context validator is production-callable', () {
+      final String source =
+          File('lib/src/utils/misc/update_checker_release.dart')
+              .readAsStringSync();
+      final int helper = source.indexOf(
+        'static bool canShowDialogFromContext(BuildContext context)',
+      );
+      final int previousAnnotation =
+          source.lastIndexOf('@visibleForTesting', helper);
+      final int previousMember = source.lastIndexOf('\n  static ', helper - 1);
+
+      expect(helper, isNonNegative);
+      expect(
+        previousAnnotation,
+        lessThan(previousMember),
+        reason: 'main.dart calls this helper in production startup code, so it '
+            'must not be marked visibleForTesting.',
+      );
+    });
+
+    test(
+        'source guard: injected installer diagnostics are not hidden behind '
+        'Platform.isWindows', () {
+      final String source =
+          File('lib/src/utils/misc/platform_updater.dart').readAsStringSync();
+      final int injectedFlag = source.indexOf(
+          'final bool hasInjectedDiagnostics = collectDiagnostics != null;');
+      final int injectedDiagnostics = source.indexOf(
+          'collectDiagnostics != null\n            ? await collectDiagnostics()');
+      final int platformFallback =
+          source.indexOf('Platform.isWindows\n                ? await '
+              'collectWindowsInstallerDiagnostics');
+      final int injectedBlockerCheck =
+          source.indexOf('if (Platform.isWindows || hasInjectedDiagnostics) {\n'
+              '        _throwIfWindowsInstallBlocked');
+
+      expect(injectedFlag, isNonNegative);
+      expect(injectedDiagnostics, isNonNegative);
+      expect(platformFallback, isNonNegative);
+      expect(
+        injectedDiagnostics,
+        lessThan(platformFallback),
+        reason: 'CI runs these tests on Linux; explicit diagnostics must be '
+            'honored before the real-platform fallback.',
+      );
+      expect(
+        injectedBlockerCheck,
+        isNonNegative,
+        reason: 'Injected diagnostics must still exercise the held-libmpv '
+            'blocker path on non-Windows hosts.',
+      );
+    });
+  });
+
+  // TODO-1197/1198: auto-install cross-restart failure backoff guard. An
+  // installer that cannot land (WebView2/libmpv lock -> Inno DeleteFile code5)
+  // used to exit -> relaunch -> auto-install again in an infinite loop. Backoff
+  // predicate: a handoff marker for the SAME target version still on disk = the
+  // last attempt did not land -> back off (caller falls back to a manual
+  // dialog). A genuinely NEW version resets the backoff (never block forever).
+  group('WindowsUpdateHandoff.shouldBackOffAutoInstall (TODO-1197/1198)', () {
+    test('backs off when a marker for the SAME target version persists',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.1+468',
+        installerPath: 'hibiki-1.0.1-windows-setup.exe',
+        innoLogPath: 'hibiki-1.0.1.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 9),
+      );
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.1+468',
+        ),
+        isTrue,
+      );
+    });
+
+    test('ignores leading-v differences when matching the target', () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.1',
+        installerPath: 'hibiki-1.0.1-windows-setup.exe',
+        innoLogPath: 'hibiki-1.0.1.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 9),
+      );
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: 'v1.0.1',
+        ),
+        isTrue,
+      );
+    });
+
+    test('resets (no backoff) for a genuinely NEW target version', () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.1+468',
+        installerPath: 'hibiki-1.0.1-windows-setup.exe',
+        innoLogPath: 'hibiki-1.0.1.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 9),
+      );
+      // A newer release must be allowed to auto-install once — a stale failed
+      // version must never permanently block future updates.
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.2+470',
+        ),
+        isFalse,
+      );
+    });
+
+    test('resets for a new debug build with a different +fingerprint',
+        () async {
+      final File marker = await _markerFile();
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.1-debug.5+aaaaaaa',
+        installerPath: 'hibiki-debug-setup.exe',
+        innoLogPath: 'hibiki-debug.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 9),
+      );
+      // Same base version, fresh CI fingerprint (+sha) = a NEW build; the build
+      // metadata must be kept in the identity check so it retries once.
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.1-debug.5+bbbbbbb',
+        ),
+        isFalse,
+      );
+      // The identical debug fingerprint that failed still backs off.
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.1-debug.5+aaaaaaa',
+        ),
+        isTrue,
+      );
+    });
+
+    test('no backoff when no marker exists (fail-open)', () async {
+      final File marker = await _markerFile();
+      expect(await marker.exists(), isFalse);
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.1+468',
+        ),
+        isFalse,
+      );
+    });
+
+    test('no backoff when the marker JSON is corrupt (fail-open)', () async {
+      final File marker = await _markerFile();
+      await marker.parent.create(recursive: true);
+      await marker.writeAsString('{ this is not valid json');
+      expect(
+        await WindowsUpdateHandoff.shouldBackOffAutoInstall(
+          markerFile: marker,
+          candidateVersion: '1.0.1+468',
+        ),
+        isFalse,
+      );
+    });
+  });
+
+  // TODO-1197/1198: writePending preserves the previous run's lastPrompted*
+  // fields when rewriting a pending record for the SAME target, so reconcile's
+  // idempotency guard keeps suppressing the repeat "install incomplete" dialog
+  // across the loop; a different target clears them (a fresh update attempt).
+  group('WindowsUpdateHandoff.writePending lastPrompted carry-over', () {
+    Future<void> seedMarkerWithLastPrompted(
+      File marker, {
+      required String targetVersion,
+      required String lastPromptedAppVersion,
+      required String lastPromptedFailureFingerprint,
+    }) async {
+      await marker.parent.create(recursive: true);
+      await marker.writeAsString(jsonEncode(<String, dynamic>{
+        'targetVersion': targetVersion,
+        'installerPath': 'hibiki-setup.exe',
+        'innoLogPath': 'hibiki.install.log',
+        'startedAt': DateTime.utc(2026, 7, 5, 9).toIso8601String(),
+        'installerLaunchSucceeded': false,
+        'lastPromptedAppVersion': lastPromptedAppVersion,
+        'lastPromptedFailureFingerprint': lastPromptedFailureFingerprint,
+        'lastPromptedAt': DateTime.utc(2026, 7, 5, 9, 30).toIso8601String(),
+      }));
+    }
+
+    test('preserves lastPrompted fields when the target version is unchanged',
+        () async {
+      final File marker = await _markerFile();
+      await seedMarkerWithLastPrompted(
+        marker,
+        targetVersion: '1.0.1+468',
+        lastPromptedAppVersion: '1.0.0+467',
+        lastPromptedFailureFingerprint: 'fp-old',
+      );
+
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.1+468',
+        installerPath: 'hibiki-1.0.1-windows-setup.exe',
+        innoLogPath: 'hibiki-1.0.1.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 10),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record, isNotNull);
+      expect(record!.lastPromptedAppVersion, '1.0.0+467');
+      expect(record.lastPromptedFailureFingerprint, 'fp-old');
+      // The launch-state fields still reset (a fresh handoff attempt).
+      expect(record.installerLaunchSucceeded, isNull);
+    });
+
+    test('clears lastPrompted fields when the target version changes',
+        () async {
+      final File marker = await _markerFile();
+      await seedMarkerWithLastPrompted(
+        marker,
+        targetVersion: '1.0.1+468',
+        lastPromptedAppVersion: '1.0.0+467',
+        lastPromptedFailureFingerprint: 'fp-old',
+      );
+
+      await WindowsUpdateHandoff.writePending(
+        markerFile: marker,
+        targetVersion: '1.0.2+470',
+        installerPath: 'hibiki-1.0.2-windows-setup.exe',
+        innoLogPath: 'hibiki-1.0.2.install.log',
+        startedAt: DateTime.utc(2026, 7, 5, 10),
+      );
+
+      final WindowsUpdateHandoffRecord? record =
+          await WindowsUpdateHandoff.read(marker);
+      expect(record, isNotNull);
+      expect(record!.lastPromptedAppVersion, isNull);
+      expect(record.lastPromptedFailureFingerprint, isNull);
+      expect(record.lastPromptedAt, isNull);
+    });
+  });
+
+  group('BUG-2203 安装器停在启动段 / 诊断只认观测不认子串', () {
+    // 用户机上的**真实**日志（2026-09-06，fushi-2.2.4-debug.13582，逐行照抄，
+    // 只把路径与 /SL5 参数做了脱敏）。现场：09:35:03.752 launcher 启动安装器，
+    // 09:35:04.039 日志戛然而止 —— 安装器在 InitializeSetup 里被自己的
+    // `taskkill /IM fushi.exe /T` 连同所在的祖先进程树（fushi.exe →
+    // fushi_update_launcher.exe → setup.exe）一起杀掉，所以没有任何
+    // abort / exception / Deinitializing 行。
+    const String killedAtStartupLog =
+        r'''2026-09-06 09:35:03.972   Log opened. (Time zone: UTC+08:00)
+2026-09-06 09:35:03.972   Setup version: Inno Setup version 6.7.1
+2026-09-06 09:35:03.972   Original Setup EXE: C:\updates\fushi-setup.exe
+2026-09-06 09:35:03.973   Setup command line: /SL5="x,1,2,C:\setup.exe" /VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART /DIR=D:\APP\Hibiki
+2026-09-06 09:35:03.973   Windows version: 10.0.26200
+2026-09-06 09:35:03.973   Windows architecture: x64 (64-bit)
+2026-09-06 09:35:03.973   Machine types supported by system: x86 x64
+2026-09-06 09:35:03.973   User privileges: None
+2026-09-06 09:35:04.037   Administrative install mode: No
+2026-09-06 09:35:04.037   Install mode root key: HKEY_CURRENT_USER
+2026-09-06 09:35:04.037   64-bit install mode: No
+2026-09-06 09:35:04.037   RedirectionGuard status for current process: Enabled in enforcing mode
+2026-09-06 09:35:04.038   Created temporary directory: C:\Temp\is-D5OX8W7L61.tmp
+2026-09-06 09:35:04.039   -- DLL function import --
+2026-09-06 09:35:04.039   Function and DLL name: OpenMutexW@kernel32.dll
+2026-09-06 09:35:04.039   Importing the DLL function. Dest DLL name: kernel32.dll
+2026-09-06 09:35:04.039   Successfully imported the DLL function. Delay loaded? No
+2026-09-06 09:35:04.039   -- DLL function import --
+2026-09-06 09:35:04.039   Function and DLL name: CloseHandle@kernel32.dll
+2026-09-06 09:35:04.039   Importing the DLL function. Dest DLL name: kernel32.dll
+2026-09-06 09:35:04.039   Successfully imported the DLL function. Delay loaded? No
+2026-09-06 09:35:04.039   -- DLL function import --
+2026-09-06 09:35:04.039   Function and DLL name: CreateFileW@kernel32.dll
+2026-09-06 09:35:04.039   Importing the DLL function. Dest DLL name: kernel32.dll
+2026-09-06 09:35:04.039   Successfully imported the DLL function. Delay loaded? No''';
+
+    WindowsUpdateHandoffRecord recordWith({bool? launcherMutexReleased}) {
+      return WindowsUpdateHandoffRecord(
+        targetVersion: '2.2.4-debug.13582',
+        installerPath: r'C:\tmp\setup.exe',
+        innoLogPath: r'C:\tmp\setup.install.log',
+        startedAt: DateTime.utc(2026, 9, 6, 1, 32, 53),
+        innoLogExists: true,
+        launcherMutexReleased: launcherMutexReleased,
+      );
+    }
+
+    test('真实现场日志判成「停在启动段」，不再误报 app_mutex_running', () {
+      final WindowsInstallerFailureSummary summary =
+          summarizeWindowsInstallerFailure(
+        record: recordWith(),
+        innoLogContents: killedAtStartupLog,
+      );
+
+      // 旧实现对这份日志**恒定**给出 app_mutex_running：它把下面这行
+      // `[Code]` 段外部函数导入当成了「Fushi 仍在运行」的证据，而这一行在
+      // 每一份 Inno 日志里都有。这条用例就是那次误诊的回归闸。
+      expect(killedAtStartupLog, contains('OpenMutexW@kernel32.dll'));
+      expect(summary.type, 'installer_stopped_at_startup');
+    });
+
+    test('只剩 OpenMutexW 导入行时，不构成「Fushi 仍在运行」的证据', () {
+      // 把日志拉出启动段（多一行复制阶段），结构判据不再成立；此时与 mutex
+      // 有关的仍只有那行 import —— 不得据此判 app_mutex_running。
+      final WindowsInstallerFailureSummary summary =
+          summarizeWindowsInstallerFailure(
+        record: recordWith(),
+        innoLogContents: '$killedAtStartupLog\n'
+            r'2026-09-06 09:35:05.000   Starting the installation process.',
+      );
+
+      expect(summary.type, 'installer_incomplete');
+    });
+
+    test('launcher 实测互斥量未释放，才判 app_mutex_running', () {
+      final WindowsInstallerFailureSummary summary =
+          summarizeWindowsInstallerFailure(
+        record: recordWith(launcherMutexReleased: false),
+        innoLogContents: '$killedAtStartupLog\n'
+            r'2026-09-06 09:35:05.000   Starting the installation process.',
+      );
+
+      expect(summary.type, 'app_mutex_running');
+    });
+
+    test('停在启动段 + 互斥量未释放：两条事实都要出现在消息里', () {
+      final WindowsInstallerFailureSummary summary =
+          summarizeWindowsInstallerFailure(
+        record: recordWith(launcherMutexReleased: false),
+        innoLogContents: killedAtStartupLog,
+      );
+
+      expect(summary.type, 'installer_stopped_at_startup');
+      expect(summary.message, contains('FushiSingleInstanceMutex'));
+    });
+
+    test('走出启动段的日志不算「停在启动段」，空日志不下结论', () {
+      expect(windowsInnoLogStoppedDuringStartup(killedAtStartupLog), isTrue);
+      expect(
+        windowsInnoLogStoppedDuringStartup(
+          '$killedAtStartupLog\n'
+          r'2026-09-06 09:35:05.000   -- File entry --',
+        ),
+        isFalse,
+      );
+      expect(windowsInnoLogStoppedDuringStartup(''), isFalse);
+    });
+
+    test('launcher 写进 marker 的未知键，经 Dart 读写一轮后仍在', () {
+      // C++ launcher（`update_launcher.cpp` 的 `AppendMarkerFields`）写下的观测。
+      // 旧实现在 fromJson → toJson 这一轮把它们全部静默丢掉，事后连「是
+      // OpenProcess 失败还是真的等超时」都分不出来。
+      final Map<String, dynamic> onDisk = <String, dynamic>{
+        'targetVersion': '2.2.4-debug.13582',
+        'installerPath': r'C:\tmp\setup.exe',
+        'innoLogPath': r'C:\tmp\setup.install.log',
+        'startedAt': '2026-09-06T01:32:53.434671Z',
+        'parentExitObserved': false,
+        'parentExitTimedOut': true,
+        'parentExitTimedOutAt': '2026-09-06T01:34:53.517Z',
+        'launcherMutexReleased': false,
+        'launcherMutexCheckedAt': '2026-09-06T01:35:03.752Z',
+        'appAliveAfterInstaller': false,
+        'appRelaunchedByLauncher': true,
+        'appRelaunchPath': r'D:\APP\Hibiki\fushi.exe',
+      };
+
+      final Map<String, dynamic> roundTripped =
+          WindowsUpdateHandoffRecord.fromJson(onDisk).toJson();
+
+      for (final String key in onDisk.keys) {
+        expect(roundTripped.containsKey(key), isTrue,
+            reason: 'marker 键 $key 在 Dart 读写一轮后丢失了');
+      }
+      expect(roundTripped['parentExitTimedOut'], isTrue);
+      expect(roundTripped['launcherMutexReleased'], isFalse);
+      expect(roundTripped['appRelaunchedByLauncher'], isTrue);
+    });
+
+    test('模型写出的每个键都被自己认识（extraFields 与已知键不重叠）', () {
+      // 新增 model 字段却忘了登记进 `_knownJsonKeys`，会让该键在下一轮读回时落进
+      // extraFields，随后被 toJson 重复写出。这条用例是那个疏漏的闸门。
+      final WindowsUpdateHandoffRecord full = WindowsUpdateHandoffRecord(
+        targetVersion: '1.2.3',
+        installerPath: r'C:\tmp\setup.exe',
+        innoLogPath: r'C:\tmp\setup.log',
+        startedAt: DateTime.utc(2026, 9, 6),
+        currentExecutablePath: r'D:\APP\Hibiki\fushi.exe',
+        currentInstallDir: r'D:\APP\Hibiki',
+        targetInstallDir: r'D:\APP\Hibiki',
+        detectedInstallLocations: const <WindowsDetectedInstallLocation>[
+          WindowsDetectedInstallLocation(
+            source: 'current',
+            path: r'D:\APP\Hibiki',
+          ),
+        ],
+        runningFushiProcesses: const <WindowsProcessInfo>[
+          WindowsProcessInfo(pid: 1, name: 'fushi.exe'),
+        ],
+        libmpvModuleHolders: const <WindowsProcessInfo>[
+          WindowsProcessInfo(pid: 2, name: 'mpv.exe'),
+        ],
+        galHookModuleHolders: const <WindowsProcessInfo>[
+          WindowsProcessInfo(pid: 3, name: 'game.exe'),
+        ],
+        innoLogDeleteFileFailures: const <WindowsInnoDeleteFileFailure>[
+          WindowsInnoDeleteFileFailure(path: r'D:\a.dll', code: 5),
+        ],
+        pathMismatchWarning: 'warn',
+        launcherStartedAt: DateTime.utc(2026, 9, 6, 0, 1),
+        launcherPid: 7028,
+        parentProcessId: 97348,
+        parentExitObserved: false,
+        parentExitObservedAt: DateTime.utc(2026, 9, 6, 0, 2),
+        launcherMutexReleased: false,
+        installerLaunchSucceeded: true,
+        installerLaunchedAt: DateTime.utc(2026, 9, 6, 0, 3),
+        installerPid: 12024,
+        innoLogExists: true,
+        innoLogSizeBytes: 2185,
+        innoLogModifiedAt: DateTime.utc(2026, 9, 6, 0, 4),
+        installerFailureType: 'installer_stopped_at_startup',
+        installerFailureSummary: 'summary',
+        installerLaunchFailedAt: DateTime.utc(2026, 9, 6, 0, 5),
+        launchError: 'err',
+        failureFingerprint: 'fp',
+        lastPromptedAppVersion: '1.2.2',
+        lastPromptedFailureFingerprint: 'fp2',
+        lastPromptedAt: DateTime.utc(2026, 9, 6, 0, 6),
+      );
+
+      final WindowsUpdateHandoffRecord reread =
+          WindowsUpdateHandoffRecord.fromJson(full.toJson());
+      expect(
+        reread.extraFields,
+        isEmpty,
+        reason: '这些键是模型自己写出去的，读回来必须被自己认识：'
+            '${reread.extraFields.keys.join(", ")}',
+      );
+    });
+  });
+}

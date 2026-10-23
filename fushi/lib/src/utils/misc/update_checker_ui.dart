@@ -1,0 +1,666 @@
+part of 'update_checker.dart';
+
+/// G4 收敛：算法本体移入 [FushiByteFormat]（本函数曾是全仓 7 份手写副本的基底），
+/// 这里保留同名薄委托，既有调用点/测试零改动。
+@visibleForTesting
+String formatUpdateDownloadByteCount(int? bytes) =>
+    FushiByteFormat.bytes(bytes);
+
+@visibleForTesting
+String formatUpdateDownloadSpeed(double? bytesPerSecond) =>
+    FushiByteFormat.speed(bytesPerSecond);
+
+/// **纯函数**：落地入口种类 → 「前往下载」主按钮文案。文案必须说清去哪儿，否则
+/// 用户点了「下载」结果跳出 App Store / TestFlight 会以为是误触。
+@visibleForTesting
+String updateLandingActionLabel(UpdateLandingKind kind) => switch (kind) {
+      UpdateLandingKind.releasePage => t.update_download,
+      UpdateLandingKind.testFlight => t.update_testflight_open,
+      UpdateLandingKind.appStore => t.update_app_store_open,
+    };
+
+@visibleForTesting
+double? updateDownloadBytesPerSecond({
+  required int startedBytes,
+  required int receivedBytes,
+  required Duration elapsed,
+}) {
+  if (elapsed <= Duration.zero) return null;
+  final int delta = receivedBytes - startedBytes;
+  if (delta <= 0) return 0;
+  return delta * Duration.microsecondsPerSecond / elapsed.inMicroseconds;
+}
+
+@visibleForTesting
+class UpdateAvailableDialog extends StatelessWidget {
+  const UpdateAvailableDialog({
+    required this.version,
+    required this.releaseNotes,
+    required this.primaryLabel,
+    required this.onPrimary,
+    this.secondaryLabel,
+    this.onSecondary,
+    super.key,
+  });
+
+  final String version;
+  final String releaseNotes;
+  final String primaryLabel;
+  final VoidCallback onPrimary;
+
+  /// 可选的第二入口。iOS 上主按钮指向 TestFlight / App Store 时，这里给出
+  /// 「发布页」——GitHub Release 里的未签名 ipa 是侧载用户唯一的取包处，主按钮改
+  /// 指商店后必须保留这条路，否则等于把侧载用户的更新链路直接掐断。
+  final String? secondaryLabel;
+  final VoidCallback? onSecondary;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+
+    return FushiDialogFrame(
+      maxWidth: 520,
+      maxHeightFactor: 0.9,
+      scrollable: false,
+      insetPadding: EdgeInsets.all(tokens.spacing.gap),
+      child: FushiModalSheetFrame(
+        title: t.update_available,
+        leadingIcon: FushiIcons.downloading,
+        scrollable: true,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              t.update_message(version: version),
+              style: tokens.type.listSubtitle,
+            ),
+            if (releaseNotes.isNotEmpty) ...<Widget>[
+              SizedBox(height: tokens.spacing.gap),
+              MarkdownBody(
+                data: releaseNotes,
+                selectable: true,
+                // TODO-966: flutter_markdown 0.6.23 在 selectable 时会无条件
+                // 解引用 onSelectionChanged!（builder.dart:957），不传则选中文本即崩；
+                // 补一个空回调保留可选能力。
+                onSelectionChanged: (String? text, TextSelection selection,
+                    SelectionChangedCause? cause) {},
+                onTapLink: (_, href, __) {
+                  if (href == null) return;
+                  launchUrl(
+                    Uri.parse(href),
+                    mode: LaunchMode.externalApplication,
+                  );
+                },
+                // flutter_markdown 0.6 未迁 material_ui，只收 SDK 旧 ThemeData：经
+                // LegacyDesignCompatibility 桥出来的旧主题（与 app 主题同色同字）。
+                styleSheet: MarkdownStyleSheet.fromTheme(
+                  legacy.Theme.of(context),
+                ).copyWith(
+                  p: tokens.type.listSubtitle,
+                ),
+              ),
+            ],
+          ],
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: <Widget>[
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(t.update_skip),
+            ),
+            if (secondaryLabel != null && onSecondary != null)
+              adaptiveDialogAction(
+                context: context,
+                onPressed: onSecondary,
+                child: Text(secondaryLabel!),
+              ),
+            adaptiveDialogAction(
+              context: context,
+              isDefaultAction: true,
+              onPressed: onPrimary,
+              child: Text(primaryLabel),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// BUG-427/TODO-852: shown when the Android install fails because the
+/// "install unknown apps" permission is not yet granted. The user is sent to
+/// the system setting by the native side; this dialog lets them retry the
+/// install (reusing the already-downloaded apk) once they return, or cancel.
+/// Pops `true` to retry, `false`/dismiss to cancel.
+class InstallPermissionRetryDialog extends StatelessWidget {
+  const InstallPermissionRetryDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return FushiDialogFrame(
+      maxWidth: 520,
+      maxHeightFactor: 0.9,
+      scrollable: false,
+      insetPadding: EdgeInsets.all(tokens.spacing.gap),
+      child: FushiModalSheetFrame(
+        title: t.update_install_permission_title,
+        leadingIcon: FushiIcons.shield,
+        scrollable: true,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: Text(
+          t.update_install_permission_message,
+          style: tokens.type.listSubtitle,
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: <Widget>[
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.of(context).pop(false),
+              child: Text(t.update_install_permission_cancel),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              isDefaultAction: true,
+              onPressed: () => Navigator.of(context).pop(true),
+              child: Text(t.update_install_permission_retry),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class WindowsUpdateHandoffResultDialog extends StatelessWidget {
+  const WindowsUpdateHandoffResultDialog({
+    required this.result,
+    super.key,
+  });
+
+  final WindowsUpdateHandoffResult result;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final WindowsUpdateHandoffRecord record = result.record;
+    final String title = switch (result.status) {
+      WindowsUpdateHandoffStatus.installed => t.update_install_success_title,
+      WindowsUpdateHandoffStatus.incomplete =>
+        t.update_install_incomplete_title,
+      WindowsUpdateHandoffStatus.launchFailed =>
+        t.update_install_launch_failed_title,
+    };
+    final String message = switch (result.status) {
+      WindowsUpdateHandoffStatus.installed =>
+        t.update_install_success_message(version: record.targetVersion),
+      WindowsUpdateHandoffStatus.incomplete =>
+        t.update_install_incomplete_message,
+      WindowsUpdateHandoffStatus.launchFailed =>
+        t.update_install_launch_failed_message(version: record.targetVersion),
+    };
+    final IconData icon = switch (result.status) {
+      WindowsUpdateHandoffStatus.installed => FushiIcons.success,
+      WindowsUpdateHandoffStatus.incomplete => FushiIcons.error,
+      WindowsUpdateHandoffStatus.launchFailed => FushiIcons.warning,
+    };
+
+    return FushiDialogFrame(
+      maxWidth: 520,
+      maxHeightFactor: 0.9,
+      scrollable: false,
+      insetPadding: EdgeInsets.all(tokens.spacing.gap),
+      child: FushiModalSheetFrame(
+        title: title,
+        leadingIcon: icon,
+        scrollable: true,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              message,
+              style: tokens.type.listSubtitle,
+            ),
+            if (result.status != WindowsUpdateHandoffStatus.installed) ...[
+              if (record.installerFailureSummary != null) ...[
+                SizedBox(height: tokens.spacing.gap),
+                SelectableText(
+                  t.update_install_failure_summary(
+                    summary: record.installerFailureSummary!,
+                  ),
+                  style: tokens.type.listSubtitle,
+                ),
+              ],
+              SizedBox(height: tokens.spacing.gap),
+              SelectableText(
+                t.update_install_log_path(path: record.innoLogPath),
+                style: tokens.type.listSubtitle,
+              ),
+              if (record.currentExecutablePath != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_current_executable(
+                    path: record.currentExecutablePath!,
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.targetInstallDir != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_target_dir(path: record.targetInstallDir!),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              for (final WindowsDetectedInstallLocation location
+                  in record.detectedInstallLocations)
+                if (location.path.isNotEmpty) ...[
+                  SizedBox(height: tokens.spacing.gap / 2),
+                  SelectableText(
+                    t.update_install_detected_location(
+                      source: location.source,
+                      path: location.path,
+                    ),
+                    style: tokens.type.metadata,
+                  ),
+                ],
+              if (record.pathMismatchWarning != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_path_mismatch(
+                    warning: record.pathMismatchWarning!,
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              for (final WindowsProcessInfo process
+                  in record.runningFushiProcesses) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_running_process(
+                    pid: process.pid,
+                    path: _windowsProcessPathLabel(process),
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              for (final WindowsProcessInfo process
+                  in record.libmpvModuleHolders) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_libmpv_holder(
+                    pid: process.pid,
+                    path: _windowsProcessPathLabel(process),
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              // 被 hook 的游戏 / `--hold` 的 injector host 正占着 helper 组件：这是
+              // 「更新装不上」里唯一需要用户去关**游戏**而不是关 Fushi 的一类，必须与
+              // 上面的 libmpv 占用者分开说（BUG-1675）。
+              for (final WindowsProcessInfo process
+                  in record.galHookModuleHolders) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_gal_hook_holder(
+                    pid: process.pid,
+                    path: _windowsProcessPathLabel(process),
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              for (final WindowsInnoDeleteFileFailure failure
+                  in record.innoLogDeleteFileFailures) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_deletefile_failure(
+                    path: failure.path,
+                    code: failure.code,
+                  ),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.runningFushiProcesses.isNotEmpty ||
+                  record.libmpvModuleHolders.isNotEmpty ||
+                  record.galHookModuleHolders.isNotEmpty ||
+                  record.innoLogDeleteFileFailures.isNotEmpty) ...[
+                SizedBox(height: tokens.spacing.gap),
+                Text(
+                  t.update_install_manual_close_retry,
+                  style: tokens.type.listSubtitle,
+                ),
+              ],
+              if (record.diagnostics.hasLockEvidence) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                Text(
+                  t.update_install_restart_windows_hint,
+                  style: tokens.type.listSubtitle,
+                ),
+              ],
+              if (record.launcherPid != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_launcher_pid(pid: record.launcherPid!),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.parentExitObserved != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                Text(
+                  record.parentExitObserved!
+                      ? t.update_install_parent_exit_observed
+                      : t.update_install_parent_exit_not_observed,
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.installerPid != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  t.update_install_installer_pid(pid: record.installerPid!),
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.innoLogExists != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                Text(
+                  record.innoLogExists!
+                      ? t.update_install_log_observed
+                      : t.update_install_log_not_observed,
+                  style: tokens.type.metadata,
+                ),
+              ],
+              if (record.launchError != null) ...[
+                SizedBox(height: tokens.spacing.gap / 2),
+                SelectableText(
+                  record.launchError!,
+                  style: tokens.type.metadata,
+                ),
+              ],
+            ],
+          ],
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: <Widget>[
+            adaptiveDialogAction(
+              context: context,
+              isDefaultAction: true,
+              onPressed: () => Navigator.of(context).pop(),
+              child: Text(t.dialog_ok),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String _windowsProcessPathLabel(WindowsProcessInfo process) {
+  return process.path ?? process.name ?? 'unknown';
+}
+
+@visibleForTesting
+Widget buildUpdateDownloadOverlayForTest({
+  required ValueNotifier<double> progress,
+  required ValueNotifier<String> status,
+  required ValueNotifier<UpdateDownloadDiagnostics?> diagnostics,
+  required VoidCallback onHide,
+  VoidCallback? onCancel,
+  ValueNotifier<String?>? notice,
+}) {
+  return _DownloadOverlay(
+    progress: progress,
+    status: status,
+    notice: notice ?? ValueNotifier<String?>(null),
+    diagnostics: diagnostics,
+    onHide: onHide,
+    onCancel: onCancel ?? () {},
+  );
+}
+
+class _DownloadOverlay extends StatelessWidget {
+  const _DownloadOverlay({
+    required this.progress,
+    required this.status,
+    required this.notice,
+    required this.diagnostics,
+    required this.onHide,
+    required this.onCancel,
+  });
+  final ValueNotifier<double> progress;
+  final ValueNotifier<String> status;
+
+  /// 整轮下载都成立的一句通告（当前唯一来源：所选下载来源对本资产不适用）。
+  /// null = 无事可报，不占位。
+  final ValueNotifier<String?> notice;
+  final ValueNotifier<UpdateDownloadDiagnostics?> diagnostics;
+  final VoidCallback onHide;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return Positioned.fill(
+      child: Material(
+        color: Theme.of(context).colorScheme.scrim.withValues(alpha: 0.54),
+        child: Center(
+          child: SingleChildScrollView(
+            padding: EdgeInsets.symmetric(
+              horizontal: tokens.spacing.gap,
+              vertical: tokens.spacing.gap,
+            ),
+            child: FushiCard(
+              margin: EdgeInsets.zero,
+              padding: EdgeInsets.all(tokens.spacing.card),
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 420),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    ValueListenableBuilder<String>(
+                      valueListenable: status,
+                      // M3E：状态行 titleLarge emphasized。
+                      builder: (_, s, __) => Text(
+                        s,
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleLarge
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    ValueListenableBuilder<String?>(
+                      valueListenable: notice,
+                      builder: (_, value, __) {
+                        if (value == null) return const SizedBox.shrink();
+                        return Padding(
+                          padding: EdgeInsets.only(top: tokens.spacing.gap / 2),
+                          child: Text(
+                            value,
+                            style: Theme.of(context).textTheme.bodySmall,
+                            textAlign: TextAlign.center,
+                          ),
+                        );
+                      },
+                    ),
+                    SizedBox(height: tokens.spacing.gap),
+                    ValueListenableBuilder<double>(
+                      valueListenable: progress,
+                      builder: (_, p, __) {
+                        // 双层防线：渲染前 clamp(0,1)，防任何上游异常进度值
+                        // （>100% / 负值）穿透到进度条与百分比文字（TODO-628/650）。
+                        final double clamped = p.clamp(0.0, 1.0);
+                        return Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            // M3E：百分比是 Display 级大数字（primary），
+                            // 下方波浪进度条（MD3 下 Fushi 包装画波浪）。
+                            Text(
+                              '${(clamped * 100).toStringAsFixed(0)}%',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .displaySmall
+                                  ?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                    color: isGlassDesign(context)
+                                        ? null
+                                        : Theme.of(context).colorScheme.primary,
+                                  ),
+                            ),
+                            SizedBox(height: tokens.spacing.gap),
+                            FushiLinearProgressIndicator(
+                              value: clamped > 0 ? clamped : null,
+                            ),
+                          ],
+                        );
+                      },
+                    ),
+                    ValueListenableBuilder<UpdateDownloadDiagnostics?>(
+                      valueListenable: diagnostics,
+                      builder: (_, value, __) {
+                        if (value == null) return const SizedBox.shrink();
+                        return Padding(
+                          padding: EdgeInsets.only(top: tokens.spacing.gap),
+                          child: _DownloadDiagnosticsPanel(value: value),
+                        );
+                      },
+                    ),
+                    SizedBox(height: tokens.spacing.gap),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: <Widget>[
+                        // 取消（逃生口·TODO-738）：全死源串行回退期间用户可主动中断，
+                        // 不必盯着「正在连接更新源…」干等几分钟。
+                        FushiTextButton(
+                          onPressed: onCancel,
+                          child: Text(t.update_cancel),
+                        ),
+                        FushiTextButton(
+                          onPressed: onHide,
+                          child: Text(t.update_hide),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DownloadDiagnosticsPanel extends StatelessWidget {
+  const _DownloadDiagnosticsPanel({required this.value});
+
+  final UpdateDownloadDiagnostics value;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final TextStyle? style = Theme.of(context).textTheme.bodySmall;
+    // 续传行只在「确实发生了续传相关的事」时出现：全新下载（none）没有可报的
+    // 续传事实，多显示一行「未续传」是把「没这回事」说成「这事没成」。
+    final String? resumeStatus = switch (value.resumeOutcome) {
+      DownloadResumeOutcome.resumed => t.update_download_resumed,
+      DownloadResumeOutcome.restartedFromZero =>
+        t.update_download_restarted_from_zero,
+      DownloadResumeOutcome.none => null,
+    };
+    return DefaultTextStyle.merge(
+      style: style,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _DiagnosticLine(
+            text: t.update_download_source(source: value.sourceHost),
+          ),
+          SizedBox(height: tokens.spacing.gap / 2),
+          _DiagnosticLine(
+            text: t.update_download_size(
+              received: formatUpdateDownloadByteCount(value.receivedBytes),
+              total: formatUpdateDownloadByteCount(value.totalBytes),
+            ),
+          ),
+          SizedBox(height: tokens.spacing.gap / 2),
+          _DiagnosticLine(
+            text: t.update_download_speed(
+              speed: formatUpdateDownloadSpeed(value.bytesPerSecond),
+            ),
+          ),
+          if (resumeStatus != null) ...<Widget>[
+            SizedBox(height: tokens.spacing.gap / 2),
+            _DiagnosticLine(
+              text: t.update_download_resume_status(status: resumeStatus),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _DiagnosticLine extends StatelessWidget {
+  const _DiagnosticLine({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      text,
+      maxLines: 2,
+      overflow: TextOverflow.ellipsis,
+      softWrap: true,
+    );
+  }
+}

@@ -1,0 +1,56 @@
+[根目录](../../CLAUDE.md) > [packages](../) > **fushi_anki**
+
+# fushi_anki
+
+## 模块职责
+
+Anki 集成模块：定义 Anki 服务抽象接口，提供 AnkiDroid（Android 原生 Content Provider）和 AnkiConnect（桌面 HTTP API）两种实现，支持卡片创建、牌组/模型查询、重复检测。
+
+## 入口与启动
+
+- 库入口：`lib/fushi_anki.dart`
+- 服务抽象：`lib/src/anki_service.dart` -- `AnkiService` 抽象类。
+- 无独立启动流程，由主应用 `AppModel` 根据平台选择具体实现。
+
+## 对外接口
+
+- `AnkiService` -- 抽象接口：`isAvailable()` / `getDeckNames()` / `getModelNames()` / `getModelFields()` / `addNote()` / `isDuplicate()`。
+- `AnkiRepository` (`ankidroid/`) -- AnkiDroid Content Provider 实现（Android 专用）。
+- `AnkiConnectRepository` + `AnkiConnectService` (`ankiconnect/`) -- AnkiConnect HTTP 实现（桌面/远程）。
+- `AnkiConnectInstaller` (`ankiconnect/ankiconnect_installer.dart`) -- 代装 AnkiConnect 插件（仅 Windows）：从 AnkiWeb 下裸包、**补上包内没有的 `manifest.json`** 后重新打包，再把 `.ankiaddon` 交给正在运行的 `anki.exe`，由 Anki 自己弹确认框并完成安装。下载出站走包内工厂钩子 `ankiAddonDownloadHttpClientFactory`（app 侧接线，经应用代理）——与打 localhost 必须直连的 `AnkiConnectService` 方向相反。
+- `AnkiDesktopLauncher` (`ankiconnect/anki_desktop_launcher.dart`) -- 拉起 Anki 桌面版（issue #1949；设置 `autoLaunchAnkiDesktop` / `ankiDesktopExecutable`，app 在 `main()` 启动后调 `autoLaunchOnStartup` 一次）：本机 AnkiConnect 已在监听就不重复启动；Windows 必须有用户配置的路径（不猜注册表），macOS / Linux 回退 `open -a Anki` / PATH 上的 `anki`。没配路径时只从 `findRunningAnkiExecutable` 学入口 exe——新 launcher 架构下监听 8765 的是 venv `pythonw.exe`，它认不出就返回 null，宁可不学也不学错。
+- `BaseAnkiRepository` -- 共享基类。
+- `AnkiModels` -- Anki 数据模型。
+- `LapisPreset` -- 预设卡片模板。
+
+## 关键依赖与配置
+
+- `shared_preferences: ^2.2.2` -- 持久化 AnkiConnect 地址等设置。
+- `http: ^1.1.0` -- AnkiConnect HTTP 通信。
+- 无 fushi_core 依赖（独立模块）。
+
+## 数据模型
+
+- `AnkiModels` -- 牌组/模型/字段元数据。
+- `LapisPreset` -- 预设导出模板配置。
+- AnkiMapping（定义在 `fushi_core/tables.dart`）-- Anki 导出映射配置。
+
+## 测试与质量
+
+- 主应用测试：`fushi/test/anki/anki_models_test.dart`
+- 本包无独立 test 目录。
+
+## 相关文件清单
+
+- `lib/fushi_anki.dart` -- 库入口
+- `lib/src/anki_service.dart` -- 服务抽象
+- `lib/src/anki_models.dart` -- 数据模型
+- `lib/src/base_anki_repository.dart` -- 共享基类
+- `lib/src/lapis_preset.dart` -- 预设模板
+- `lib/src/ankidroid/anki_repository.dart` -- AnkiDroid 实现
+- `lib/src/ankiconnect/ankiconnect_repository.dart` -- AnkiConnect 实现
+- `lib/src/ankiconnect/ankiconnect_service.dart` -- AnkiConnect HTTP 服务
+
+## 变更记录 (Changelog)
+
+- 2026-05-23: 初始文档生成。

@@ -1,0 +1,2648 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:path/path.dart' as p;
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:fushi/media.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/pages.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi_engine/epub/epub_storage.dart';
+import 'package:fushi/src/media/audiobook/lyrics_player/lyrics_theme_host.dart';
+import 'package:fushi/src/focus/fushi_focus_controller.dart';
+import 'package:fushi_audio/fushi_audio.dart';
+import 'package:fushi/src/media/audiobook/book_import_dialog.dart';
+import 'package:fushi/src/media/manga/interconnect/interconnect_manga_source.dart'
+    show InterconnectMangaCatalog;
+import 'package:fushi/src/media/manga/library/online_manga_library_entry.dart';
+import 'package:fushi/src/reader/page_turn_animation.dart';
+import 'package:fushi/src/reader/reader_chrome_floating.dart';
+import 'package:fushi/src/reader/highlight_stroke_style.dart';
+import 'package:fushi/src/reader/reader_settings.dart';
+import 'package:fushi_engine/sync/deletion_propagation.dart';
+import 'package:fushi/src/shortcuts/visual/gamepad_glyphs.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_engine/media/media_pref_keys.dart' as pref_keys;
+export 'package:fushi_engine/media/media_pref_keys.dart'
+    show kReaderSourcePersistedKey;
+
+/// BUG-793：EPUB 书 bookKey 集合的响应式来源。`.distinct(listEquals)` 按集合去重
+/// ——插入/删除触发，改作者/封面等纯列更新（集合不变）不触发，避免书架无谓重算。
+/// [fushiBooksProvider] 订阅它后，任意导入路径落库都自动刷新，无需每个导入点各自
+/// `ref.invalidate`（现存 invalidate 保留为即时刷新兜底，二者不冲突）。
+final _epubBookKeysProvider = StreamProvider<List<String>>((ref) {
+  return ref
+      .watch(appProvider)
+      .database
+      .watchEpubBookKeys()
+      .distinct(listEquals);
+});
+
+/// BUG-793：有声书（SrtBooks）uid 集合的响应式来源，作用同 [_epubBookKeysProvider]。
+final _srtBookUidsProvider = StreamProvider<List<String>>((ref) {
+  return ref
+      .watch(appProvider)
+      .database
+      .watchSrtBookUids()
+      .distinct(listEquals);
+});
+
+final fushiBooksProvider =
+    FutureProvider.family<List<MediaItem>, Language>((ref, language) {
+  // BUG-793：订阅 EPUB 书集合变化，任意导入路径落库后自动重算书架。
+  ref.watch(_epubBookKeysProvider);
+  return ReaderFushiSource.instance.getBooksFromDb(
+    appModel: ref.watch(appProvider),
+  );
+});
+
+final srtBooksProvider = FutureProvider<List<SrtBook>>((ref) {
+  // BUG-793：订阅有声书集合变化，任意导入路径落库后自动重算。
+  ref.watch(_srtBookUidsProvider);
+  final db = ref.watch(appProvider).database;
+  return SrtBookRepository(db).listAll();
+});
+
+/// 每本书的「最后阅读时间」（`reader_positions.updatedAt` 毫秒，key=书稳定身份：
+/// v82 起 epub 行 = `EpubBooks.uid`，非 epub 遗留行沿用其原键。EPUB/SRT 同源——
+/// SRT 书经阅读器落位置也用其配对 epub 行的 uid）。消费方手里是 bookKey 时先经
+/// [epubBookUidByKeyProvider] 换算再查。BUG-777：继续阅读 hero 与书架「最近阅读」
+/// 排序的唯一 recency 真相源；关书时与 [fushiBooksProvider] 同点失效
+/// （[ReaderFushiSource.onSourceExit]），不会陈旧。
+final bookLastReadAtProvider = FutureProvider<Map<String, int>>((ref) async {
+  final FushiDatabase db = ref.watch(appProvider).database;
+  final List<ReaderPositionRow> rows = await db.getAllReaderPositions();
+  return <String, int>{
+    for (final ReaderPositionRow r in rows) r.bookUid: r.updatedAt,
+  };
+});
+
+/// 「读完」的书的 bookKey 集合（`EpubBooks.completedAt` 非 null：手动标记或读到
+/// 末尾由阅读器自动写入），口径与书架 `_completedBookKeys` 同源。BUG-2918：首页
+/// 「继续」区判在读必须经 [classifyShelfReadStatus] 查它——阅读器落库的位置是
+/// 末页**首个可见字符**，读到最后一页 position 也永远 < duration，只看进度会把
+/// 读完的书当「在读」并显示四舍五入出的 100%。与 [bookLastReadAtProvider] 同点失效。
+final completedEpubBookKeysProvider =
+    FutureProvider<Set<String>>((ref) async {
+  final FushiDatabase db = ref.watch(appProvider).database;
+  return db.getCompletedEpubBookKeys();
+});
+
+/// bookKey → `EpubBooks.uid` 换算表（v82）。书架/首页的通货是 MediaItem
+/// （身份 = mediaIdentifier 里的 bookKey），查 [bookLastReadAtProvider] 前经此
+/// 换算；空 uid 行不进表（查不到 = 无阅读记录，与 resolveEpubBookUid 契约一致）。
+/// 订阅书集合流，导入/删除后自动重算（uid 对既有行恒不变）。
+final epubBookUidByKeyProvider =
+    FutureProvider<Map<String, String>>((ref) async {
+  ref.watch(_epubBookKeysProvider);
+  final FushiDatabase db = ref.watch(appProvider).database;
+  final List<EpubBookMeta> rows = await db.getEpubBookMetas();
+  return <String, String>{
+    for (final EpubBookMeta r in rows)
+      if (r.uid.isNotEmpty) r.bookKey: r.uid,
+  };
+});
+
+/// 按 bookKey 查 [bookLastReadAtProvider] 映射：先经 [epubBookUidByKeyProvider]
+/// 换算成 uid 再查，换算不上（非 epub 遗留行 / 空键）退回原键。书架 hero 与
+/// 「最近阅读」排序共用这一跳——BUG-2904：hero 曾直接拿 bookKey 查 uid 键表，
+/// 恒查空、退化成列表序（= 最近导入的在读书），读了新书「继续阅读」也不换。
+int? lastReadAtForBookKey(
+  Map<String, int> lastReadAtByUid,
+  Map<String, String> epubUidByKey,
+  String? bookKey,
+) {
+  if (bookKey == null) return null;
+  return lastReadAtByUid[epubUidByKey[bookKey] ?? bookKey];
+}
+
+/// 书架阅读进度（position / duration，字符为单位）。TODO-1346：书架进度条以前只按
+/// `sectionIndex` 累加「之前各章字数」、完全忽略当前章内的 `charOffset`，读到某章开头
+/// （charOffset 再大也不计）时书架显示极低%，让用户以为「进度没了」。
+///
+/// - `sectionChars`：每章字数（来自 `epubBooks.chaptersJson[i].characters`，缺则 0）。
+/// - `charOffset` 与 `characters` **同单位**（都是字符计数；已核实每条真实进度
+///   `charOffset ≤ 当前章 characters`）。`-1` 是「仅章节、章内偏移未知」哨兵 → 当 0。
+///
+/// 计算：
+/// - 有每章字数（全书字数>0）：`position = Σ前面各章字数 + 章内偏移`，
+///   `duration = 全书字数`；position clamp 到 [0, 全书字数]（防 >100%）。
+///   章内偏移优先用精确 `charOffset`（与章字数同单位）；`charOffset < 0`
+///   （听书 cue 派生位置无精确偏移的哨兵，见 [ReaderPositions.charOffset] 注释）
+///   时回退到归一化 `normCharOffset` 分数——`intra = normCharOffset/10000 × 本章字数`，
+///   与阅读器 restore 的回退口径一致（BUG-728：书架旧实现漏了这条回退，听书进度
+///   停在章边界甚至显 0%）。
+/// - 老书无 `characters`（全书字数=0）但有章结构：回退章级 `sectionIndex / 章数`，
+///   避免恒显 0%。
+/// - 完全无章结构：`(0, 1)`（0%，不崩）。
+({int position, int duration}) computeBookProgress({
+  required List<int> sectionChars,
+  required int? sectionIndex,
+  required int charOffset,
+  int normCharOffset = 0,
+}) {
+  final int totalChars = sectionChars.fold<int>(0, (int a, int b) => a + b);
+  final int chapterCount = sectionChars.length;
+  if (totalChars > 0) {
+    if (sectionIndex == null || chapterCount == 0) {
+      return (position: 0, duration: totalChars);
+    }
+    final int clampedSection = sectionIndex.clamp(0, chapterCount - 1);
+    int charsRead = 0;
+    for (int i = 0; i < clampedSection; i++) {
+      charsRead += sectionChars[i];
+    }
+    final int sectionSize = sectionChars[clampedSection];
+    // 精确偏移（charOffset >= 0）直接用；否则回退归一化分数（0-10000）还原听书
+    // 时的章内进度。normCharOffset 也 clamp 到 [0,10000] 防脏数据越界。
+    final int intra = charOffset >= 0
+        ? charOffset.clamp(0, sectionSize)
+        : (normCharOffset.clamp(0, 10000) * sectionSize / 10000).round();
+    return (
+      position: (charsRead + intra).clamp(0, totalChars),
+      duration: totalChars,
+    );
+  }
+  if (chapterCount > 0 && sectionIndex != null) {
+    return (
+      position: sectionIndex.clamp(0, chapterCount),
+      duration: chapterCount,
+    );
+  }
+  return (position: 0, duration: 1);
+}
+
+/// 页式书（漫画 / PDF）的位置行是不是「重置阅读状态」写回的开头位置。
+///
+/// 页式阅读器落位置恒显式传 `charOffset >= 0`（翻页 0、条漫存页内千分比），只有
+/// `library_progress_reset.dart` 的重置会写「第 0 页 + 精确锚缺席（-1）」——重置不能
+/// 删行（两条同步通道都会把对端位置灌回来），只能写一条新位置，这一形状就是它的
+/// 标记。书架按 1-based 页序算进度（停在第 1 页也算在读），不认这一形状的话重置后
+/// 的卷仍会显示「在读」并留在「继续阅读」里。[charOffset] 取仓库模型的值（-1 已
+/// 映射为 null）。
+bool isPageBasedResetPosition({
+  required int sectionIndex,
+  required int? charOffset,
+}) =>
+    sectionIndex == 0 && (charOffset == null || charOffset < 0);
+
+/// [ReaderFushiSource.deleteBook] 的结果（TODO-1359）。
+///
+/// 旧接口只回 `Future<bool>`，删除失败时调用方拿不到任何原因，只能弹一个笼统的
+/// 「删除书籍失败」toast——用户「报错日志呢？为什么删不掉？」正是这个信息丢失的症
+/// 状。[failureReason] 在失败时携带面向诊断的原因（同一原因已写入
+/// `ErrorLogService`），供调用方在 toast 里一并展示。
+class DeleteBookResult {
+  const DeleteBookResult._(
+    this.deleted,
+    this.failureReason, [
+    this.localFiles = const LocalFileDeleteReport(),
+  ]);
+
+  /// 成功删除（DB 行已删）。磁盘副本清理失败不影响成功判定，只记日志。
+  const DeleteBookResult.success({
+    LocalFileDeleteReport localFiles = const LocalFileDeleteReport(),
+  }) : this._(true, null, localFiles);
+
+  /// 删除失败，[reason] 是面向诊断的原因（已写入 ErrorLogService）。
+  const DeleteBookResult.failure(String reason) : this._(false, reason);
+
+  /// 是否真正删除了这本书（以 DB 行是否被移除为准）。
+  final bool deleted;
+
+  /// 失败原因；[deleted] 为 true 时恒为 null。
+  final String? failureReason;
+
+  /// 「同时删除本地文件」的逐条结果（没勾选时恒为空）。删除本身成功、原件却一个
+  /// 都没删掉（正在播放、句柄占用）是必须让用户看见的状态，不能混进 [deleted]。
+  final LocalFileDeleteReport localFiles;
+}
+
+/// 一个阅读器页登记给 [ReaderFushiSource] 的一组实时 hook（BUG-3001）。按对象
+/// 身份登记 / 注销，见 [ReaderFushiSource.attachLiveHooks]。
+class ReaderLiveHooks {
+  const ReaderLiveHooks({
+    required this.settingsChanged,
+    required this.layoutReload,
+    required this.chromeReload,
+    required this.chromeReanchor,
+  });
+
+  final VoidCallback settingsChanged;
+  final VoidCallback layoutReload;
+  final VoidCallback chromeReload;
+  final VoidCallback chromeReanchor;
+}
+
+/// 阅读器媒体源的**持久化身份键**（DB pref 前缀 `src:reader_fushi:`、
+/// media_items 的 sourceKey 行都用它）。历史值 `reader_ttu` 已由 v70 Drift 迁移
+/// （W2-1）一次性改写为本值；旧字面量只允许活在 fushi_core 的迁移阶梯里。
+/// 全仓对该字面量的引用一律走本常量（改名守卫锚点）。
+
+class ReaderFushiSource extends ReaderMediaSource {
+  ReaderFushiSource._()
+      : super(
+          uniqueKey: kReaderSourcePersistedKey,
+          sourceName: t.source_name_bookshelf,
+          description: t.source_description_epub,
+          icon: Icons.auto_stories_outlined,
+          implementsSearch: false,
+          implementsHistory: false,
+        );
+
+  static ReaderFushiSource get instance => _instance;
+  static final ReaderFushiSource _instance = ReaderFushiSource._();
+
+  static int get defaultScrollingSpeed => 100;
+
+  // ── identifier helpers ────────────────────────────────────────────────
+
+  static const String kHost = ReaderCustomFontCss.kReaderResourceHost;
+  static const String kResourceScheme =
+      ReaderCustomFontCss.kReaderResourceScheme;
+
+  // BUG-658 / TODO-1344: embed the bookKey RAW (no percent-encoding). The
+  // inverse [parseBookKey] slices the raw remainder back off, so the two are
+  // lossless for keys that contain literal `%XX` sanitize escapes. Both share
+  // the [_bookIdentifierPrefix] constant so the encode/decode pair can never
+  // drift apart.
+  static String mediaIdentifierFor(String bookKey) =>
+      '$_bookIdentifierPrefix$bookKey';
+
+  /// 「这本书该用哪个阅读器打开」的**唯一派生点**：`EpubBooks.format` →
+  /// `MediaItem.mediaSourceIdentifier`。
+  ///
+  /// 三种书共用 `mediaIdentifier`（`hoshi://book/<bookKey>`，与 format 无关），
+  /// 路由只认 `mediaSourceIdentifier`，而它**只能**由**当前**的 `format` 现算。
+  /// 书架列书（[_bookToMediaItem]）与所有「手上只有 bookKey、要跳回原文」的入口
+  /// （收藏句 / 制卡句）必须共用本函数：任何自己写死 `ReaderFushiSource.instance`
+  /// 的入口，在漫画 / PDF 书上**今天就已经**用错阅读器打开（漫画行的 `epubPath`
+  /// 是 `manga.json`、`chaptersJson` 是 `'[]'`，落到 EPUB 阅读器直接在解析路径
+  /// 出错），书 ↔ 漫画转化只是把它从「导入即错」放大成「转化后突然错」。
+  static String mediaSourceKeyFor(BookFormat format) {
+    switch (format) {
+      case BookFormat.pdf:
+        return ReaderPdfSource.kUniqueKey;
+      case BookFormat.manga:
+        return MangaFushiSource.kUniqueKey;
+      case BookFormat.epub:
+        return instance.uniqueKey;
+    }
+  }
+
+  // HBK-AUDIT-127: percent-encode the href when building the URL so it is
+  // symmetric with the consumer side, which decodes the whole post-'/epub/'
+  // path with Uri.decodeComponent (reader_fushi_page.dart, epub_book.dart).
+  // Encoding per path segment (and rejoining with '/') preserves the path
+  // structure while escaping spaces and literal '%' (which a raw href would
+  // leave to be mis-decoded or to throw on decode). Mirrors fontUrl's encoding.
+  static String epubUrl(String href) {
+    final String encoded = href.split('/').map(Uri.encodeComponent).join('/');
+    if (webViewUsesCustomSchemeTransport) {
+      return '$kResourceScheme://$kHost/epub/$encoded';
+    }
+    return 'https://$kHost/epub/$encoded';
+  }
+
+  static String fontUrl(String path) {
+    final String encoded = Uri.encodeComponent(path);
+    if (webViewUsesCustomSchemeTransport) {
+      return '$kResourceScheme://$kHost/fonts/$encoded';
+    }
+    return 'https://$kHost/fonts/$encoded';
+  }
+
+  // BUG-097: decide whether a navigation URL belongs to the OS browser. Internal
+  // book content lives on the [kHost] virtual host (https://fushi.local/...), so
+  // an internal link that failed to resolve to a chapter must NEVER be handed to
+  // the OS — that opens a blank page for a non-existent host. Only genuine
+  // external schemes on a different host are external.
+  static bool isExternalUrl(String url) {
+    final Uri? uri = Uri.tryParse(url);
+    if (uri == null) return false;
+    if (uri.host == kHost) return false;
+    const Set<String> externalSchemes = {'http', 'https', 'mailto', 'tel'};
+    return externalSchemes.contains(uri.scheme);
+  }
+
+  /// Parse `hoshi://book/<bookKey>` back to the bookKey. Returns null for an
+  /// unparseable identifier. The bookKey is the sanitized title (the EpubBooks
+  /// primary key); legacy `hoshi://book/<int>` identifiers were rewritten to
+  /// the key form by the v16 migration, so no int branch is needed.
+  ///
+  /// BUG-658 / TODO-1344: extract the RAW remainder after the fixed prefix —
+  /// this must be the exact inverse of [mediaIdentifierFor], which embeds the
+  /// key with plain string interpolation (`'fushi://book/$bookKey'`, no
+  /// encoding). A sanitized bookKey can itself contain literal percent-escapes:
+  /// [sanitizeTtuFilename] maps every `/?<>\\:|%"*` in the title to its `%XX`
+  /// form, so a title like `Do Androids Dream of Electric Sheep?` or
+  /// `業物語 <物語> (講談社ＢＯＸ)` becomes the key `...Sheep%3F` /
+  /// `業物語 %3C物語%3E (...)`. The old implementation parsed the identifier via
+  /// `Uri.pathSegments`, which percent-DECODES (`%3F`->`?`, `%2F`->`/`, ...),
+  /// producing a key that no longer equals the stored EpubBooks primary key.
+  /// Such books imported fine but could then be neither opened
+  /// (`getEpubBook(decodedKey) == null` -> `book_file_not_found`) nor deleted
+  /// ([deleteBook] early-returns false). A raw string slice is lossless for
+  /// every key — with or without `%` — and identical to the old result for keys
+  /// that contain no `%` (the common case), so nothing that worked before
+  /// changes. Mirrors the HBK-AUDIT-127 encode/decode-symmetry fix for
+  /// [epubUrl]/[fontUrl].
+  static const String _bookIdentifierPrefix =
+      pref_keys.kReaderBookIdentifierPrefix;
+
+  static String? parseBookKey(String identifier) {
+    if (!identifier.startsWith(_bookIdentifierPrefix)) return null;
+    final String bookKey = identifier.substring(_bookIdentifierPrefix.length);
+    if (bookKey.isEmpty) return null;
+    return bookKey;
+  }
+
+  /// BUG-1018 (A3): standalone SRT books (empty bookKey sentinel) need their
+  /// OWN media identity. They previously all shared `mediaIdentifierFor('')`
+  /// == `hoshi://book/`, so every standalone SRT book's override title/cover
+  /// landed on the same preference key and stomped each other, and the author
+  /// save silently no-opped (parseBookKey returned null). Their identity is
+  /// the stable `SrtBook.uid` under a distinct prefix that can never collide
+  /// with a sanitized EPUB bookKey identifier.
+  static const String _srtBookIdentifierPrefix = 'fushi://srtbook/';
+
+  static String mediaIdentifierForSrtUid(String uid) =>
+      '$_srtBookIdentifierPrefix$uid';
+
+  /// Inverse of [mediaIdentifierForSrtUid]; null for non-SRT identifiers.
+  static String? parseSrtBookUid(String identifier) {
+    if (!identifier.startsWith(_srtBookIdentifierPrefix)) return null;
+    final String uid = identifier.substring(_srtBookIdentifierPrefix.length);
+    if (uid.isEmpty) return null;
+    return uid;
+  }
+
+  /// BUG-1018 (A1): resolve the user's override display title for a book by
+  /// its stable [bookKey], for surfaces that don't hold a full [MediaItem]
+  /// (home continue/activity rows, reading statistics, audiobook notification
+  /// metadata). Single source of truth: the same preference the edit dialog
+  /// writes via [setOverrideTitleFromMediaItem]. Returns null when the user
+  /// never renamed the book (callers fall back to the DB title).
+  String? overrideTitleForBookKey(String bookKey) {
+    if (bookKey.isEmpty) return null;
+    return _overrideTitleForIdentifier(mediaIdentifierFor(bookKey));
+  }
+
+  /// [overrideTitleForBookKey]'s standalone-SRT sibling (identity = uid).
+  String? overrideTitleForSrtUid(String uid) {
+    if (uid.isEmpty) return null;
+    return _overrideTitleForIdentifier(mediaIdentifierForSrtUid(uid));
+  }
+
+  /// BUG-1317：这里合成的 `mediaSourceIdentifier` **不再参与 override 身份**。
+  ///
+  /// 它以前是个谎——恒填 EPUB 源，于是一本漫画 / PDF 书的 override 键被按 EPUB 源
+  /// 拼出来，与编辑弹窗按真实 format 写进去的键对不上（首页 / 统计 / 通知栏读不到
+  /// 用户改的名字）。现在 override 键只由 `mediaIdentifier` 派生、统一存进
+  /// [overrideStore]，回退位置取自 `this` 的 [legacyOverrideStores]（书族三源全在
+  /// 内），所以本处填哪个源键都读到同一个值。保留 `uniqueKey` 只因它对本类自洽。
+  String? _overrideTitleForIdentifier(String mediaIdentifier) {
+    return getOverrideTitleFromMediaItem(
+        overrideTitleMediaItemForIdentifier(mediaIdentifier));
+  }
+
+  /// 只为 override 书名读写而合成的**最小 [MediaItem]**（BUG-1488 提取为公开）。
+  ///
+  /// `canEdit: true` 是硬要求：[getOverrideTitleFromMediaItem] 与
+  /// [setOverrideTitleFromMediaItem] 在 `!canEdit` 时**静默失效**（读返 null、
+  /// 写…也照写但读不回来）。手上只有 bookKey 的写入方（互联下载后收下 host 改名）
+  /// 必须复用本入口，别再各自 new 一个 MediaItem 踩这个无报错的坑。
+  MediaItem overrideTitleMediaItemForIdentifier(String mediaIdentifier) {
+    return MediaItem(
+      mediaIdentifier: mediaIdentifier,
+      title: '',
+      mediaTypeIdentifier: mediaType.uniqueKey,
+      mediaSourceIdentifier: uniqueKey,
+      position: 0,
+      duration: 1,
+      canDelete: false,
+      canEdit: true,
+    );
+  }
+
+  /// [overrideTitleMediaItemForIdentifier] 的 bookKey 便捷形态。
+  MediaItem overrideTitleMediaItemForBookKey(String bookKey) =>
+      overrideTitleMediaItemForIdentifier(mediaIdentifierFor(bookKey));
+
+  /// BUG-220: EPUB books carry an editable author column, so expose author
+  /// editing in the media edit dialog.
+  @override
+  bool get supportsAuthorEdit => true;
+
+  /// BUG-220: persist the edited author directly to the `epubBooks.author`
+  /// column (NOT the primary key, so no re-key is needed — unlike the title,
+  /// which is overridden via a preference). A blank author clears the column.
+  ///
+  /// BUG-1018 (A3): standalone SRT books (identity `hoshi://srtbook/<uid>`)
+  /// write through to the `srt_books.author` column instead of silently
+  /// no-opping like the old empty-bookKey identifier did.
+  @override
+  Future<void> setAuthorFromMediaItem({
+    required MediaItem item,
+    required String? author,
+  }) async {
+    final FushiDatabase? db = sharedDatabase;
+    if (db == null) return;
+    final String? bookKey = parseBookKey(item.mediaIdentifier);
+    if (bookKey != null) {
+      await db.updateEpubBookAuthor(bookKey, author);
+      return;
+    }
+    final String? srtUid = parseSrtBookUid(item.mediaIdentifier);
+    if (srtUid == null) return;
+    final SrtBookRepository repo = SrtBookRepository(db);
+    final SrtBook? book = await repo.findByUid(srtUid);
+    if (book == null) return;
+    // Mirror updateEpubBookAuthor's blank-clears semantics.
+    final String trimmed = (author ?? '').trim();
+    book.author = trimmed.isEmpty ? null : trimmed;
+    await repo.save(book);
+  }
+
+  @override
+  Future<void> prepareResources() async {}
+
+  // HBK-AUDIT-042 / HBK-AUDIT-124: removed the dead generateAudio override and
+  // its _pendingCue/_pendingAudioFiles + setPendingSentenceAudio/
+  // clearPendingSentenceAudio machinery. They had zero callers, so the override
+  // always returned null; the live sentence-audio mining is done inline in
+  // reader_fushi_page.dart. The misleading overridesAutoAudio:true flag was
+  // dropped from the constructor (now defaults to false) for the same reason.
+
+  @override
+  Future<void> onSourceExit({
+    required AppModel appModel,
+    required WidgetRef ref,
+  }) async {
+    ref.invalidate(fushiBooksProvider(JapaneseLanguage.instance));
+    // BUG-777：阅读中位置持续落库刷新 updatedAt，关书回书架时 recency 映射与
+    // 书列表同点失效，继续阅读 hero /「最近阅读」排序立即反映本次阅读。
+    ref.invalidate(bookLastReadAtProvider);
+    // BUG-2918：读到末尾时阅读器写 completedAt，关书回首页「继续」区立即剔除。
+    ref.invalidate(completedEpubBookKeysProvider);
+  }
+
+  @override
+  Future<void> onSearchBarTap({
+    required BuildContext context,
+    required WidgetRef ref,
+    required AppModel appModel,
+  }) async {}
+
+  @override
+  Widget buildLaunchPage({
+    MediaItem? item,
+    Bookmark? initialBookmarkJump,
+  }) {
+    final String bookKey = _extractBookKey(item?.mediaIdentifier ?? '');
+    return FushiAppUiScaleNeutralizer(
+      // 歌词模式配色的注入点：页面 context 弹出的侧栏 / 菜单 / 对话框都在它之下。
+      child: LyricsThemeHost(
+        child: ReaderFushiPage(
+          item: item,
+          bookKey: bookKey,
+          initialBookmarkJump: initialBookmarkJump,
+        ),
+      ),
+    );
+  }
+
+  // HBK-AUDIT-126: parseBookKey returns null for an empty/unknown identifier.
+  // We log the failure so the corruption is observable instead of swallowed;
+  // an empty-string sentinel remains only because ReaderFushiPage.bookKey is a
+  // non-null String and ReaderFushiPage already renders an empty/error state
+  // for an unknown key.
+  static String _extractBookKey(String identifier) {
+    final String? bookKey = parseBookKey(identifier);
+    if (bookKey == null) {
+      ErrorLogService.instance.log(
+        'ReaderFushiSource._extractBookKey',
+        'unparseable media identifier: "$identifier"',
+        StackTrace.current,
+      );
+      return '';
+    }
+    return bookKey;
+  }
+
+  @override
+  List<Widget> getActions({
+    required BuildContext context,
+    required WidgetRef ref,
+    required AppModel appModel,
+  }) {
+    return [
+      buildBookImportButton(context: context, ref: ref, appModel: appModel),
+    ];
+  }
+
+  Widget buildBookImportButton({
+    required BuildContext context,
+    required WidgetRef ref,
+    required AppModel appModel,
+    FushiFocusId? focusId,
+    String? label,
+  }) {
+    // 不覆盖 size：书架页头同排的其它按钮（管理来源 / 合集 / 统计，走
+    // _headerAction → FushiIconButton）与视频 tab 的导入按钮都用默认 24。
+    // 此前这里显式塞 titleLarge.fontSize(~22) 让「添加」按钮比兄弟小一圈、
+    // 外框也短一截，看起来大小和位置都对不齐（BUG-735）。回落默认即对齐。
+    return FushiIconButton(
+      tooltip: t.srt_import,
+      // 宽窗展开为「图标+文字」（书架页头传入）；null 时保持纯图标（其它调用点）。
+      label: label,
+      icon: Icons.library_add_outlined,
+      focusId: focusId,
+      onTap: () async {
+        final bool? imported = await showAppDialog<bool>(
+          context: context,
+          builder: (_) => BookImportDialog(
+            prefs: appModel.prefsRepo,
+            repo: SrtBookRepository(appModel.database),
+            audiobookRepo: AudiobookRepository(appModel.database),
+            db: appModel.database,
+          ),
+        );
+        if (imported == true) {
+          ref.invalidate(fushiBooksProvider(JapaneseLanguage.instance));
+          ref.invalidate(srtBooksProvider);
+        }
+      },
+    );
+  }
+
+  @override
+  BasePage buildHistoryPage({MediaItem? item, Widget? navigation}) {
+    return ReaderFushiHistoryPage(navigation: navigation);
+  }
+
+  // ── Book listing from Drift ─────────────────────────────────────────
+
+  Future<List<MediaItem>> getBooksFromDb({
+    required AppModel appModel,
+  }) async {
+    final FushiDatabase db = appModel.database;
+    final List<EpubBookRow> books = await db.getAllEpubBooks();
+    // 阅读位置一次整表取完（书 uid → 位置）。之前每本各查一次
+    // `findByBookUid`：Drift 在单连接上串行执行，`Future.wait` 只能重叠 await、
+    // 重叠不了 SQL，书架延迟仍随库大小线性增长（N 次往返 + N 次语句准备）。
+    final Map<String, ReaderPosition> positions =
+        await ReaderPositionRepository(db).findAllByBookUid();
+
+    // HBK-AUDIT-128: previously this was a serial for-loop where every book
+    // awaited up to four File.exists() cover probes one after another, so
+    // shelf latency scaled linearly with library size. Map each book to a
+    // Future and resolve them with Future.wait so the cover probes overlap;
+    // Future.wait preserves input order so the shelf ordering is unchanged.
+    return Future.wait<MediaItem>(
+      books.map(
+        (EpubBookRow book) => _bookToMediaItem(
+          book,
+          book.uid.isEmpty ? null : positions[book.uid],
+        ),
+      ),
+    );
+  }
+
+  /// 按 bookKey 解析出 [MediaItem]（TODO-291：首页「正在听书」迷你条「回到书」用，
+  /// 此处没有现成的 MediaItem，需按 key 重建）。书不存在返回 null。
+  Future<MediaItem?> mediaItemForBookKey(String bookKey) async {
+    final FushiDatabase? db = sharedDatabase;
+    if (db == null) return null;
+    final EpubBookRow? book = await db.getEpubBook(bookKey);
+    if (book == null) return null;
+    // v82：位置键 = 行 uid（空 uid 视同无阅读记录）。
+    final ReaderPosition? pos = book.uid.isEmpty
+        ? null
+        : await ReaderPositionRepository(db).findByBookUid(book.uid);
+    return _bookToMediaItem(book, pos);
+  }
+
+  /// 在线漫画的章级进度。
+  ///
+  /// 「读到第几话」= 从**末尾**往回数：源按新→旧返回，列表 0 是最新一话，所以
+  /// 下标越大越旧。没选过章 = 一话都没开始读，position 0。
+  static ({int position, int duration}) _onlineMangaProgress(
+    OnlineMangaLibraryEntry entry,
+  ) {
+    final int total = entry.chapters.length;
+    if (total == 0) return (position: 0, duration: 1);
+    final int? selected = entry.currentChapterIndex;
+    if (selected == null || selected < 0 || selected >= total) {
+      return (position: 0, duration: total);
+    }
+    return (position: (total - selected).clamp(0, total), duration: total);
+  }
+
+  /// Resolve a single [EpubBookRow] into a [MediaItem], probing its cover
+  /// concurrently with sibling books (HBK-AUDIT-128). [pos] is the book's
+  /// reader position (already keyed by uid by the caller; null = never read).
+  Future<MediaItem> _bookToMediaItem(
+    EpubBookRow book,
+    ReaderPosition? pos,
+  ) async {
+    int position = 0;
+    int duration = 1;
+
+    List<int> sectionChars = const <int>[];
+    if (book.chaptersJson.isNotEmpty) {
+      try {
+        final List<dynamic> chapters =
+            jsonDecode(book.chaptersJson) as List<dynamic>;
+        sectionChars = chapters
+            .map((dynamic c) =>
+                ((c as Map<String, dynamic>)['characters'] as num?)?.toInt() ??
+                0)
+            .toList();
+      } catch (e, stack) {
+        ErrorLogService.instance
+            .log('ReaderFushiSource.sectionChars', e, stack);
+      }
+    }
+    final int totalChars = sectionChars.fold<int>(0, (a, b) => a + b);
+
+    // 书架列书 format-agnostic（本方法列全部 EpubBooks 行），但打开路由按 `format`
+    // 三态分流 mediaSourceIdentifier：`'pdf'` → [ReaderPdfSource]（进 ReaderPdfPage）、
+    // `'manga'` → [MangaFushiSource]（进 MangaFushiPage）、其余 → 本源（EPUB 阅读器）。
+    // 缺这条分流，PDF/漫画行会用 EPUB 阅读器打开并在解压/解析路径崩溃。媒体标识前缀
+    // 共用 `hoshi://book/<bookKey>`（bookKey 是主键、与 format 无关），路由只认
+    // mediaSourceIdentifier。
+    final BookFormat format = BookFormat.parseOrEpub(book.format);
+    // 页码型书（PDF/漫画）：进度单位是页而非章内字数。
+    final bool pageBased = format.isPagedImageBook;
+
+    // TODO-1346：进度纳入当前章内 charOffset（与章字数同单位），并对老书无字数时
+    // 回退章级粗粒度，避免书架恒显 0%。见 [computeBookProgress]。
+    // 在线漫画的进度是**章级**的，不能走下面的页级分支。
+    //
+    // 那条分支算的是 `sectionIndex+1 ÷ chapterCount`，而在线条目里这两个量纲
+    // 根本不同：`chapterCount` 写的是**章数**（OnlineMangaLibraryService.add），
+    // `sectionIndex` 存的是**当前章内的页码**（阅读器 _persistPosition）。于是
+    // 「第 3 章的第 8 页 ÷ 共 128 章」= 6%，翻页时进度条乱跳，换章时反而回退。
+    // 本地 mokuro 卷两个量纲一致（都是页），继续走页级分支。
+    final OnlineMangaLibraryEntry? onlineEntry = pageBased
+        ? OnlineMangaLibraryEntry.tryParse(book.sourceMetadata)
+        : null;
+    final ({int position, int duration}) prog = onlineEntry != null
+        ? _onlineMangaProgress(onlineEntry)
+        : pageBased
+            // PDF Phase 3 / 漫画同款：进度单位是**页**（sectionIndex=当前页 0-based，
+            // chapterCount=总页数）。chaptersJson='[]' 无字数，走 computeBookProgress 会恒回
+            // (0,1)=0%。用 sectionIndex+1（1-based 页序）而非 0-based：停在第 1 页时
+            // position>0 才会被 `tallyShelfProgress` 计入「在读」并进「继续阅读」；读到最后
+            // 一页 position==duration 恰好等于「读完」判据，两端都自洽。
+            // 1-based 只对**有阅读记录**的书成立：没有记录（pos==null）= 一页没
+            // 翻过，position 0 = 未读。旧写法 `(pos?.sectionIndex ?? 0) + 1` 把没开
+            // 过的卷也算成停在第 1 页——书架「未读」筛选永远筛不出本地漫画 / PDF，
+            // 只有 1 页的卷还直接算「读完」。
+            ? (
+                // 1-based 页序直接 clamp 到 [1, 总页数]，脏 sectionIndex 也不会让
+                // position 溢出 duration（>100%）。
+                // 「重置阅读状态」写回的开头位置（页式阅读器从不写缺席的精确锚，
+                // 见 [isPageBasedResetPosition]）同样算未读。
+                position: pos == null ||
+                        isPageBasedResetPosition(
+                          sectionIndex: pos.sectionIndex,
+                          charOffset: pos.charOffset,
+                        )
+                    ? 0
+                    : (pos.sectionIndex + 1).clamp(
+                        1,
+                        book.chapterCount > 0 ? book.chapterCount : 1,
+                      ),
+                duration: book.chapterCount > 0 ? book.chapterCount : 1,
+              )
+            : computeBookProgress(
+                sectionChars: sectionChars,
+                sectionIndex: pos?.sectionIndex,
+                charOffset: pos?.charOffset ?? -1,
+                // BUG-728：听书时 charOffset 存 -1，章内进度只在 normCharOffset（0-10000）
+                // 里，传进去让 computeBookProgress 回退还原，否则书架进度停在章边界。
+                normCharOffset: pos?.normCharOffset ?? 0,
+              );
+    position = prog.position;
+    duration = prog.duration;
+
+    final String? imageUrl = await _resolveCoverUrl(book);
+
+    return MediaItem(
+      mediaIdentifier: mediaIdentifierFor(book.bookKey),
+      title: book.title,
+      // BUG-220: 回填导入时写入 epubBooks.author 的作者，详情弹窗据此显示。
+      author: book.author,
+      imageUrl: imageUrl,
+      mediaTypeIdentifier: mediaType.uniqueKey,
+      mediaSourceIdentifier: mediaSourceKeyFor(format),
+      position: position,
+      duration: duration,
+      canDelete: false,
+      canEdit: true,
+      sourceMetadata: totalChars > 0 ? jsonEncode(sectionChars) : null,
+    );
+  }
+
+  /// BUG-513: process-level cache mapping a book's stable [EpubBookRow.bookKey]
+  /// to the last cover URL that was successfully resolved from disk. The cover
+  /// path is not a persisted column, so [_resolveCoverUrl] re-probes the disk
+  /// with `File.exists()` on every `fushiBooksProvider` rebuild (and the shelf
+  /// invalidates that provider on a great many actions). Under IO contention —
+  /// notably the VACUUM + wal_checkpoint(TRUNCATE) that `deleteBook` runs right
+  /// before the shelf re-probes every surviving book — `File.exists()` can
+  /// momentarily return false for a file that is still on disk, collapsing that
+  /// book's `imageUrl` to null; the null is then cached by the shelf AsyncValue
+  /// and the cover visibly disappears until a cold restart re-probes it.
+  ///
+  /// Keying by bookKey (stable, unique) rather than by extractDir keeps the
+  /// cache correct across renamed/moved books. The cache only ever holds URLs
+  /// that were once true on disk, so a transient miss falls back to a real
+  /// previous cover, never to a fabricated path.
+  static final Map<String, String> _lastGoodCoverUrlByBookKey =
+      <String, String>{};
+
+  /// Test seam: reset the process cover cache between tests so state does not
+  /// leak across cases sharing the [instance] singleton.
+  @visibleForTesting
+  static void debugResetCoverCache() => _lastGoodCoverUrlByBookKey.clear();
+
+  /// Build the ordered candidate cover paths for a book: the declared cover
+  /// path (if any) wins over the conventional `cover.jpg/jpeg/png` fallbacks.
+  @visibleForTesting
+  static List<String> coverCandidatePaths({
+    required String extractDir,
+    String? coverPath,
+  }) {
+    final List<String> candidates = <String>[];
+    if (coverPath != null && coverPath.isNotEmpty) {
+      String coverRel = coverPath;
+      if (coverRel.startsWith('/')) coverRel = coverRel.substring(1);
+      candidates.add(p.join(extractDir, coverRel));
+    }
+    for (final String name in const <String>[
+      'cover.jpg',
+      'cover.jpeg',
+      'cover.png',
+    ]) {
+      candidates.add(p.join(extractDir, name));
+    }
+    return candidates;
+  }
+
+  /// Pure, injectable cover resolution (BUG-513). Probes [candidates]
+  /// concurrently with [probe] and returns the `file://` URL of the first
+  /// existing one in priority order. On a total miss it does NOT collapse to
+  /// null: if [cache] holds a previously-resolved URL for [bookKey] it returns
+  /// that (a transient `File.exists()` false must not blank an on-disk cover),
+  /// otherwise null. A successful probe refreshes the cache entry.
+  ///
+  /// Kept static + parameterised so it is unit-testable with a mock filesystem;
+  /// the instance [_resolveCoverUrl] wires in the real `File.exists` + process
+  /// cache.
+  @visibleForTesting
+  static Future<String?> resolveCoverUrlFor({
+    required String bookKey,
+    required List<String> candidates,
+    required Future<bool> Function(String path) probe,
+    required Map<String, String> cache,
+  }) async {
+    final List<bool> existed = await Future.wait<bool>(
+      candidates.map(probe),
+    );
+    for (int i = 0; i < candidates.length; i++) {
+      if (existed[i]) {
+        final String url = Uri.file(candidates[i]).toString();
+        if (bookKey.isNotEmpty) cache[bookKey] = url;
+        return url;
+      }
+    }
+    // Total miss. Fall back to the last successfully-resolved cover for this
+    // book so a transient IO race (e.g. VACUUM contention after deleteBook)
+    // cannot blank a cover whose file is still on disk. Only real, previously
+    // observed URLs live in the cache, so this never fabricates a path.
+    if (bookKey.isNotEmpty) return cache[bookKey];
+    return null;
+  }
+
+  /// Resolve a book's cover image URL, probing the declared cover path and the
+  /// conventional fallback names concurrently (HBK-AUDIT-128), with a
+  /// last-good fallback so transient probe misses don't blank the cover
+  /// (BUG-513).
+  Future<String?> _resolveCoverUrl(EpubBookRow book) async {
+    final List<String> candidates = coverCandidatePaths(
+      extractDir: book.extractDir,
+      coverPath: book.coverPath,
+    );
+    final String? direct = await resolveCoverUrlFor(
+      bookKey: book.bookKey,
+      candidates: candidates,
+      probe: (String path) => File(path).exists(),
+      cache: _lastGoodCoverUrlByBookKey,
+    );
+    if (direct != null) return direct;
+    // TODO-1319 / BUG-612: on a case-SENSITIVE filesystem (Android/Linux) the
+    // persisted coverPath may carry the wrong case. A book imported or backed
+    // up on a case-INSENSITIVE host (Windows/macOS) stored the cover href after
+    // p.canonicalize lower-cased it (epub_parser _itemRelHref), while the
+    // extracted files keep their real case (TODO-739). Once such a book reaches
+    // a case-sensitive device via backup restore or a raw data copy (both
+    // persist coverPath verbatim without re-parsing), File(join(extractDir,
+    // "oebps/images/cover.jpg")) misses the real "OEBPS/Images/Cover.jpg" and
+    // the cover -- though detected at import -- never renders. Resolve the
+    // declared cover (and the conventional fallbacks) case-insensitively against
+    // the real extracted files as a last resort so the cover still shows.
+    // Shared with card mining via [resolveCoverFilePath] (TODO-1388 / BUG-703)
+    // so both surfaces resolve to the identical on-disk cover file.
+    final String? resolved = resolveCoverFilePath(
+      extractDir: book.extractDir,
+      coverPath: book.coverPath,
+    );
+    if (resolved != null) {
+      final String url = Uri.file(resolved).toString();
+      if (book.bookKey.isNotEmpty) {
+        _lastGoodCoverUrlByBookKey[book.bookKey] = url;
+      }
+      return url;
+    }
+    return null;
+  }
+
+  /// Real-filesystem child lister for [resolveCaseInsensitive]. Returns the
+  /// child entity paths of [dir], or an empty list if it is missing/unreadable.
+  static List<String> _listDirEntries(String dir) {
+    final Directory d = Directory(dir);
+    if (!d.existsSync()) return const <String>[];
+    try {
+      return d
+          .listSync(followLinks: false)
+          .map((FileSystemEntity e) => e.path)
+          .toList();
+    } catch (_) {
+      return const <String>[];
+    }
+  }
+
+  /// Case-insensitive on-disk resolution of a book cover (TODO-1319 / BUG-612).
+  ///
+  /// Walks each relative candidate in [relPaths] segment by segment under
+  /// [extractDir], matching each segment against the real directory entries
+  /// from [listDir] -- exact case first, then case-insensitively. Returns the
+  /// first candidate that fully resolves to an on-disk path, or null. This lets
+  /// a coverPath whose case was mangled by a case-insensitive host still find
+  /// the case-preserved extracted file on a case-sensitive device.
+  ///
+  /// Pure + injectable ([listDir]) so it is unit-testable with a mock
+  /// filesystem; the instance path wires in [_listDirEntries].
+  @visibleForTesting
+  static String? resolveCaseInsensitive({
+    required String extractDir,
+    required List<String> relPaths,
+    required List<String> Function(String dir) listDir,
+  }) {
+    for (final String rel in relPaths) {
+      if (rel.isEmpty || p.isAbsolute(rel)) continue;
+      final List<String> segs = p
+          .split(rel)
+          .where((String s) => s.isNotEmpty && s != '.' && s != '/')
+          .toList();
+      if (segs.isEmpty) continue;
+      String current = extractDir;
+      bool resolvedAll = true;
+      for (final String seg in segs) {
+        final List<String> children = listDir(current);
+        String? match;
+        for (final String child in children) {
+          if (p.basename(child) == seg) {
+            match = child;
+            break;
+          }
+        }
+        if (match == null) {
+          final String segLower = seg.toLowerCase();
+          for (final String child in children) {
+            if (p.basename(child).toLowerCase() == segLower) {
+              match = child;
+              break;
+            }
+          }
+        }
+        if (match == null) {
+          resolvedAll = false;
+          break;
+        }
+        current = match;
+      }
+      if (resolvedAll) return current;
+    }
+    return null;
+  }
+
+  /// Resolve a book cover to its on-disk **file path** (not a `file://` URL),
+  /// reusing the exact same case-insensitive resolution the library grid uses
+  /// (`_resolveCoverUrl`) so card mining and shelf display agree on which cover
+  /// file to use (TODO-1388 / BUG-703). The declared [coverPath] wins over the
+  /// conventional `cover.jpg/jpeg/png` fallbacks; each candidate is matched
+  /// exact-case-first then case-insensitively against the real extracted files,
+  /// so a coverPath whose case was mangled by a case-insensitive import host
+  /// (Windows/macOS `p.canonicalize` lower-casing, epub_parser _itemRelHref)
+  /// still finds the case-preserved file on a case-sensitive device
+  /// (Android/Linux). Returns null when no candidate resolves to a real file.
+  ///
+  /// Static + wiring the real [_listDirEntries] lister so mining (which only
+  /// had a naive `File(join(extractDir, coverHref)).existsSync()` probe --
+  /// blind to case, hence the missing cover on Android) shares one resolution
+  /// with the grid instead of drifting.
+  ///
+  /// Not `@visibleForTesting`: this is genuine production API consumed by both
+  /// the shelf grid (`_resolveCoverUrl`) and card mining (`mining.part.dart`).
+  static String? resolveCoverFilePath({
+    required String extractDir,
+    String? coverPath,
+  }) {
+    final String? resolved = resolveCaseInsensitive(
+      extractDir: extractDir,
+      relPaths: <String>[
+        if (coverPath != null && coverPath.isNotEmpty) coverPath,
+        'cover.jpg',
+        'cover.jpeg',
+        'cover.png',
+      ],
+      listDir: _listDirEntries,
+    );
+    if (resolved != null && File(resolved).existsSync()) return resolved;
+    return null;
+  }
+
+  /// 删一本书（EPUB / PDF / 漫画 / 字幕书）攒下的统计：「同时删除统计数据」勾选的
+  /// 落地，书架单删 / 批删 / 合集连删 / 漫画作品页移出书架共用。
+  ///
+  /// 逐身份走 [FushiDatabase.deleteReadingStatisticsForTitle]：它在一个事务里删
+  /// `study_segments` 并按身份立碑、删 legacy 阅读时长/字数与查词/制卡计数，并立
+  /// title 墓碑防同步复活。[mediaKeys] 同时给 bookKey 与 srt uid——后台听书时钟对
+  /// 纯字幕书以 uid 为身份（`SessionBookInfo.studyMediaKey`），两个都得清。
+  ///
+  /// best-effort：统计删失败不该拦住书本身的删除（用户可在统计页再删），只记日志。
+  static Future<void> deleteBookStatistics({
+    required FushiDatabase db,
+    required String title,
+    required Iterable<String> mediaKeys,
+  }) async {
+    for (final String key
+        in mediaKeys.where((String k) => k.isNotEmpty).toSet()) {
+      try {
+        await db.deleteReadingStatisticsForTitle(title, bookKey: key);
+      } catch (e, stack) {
+        ErrorLogService.instance
+            .log('ReaderFushiSource.deleteStatistics', e, stack);
+      }
+    }
+  }
+
+  /// 删除这本字幕书时能否提供「同时删除统计数据」。
+  ///
+  /// 只有配对了 EPUB 的字幕书（bookKey 非空，走 [deleteBook]）能安全删统计。纯字幕书
+  /// （bookKey 空）不行：它的 legacy `reading_statistics` / book 类查词制卡计数与
+  /// `(title, 'book')` 墓碑只能按 title 定位，同名 EPUB 的统计会被连坐删掉（PR #1697
+  /// 审查阻断 2）。书架单删 / 批删 / 合集连删共用这一条判据：不摆勾选、执行时跳过。
+  static bool srtBookOffersStatisticsDeletion(SrtBook book) =>
+      book.bookKey.isNotEmpty;
+
+  /// Delete a book and all of its associated data.
+  ///
+  /// Pass [appModel] to also clear the override thumbnail file (it is needed to
+  /// resolve the thumbnails directory); the override title preference is always
+  /// cleared regardless (HBK-AUDIT-040).
+  /// [scope] 控制删除传播：[DeleteScope.syncEverywhere] 记一条 sync 删除墓碑，供同步
+  /// 时发布到远端标记、其他设备逐条确认后也删；[DeleteScope.keepLocalOnly]（默认）只删
+  /// 本机不传播（消费远端删除标记时也走此值——删本地、绝不再回写墓碑造成循环）。备份防
+  /// 复活墓碑（[FushiDatabase.deleteEpubBook] 的 tombstone:true）与 scope 无关，永远记
+  /// （用户在本机删的东西，导入自己的旧备份不该复活）。
+  /// [deleteLocalFiles]（默认 false，对应删除弹窗「同时删除本地文件」）：true 时连
+  /// 这本书附带的有声书 / 配对字幕书**显式登记的原始音频文件**一起删。书本体
+  /// （EPUB / PDF / 漫画）导入即拷贝进 app 目录、原件路径根本没入库，没有可删的
+  /// 原件——这就是 [hasLocalFiles] 只看音频列的原因，也是「同时删除本地文件」这条
+  /// 披露只讲音频的原因。
+  /// [deleteStatistics]（默认 false，对应删除弹窗「同时删除统计数据」）：true 时在删
+  /// 行**之前**把这本书攒下的统计一并删掉（[deleteBookStatistics]）——标题与 srt uid
+  /// 都住在即将被删的行上，行一删就无从定位。
+  Future<DeleteBookResult> deleteBook({
+    required FushiDatabase db,
+    required String bookKey,
+    AppModel? appModel,
+    DeleteScope scope = DeleteScope.keepLocalOnly,
+    bool deleteLocalFiles = false,
+    bool deleteStatistics = false,
+  }) async {
+    try {
+      // 原件位置在 audiobooks / srt_books 行上，deleteEpubBook 的事务会把它们
+      // 级联删掉，必须先快照。
+      final Audiobook? audiobookBefore = deleteLocalFiles
+          ? await AudiobookRepository(db).findByBookKey(bookKey)
+          : null;
+      LocalFileDeleteReport localFileReport = const LocalFileDeleteReport();
+      // HBK-AUDIT-041: db.deleteEpubBook removes every associated DB row
+      // (readerPositions, bookmarks, srtBooks, audioCues, audiobooks for the
+      // same bookKey) inside one transaction. Previously deleteBook ALSO
+      // deleted the audiobook/srt rows via the repos, double-deleting the same
+      // rows and splitting the deletion across non-atomic layers. We now let
+      // the transaction own all row deletes and only run the non-redundant
+      // on-disk cleanups (deletePersistDir, extracted dir) afterwards.
+      //
+      // The book's on-disk extract dir and the srt uid must be resolved BEFORE
+      // the transaction, because deleteEpubBook deletes the rows they live on.
+      final EpubBookRow? bookRow = await db.getEpubBook(bookKey);
+      final SrtBookRepository srtRepo = SrtBookRepository(db);
+      final SrtBook? srt = await srtRepo.findByBookKey(bookKey);
+
+      // BUG-439：bookKey 指向的行不存在（孤儿壳行 bookKey==''、key 不匹配、或重复
+      // 删除）时，以前 deleteEpubBook 删 0 行后仍无条件 return true 谎报成功，调用方
+      // 据此把这本计入「已删除 N 本」。这里在删之前就判定：没有任何对应行（EPUB 行
+      // 与按 bookKey 关联的 SRT 行都不存在）→ 真的没东西可删 → 如实回报失败并带上
+      // 原因（TODO-1359 起写入 ErrorLogService），不跑磁盘清理/VACUUM，也不谎报成功。
+      if (bookRow == null && srt == null) {
+        final String reason = '找不到这本书的数据（bookKey="$bookKey" 无对应行，'
+            '可能已删除或书架条目已失效）';
+        ErrorLogService.instance
+            .logDiagnostic('ReaderFushiSource.deleteBook', reason);
+        debugPrint('[ReaderFushiSource] deleteBook: $reason');
+        return DeleteBookResult.failure(reason);
+      }
+
+      if (deleteStatistics) {
+        await deleteBookStatistics(
+          db: db,
+          title: bookRow?.title ?? srt!.title,
+          mediaKeys: <String>[bookKey, if (srt != null) srt.uid],
+        );
+      }
+
+      // 跨端删除墓碑键：两端键不同的书写**对端键**（BUG-3443 同类）——经互联收下的
+      // 在线漫画取描述符里的对端键（本机键是单向哈希），从对端下载、落地键不同的书取
+      // 别名表。必须删行前取：deleteEpubBook 会级联删掉别名。
+      final String syncTombstoneKey = scope == DeleteScope.syncEverywhere
+          ? InterconnectMangaCatalog.peerBookKeyOf(bookRow?.sourceMetadata) ??
+              await db.syncDeletionBookKeyOf(bookKey)
+          : bookKey;
+
+      // TODO-1195 part B: a user shelf delete records a tombstone so a later
+      // backup MERGE import never resurrects this book from an old backup.
+      final int deletedRows = await db.deleteEpubBook(bookKey, tombstone: true);
+
+      // 删除传播（显式确认式）：仅当用户在删除弹窗选「同步删除」(syncEverywhere) 才记
+      // 一条 sync 删除墓碑，供同步时发布到远端标记、其他设备逐条确认后也删。keepLocalOnly
+      // （含消费远端删除标记的路径）不记，避免「删本地→回写墓碑→再传播」循环。host 服务
+      // 客户端删除走 _cleanupBookOnDisk 不经本方法。best-effort：记账失败不翻转删除结果。
+      if (deletedRows > 0 && scope == DeleteScope.syncEverywhere) {
+        try {
+          await db.writeSyncDeletionTombstone(
+              'book', syncTombstoneKey, DateTime.now().millisecondsSinceEpoch);
+        } catch (_) {
+          // best-effort：删除墓碑记账失败不影响书已删。
+        }
+      }
+
+      // TODO-1359 根因：DB 行（唯一真相源）此刻已删，这本书对用户已经消失。下面的
+      // 磁盘副本/偏好清理属于删完再打扫的尾活——Windows 上解压目录若被 WebView
+      // baseURI / 封面图句柄 / 杀软占用，dir.delete(recursive:true) 会抛 errno
+      // 32/145。以前这些清理在外层 try 里裸跑，一抛异常就落到最外层 catch 谎报「删除
+      // 失败」（尽管 DB 行早已删掉），调用方据此不刷新书架、书还挂在架上、解压目录也
+      // 泄漏——这正是用户「为什么删不掉」的真实根因。改为与下方 VACUUM 同一纪律：尾活
+      // 失败只记日志、不翻转删除结果（磁盘副本孤儿无害，DB 行已消失不会再被引用）。
+      try {
+        // On-disk cleanups (not covered by the DB transaction). The audiobook
+        // persist dir is keyed by the book's own key now (no legacy uid).
+        await AudiobookStorage.deletePersistDir(bookKey);
+        if (srt != null) {
+          await AudiobookStorage.deletePersistDir(srt.uid);
+        }
+        // Locate the extracted dir by the stored extract_dir column (the on-disk
+        // folder name may still be the legacy int id; the column is the truth).
+        if (bookRow != null) {
+          await EpubStorage.deleteBookDir(bookRow.extractDir);
+        }
+        // 用户明确勾选后才删原始音频；两条记录可能指向同一批文件，第二次删到的
+        // 已不存在，[deleteLocalFiles] 既不计入 removed 也不计入 failures。
+        if (deleteLocalFiles) {
+          if (audiobookBefore != null) {
+            localFileReport = localFileReport.merge(
+              await deleteAudiobookLocalFiles(audiobookBefore.audioPaths),
+            );
+          }
+          if (srt != null) {
+            localFileReport = localFileReport.merge(
+              await deleteAudiobookLocalFiles(srt.audioPaths),
+            );
+          }
+          for (final LocalFileDeleteFailure failure
+              in localFileReport.failures) {
+            ErrorLogService.instance.log(
+              'ReaderFushiSource.deleteBook.localFiles',
+              failure,
+            );
+          }
+        }
+
+        // HBK-AUDIT-040: these books are created with canDelete:false, so the
+        // generic AppModel.deleteMediaItem cleanup (clearOverrideValues) never
+        // runs for them. Clear the override title preference here, and the
+        // override thumbnail file when an AppModel is available, so renamed/
+        // recovered books do not leave orphaned override rows/files behind.
+        final MediaItem item = MediaItem(
+          mediaIdentifier: mediaIdentifierFor(bookKey),
+          title: '',
+          mediaTypeIdentifier: mediaType.uniqueKey,
+          mediaSourceIdentifier: uniqueKey,
+          position: 0,
+          duration: 1,
+          canDelete: false,
+          canEdit: true,
+        );
+        if (appModel != null) {
+          await clearOverrideValues(appModel: appModel, item: item);
+        } else {
+          await clearOverrideTitle(item);
+        }
+      } catch (e, stack) {
+        ErrorLogService.instance
+            .log('ReaderFushiSource.deleteBook.cleanup', e, stack);
+        debugPrint('[ReaderFushiSource] deleteBook post-DB cleanup failed '
+            '(DB rows already removed; on-disk copy may leak): $e');
+      }
+
+      // BUG-276: 上面已删 DB 行 + 解压目录/有声书副本，但 SQLite 删除只把页放回
+      // freelist、不归还磁盘；WAL 也会继续增长。删一本书后 VACUUM 回收空间
+      // （否则用户「书都删了占用没降」）。VACUUM 必须在事务外，这里已在事务外；
+      // 失败不应让删除整体失败（行已删），只记日志。
+      try {
+        await db.customStatement('VACUUM');
+        await db.customStatement('PRAGMA wal_checkpoint(TRUNCATE)');
+      } catch (e, stack) {
+        ErrorLogService.instance
+            .log('ReaderFushiSource.deleteBook.vacuum', e, stack);
+        debugPrint('[ReaderFushiSource] VACUUM after delete failed: $e');
+      }
+      // 真删了 EPUB 行，或清理了按 bookKey 关联的 SRT 行/磁盘副本，才算删除成功。
+      // 过了上面的早退守卫后两者至少有一个为真，这里如实回报删除结果。
+      if (deletedRows > 0 || srt != null) {
+        return DeleteBookResult.success(localFiles: localFileReport);
+      }
+      final String reason = 'DB 删除未移除任何行（bookKey="$bookKey"，deletedRows=0）';
+      ErrorLogService.instance
+          .logDiagnostic('ReaderFushiSource.deleteBook', reason);
+      debugPrint('[ReaderFushiSource] deleteBook: $reason');
+      return DeleteBookResult.failure(reason);
+    } catch (e, stack) {
+      ErrorLogService.instance.log('ReaderFushiSource.deleteBook', e, stack);
+      debugPrint('[ReaderFushiSource] deleteBook failed: $e');
+      return DeleteBookResult.failure(e.toString());
+    }
+  }
+
+  /// 删除书架上的一张**字幕书卡**（srt_books 行；书架卡 key `srt_<uid>`）。
+  ///
+  /// BUG-3101：配对了 EPUB 的字幕书（`bookKey` 非空）由 [deleteBook] 整本删——
+  /// `deleteEpubBook` 的事务按 bookKey 级联删掉这本书的 srt_books 行。调用方以前在
+  /// [deleteBook] 之后又按 uid 调一次 `SrtBookRepository.delete`，行早已不在，回报
+  /// 删了 0 行，于是单本删除**每次**弹「删除书籍失败」（不论删除范围）、批量删除把它
+  /// 计成 0 本。这里按身份二选一，只走一条删除路径：
+  ///
+  /// * `bookKey` 非空 → [deleteBook]（EPUB 行、SRT 行、cue、有声书、墓碑 `book`、
+  ///   原件、统计一并处理）；
+  /// * `bookKey` 为空（纯字幕书）→ `SrtBookRepository.delete`（standalone 行按
+  ///   [scope] 写 `srtbook` 墓碑）。纯字幕书不删统计：它的统计只能按 title 定位，会
+  ///   连坐同名 EPUB（[deleteStatistics] 对它无效）。
+  Future<DeleteBookResult> deleteSrtShelfBook({
+    required FushiDatabase db,
+    required SrtBook book,
+    DeleteScope scope = DeleteScope.keepLocalOnly,
+    bool deleteLocalFiles = false,
+    bool deleteStatistics = false,
+  }) async {
+    if (book.bookKey.isNotEmpty) {
+      return deleteBook(
+        db: db,
+        bookKey: book.bookKey,
+        scope: scope,
+        deleteLocalFiles: deleteLocalFiles,
+        deleteStatistics: deleteStatistics,
+      );
+    }
+    try {
+      final SrtBookDeleteResult removed = await SrtBookRepository(db).delete(
+        book.uid,
+        propagateDeletion: scope == DeleteScope.syncEverywhere,
+        deleteLocalFiles: deleteLocalFiles,
+      );
+      if (removed.deleted == 0) {
+        final String reason = '找不到这本字幕书的数据（uid="${book.uid}" 无对应行，'
+            '可能已删除或书架条目已失效）';
+        ErrorLogService.instance
+            .logDiagnostic('ReaderFushiSource.deleteSrtShelfBook', reason);
+        return DeleteBookResult.failure(reason);
+      }
+      return DeleteBookResult.success(localFiles: removed.localFiles);
+    } catch (e, stack) {
+      ErrorLogService.instance
+          .log('ReaderFushiSource.deleteSrtShelfBook', e, stack);
+      return DeleteBookResult.failure(e.toString());
+    }
+  }
+
+  /// 这本书（按 [bookKey]）有没有本机可删的原件——删除确认框据此决定摆不摆
+  /// 「同时删除本地文件」勾选框。只看附带有声书 / 配对字幕书**显式登记在 app 持久
+  /// 目录之外**的原始音频（见 [deleteBook] 与 `audiobook_local_files.dart`）。
+  Future<bool> hasLocalFiles({
+    required FushiDatabase db,
+    required String bookKey,
+  }) async {
+    if (bookKey.isEmpty) return false;
+    final Audiobook? ab = await AudiobookRepository(db).findByBookKey(bookKey);
+    if (ab != null && await resolveAudiobookHasLocalFiles(ab.audioPaths)) {
+      return true;
+    }
+    final SrtBook? srt = await SrtBookRepository(db).findByBookKey(bookKey);
+    return srt != null && await resolveAudiobookHasLocalFiles(srt.audioPaths);
+  }
+
+  // ── Settings (same keys as ReaderTtuSource for seamless migration) ──
+
+  static ReaderSettings? readerSettings;
+
+  /// 当前**生效**的 [ReaderSettings]。查词弹窗一侧（静态设置注入 + 字体 URL 拦截器
+  /// 白名单）的唯一取值入口——两边必须解析出同一份设置，否则就是「CSS 里引了某个
+  /// 字体，拦截器却拒绝供给」这类哑失败。
+  ///
+  /// **不要直接读 [readerSettings]。** 它在整个进程里只有一个赋值点
+  /// （`AppModel._initialiseOnce()`），而 `AppModel.initialiseForDictionaryPopup()`
+  /// 从不给它赋值。于是在 Android 独立 `:popup` 进程与悬浮查词窗
+  /// （`popup_main.dart` / `floating_dict_main.dart`）里它**恒为 null**：任何直接
+  /// 读它的判据在 app 外查词时都会静默退化成「用户什么都没配」。
+  ///
+  /// 没有活着的阅读器时退到 DB 背书的实例。注意必须**同时**灌 prefs 快照
+  /// （[ReaderSettings.applyPrefsSnapshot]）：`ReaderSettings(db)` 的内存缓存是空
+  /// 的，且所有读取器都是同步 getter、不会自己回源，只 new 一个出来等于返回一份
+  /// 「所有设置都是默认值」的假设置。快照取自 [AppModel.prefsRepo]（已在初始化里
+  /// 一次性读全表），因此这条路是纯内存的，热路径可调用。
+  ///
+  /// DB / prefs 仓库任一未就绪时返回 null（两者都是 late 字段，早期与测试 seam 会
+  /// 撞进未赋值窗口），调用方按「无设置」降级。
+  static ReaderSettings? resolveEffectiveReaderSettings(AppModel appModel) {
+    final ReaderSettings? live = readerSettings;
+    if (live != null) return live;
+    if (!appModel.isDatabaseReady || !appModel.isPreferencesReady) return null;
+    return ReaderSettings(appModel.database)
+      ..applyPrefsSnapshot(appModel.prefsRepo.prefsSnapshot);
+  }
+
+  /// Fired on CSS-only setting changes (font size / line height / margins /
+  /// indentation / justify / kerning / vpal / furigana / vert-orient). The
+  /// reader live-updates the injected stylesheet without a full chapter reload.
+  static VoidCallback? onSettingsChangedLive;
+
+  /// Fired on structural layout changes that the CSS injection alone cannot
+  /// express (writing mode / view mode / page columns / spread mode / spread
+  /// direction / prioritize reader styles). The reader rebuilds the chapter so
+  /// the pagination engine re-runs. Kept separate from [onSettingsChangedLive]
+  /// so the reload-vs-CSS choice is key-accurate for every surface that mutates
+  /// reader settings, not just the in-book sheet.
+  static VoidCallback? onLayoutReloadLive;
+
+  /// Fired on pure Flutter chrome layout changes (e.g. reverse reader bottom
+  /// bar) that neither touch the injected CSS nor require a chapter reload.
+  /// The reader simply rebuilds its chrome layer once to re-read the preference;
+  /// kept separate from [onSettingsChangedLive] (which also runs a WebView CSS
+  /// re-eval + re-anchor) and [onLayoutReloadLive] (which re-runs pagination).
+  static VoidCallback? onChromeReloadLive;
+
+  /// TODO-975: fired when a chrome change alters the reserved chrome HEIGHT fed
+  /// to the WebView (toggling the top progress bar on/off, or flipping a surface
+  /// between squeeze and floating mode). Unlike [onChromeReloadLive] (a pure
+  /// rebuild that never changes the reserve), this path additionally re-applies
+  /// the chrome insets and runs the style-reanchor orchestration so the
+  /// continuous-mode scroll position is preserved when the reserve changes (the
+  /// reflow would otherwise zero `window.scrollY` and bounce to chapter start).
+  static VoidCallback? onChromeReanchorLive;
+
+  /// 四个实时 hook 的持有者栈（BUG-3001）。同一时刻可能挂着不止一个阅读器页：
+  /// 切卷走 `pushReplacement`，新页 initState 注册 hook 时旧页要等转场结束才
+  /// dispose；卡片来源也可能在一个阅读器上再叠开一个。旧实现由各页 dispose
+  /// 无条件把四个 hook 置 null，后销毁的那一页会把仍在显示的阅读器的 hook 一起
+  /// 抹掉——之后改按钮布局等设置偏好照写、阅读器却收不到通知，退出重进才生效。
+  /// 现在每页只登记 / 注销自己那一组，hook 恒指向栈顶（最上层、仍存活的那页）。
+  static final List<ReaderLiveHooks> _liveHookOwners = <ReaderLiveHooks>[];
+
+  /// 阅读器页 initState 登记自己的实时 hook；成为栈顶，四个 hook 指向它。
+  static void attachLiveHooks(ReaderLiveHooks hooks) {
+    _liveHookOwners.remove(hooks);
+    _liveHookOwners.add(hooks);
+    _applyTopLiveHooks();
+  }
+
+  /// 阅读器页 dispose 注销自己那一组（按身份）；hook 回落到剩下的栈顶，栈空时
+  /// 置 null（不让静态 hook 泄漏到已销毁页）。注销非栈顶的一组不影响当前 hook。
+  static void detachLiveHooks(ReaderLiveHooks hooks) {
+    _liveHookOwners.remove(hooks);
+    _applyTopLiveHooks();
+  }
+
+  static void _applyTopLiveHooks() {
+    final ReaderLiveHooks? top =
+        _liveHookOwners.isEmpty ? null : _liveHookOwners.last;
+    onSettingsChangedLive = top?.settingsChanged;
+    onLayoutReloadLive = top?.layoutReload;
+    onChromeReloadLive = top?.chromeReload;
+    onChromeReanchorLive = top?.chromeReanchor;
+  }
+
+  @visibleForTesting
+  static int get debugLiveHookOwnerCount => _liveHookOwners.length;
+
+  /// 手柄按钮图显示品牌（TODO-1113 / TODO-612）。纯**显示偏好**：只决定快捷键设置页
+  /// 里手柄面键渲染成 Xbox A/B/X/Y、PlayStation ✕○□△ 还是 Nintendo Switch B/A/Y/X，
+  /// 与 binding 序列化完全解耦（[GamepadButton.serialize] 恒定）。以 token 字符串持久化，
+  /// 未知/缺省回退 Xbox。
+  GamepadBrand get gamepadGlyphBrand => GamepadBrand.fromToken(
+        getPreference<String?>(
+          key: 'gamepad_glyph_brand',
+          defaultValue: null,
+        ),
+      );
+
+  Future<void> setGamepadGlyphBrand(GamepadBrand brand) async {
+    await setPreference<String>(
+      key: 'gamepad_glyph_brand',
+      value: brand.token,
+    );
+  }
+
+  bool get volumePageTurningEnabled => getPreference<bool>(
+      key: 'volume_page_turning_enabled', defaultValue: true);
+
+  void toggleVolumePageTurningEnabled() async {
+    await setPreference<bool>(
+      key: 'volume_page_turning_enabled',
+      value: !volumePageTurningEnabled,
+    );
+  }
+
+  bool get volumePageTurningInverted => getPreference<bool>(
+      key: 'volume_page_turning_inverted', defaultValue: false);
+
+  void toggleVolumePageTurningInverted() async {
+    await setPreference<bool>(
+      key: 'volume_page_turning_inverted',
+      value: !volumePageTurningInverted,
+    );
+  }
+
+  bool get volumeKeySentenceNavEnabled => getPreference<bool>(
+      key: 'volume_key_sentence_nav_enabled', defaultValue: true);
+
+  void toggleVolumeKeySentenceNavEnabled() async {
+    await setPreference<bool>(
+      key: 'volume_key_sentence_nav_enabled',
+      value: !volumeKeySentenceNavEnabled,
+    );
+  }
+
+  bool get invertSwipeDirection =>
+      readerSettings?.invertSwipeDirection ??
+      getPreference<bool>(
+        key: 'invert_swipe_direction',
+        defaultValue: true,
+      );
+
+  // 注意：本文件里 toggle/setter 的紧凑 `??` 形分两种——ttu 区带
+  // onSettingsChangedLive 尾调，本区（行为开关）不带。收敛冗长双分支时保持
+  // 各自原有的（不）触发语义，勿混淆。
+  void toggleInvertSwipeDirection() async {
+    await (readerSettings?.toggleInvertSwipeDirection() ??
+        setPreference<bool>(
+          key: 'invert_swipe_direction',
+          value: !invertSwipeDirection,
+        ));
+  }
+
+  // TODO-120: 反转键盘方向键翻页方向（仅键盘方向键），默认 false。
+  bool get reverseArrowPageTurn =>
+      readerSettings?.reverseArrowPageTurn ??
+      getPreference<bool>(
+        key: 'reverse_arrow_page_turn',
+        defaultValue: false,
+      );
+
+  void toggleReverseArrowPageTurn() async {
+    await (readerSettings?.toggleReverseArrowPageTurn() ??
+        setPreference<bool>(
+          key: 'reverse_arrow_page_turn',
+          value: !reverseArrowPageTurn,
+        ));
+  }
+
+  // TODO-830: 反转有声书底栏 ⏮⏭ 前进/后退按钮的功能方向（per-reader，分层与
+  // invert_swipe_direction / reverse_arrow_page_turn 一致），默认 false。
+  bool get invertAudiobookSkipDirection =>
+      readerSettings?.invertAudiobookSkipDirection ??
+      getPreference<bool>(
+        key: 'invert_audiobook_skip_direction',
+        defaultValue: false,
+      );
+
+  void toggleInvertAudiobookSkipDirection() async {
+    await (readerSettings?.toggleInvertAudiobookSkipDirection() ??
+        setPreference<bool>(
+          key: 'invert_audiobook_skip_direction',
+          value: !invertAudiobookSkipDirection,
+        ));
+  }
+
+  // TODO-080B: read through THIS source's profile-aware preference cache
+  // ([_preferences], reloaded by AppModel.refreshPrefCache on every profile
+  // switch) instead of the reader-page-owned static [readerSettings] snapshot.
+  // The video page (and any DictionaryPageMixin surface) never refreshes
+  // [readerSettings], so going through it leaked a stale "last reader profile"
+  // value — subtitle lookups auto-read even after the user turned the setting
+  // off. The DB row (`src:reader_fushi:auto_read_on_lookup`) is identical for
+  // both code paths, so there is a single source of truth and no migration.
+  bool get autoReadOnLookup =>
+      getPreference<bool>(key: 'auto_read_on_lookup', defaultValue: true);
+
+  // Single source of truth: write through this source's profile-aware cache +
+  // DB row. No other reader reads ReaderSettings.autoReadOnLookup directly
+  // (every consumer goes through this getter), so there is nothing to keep in
+  // sync — the old `if (readerSettings != null)` branch was a redundant second
+  // write to the same DB row in a different encoding. See [autoReadOnLookup].
+  void toggleAutoReadOnLookup() async {
+    await setPreference<bool>(
+      key: 'auto_read_on_lookup',
+      value: !autoReadOnLookup,
+    );
+  }
+
+  int get lookupAudioVolume {
+    final int raw = readerSettings?.lookupAudioVolume ??
+        getPreference<int>(key: 'lookup_audio_volume', defaultValue: 100);
+    return ReaderSettings.normalizeLookupAudioVolume(raw);
+  }
+
+  double get lookupAudioVolumeGain => lookupAudioVolume / 100.0;
+
+  Future<void> setLookupAudioVolume(num volume) async {
+    final int clamped = ReaderSettings.normalizeLookupAudioVolume(volume);
+    await (readerSettings?.setLookupAudioVolume(clamped) ??
+        setPreference<int>(key: 'lookup_audio_volume', value: clamped));
+  }
+
+  bool get pauseOnLookup =>
+      getPreference<bool>(key: 'pause_on_lookup', defaultValue: true);
+
+  Future<void> setPauseOnLookup({required bool value}) async {
+    await setPreference<bool>(key: 'pause_on_lookup', value: value);
+  }
+
+  /// 悬停查词时，鼠标离开字幕与查词浮层后是否自动关掉浮层并恢复播放（免去「再点一下
+  /// 空白」那一步）。只作用于**悬停发起**的查词会话——点击查词是显式的「停在这儿看」，
+  /// 鼠标移开不关（判据见 `VideoFushiPage.shouldAutoResumeOnHoverLeave`）。
+  ///
+  /// 悬停是桌面鼠标行为，移动端没有 OS hover、自然不触发（设置项也走
+  /// `DesktopLookupService.isDesktop` 桌面门控）。默认开启：会走到这条路径的前提是
+  /// 用户已经在用悬停查词（`hover_auto_lookup` 或 Shift+悬停），而那时「移开就继续播」
+  /// 正是预期行为。
+  bool get resumeOnLookupLeave =>
+      getPreference<bool>(key: 'resume_on_lookup_leave', defaultValue: true);
+
+  Future<void> setResumeOnLookupLeave({required bool value}) async {
+    await setPreference<bool>(key: 'resume_on_lookup_leave', value: value);
+  }
+
+  /// TODO-756b：是否“鼠标悬停即自动查词”。开启时无需按住 Shift，鼠标悬停在
+  /// 字幕/正文字符上即触发查词（与 TODO-756a 的 Shift-悬停同链路）；关闭时退回
+  /// 756a 的 Shift+悬停行为。悬停是桌面鼠标行为，移动端无 OS hover、自然不触发
+  /// （配置项在设置 UI 走 DesktopLookupService.isDesktop 桌面门控隐藏）。默认
+  /// false（保持 756a 既有行为）。视频页与阅读器共享 [instance]，天然通用。
+  bool get hoverAutoLookup =>
+      getPreference<bool>(key: 'hover_auto_lookup', defaultValue: false);
+
+  Future<void> setHoverAutoLookup({required bool value}) async {
+    await setPreference<bool>(key: 'hover_auto_lookup', value: value);
+    onSettingsChangedLive?.call();
+  }
+
+  /// 0 = skip by sentence (default), 5/10/15/30 = skip by N seconds.
+  int get skipActionSeconds =>
+      getPreference<int>(key: 'skip_action_seconds', defaultValue: 0);
+
+  Future<void> setSkipActionSeconds(int value) async {
+    await setPreference<int>(key: 'skip_action_seconds', value: value);
+    onSettingsChangedLive?.call();
+  }
+
+  double get dismissSwipeSensitivity => getPreference<double>(
+        key: 'dismiss_swipe_sensitivity',
+        defaultValue: 0.6,
+      );
+
+  Future<void> setDismissSwipeSensitivity(double value) async {
+    await setPreference<double>(
+      key: 'dismiss_swipe_sensitivity',
+      value: value,
+    );
+  }
+
+  /// TODO-407②：查词弹窗是否允许"水平滑动关闭"。读全局偏好 `enable_swipe_to_close`；
+  /// 未持久化时回退到 [ReaderSettings.defaultSwipeToClose]（桌面 Windows/Linux 默认
+  /// false，触摸平台 true）。这是**鼠标 / 触控板**那半边；触摸半边见
+  /// [enableTouchSwipeToClose]。
+  ///
+  /// BUG-2770：走 [readStoredPreference] 而不是 [getPreference]——后者会把平台默认
+  /// false 回填进缓存，[enableTouchSwipeToClose] 随后就把它误当成「用户显式关闭」。
+  bool get enableSwipeToClose =>
+      readStoredPreference<bool>('enable_swipe_to_close') ??
+      ReaderSettings.defaultSwipeToClose(defaultTargetPlatform);
+
+  Future<void> setEnableSwipeToClose(bool value) async {
+    await setPreference<bool>(
+      key: 'enable_swipe_to_close',
+      value: value,
+    );
+  }
+
+  /// BUG-2770：「滑动关闭弹窗」的**触摸半边**（手指 / 触控笔）。读同一个偏好键
+  /// `enable_swipe_to_close`，但未持久化时恒为 true（所有平台）——
+  /// [ReaderSettings.defaultSwipeToClose] 让 Windows/Linux 默认 false 是 BUG-299 为
+  /// **鼠标**框选误触设的防线，此前连触屏一起关掉，Windows 触屏玩 galgame 时查词弹窗
+  /// 怎么横滑都关不掉。用户显式关掉开关 → 触摸也关；显式开 → 与 [enableSwipeToClose]
+  /// 同为 true。鼠标 / 触控板那半边仍只看 [enableSwipeToClose]。
+  bool get enableTouchSwipeToClose =>
+      readStoredPreference<bool>('enable_swipe_to_close') ?? true;
+
+  /// 滑动关闭查词弹窗时，松手后是否播放「补间滑出屏外 / 弹回原位」动画。默认 true
+  /// （保持既有手感）；关掉则松手当帧就关，与墨水屏模式下的行为一致。唯一消费点是
+  /// [popupDismissAnimationDuration]。
+  bool get popupDismissAnimation => getPreference<bool>(
+        key: 'popup_dismiss_animation',
+        defaultValue: true,
+      );
+
+  Future<void> setPopupDismissAnimation(bool value) async {
+    await setPreference<bool>(
+      key: 'popup_dismiss_animation',
+      value: value,
+    );
+  }
+
+  /// 滚动（连续）模式下，查词弹窗开着时继续滚动正文（横排纵向滚、竖排横向滚）
+  /// 即关闭弹窗，并把这次滚动交给正文。默认开启；只在滚动模式生效。
+  bool get dismissPopupOnScroll => getPreference<bool>(
+        key: 'dismiss_popup_on_scroll',
+        defaultValue: true,
+      );
+
+  Future<void> setDismissPopupOnScroll(bool value) async {
+    await setPreference<bool>(
+      key: 'dismiss_popup_on_scroll',
+      value: value,
+    );
+  }
+
+  /// 制卡被收下（成功 / 进待发队列）后关掉整个查词弹窗栈（用户建议 q16Apecgbg：
+  /// 「查词框妨碍阅读」）。默认关闭 = 制卡后弹窗照旧留着（既有行为）。接线在
+  /// `closePopupAfterAcceptedMine`（阅读器 / 有声书 / 视频两条弹窗车道共用）。
+  bool get closePopupAfterMining =>
+      getPreference<bool>(key: 'close_popup_after_mining', defaultValue: false);
+
+  Future<void> setClosePopupAfterMining(bool value) async {
+    await setPreference<bool>(key: 'close_popup_after_mining', value: value);
+  }
+
+  /// 鼠标滚轮翻页节流间隔（毫秒），越大翻页越慢。默认 450ms。
+  int get wheelPageTurnInterval =>
+      readerSettings?.wheelPageTurnInterval ??
+      getPreference<int>(
+        key: 'wheel_page_turn_interval',
+        defaultValue: 450,
+      );
+
+  Future<void> setWheelPageTurnInterval(int value) async {
+    await (readerSettings?.setWheelPageTurnInterval(value) ??
+        setPreference<int>(key: 'wheel_page_turn_interval', value: value));
+  }
+
+  /// 翻页动画效果（只在翻页模式生效；小说默认淡入淡出）。落盘 key 与
+  /// [ReaderSettings.pageTurnAnimation] 同一个，`readerSettings` 为 null 的旁路
+  /// entry point 走偏好表兜底。
+  PageTurnAnimation get pageTurnAnimation =>
+      readerSettings?.pageTurnAnimation ??
+      PageTurnAnimation.fromKey(
+        getPreference<String?>(
+          key: ReaderSettings.pageTurnAnimationKey,
+          defaultValue: null,
+        ),
+        fallback: ReaderSettings.defaultPageTurnAnimation,
+      );
+
+  Future<void> setPageTurnAnimation(PageTurnAnimation value) async {
+    await (readerSettings?.setPageTurnAnimation(value) ??
+        setPreference<String>(
+          key: ReaderSettings.pageTurnAnimationKey,
+          value: value.key,
+        ));
+  }
+
+  PageTurnAnimationSpeed get pageTurnAnimationSpeed {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) return settings.pageTurnAnimationSpeed;
+    final String? stored = getPreference<String?>(
+      key: ReaderSettings.pageTurnAnimationSpeedKey,
+      defaultValue: null,
+    );
+    return stored == null
+        ? ReaderSettings.defaultPageTurnAnimationSpeed
+        : PageTurnAnimationSpeed.fromKey(stored);
+  }
+
+  Future<void> setPageTurnAnimationSpeed(PageTurnAnimationSpeed value) async {
+    await (readerSettings?.setPageTurnAnimationSpeed(value) ??
+        setPreference<String>(
+          key: ReaderSettings.pageTurnAnimationSpeedKey,
+          value: value.key,
+        ));
+  }
+
+  bool get pageTurnFollowDrag =>
+      readerSettings?.pageTurnFollowDrag ??
+      getPreference<bool>(
+        key: ReaderSettings.pageTurnFollowDragKey,
+        defaultValue: ReaderSettings.defaultPageTurnFollowDrag,
+      );
+
+  Future<void> setPageTurnFollowDrag(bool value) async {
+    await (readerSettings?.setPageTurnFollowDrag(value) ??
+        setPreference<bool>(
+          key: ReaderSettings.pageTurnFollowDragKey,
+          value: value,
+        ));
+  }
+
+  /// 翻页滑动**灵敏度**（TODO-113 / BUG-2563），缩放 JS `_gestureEnd` 的距离阈值；
+  /// **值越大越灵敏**。语义与落盘 key 必须与 [ReaderSettings.swipePageTurnSensitivity]
+  /// 逐字一致：`readerSettings` 为 null 的 entry point（`:popup` / 悬浮查词，见
+  /// [resolveEffectiveReaderSettings]）若在这里读写旧的「阈值倍数」key，写进去的新语义值
+  /// 会被 [ReaderSettings] 当 legacy 倍数再取一次倒数，设置整个翻反。
+  double get swipePageTurnSensitivity {
+    final double? fromSettings = readerSettings?.swipePageTurnSensitivity;
+    if (fromSettings != null) return fromSettings;
+    final double? stored = getPreference<double?>(
+      key: ReaderSettings.swipeSensitivityKey,
+      defaultValue: null,
+    );
+    if (stored != null) {
+      return ReaderSettings.normalizeSwipePageTurnSensitivity(stored);
+    }
+    final double? legacyMultiplier = getPreference<double?>(
+      key: ReaderSettings.legacySwipeSensitivityMultiplierKey,
+      defaultValue: null,
+    );
+    if (legacyMultiplier != null && legacyMultiplier > 0) {
+      return ReaderSettings.normalizeSwipePageTurnSensitivity(
+        1.0 / legacyMultiplier,
+      );
+    }
+    return ReaderSettings.defaultSwipePageTurnSensitivity;
+  }
+
+  // 分支刻意不对称：settings 路径传原值（其内部自会归一），偏好路径先归一再落库。
+  // 旧倍数 key 只读不写（与 [ReaderSettings] 同一条纪律）。
+  Future<void> setSwipePageTurnSensitivity(double value) async {
+    await (readerSettings?.setSwipePageTurnSensitivity(value) ??
+        setPreference<double>(
+          key: ReaderSettings.swipeSensitivityKey,
+          value: ReaderSettings.normalizeSwipePageTurnSensitivity(value),
+        ));
+  }
+
+  bool get highlightOnTap =>
+      readerSettings?.highlightOnTap ??
+      getPreference<bool>(key: 'highlight_on_tap', defaultValue: true);
+
+  void toggleHighlightOnTap() async {
+    await (readerSettings?.toggleHighlightOnTap() ??
+        setPreference<bool>(
+          key: 'highlight_on_tap',
+          value: !highlightOnTap,
+        ));
+  }
+
+  bool get showTopProgressBar =>
+      readerSettings?.showTopProgressBar ??
+      getPreference<bool>(key: 'show_top_progress_bar', defaultValue: true);
+
+  void toggleShowTopProgressBar() async {
+    await (readerSettings?.toggleShowTopProgressBar() ??
+        setPreference<bool>(
+          key: 'show_top_progress_bar',
+          value: !showTopProgressBar,
+        ));
+  }
+
+  /// 底部状态行左段「阅读计时器」是否显示（分层同 [showTopProgressBar]）。
+  bool get showReadingTimer =>
+      readerSettings?.showReadingTimer ??
+      getPreference<bool>(key: 'show_reading_timer', defaultValue: true);
+
+  void toggleShowReadingTimer() async {
+    await (readerSettings?.toggleShowReadingTimer() ??
+        setPreference<bool>(
+          key: 'show_reading_timer',
+          value: !showReadingTimer,
+        ));
+  }
+
+  bool get keepScreenAwake =>
+      readerSettings?.keepScreenAwake ??
+      getPreference<bool>(key: 'keep_screen_awake', defaultValue: true);
+
+  void toggleKeepScreenAwake() async {
+    await (readerSettings?.toggleKeepScreenAwake() ??
+        setPreference<bool>(
+          key: 'keep_screen_awake',
+          value: !keepScreenAwake,
+        ));
+  }
+
+  bool get lyricsMode =>
+      getPreference<bool>(key: 'lyrics_mode', defaultValue: false);
+
+  Future<void> setLyricsMode(bool value) async {
+    await setPreference<bool>(key: 'lyrics_mode', value: value);
+  }
+
+  /// 每本书独立记忆的歌词模式：这本书上次停在歌词还是正文。书没有自己的记录
+  /// （从没在这本书上切过）时回落全局 `lyrics_mode`——它记的是「最近一次切到的
+  /// 模式」，当作新书的默认值，老用户升级后行为不变。
+  bool lyricsModeForBook(String? bookKey) {
+    if (bookKey == null || bookKey.isEmpty) return lyricsMode;
+    return readStoredPreference<bool>(lyricsModeBookPrefKey(bookKey)) ??
+        lyricsMode;
+  }
+
+  /// 切换歌词模式：写这本书自己的记录，同时更新全局默认值。
+  Future<void> setLyricsModeForBook(String? bookKey, bool value) async {
+    if (bookKey != null && bookKey.isNotEmpty) {
+      await setPreference<bool>(
+          key: lyricsModeBookPrefKey(bookKey), value: value);
+    }
+    await setLyricsMode(value);
+  }
+
+  /// 每书歌词模式的偏好短键。它是**按书的阅读状态**（同 `audiobook_follow_`
+  /// 家族），不随 Profile 快照走——`ProfileKeys` 按
+  /// [pref_keys.kLyricsModeBookPrefDbPrefix] 排除。
+  static String lyricsModeBookPrefKey(String bookKey) =>
+      '${pref_keys.kLyricsModeBookPrefShortPrefix}$bookKey';
+
+  bool get tapEmptyToHideChrome =>
+      readerSettings?.tapEmptyToHideChrome ??
+      getPreference<bool>(key: 'tap_empty_hide_chrome', defaultValue: true);
+
+  void toggleTapEmptyToHideChrome() async {
+    await (readerSettings?.toggleTapEmptyToHideChrome() ??
+        setPreference<bool>(
+          key: 'tap_empty_hide_chrome',
+          value: !tapEmptyToHideChrome,
+        ));
+  }
+
+  // TODO-728: bottom-bar current-sentence cue toggle (per-reader; layered like
+  // showTopProgressBar / tapEmptyToHideChrome), default true = current behavior.
+  bool get showBottomBarCue =>
+      readerSettings?.showBottomBarCue ??
+      getPreference<bool>(key: 'show_bottom_bar_cue', defaultValue: true);
+
+  void toggleShowBottomBarCue() async {
+    await (readerSettings?.toggleShowBottomBarCue() ??
+        setPreference<bool>(
+          key: 'show_bottom_bar_cue',
+          value: !showBottomBarCue,
+        ));
+  }
+
+  // TODO-728: top reading-progress position (per-reader; layered like the
+  // booleans above). 'left' | 'center' | 'right', default 'center'. Normalized
+  // through ReaderSettings so a bad stored value degrades to 'center'.
+  String get topProgressPosition =>
+      readerSettings?.topProgressPosition ??
+      ReaderSettings.normalizeTopProgressPosition(
+        getPreference<String>(
+          key: 'top_progress_position',
+          defaultValue: 'center',
+        ),
+      );
+
+  void setTopProgressPosition(String value) async {
+    final String normalized =
+        ReaderSettings.normalizeTopProgressPosition(value);
+    await (readerSettings?.setTopProgressPosition(normalized) ??
+        setPreference<String>(
+          key: 'top_progress_position',
+          value: normalized,
+        ));
+  }
+
+  // TODO-975 决策#2：顶部进度悬浮开关（per-reader，分层同 showTopProgressBar），
+  // 默认 true = 悬浮。底栏悬浮复用 tapEmptyToHideChrome（决策#3），不另设开关。
+  bool get topProgressFloating =>
+      readerSettings?.topProgressFloating ??
+      getPreference<bool>(key: 'top_progress_floating', defaultValue: true);
+
+  void toggleTopProgressFloating() async {
+    await (readerSettings?.toggleTopProgressFloating() ??
+        setPreference<bool>(
+          key: 'top_progress_floating',
+          value: !topProgressFloating,
+        ));
+  }
+
+  // TODO-975 决策#1：悬浮 chrome 自动收起时长（毫秒，顶部/底栏共用），默认 3000，
+  // 可调 1000–10000。分层同上；经 ReaderSettings 归一，越界存值降级回默认。
+  int get autoHideChromeMillis =>
+      readerSettings?.autoHideChromeMillis ??
+      normalizeAutoHideChromeMillis(
+        getPreference<int>(
+          key: 'auto_hide_chrome_millis',
+          defaultValue: kDefaultAutoHideChromeMillis,
+        ),
+      );
+
+  void setAutoHideChromeMillis(int value) async {
+    final int normalized = normalizeAutoHideChromeMillis(value);
+    await (readerSettings?.setAutoHideChromeMillis(normalized) ??
+        setPreference<int>(
+          key: 'auto_hide_chrome_millis',
+          value: normalized,
+        ));
+  }
+
+  /// 关掉顶栏和底栏、由应用内悬浮球接管（per-reader，分层同上）。默认 false。
+  /// 是否真的生效还要看应用内悬浮球开没开（`readerToolbarsHidden`）。
+  bool get hideToolbars =>
+      readerSettings?.hideToolbars ??
+      getPreference<bool>(key: 'hide_toolbars', defaultValue: false);
+
+  Future<void> setHideToolbars(bool value) async {
+    await (readerSettings?.setHideToolbars(value) ??
+        setPreference<bool>(key: 'hide_toolbars', value: value));
+  }
+
+  // ── ttu 阅读器设置 ─────────────────────────────────────────────────
+
+  double get readerFontSize =>
+      readerSettings?.fontSize ??
+      getPreference<double>(key: 'font_size', defaultValue: 20);
+  Future<void> setReaderFontSize(double v) async {
+    await (readerSettings?.setFontSize(v) ??
+        setPreference<double>(key: 'font_size', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 正文字重。UI 侧（SettingsStepperItem）值域是 double，存储与 CSS 侧是整数轴，
+  /// 故在此边界一次性 `round()`，不让 `400.0` 这类值流进 CSS 生成器。
+  ///
+  /// 读写两侧都夹到 CSS 的合法轴 100~900：stepper 自己保证了值域，但这个 facade 是
+  /// public，值也可能从旧机 / 同步 / 手改 DB 进来。越界值会生成 `font-weight: 0`
+  /// 这类整条被浏览器丢弃的声明——不崩，但静默退回书自带样式，极难查。
+  double get readerFontWeight => _clampFontWeight(readerSettings?.fontWeight ??
+          getPreference<int>(key: 'font_weight', defaultValue: 400))
+      .toDouble();
+  Future<void> setReaderFontWeight(double v) async {
+    final int weight = _clampFontWeight(v.round());
+    await (readerSettings?.setFontWeight(weight) ??
+        setPreference<int>(key: 'font_weight', value: weight));
+    onSettingsChangedLive?.call();
+  }
+
+  static int _clampFontWeight(int v) => v.clamp(100, 900);
+
+  double get lyricsFontSize =>
+      readerSettings?.lyricsFontSize ??
+      getPreference<double>(key: 'lyrics_font_size', defaultValue: 24);
+  Future<void> setLyricsFontSize(double v) async {
+    await (readerSettings?.setLyricsFontSize(v) ??
+        setPreference<double>(key: 'lyrics_font_size', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// TODO-368: 歌词字幕文字色（独立于主题色）。ARGB int；`0` = 未设置（跟随主题）。
+  int get lyricsTextColor =>
+      readerSettings?.lyricsTextColor ??
+      getPreference<int>(key: 'lyrics_text_color', defaultValue: 0);
+  Future<void> setLyricsTextColor(int v) async {
+    await (readerSettings?.setLyricsTextColor(v) ??
+        setPreference<int>(key: 'lyrics_text_color', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  Future<void> clearLyricsTextColor() async {
+    await (readerSettings?.clearLyricsTextColor() ??
+        setPreference<int>(key: 'lyrics_text_color', value: 0));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 歌词模式当前行高亮色。ARGB int；`0` = 未设置（跟随播放器主题）。写后走
+  /// `onSettingsChangedLive` → 歌词态 `_updateLyricsStyleLive` 热更 CSS 变量。
+  int get lyricsHighlightColor =>
+      readerSettings?.lyricsHighlightColor ??
+      getPreference<int>(key: 'lyrics_highlight_color', defaultValue: 0);
+  Future<void> setLyricsHighlightColor(int v) async {
+    await (readerSettings?.setLyricsHighlightColor(v) ??
+        setPreference<int>(key: 'lyrics_highlight_color', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  Future<void> clearLyricsHighlightColor() async {
+    await (readerSettings?.clearLyricsHighlightColor() ??
+        setPreference<int>(key: 'lyrics_highlight_color', value: 0));
+    onSettingsChangedLive?.call();
+  }
+
+  double get lyricsMarginTop =>
+      readerSettings?.lyricsMarginTop ??
+      getPreference<double>(key: 'lyrics_margin_top', defaultValue: 0);
+  Future<void> setLyricsMarginTop(double v) async {
+    await (readerSettings?.setLyricsMarginTop(v) ??
+        setPreference<double>(key: 'lyrics_margin_top', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  double get lyricsMarginBottom =>
+      readerSettings?.lyricsMarginBottom ??
+      getPreference<double>(key: 'lyrics_margin_bottom', defaultValue: 0);
+  Future<void> setLyricsMarginBottom(double v) async {
+    await (readerSettings?.setLyricsMarginBottom(v) ??
+        setPreference<double>(key: 'lyrics_margin_bottom', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  double get lyricsMarginLeft =>
+      readerSettings?.lyricsMarginLeft ??
+      getPreference<double>(key: 'lyrics_margin_left', defaultValue: 0);
+  Future<void> setLyricsMarginLeft(double v) async {
+    await (readerSettings?.setLyricsMarginLeft(v) ??
+        setPreference<double>(key: 'lyrics_margin_left', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  double get lyricsMarginRight =>
+      readerSettings?.lyricsMarginRight ??
+      getPreference<double>(key: 'lyrics_margin_right', defaultValue: 0);
+  Future<void> setLyricsMarginRight(double v) async {
+    await (readerSettings?.setLyricsMarginRight(v) ??
+        setPreference<double>(key: 'lyrics_margin_right', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// TODO-907: 歌词竖排开关（独立 key，**不复用** `writing_mode` 正文真值）。
+  /// 默认 `false` = 横排。切换走整页重建（`_loadLyricsPage`），不在此触发 live。
+  bool get lyricsVerticalWriting =>
+      readerSettings?.lyricsVerticalWriting ??
+      getPreference<bool>(key: 'lyrics_vertical_writing', defaultValue: false);
+  Future<void> setLyricsVerticalWriting(bool v) async {
+    await (readerSettings?.setLyricsVerticalWriting(v) ??
+        setPreference<bool>(key: 'lyrics_vertical_writing', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// TODO-908: 歌词听力沉浸模糊开关（独立 key `lyrics_blur`，默认 `false`）。
+  /// 切换走 live 样式更新（`onSettingsChangedLive` → `_updateLyricsStyleLive` →
+  /// `__lyricsSetBlur`），不重建整页。
+  bool get lyricsBlur =>
+      readerSettings?.lyricsBlur ??
+      getPreference<bool>(key: 'lyrics_blur', defaultValue: false);
+  Future<void> setLyricsBlur(bool v) async {
+    await (readerSettings?.setLyricsBlur(v) ??
+        setPreference<bool>(key: 'lyrics_blur', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 歌词模式宽屏左右互换（`lyrics_panel_mirrored`，默认 `false`）。只影响
+  /// Flutter 覆盖层的布局，歌词页不用重载。
+  bool get lyricsPanelMirrored =>
+      readerSettings?.lyricsPanelMirrored ??
+      getPreference<bool>(key: 'lyrics_panel_mirrored', defaultValue: false);
+  Future<void> setLyricsPanelMirrored(bool v) async {
+    await (readerSettings?.setLyricsPanelMirrored(v) ??
+        setPreference<bool>(key: 'lyrics_panel_mirrored', value: v));
+  }
+
+  /// 歌词模式逐字跟读渐变（`lyrics_sweep`，默认 `true`）。热更走
+  /// `onSettingsChangedLive` → `_updateLyricsStyleLive` 换 body class。
+  bool get lyricsSweep =>
+      readerSettings?.lyricsSweep ??
+      getPreference<bool>(key: 'lyrics_sweep', defaultValue: true);
+  Future<void> setLyricsSweep(bool v) async {
+    await (readerSettings?.setLyricsSweep(v) ??
+        setPreference<bool>(key: 'lyrics_sweep', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 歌词模式灰显未朗读的原文（`lyrics_show_skipped_text`，默认 `true`）。热更走
+  /// `onSettingsChangedLive` → `_updateLyricsStyleLive` → `__lyricsSetShowSkipped`。
+  bool get lyricsShowSkippedText =>
+      readerSettings?.lyricsShowSkippedText ??
+      getPreference<bool>(key: 'lyrics_show_skipped_text', defaultValue: true);
+  Future<void> setLyricsShowSkippedText(bool v) async {
+    await (readerSettings?.setLyricsShowSkippedText(v) ??
+        setPreference<bool>(key: 'lyrics_show_skipped_text', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 有声书正文当前句铺底色（`audio_highlight_background`，默认 `true`）。
+  bool get audioHighlightBackground =>
+      readerSettings?.audioHighlightBackground ??
+      getPreference<bool>(key: 'audio_highlight_background', defaultValue: true);
+  Future<void> setAudioHighlightBackground(bool v) async {
+    await (readerSettings?.setAudioHighlightBackground(v) ??
+        setPreference<bool>(key: 'audio_highlight_background', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 有声书正文当前句字色（`audio_highlight_text_color`，ARGB；`0` = 不改字色）。
+  int get audioHighlightTextColor =>
+      readerSettings?.audioHighlightTextColor ??
+      getPreference<int>(key: 'audio_highlight_text_color', defaultValue: 0);
+  Future<void> setAudioHighlightTextColor(int v) async {
+    await (readerSettings?.setAudioHighlightTextColor(v) ??
+        setPreference<int>(key: 'audio_highlight_text_color', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// 一类高亮的笔触配置（键见 [ReaderSettings.highlightStrokeConfig]）。
+  HighlightStrokeConfig highlightStrokeConfig(HighlightKind kind) {
+    final ReaderSettings? s = readerSettings;
+    if (s != null) return s.highlightStrokeConfig(kind);
+    final String p = kind.prefPrefix;
+    final HighlightStrokeConfig d = kind.defaults;
+    return HighlightStrokeConfig(
+      style: HighlightStrokeStyle.fromWire(
+        getPreference<String>(key: '${p}_style', defaultValue: d.style.wireName),
+      ),
+      thickness: getPreference<double>(
+        key: '${p}_thickness',
+        defaultValue: d.thickness,
+      ),
+      opacity: getPreference<double>(
+        key: '${p}_opacity',
+        defaultValue: d.opacity,
+      ),
+      coverRuby: getPreference<bool>(
+        key: '${p}_cover_ruby',
+        defaultValue: d.coverRuby,
+      ),
+      roughness: getPreference<double>(
+        key: '${p}_roughness',
+        defaultValue: d.roughness,
+      ),
+      animate: getPreference<bool>(
+        key: '${p}_animate',
+        defaultValue: d.animate,
+      ),
+    );
+  }
+
+  /// 写一类高亮的笔触配置（设置页一次改一项也走这里，只写变了的键），写完热刷新正文。
+  Future<void> setHighlightStrokeConfig(
+    HighlightKind kind,
+    HighlightStrokeConfig next,
+  ) async {
+    final ReaderSettings? s = readerSettings;
+    if (s != null) {
+      await s.setHighlightStrokeConfig(kind, next);
+    } else {
+      final String p = kind.prefPrefix;
+      final HighlightStrokeConfig prev = highlightStrokeConfig(kind);
+      if (next.style != prev.style) {
+        await setPreference<String>(
+          key: '${p}_style',
+          value: next.style.wireName,
+        );
+      }
+      if (next.thickness != prev.thickness) {
+        await setPreference<double>(
+          key: '${p}_thickness',
+          value: next.thickness,
+        );
+      }
+      if (next.opacity != prev.opacity) {
+        await setPreference<double>(key: '${p}_opacity', value: next.opacity);
+      }
+      if (next.coverRuby != prev.coverRuby) {
+        await setPreference<bool>(
+          key: '${p}_cover_ruby',
+          value: next.coverRuby,
+        );
+      }
+      if (next.roughness != prev.roughness) {
+        await setPreference<double>(
+          key: '${p}_roughness',
+          value: next.roughness,
+        );
+      }
+      if (next.animate != prev.animate) {
+        await setPreference<bool>(key: '${p}_animate', value: next.animate);
+      }
+    }
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerLineHeight =>
+      readerSettings?.lineHeight ??
+      getPreference<double>(key: 'line_height', defaultValue: 1.65);
+  Future<void> setReaderLineHeight(double v) async {
+    await (readerSettings?.setLineHeight(v) ??
+        setPreference<double>(key: 'line_height', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get readerWritingMode =>
+      readerSettings?.writingMode ??
+      getPreference<String>(
+        key: 'writing_mode',
+        defaultValue: 'vertical-rl',
+      );
+  Future<void> setReaderWritingMode(String v) async {
+    await (readerSettings?.setWritingMode(v) ??
+        setPreference<String>(key: 'writing_mode', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get readerViewMode =>
+      readerSettings?.viewMode ??
+      getPreference<String>(
+        key: 'view_mode',
+        defaultValue: 'paginated',
+      );
+  Future<void> setReaderViewMode(String v) async {
+    await (readerSettings?.setViewMode(v) ??
+        setPreference<String>(key: 'view_mode', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  int get readerVisualNovelRevealSpeed =>
+      readerSettings?.visualNovelRevealSpeed ??
+      getPreference<int>(key: 'vn_reveal_speed', defaultValue: 45)
+          .clamp(0, 120);
+  Future<void> setReaderVisualNovelRevealSpeed(int v) async {
+    final int normalized = v.clamp(0, 120);
+    await (readerSettings?.setVisualNovelRevealSpeed(normalized) ??
+        setPreference<int>(key: 'vn_reveal_speed', value: normalized));
+  }
+
+  String get readerVisualNovelScreenMode {
+    final String raw = readerSettings?.visualNovelScreenMode ??
+        getPreference<String>(key: 'vn_screen_mode', defaultValue: 'block');
+    return raw.toLowerCase() == 'sentences' ? 'sentences' : 'block';
+  }
+
+  Future<void> setReaderVisualNovelScreenMode(String v) async {
+    final String normalized =
+        v.toLowerCase() == 'sentences' ? 'sentences' : 'block';
+    await (readerSettings?.setVisualNovelScreenMode(normalized) ??
+        setPreference<String>(key: 'vn_screen_mode', value: normalized));
+  }
+
+  int get readerVisualNovelSentencesPerScreen =>
+      readerSettings?.visualNovelSentencesPerScreen ??
+      getPreference<int>(key: 'vn_sentences_per_screen', defaultValue: 1)
+          .clamp(1, 12);
+  Future<void> setReaderVisualNovelSentencesPerScreen(int v) async {
+    final int normalized = v.clamp(1, 12);
+    await (readerSettings?.setVisualNovelSentencesPerScreen(normalized) ??
+        setPreference<int>(
+          key: 'vn_sentences_per_screen',
+          value: normalized,
+        ));
+  }
+
+  bool get readerVisualNovelPreserveDialogue =>
+      readerSettings?.visualNovelPreserveDialogueBubbles ??
+      getPreference<bool>(key: 'vn_preserve_dialogue', defaultValue: false);
+  Future<void> setReaderVisualNovelPreserveDialogue(bool v) async {
+    await (readerSettings?.setVisualNovelPreserveDialogueBubbles(v) ??
+        setPreference<bool>(key: 'vn_preserve_dialogue', value: v));
+  }
+
+  bool get readerVisualNovelClickAdvance =>
+      readerSettings?.visualNovelClickAdvance ??
+      getPreference<bool>(key: 'vn_click_advance', defaultValue: false);
+  Future<void> setReaderVisualNovelClickAdvance(bool v) async {
+    await (readerSettings?.setVisualNovelClickAdvance(v) ??
+        setPreference<bool>(key: 'vn_click_advance', value: v));
+  }
+
+  bool get readerVisualNovelMergeSpokenSentence =>
+      readerSettings?.visualNovelMergeCrossScreenSentenceAudioCues ??
+      getPreference<bool>(
+        key: 'vn_merge_cross_screen_cues',
+        defaultValue: false,
+      );
+  Future<void> setReaderVisualNovelMergeSpokenSentence(bool v) async {
+    await (readerSettings?.setVisualNovelMergeCrossScreenSentenceAudioCues(v) ??
+        setPreference<bool>(key: 'vn_merge_cross_screen_cues', value: v));
+  }
+
+  String get readerTheme =>
+      readerSettings?.theme ??
+      getPreference<String>(
+        key: 'theme',
+        defaultValue: 'light-theme',
+      );
+  Future<void> setReaderTheme(String v) async {
+    await (readerSettings?.setTheme(v) ??
+        setPreference<String>(key: 'theme', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get readerFuriganaMode {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      return settings.furiganaMode;
+    }
+    final dynamic legacy =
+        getPreference<bool?>(key: 'hide_furigana', defaultValue: null);
+    if (legacy != null) {
+      final String oldStyle = _legacyFuriganaStyle;
+      final String mode = (legacy as bool) ? 'hidden' : 'off';
+      final String merged = normalizeFuriganaMode(
+        (legacy && (oldStyle == 'partial' || oldStyle == 'toggle'))
+            ? oldStyle
+            : mode,
+      );
+      setPreference<String>(key: 'furigana_mode', value: merged);
+      // HBK-AUDIT-125: remove the legacy key via deletePreference. The old
+      // setPreference<bool?>(value: null) could not represent null through
+      // PrefCodec.encode and persisted the literal string 's:null', leaving a
+      // junk row that was re-decoded as the String 'null' on every read.
+      deletePreference(key: 'hide_furigana');
+      return merged;
+    }
+    return normalizeFuriganaMode(
+      getPreference<String>(key: 'furigana_mode', defaultValue: 'off'),
+    );
+  }
+
+  Future<void> setReaderFuriganaMode(String v) async {
+    await (readerSettings?.setFuriganaMode(v) ??
+        setPreference<String>(
+          key: 'furigana_mode',
+          value: normalizeFuriganaMode(v),
+        ));
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerTextIndentation =>
+      readerSettings?.textIndentation ??
+      getPreference<double>(key: 'text_indentation', defaultValue: 0);
+  Future<void> setReaderTextIndentation(double v) async {
+    await (readerSettings?.setTextIndentation(v) ??
+        setPreference<double>(key: 'text_indentation', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// TODO-861①：段落间距（em）。纯 CSS（live re-inject）。默认 0。
+  double get readerParagraphSpacing =>
+      readerSettings?.paragraphSpacing ??
+      getPreference<double>(key: 'paragraph_spacing', defaultValue: 0);
+  Future<void> setReaderParagraphSpacing(double v) async {
+    await (readerSettings?.setParagraphSpacing(v) ??
+        setPreference<double>(key: 'paragraph_spacing', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  /// TODO-861④：图片防剧透模糊开关。切换需重跑分页脚本给大图加 `blurred` 类
+  /// （非纯 CSS），故 schema 走 `notifyReaderLayoutChanged`（结构 reload），不在此
+  /// 触发 live。默认 false。
+  bool get readerBlurImages =>
+      readerSettings?.blurImages ??
+      getPreference<bool>(key: 'blur_images', defaultValue: false);
+  Future<void> setReaderBlurImages(bool v) async {
+    await (readerSettings?.setBlurImages(v) ??
+        setPreference<bool>(key: 'blur_images', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerMarginTop =>
+      readerSettings?.marginTop ??
+      getPreference<double>(
+        key: 'margin_top',
+        defaultValue: ReaderSettings.defaultMarginTopPercent,
+      );
+  Future<void> setReaderMarginTop(double v) async {
+    final double normalized = ReaderSettings.normalizeMarginPercent(v);
+    await (readerSettings?.setMarginTop(normalized) ??
+        setPreference<double>(key: 'margin_top', value: normalized));
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerMarginBottom =>
+      readerSettings?.marginBottom ??
+      getPreference<double>(
+        key: 'margin_bottom',
+        defaultValue: ReaderSettings.defaultMarginBottomPercent,
+      );
+  Future<void> setReaderMarginBottom(double v) async {
+    final double normalized = ReaderSettings.normalizeMarginPercent(v);
+    await (readerSettings?.setMarginBottom(normalized) ??
+        setPreference<double>(key: 'margin_bottom', value: normalized));
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerMarginLeft =>
+      readerSettings?.marginLeft ??
+      getPreference<double>(
+        key: 'margin_left',
+        defaultValue: ReaderSettings.defaultMarginLeftPercent,
+      );
+  Future<void> setReaderMarginLeft(double v) async {
+    final double normalized = ReaderSettings.normalizeMarginPercent(v);
+    await (readerSettings?.setMarginLeft(normalized) ??
+        setPreference<double>(key: 'margin_left', value: normalized));
+    onSettingsChangedLive?.call();
+  }
+
+  double get readerMarginRight =>
+      readerSettings?.marginRight ??
+      getPreference<double>(
+        key: 'margin_right',
+        defaultValue: ReaderSettings.defaultMarginRightPercent,
+      );
+  Future<void> setReaderMarginRight(double v) async {
+    final double normalized = ReaderSettings.normalizeMarginPercent(v);
+    await (readerSettings?.setMarginRight(normalized) ??
+        setPreference<double>(key: 'margin_right', value: normalized));
+    onSettingsChangedLive?.call();
+  }
+
+  int get readerPageColumns =>
+      readerSettings?.pageColumns ??
+      getPreference<int>(key: 'page_columns', defaultValue: 0);
+  Future<void> setReaderPageColumns(int v) async {
+    await (readerSettings?.setPageColumns(v) ??
+        setPreference<int>(key: 'page_columns', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  // 默认与 [ReaderSettings.pageCrease] 同为 false。纯 CSS 键，只触发样式热下发。
+  bool get readerPageCrease =>
+      readerSettings?.pageCrease ??
+      getPreference<bool>(key: 'page_crease', defaultValue: false);
+  Future<void> setReaderPageCrease(bool v) async {
+    await (readerSettings?.setPageCrease(v) ??
+        setPreference<bool>(key: 'page_crease', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  // BUG-1280：默认与 [ReaderSettings.spreadMode] 同为 'off'（两处必须一致，否则
+  // readerSettings 未就绪时读到的默认与阅读器实际用的默认相反）。
+  String get readerSpreadMode =>
+      readerSettings?.spreadMode ??
+      getPreference<String>(key: 'spread_mode', defaultValue: 'off');
+  Future<void> setReaderSpreadMode(String v) async {
+    await (readerSettings?.setSpreadMode(v) ??
+        setPreference<String>(key: 'spread_mode', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get readerSpreadDirection =>
+      readerSettings?.spreadDirection ??
+      getPreference<String>(key: 'spread_direction', defaultValue: 'rtl');
+  Future<void> setReaderSpreadDirection(String v) async {
+    await (readerSettings?.setSpreadDirection(v) ??
+        setPreference<String>(key: 'spread_direction', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  // TODO-1128: merge standalone single-image chapters into the neighbouring
+  // text chapter's continuous flow. A *structural* layout key (it changes the
+  // virtual-page/spread map and the injected chapter DOM, not just CSS). Mirrors
+  // setReaderSpreadMode/setReaderBlurImages: the setter fires the CSS-live hook only;
+  // the caller (schema UI via notifyReaderLayoutChanged, or the in-reader quick
+  // sheet via its layout-key reload) drives the structural reload — which now
+  // rebuilds the spread map before reloading. Firing onLayoutReloadLive here too
+  // would double-reload.
+  bool get readerMergeImagePages =>
+      readerSettings?.mergeImagePages ??
+      getPreference<bool>(key: 'merge_image_pages', defaultValue: true);
+  Future<void> setReaderMergeImagePages(bool v) async {
+    await (readerSettings?.setMergeImagePages(v) ??
+        setPreference<bool>(key: 'merge_image_pages', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  bool get readerEnableVerticalFontKerning =>
+      readerSettings?.enableVerticalFontKerning ??
+      getPreference<bool>(key: 'vert_kerning', defaultValue: false);
+  Future<void> setReaderEnableVerticalFontKerning(bool v) async {
+    await (readerSettings?.setEnableVerticalFontKerning(v) ??
+        setPreference<bool>(key: 'vert_kerning', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  bool get readerEnableFontVPAL =>
+      readerSettings?.enableFontVPAL ??
+      getPreference<bool>(key: 'font_vpal', defaultValue: false);
+  Future<void> setReaderEnableFontVPAL(bool v) async {
+    await (readerSettings?.setEnableFontVPAL(v) ??
+        setPreference<bool>(key: 'font_vpal', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get readerVerticalTextOrientation =>
+      readerSettings?.verticalTextOrientation ??
+      getPreference<String>(
+        key: 'vert_text_orient',
+        defaultValue: 'mixed',
+      );
+  Future<void> setReaderVerticalTextOrientation(String v) async {
+    await (readerSettings?.setVerticalTextOrientation(v) ??
+        setPreference<String>(key: 'vert_text_orient', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  bool get readerEnableTextJustification =>
+      readerSettings?.enableTextJustification ??
+      getPreference<bool>(key: 'text_justify', defaultValue: false);
+  Future<void> setReaderEnableTextJustification(bool v) async {
+    await (readerSettings?.setEnableTextJustification(v) ??
+        setPreference<bool>(key: 'text_justify', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  bool get readerPrioritizeReaderStyles =>
+      readerSettings?.prioritizeReaderStyles ??
+      getPreference<bool>(key: 'reader_styles', defaultValue: true);
+  Future<void> setReaderPrioritizeReaderStyles(bool v) async {
+    await (readerSettings?.setPrioritizeReaderStyles(v) ??
+        setPreference<bool>(key: 'reader_styles', value: v));
+    onSettingsChangedLive?.call();
+  }
+
+  String get _legacyFuriganaStyle =>
+      getPreference<String>(key: 'furigana_style', defaultValue: 'partial')
+          .toLowerCase();
+
+  // ── Custom fonts ────────────────────────────────────────────────────
+
+  List<Map<String, dynamic>> get customFonts {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      return settings.customFonts;
+    }
+    final String raw =
+        getPreference<String>(key: 'custom_fonts', defaultValue: '[]');
+    try {
+      return (jsonDecode(raw) as List<dynamic>).cast<Map<String, dynamic>>();
+    } catch (e, stack) {
+      ErrorLogService.instance.log('ReaderFushiSource.customFonts', e, stack);
+      return <Map<String, dynamic>>[];
+    }
+  }
+
+  Future<void> setCustomFonts(List<Map<String, dynamic>> fonts) async {
+    await (readerSettings?.setCustomFonts(fonts) ??
+        setPreference<String>(key: 'custom_fonts', value: jsonEncode(fonts)));
+    onSettingsChangedLive?.call();
+  }
+
+  Future<void> addCustomFont({required String name, String? path}) async {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      await settings.addCustomFont(name: name, path: path);
+      onSettingsChangedLive?.call();
+      return;
+    }
+    final List<Map<String, dynamic>> list = customFonts;
+    list.add(<String, dynamic>{
+      'name': name,
+      'path': path,
+      'enabled': true,
+    });
+    await setCustomFonts(list);
+  }
+
+  /// 尽力删除磁盘上的字体文件；失败只记日志（removeCustomFont 两分支原各持
+  /// 一份逐字相同的 try/catch，收敛到此）。
+  Future<void> _deleteCustomFontFile(String? filePath) async {
+    if (filePath == null) {
+      return;
+    }
+    try {
+      final File f = File(filePath);
+      if (await f.exists()) {
+        await f.delete();
+      }
+    } catch (e, stack) {
+      ErrorLogService.instance.log('ReaderFushiSource.deleteFont', e, stack);
+      debugPrint('[Fushi] failed to delete custom font file $filePath: $e');
+    }
+  }
+
+  Future<void> removeCustomFont(int index) async {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      final List<Map<String, dynamic>> list = settings.customFonts;
+      if (index < 0 || index >= list.length) {
+        return;
+      }
+      await _deleteCustomFontFile(list[index]['path'] as String?);
+      await settings.removeCustomFont(index);
+      onSettingsChangedLive?.call();
+      return;
+    }
+    final List<Map<String, dynamic>> list = customFonts;
+    if (index < 0 || index >= list.length) {
+      return;
+    }
+    final Map<String, dynamic> entry = list.removeAt(index);
+    await _deleteCustomFontFile(entry['path'] as String?);
+    await setCustomFonts(list);
+  }
+
+  Future<void> toggleCustomFont(int index) async {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      await settings.toggleCustomFont(index);
+      onSettingsChangedLive?.call();
+      return;
+    }
+    final List<Map<String, dynamic>> list = customFonts;
+    if (index < 0 || index >= list.length) {
+      return;
+    }
+    list[index]['enabled'] = !(list[index]['enabled'] as bool? ?? true);
+    await setCustomFonts(list);
+  }
+
+  Future<void> reorderCustomFonts(int oldIndex, int newIndex) async {
+    final ReaderSettings? settings = readerSettings;
+    if (settings != null) {
+      await settings.reorderCustomFonts(oldIndex, newIndex);
+      onSettingsChangedLive?.call();
+      return;
+    }
+    final List<Map<String, dynamic>> list = customFonts;
+    if (newIndex > oldIndex) {
+      newIndex--;
+    }
+    final Map<String, dynamic> item = list.removeAt(oldIndex);
+    list.insert(newIndex, item);
+    await setCustomFonts(list);
+  }
+
+  ({String fontFamily, String fontFaces}) buildCustomFontCss() {
+    return customFontCssForEntries(customFonts);
+  }
+
+  static ({String fontFamily, String fontFaces}) customFontCssForEntries(
+    Iterable<Map<String, dynamic>> fonts, {
+    Iterable<String> allowedDirectories = const <String>[],
+  }) =>
+      ReaderSettings.customFontCssForEntries(
+        fonts,
+        allowedDirectories: allowedDirectories,
+        fontUrlBuilder: fontUrl,
+      );
+
+  static String normalizedFontFamilyName(String name) {
+    return ReaderCustomFontCss.normalizedFontFamilyName(name);
+  }
+
+  static String cssFontFamilyName(String name) {
+    return ReaderCustomFontCss.cssFontFamilyName(name);
+  }
+
+  static String? safeCustomFontPath(
+    String fontPath, {
+    Iterable<String> allowedRoots = const <String>[],
+  }) =>
+      ReaderCustomFontCss.safeFontPath(
+        fontPath,
+        allowedRoots: allowedRoots,
+      );
+
+  // ── Furigana helpers ────────────────────────────────────────────────
+
+  // 单一真相在 [ReaderSettings]；这两个同名方法只转调，消除重复 switch
+  // （历史上 source 与 settings 各写一份，改一处忘另一处即漂移）。
+  static String normalizeFuriganaMode(String mode) =>
+      ReaderSettings.normalizeFuriganaMode(mode);
+
+  static String furiganaModeToStyle(String mode) =>
+      ReaderSettings.furiganaModeToStyle(mode);
+}

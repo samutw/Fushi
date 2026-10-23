@@ -1,0 +1,284 @@
+// 覆盖边界（勿误读）：本文件只验 reader 侧 JS 载荷的**语义**——生成函数返回的那个字符串
+// 里有什么、行为契约对不对。它证明不了这个载荷真的被拼进最终注入 WebView 的 setup 脚本。
+// 「装配完整性」（每个子载荷都被拼进去、压缩后还在）由
+// test/reader/reader_script_compactor_test.dart 的「setup 装配完整性」一组集中守——
+// 那里删掉模板中的 $caretJs / $selectionJs / $longPressDragJs 会立刻转红，本文件不会。
+// 改这里前先分清你要锁的是语义还是注入，别在本文件里重造装配断言。
+import 'package:drift/native.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi/src/reader/reader_content_styles.dart';
+import 'package:fushi/src/reader/reader_pagination_scripts.dart';
+import 'package:fushi/src/reader/reader_selection_scripts.dart';
+import 'package:fushi/src/reader/reader_settings.dart';
+
+/// TODO-1317: 手机「长按没办法选中文本（书籍）」根因守卫。
+///
+/// 症状根因（只读调查 a741cb57）：TODO-1279 在触屏 `@media (pointer: coarse)` 下
+/// `user-select:none` 掐掉了原生文本选区（为消除长按拖选原生蓝选区 + app 查词高亮的
+/// 双选区），顺带把用户的长按选中一起禁了 —— 触屏此后根本无路径选中正文。
+///
+/// 方向 B 根因修复（同时满足 1279 无双选区 + 1317 能选中）：**保留** user-select:none，
+/// 改把移动端长按拖选手势绑到 app 自绘选区机器 —— 长按 -> beginRangeSelection 定锚，
+/// 拖动 -> updateRangeSelection 扩展 CSS Custom Highlight `fushi-selection`（绝不碰
+/// window.getSelection -> 永不产生原生双选区），松手 -> endRangeSelection ->
+/// 选区菜单。原地未拖动也保留长按建立的单字选区，对齐 Hoshi 原生选择。
+///
+/// 真机长按拖选选中 + 查词/制卡、不出双选区只能真触屏 WebView 验（离屏 pointer:fine
+/// 不触发 coarse），故这里用生成的 JS/CSS 源码扫描钉死契约。
+void main() {
+  group('app 自绘拖选 API（window.fushiSelection）', () {
+    final String js = ReaderSelectionScripts.source();
+
+    test('暴露长按拖选三段式扩展选区 API + 共享 fireTextSelected', () {
+      expect(
+        js,
+        contains('beginRangeSelection: function'),
+        reason: '缺长按定锚 API',
+      );
+      expect(
+        js,
+        contains('updateRangeSelection: function'),
+        reason: '缺拖动扩展选区 API',
+      );
+      expect(
+        js,
+        contains('endRangeSelection: function'),
+        reason: '缺松手结算/触发 onTextSelected API',
+      );
+      expect(
+        js,
+        contains('collectRangeBetween: function'),
+        reason: '缺跨文本节点区间构建 helper',
+      );
+      // 单击词路径与拖选路径都经同一 fireTextSelected 发 onTextSelected（选区->查词
+      // 契约单一真相源，两路 payload 同构）。
+      expect(js, contains('fireTextSelected: function'));
+      expect(
+        js,
+        contains('return this.fireTextSelected(x, y, fromHover);'),
+        reason: 'selectFromPosition（tap 路径）必须复用 fireTextSelected',
+      );
+    });
+
+    test('拖选走 app CSS Custom Highlight，绝不建立原生选区（不破坏 1279 无双选区）', () {
+      // 拖选高亮只经 CSS Custom Highlight 门控 + highlightSelection（与 tap 同一
+      // 高亮器）；实时逐帧渲染仅在 CSS Highlight 路径（无 DOM 变更）跑。
+      expect(js, contains('renderSelectionHighlight: function'));
+      final int r = js.indexOf('renderSelectionHighlight: function');
+      final int rEnd = js.indexOf('beginRangeSelection: function');
+      final String renderBody = js.substring(r, rEnd);
+      expect(
+        renderBody,
+        contains('window.__fushiCssHighlightsSupported'),
+        reason: '拖选实时高亮必须门控在 CSS Custom Highlight 路径',
+      );
+      expect(
+        renderBody,
+        contains('highlightSelection'),
+        reason: '拖选复用 tap 的 highlightSelection 高亮器',
+      );
+
+      // 拖选 helper 段（collectRangeBetween..endRangeSelection）不得触碰原生选区 API
+      // -- 那才会复活 1279 修掉的原生蓝选区、与 app 高亮叠成双选区。
+      final int start = js.indexOf('collectRangeBetween: function');
+      final int stop = js.indexOf('getSelectionRect: function');
+      expect(start, greaterThanOrEqualTo(0));
+      expect(stop, greaterThan(start));
+      final String dragHelpers = js.substring(start, stop);
+      expect(
+        dragHelpers,
+        isNot(contains('window.getSelection')),
+        reason: '拖选绝不读/建原生选区（会造双选区）',
+      );
+      expect(dragHelpers, isNot(contains('.addRange(')), reason: '拖选绝不写原生选区');
+      expect(
+        dragHelpers,
+        isNot(contains('removeAllRanges')),
+        reason: '拖选绝不动原生选区',
+      );
+    });
+  });
+
+  // BUG-长按选择不灵敏：命中测试分两层，是这次修复的核心。查词与选文本对「这个点
+  // 算不算命中」的要求相反——查词落在空白/标点上必须放弃（否则拿标点去查词），而选
+  // 文本落在标点上完全正当。旧实现让两者共用带 isScanBoundary 剔除的同一个函数，于是
+  // 长按落在标点、句读、行首缩进上时 lpsAllowed 直接 false，**连计时器都不 arm**，
+  // 表现就是「长按半天没反应、也没有高亮」——「不灵敏」与「没高亮」其实是同一个根因。
+  group('命中测试分层：查词剔除词边界，选择不剔除', () {
+    final String js = ReaderSelectionScripts.source();
+
+    String bodyOf(String open, String close) {
+      final int a = js.indexOf(open);
+      expect(a, greaterThanOrEqualTo(0), reason: '找不到 $open');
+      final int b = js.indexOf(close, a + open.length);
+      expect(b, greaterThan(a), reason: '找不到 $open 之后的 $close');
+      return js.substring(a, b);
+    }
+
+    test('几何命中层存在且**不**做 scan 边界剔除', () {
+      expect(
+        js,
+        contains('getSelectableCharacterAtPoint: function'),
+        reason: '缺选择用的几何命中层',
+      );
+      final String body = bodyOf(
+        'getSelectableCharacterAtPoint: function',
+        'getSentenceContext: function',
+      );
+      expect(
+        body,
+        isNot(contains('isScanBoundary')),
+        reason: '选择命中不得剔除标点/空白——选中句号是正当操作',
+      );
+      expect(
+        body,
+        contains('charRangeVisible'),
+        reason: 'BUG-1797 的可见性收口必须留在几何层，否则页边距上的点又能选中',
+      );
+    });
+
+    test('查词命中仍在几何层之上剔除词边界（零回归）', () {
+      final String body = bodyOf(
+        'getCharacterAtPoint: function',
+        'getSelectableCharacterAtPoint: function',
+      );
+      expect(
+        body,
+        contains('this.getSelectableCharacterAtPoint(x, y)'),
+        reason: '查词命中须复用几何层，不得另抄一份几何',
+      );
+      expect(
+        body,
+        contains('isScanBoundary'),
+        reason: '查词仍必须在空白/标点上放弃，否则会拿标点去查词',
+      );
+    });
+  });
+
+  group('长按拖选手势 IIFE（longPressDragGestureScript）', () {
+    final String js = ReaderSelectionScripts.longPressDragGestureScript();
+
+    test('长按定时器 + 移动阈值消歧（长按拖选 vs 滑动翻页/滚动）', () {
+      expect(js, contains('setTimeout'));
+      expect(
+        js,
+        contains('var LPS_DELAY = 400;'),
+        reason:
+            'BUG-2919：默认长按时限对齐 Android ViewConfiguration 的 400ms。'
+            '280ms 会把翻页前的自然停顿判成长按，翻页变成选中。',
+      );
+      expect(
+        js,
+        contains(
+          'var LPS_SLOP_SQ = '
+          '${ReaderSettings.tapSlopPx * ReaderSettings.tapSlopPx};',
+        ),
+        reason:
+            'BUG-2919：长按容差取单击判据同一个真值 ReaderSettings.tapSlopPx。'
+            '放宽到 16px 会让慢于 16px/280ms 的滑动先被长按计时器抢走；翻页距离阈值'
+            '的下界是 tapSlopPx + 1，长按容差一旦大于 tapSlopPx 两者就重叠。',
+      );
+      expect(js, contains('LPS_DELAY'), reason: '缺长按时限');
+      expect(
+        js,
+        contains('getSelectableCharacterAtPoint(x, y)'),
+        reason:
+            'arm 门控必须走选择命中：走查词命中时，长按落在标点/句读/行首缩进上'
+            '连计时器都不 arm，用户感受就是「长按没反应」。',
+      );
+      expect(js, contains('LPS_SLOP_SQ'), reason: '缺移动阈值');
+      // 未及长按时限先移动过阈值 => 判为滑动/滚动，撤销 arm（放弃拖选，让翻页/滚动）。
+      expect(
+        js,
+        contains('> LPS_SLOP_SQ) lpsClearTimer'),
+        reason: '缺「移动超阈值->放弃长按」的 swipe 消歧',
+      );
+    });
+
+    test('拖动扩展 app 选区并阻止原生滚动（非被动 touchmove）', () {
+      expect(js, contains('updateRangeSelection'));
+      expect(js, contains('preventDefault'), reason: '拖选须阻止原生滚动');
+      // 只有非被动监听器才能 preventDefault 阻止连续模式原生滚动。
+      expect(
+        js,
+        contains('{passive: false}'),
+        reason: 'touchmove/touchend 须非被动才能 preventDefault',
+      );
+    });
+
+    // BUG-624：真拖动松手改弹选区菜单（复制/查词，走 endRangeSelection ->
+    // fireSelectionMenu -> onSelectionMenu），不再直接查词；原地未拖动也算长按选择。
+    test('松手统一结算长按选区；原地未拖动不再退回单击查词', () {
+      expect(js, contains('endRangeSelection'));
+      expect(
+        js,
+        isNot(contains('window.fushiSelection.selectText(')),
+        reason: '达到长按阈值后必须进入选择，不能再伪装成普通单击查词',
+      );
+    });
+
+    test('置全局标志与翻页/边界手势消歧', () {
+      expect(
+        js,
+        contains('window.__fushiTextSelectDragActive = true'),
+        reason: '缺与 _gestureEnd(翻页)/_bEnd(跨章) 消歧的全局标志',
+      );
+    });
+
+    test('时限/阈值可配置', () {
+      final String custom = ReaderSelectionScripts.longPressDragGestureScript(
+        delayMs: 321,
+        slop: 7,
+      );
+      expect(custom, contains('var LPS_DELAY = 321;'));
+      expect(custom, contains('var LPS_SLOP_SQ = 49;'));
+    });
+  });
+
+  group('翻页/边界手势对拖选让路（消歧守卫）', () {
+    test('连续模式边界跨章手势见到拖选标志即让路（不误跨章）', () {
+      final String js = ReaderPaginationScripts.continuousShellSource();
+      expect(
+        js,
+        contains('if (window.__fushiTextSelectDragActive) return;'),
+        reason: '_bEnd（跨章）必须在拖选进行时让路',
+      );
+    });
+  });
+
+  group('TODO-1279 无双选区未被破坏', () {
+    Future<ReaderSettings> defaultSettings(FushiDatabase db) async {
+      final ReaderSettings settings = ReaderSettings(db);
+      await settings.refreshFromDb();
+      return settings;
+    }
+
+    test('触屏 user-select:none（pointer: coarse）仍在--拖选走 app 高亮不复活原生选区', () async {
+      // BUG-2607：这条 CSS 规则只属于 Blink 触屏（Android）。iOS 改由
+      // WKPreferences.isTextInteractionEnabled=false 压原生选区（WebKit 不绘制
+      // user-select:none 文字上的 ::highlight），钉在
+      // reader_ios_highlight_user_select_bug2607_test.dart。
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      addTearDown(() {
+        debugDefaultTargetPlatformOverride = null;
+      });
+      final FushiDatabase db = FushiDatabase.forTesting(
+        NativeDatabase.memory(),
+      );
+      addTearDown(db.close);
+      final ReaderSettings settings = await defaultSettings(db);
+
+      final String css = ReaderContentStyles.css(settings: settings);
+      expect(
+        css,
+        contains('@media (pointer: coarse)'),
+        reason: '1279 触屏门控被删--原生蓝选区会复活成双选区',
+      );
+      expect(css, contains('user-select: none'));
+      expect(css, contains('-webkit-touch-callout: none'));
+    });
+  });
+}

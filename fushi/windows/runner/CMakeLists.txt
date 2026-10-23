@@ -1,0 +1,646 @@
+cmake_minimum_required(VERSION 3.14)
+project(runner LANGUAGES CXX)
+
+# TODO-617: WebView2 SDK for the global lookup overlay (global_lookup_window.cpp).
+# Pinned to the same version the flutter_inappwebview_windows fork uses so the
+# COM interfaces (ICoreWebView2_3 / ...Environment10 / ...EnvironmentOptions4)
+# match. The shared top-level ${CMAKE_BINARY_DIR}/packages is also where that
+# fork downloads WebView2, so this is idempotent.
+set(WEBVIEW_VERSION "1.0.2792.45")
+set(WIL_VERSION "1.0.231216.1")
+find_program(NUGET nuget)
+if(NOT NUGET)
+  message(NOTICE "Nuget is not installed! The global lookup overlay (WebView2) requires it. https://inappwebview.dev/docs/intro#setup-windows")
+endif()
+add_custom_target(runner_WEBVIEW2_DOWNLOAD ALL)
+add_custom_command(
+  TARGET runner_WEBVIEW2_DOWNLOAD PRE_BUILD
+  COMMAND ${NUGET} install Microsoft.Windows.ImplementationLibrary -Version ${WIL_VERSION} -ExcludeVersion -OutputDirectory ${CMAKE_BINARY_DIR}/packages
+  COMMAND ${NUGET} install Microsoft.Web.WebView2 -Version ${WEBVIEW_VERSION} -ExcludeVersion -OutputDirectory ${CMAKE_BINARY_DIR}/packages
+  DEPENDS ${NUGET}
+)
+
+add_executable(${BINARY_NAME} WIN32
+  "attached_text_surface_window.cpp"
+  "audio_loopback_capture.cpp"
+  "clipboard_image_reader.cpp"
+  "layer_origin_solver.cpp"
+  "voice_hook_reader.cpp"
+  "crash_dump.cpp"
+  "external_video_handoff.cpp"
+  "flutter_window.cpp"
+  "floating_ball_window.cpp"
+  "floating_lyric_window.cpp"
+  "foreground_selection.cpp"
+  "game_stream_input.cpp"
+  "global_lookup_shadow.cpp"
+  "global_lookup_window.cpp"
+  "global_mouse_trigger.cpp"
+  "hang_watchdog.cpp"
+  "hdr_desktop_capture.cpp"
+  "hdr_video_host_window.cpp"
+  "hook_toolbar_window.cpp"
+  "ime_association_guard.cpp"
+  "ime_language_switch.cpp"
+  "ime_space_dispatch.cpp"
+  "low_level_mouse_hook.cpp"
+  "main.cpp"
+  "screen_ocr_overlay.cpp"
+  "system_font_list.cpp"
+  "system_ocr_channel_host.cpp"
+  "system_ocr_windows.cpp"
+  "system_transparency_channel.cpp"
+  "utils.cpp"
+  "win32_window.cpp"
+  "window_capture.cpp"
+  "window_recorder.cpp"
+  "${FLUTTER_MANAGED_DIR}/generated_plugin_registrant.cc"
+  "Runner.rc"
+  "runner.exe.manifest"
+)
+add_dependencies(${BINARY_NAME} runner_WEBVIEW2_DOWNLOAD)
+apply_standard_settings(${BINARY_NAME})
+target_compile_definitions(${BINARY_NAME} PRIVATE "NOMINMAX")
+target_compile_definitions(${BINARY_NAME} PRIVATE
+  "FLUTTER_VERSION=\"${FLUTTER_VERSION}\""
+  "FLUTTER_VERSION_MAJOR=${FLUTTER_VERSION_MAJOR}"
+  "FLUTTER_VERSION_MINOR=${FLUTTER_VERSION_MINOR}"
+  "FLUTTER_VERSION_PATCH=${FLUTTER_VERSION_PATCH}"
+  "FLUTTER_VERSION_BUILD=${FLUTTER_VERSION_BUILD}"
+)
+target_link_libraries(${BINARY_NAME} PRIVATE flutter flutter_wrapper_app)
+# dwmapi: DWM caption/text color theming for the native title bar.
+target_link_libraries(${BINARY_NAME} PRIVATE dwmapi)
+# ole32 / shell32: IShellLink + IPersistFile + SHGetKnownFolderPath /
+# SHChangeNotify for TODO-901 (rewriting desktop/Start-menu .lnk icons on app
+# icon change).
+target_link_libraries(${BINARY_NAME} PRIVATE ole32 shell32)
+# d2d1 / dwrite: rendering + char hit-testing for the desktop floating lyric
+# strip (floating_lyric_window.cpp).
+target_link_libraries(${BINARY_NAME} PRIVATE d2d1 dwrite)
+# bcrypt: SHA-256 fingerprint for attached galgame surface profiles. The hash
+# fences per-executable calibration from being reused by a different build.
+target_link_libraries(${BINARY_NAME} PRIVATE bcrypt)
+# WebView2 + WIL (.targets auto-add include dirs, import lib and WebView2Loader
+# deployment) for the global lookup overlay; Shlwapi for SHCreateMemStream.
+target_link_libraries(${BINARY_NAME} PRIVATE
+  ${CMAKE_BINARY_DIR}/packages/Microsoft.Web.WebView2/build/native/Microsoft.Web.WebView2.targets)
+target_link_libraries(${BINARY_NAME} PRIVATE
+  ${CMAKE_BINARY_DIR}/packages/Microsoft.Windows.ImplementationLibrary/build/native/Microsoft.Windows.ImplementationLibrary.targets)
+target_link_libraries(${BINARY_NAME} PRIVATE Shlwapi.lib)
+# uiautomationcore: the UI Automation COM GUIDs (CLSID_CUIAutomation /
+# IID_IUIAutomation*) used by foreground_selection.cpp to read the foreground
+# app's text selection + surrounding context (TODO-1030 M0 global lookup).
+target_link_libraries(${BINARY_NAME} PRIVATE uiautomationcore.lib)
+# TODO-1162: window_capture.cpp (external-window mining) — Windows.Graphics.Capture
+# single-frame screenshot needs D3D11 + DXGI + the WinRT activation runtime
+# (RoInitialize / RoGetActivationFactory / WindowsCreateStringReference) and WIC
+# for PNG encode. window_recorder.cpp (galgame rolling window recording) shares
+# the same stack and adds WIC JPEG encode.
+target_link_libraries(${BINARY_NAME} PRIVATE d3d11 dxgi runtimeobject windowscodecs)
+# galgame 一键制卡 A 阶段：audio_loopback_capture.cpp（WASAPI loopback 抓系统混音）。
+# IMMDeviceEnumerator / IAudioClient / IAudioCaptureClient 的 CLSID/IID 由 uuid.lib（MSVC
+# 默认链接）提供，CoCreateInstance 走已链接的 ole32；avrt 供将来 pro-audio 线程优先级用。
+target_link_libraries(${BINARY_NAME} PRIVATE avrt)
+# 剪切板面板背景逐像素透明（global_lookup_window composition 模式）：DirectComposition
+# 视觉树承载 WebView2 composition controller 的透明像素，dxguid 提供 DComp/DXGI IID。
+target_link_libraries(${BINARY_NAME} PRIVATE dcomp dxguid)
+# v19 galgame 查词准入：注入侧算不出游戏 exe 摘要时由 host 兜底算 SHA-256
+# （voice_hook_reader.cpp 的 Sha256HexOfFile）。
+target_link_libraries(${BINARY_NAME} PRIVATE bcrypt)
+# BUG-1450: ImmAssociateContextEx — detach the IME from the window while no text
+# field has focus so CJK IMEs stop swallowing every shortcut key.
+target_link_libraries(${BINARY_NAME} PRIVATE imm32)
+target_include_directories(${BINARY_NAME} PRIVATE "${CMAKE_SOURCE_DIR}")
+add_dependencies(${BINARY_NAME} flutter_assemble)
+
+# HBK-AUDIT-052: timeout/failed installer waits must not restart an app into a
+# bundle still being copied or rolled back. Uses live native function bodies.
+include("tests/update_launcher_completion_test.cmake")
+
+# BUG-1239: compile and execute the production IME Space predicate/dispatch
+# seam as part of every Windows runner build. Source-string tests could not
+# detect WM_KEYDOWN -> WM_KEYUP or removed Alt/Win guards.
+add_executable(fushi_windows_ime_space_test
+  "ime_space_dispatch.cpp"
+  "tests/ime_space_dispatch_test.cpp"
+)
+apply_standard_settings(fushi_windows_ime_space_test)
+target_compile_definitions(fushi_windows_ime_space_test PRIVATE "NOMINMAX")
+add_custom_target(fushi_windows_ime_space_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_ime_space_test>"
+  DEPENDS fushi_windows_ime_space_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_ime_space_gate)
+
+# 反馈「粘贴截图」：截图工具的 32bpp DIB（alpha 常全 0）→ 不透明 PNG、掩码偏移、
+# CF_HDROP → UTF-8 路径。只测纯转换、不碰真剪贴板，所以能随每次构建跑。
+add_executable(fushi_windows_clipboard_image_reader_test
+  "clipboard_image_reader.cpp"
+  "tests/clipboard_image_reader_test.cpp"
+)
+apply_standard_settings(fushi_windows_clipboard_image_reader_test)
+target_compile_definitions(fushi_windows_clipboard_image_reader_test
+  PRIVATE "NOMINMAX")
+target_link_libraries(fushi_windows_clipboard_image_reader_test PRIVATE
+  ole32 shell32 windowscodecs user32)
+add_custom_target(fushi_windows_clipboard_image_reader_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_clipboard_image_reader_test>"
+  DEPENDS fushi_windows_clipboard_image_reader_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_clipboard_image_reader_gate)
+
+# BUG-1450: same treatment for the IME association state machine. Getting the
+# coalescing or the failure path wrong either strands the window with the IME
+# detached (no Chinese/Japanese input anywhere in the app) or re-attached (the
+# whole shortcut table dies again), so it runs on every Windows runner build.
+add_executable(fushi_windows_ime_association_test
+  "ime_association_guard.cpp"
+  "tests/ime_association_guard_test.cpp"
+)
+apply_standard_settings(fushi_windows_ime_association_test)
+target_compile_definitions(fushi_windows_ime_association_test PRIVATE "NOMINMAX")
+target_link_libraries(fushi_windows_ime_association_test PRIVATE imm32)
+add_custom_target(fushi_windows_ime_association_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_ime_association_test>"
+  DEPENDS fushi_windows_ime_association_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_ime_association_gate)
+
+# 查词输入法语言切换：切错语言 / 忘了还原，都会把用户的系统输入法状态留在错的地方
+# （Win8 起输入法是 per-user，会漏到别的应用），所以状态机随每次 Windows runner
+# 构建跑一遍。
+add_executable(fushi_windows_ime_language_test
+  "ime_language_switch.cpp"
+  "tests/ime_language_switch_test.cpp"
+)
+apply_standard_settings(fushi_windows_ime_language_test)
+target_compile_definitions(fushi_windows_ime_language_test PRIVATE "NOMINMAX")
+add_custom_target(fushi_windows_ime_language_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_ime_language_test>"
+  DEPENDS fushi_windows_ime_language_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_ime_language_gate)
+
+# BUG-1455: compile and execute the WM_ACTIVATE focus policy on every Windows
+# runner build. This guards both sides of the contract: popup drag deactivation
+# must not raise the main window, while ordinary main-window click/activation
+# must still restore focus to the live Flutter child. HWND ownership cases cover
+# view teardown/recreation and Windows handle reuse.
+add_executable(fushi_windows_activation_policy_test
+  "tests/window_activation_policy_test.cpp"
+)
+apply_standard_settings(fushi_windows_activation_policy_test)
+target_compile_definitions(fushi_windows_activation_policy_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_activation_policy_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_activation_policy_test>"
+  DEPENDS fushi_windows_activation_policy_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_activation_policy_gate)
+
+# BUG-2462: the Flutter child resize gate (child_resize_gate.h) closes the
+# engine's resize-synchroniser hazard (A -> B -> A while Dart is busy pins the
+# resize target and drops every frame = frozen window when entering fullscreen
+# during video load). Its state machine is pure; keep every transition
+# executable on each Windows runner build.
+add_executable(fushi_windows_child_resize_gate_test
+  "tests/child_resize_gate_test.cpp"
+)
+apply_standard_settings(fushi_windows_child_resize_gate_test)
+target_compile_definitions(fushi_windows_child_resize_gate_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_child_resize_gate_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_child_resize_gate_test>"
+  DEPENDS fushi_windows_child_resize_gate_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_child_resize_gate_gate)
+
+# BUG-2964: the main window's DWM frame margins / surface fill are derived from
+# one state (Mica, HDR passthrough). The 1 px hidden-title-bar shadow margin
+# drew an opaque caption-coloured line over the HDR picture; keep the decision
+# table executable on each Windows runner build.
+add_executable(fushi_windows_main_surface_composition_test
+  "tests/main_surface_composition_test.cpp"
+)
+apply_standard_settings(fushi_windows_main_surface_composition_test)
+target_compile_definitions(fushi_windows_main_surface_composition_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_main_surface_composition_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_main_surface_composition_test>"
+  DEPENDS fushi_windows_main_surface_composition_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_main_surface_composition_gate)
+
+# Capture suppression is authorized by an exact epoch/token, while text may
+# advance behind the hidden surface. Keep that release contract executable so
+# a sentence change cannot strand the invisible catch window forever or let an
+# old epoch/token reveal a newer surface.
+add_executable(fushi_windows_attached_capture_token_test
+  "tests/attached_capture_token_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_capture_token_test)
+target_compile_definitions(fushi_windows_attached_capture_token_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_capture_token_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_capture_token_test>"
+  DEPENDS fushi_windows_attached_capture_token_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_capture_token_gate)
+
+# Attached runtime hit geometry is replaceable while a physical left button is
+# still held.  Keep the down/up latch rule executable: clearing a snapshot marks
+# cancellation but only the paired up may consume the transaction release.
+add_executable(fushi_windows_attached_glyph_latch_test
+  "tests/attached_glyph_transaction_latch_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_glyph_latch_test)
+target_compile_definitions(fushi_windows_attached_glyph_latch_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_glyph_latch_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_glyph_latch_test>"
+  DEPENDS fushi_windows_attached_glyph_latch_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_glyph_latch_gate)
+
+# v19 lookup hits are untrusted shared-memory payloads. Compile and run strict
+# UTF-8/UTF-16 span, production provider-pair and bounded geometry validation
+# before the runner target may link.
+add_executable(fushi_windows_lookup_hit_validation_test
+  "tests/lookup_hit_validation_test.cpp"
+)
+apply_standard_settings(fushi_windows_lookup_hit_validation_test)
+target_compile_definitions(fushi_windows_lookup_hit_validation_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_lookup_hit_validation_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_lookup_hit_validation_test>"
+  DEPENDS fushi_windows_lookup_hit_validation_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_lookup_hit_validation_gate)
+
+# Attached profiles cross a MethodChannel and are therefore untrusted. Keep
+# the native scalar bounds and alignment enums executable so invalid values
+# cannot silently fall through to DirectWrite's left/top defaults.
+add_executable(fushi_windows_attached_layout_validation_test
+  "tests/attached_layout_validation_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_layout_validation_test)
+target_compile_definitions(fushi_windows_attached_layout_validation_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_layout_validation_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_layout_validation_test>"
+  DEPENDS fushi_windows_attached_layout_validation_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_layout_validation_gate)
+
+# Saved-sample calibration must use exactly the DirectWrite catch geometry
+# used by the live surface, including UTF-16 clusters and overflow rejection.
+add_executable(fushi_windows_attached_text_layout_test
+  "tests/attached_text_layout_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_text_layout_test)
+target_compile_definitions(fushi_windows_attached_text_layout_test PRIVATE
+  "NOMINMAX")
+target_link_libraries(fushi_windows_attached_text_layout_test PRIVATE dwrite user32)
+add_custom_target(fushi_windows_attached_text_layout_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_text_layout_test>"
+  DEPENDS fushi_windows_attached_text_layout_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_text_layout_gate)
+
+# Magpie's source viewport may crop the source client before scaling. Keep the
+# normalized source-to-presentation body mapping pure and executable, including
+# fail-closed clipping and malformed viewport input.
+add_executable(fushi_windows_attached_magpie_surface_geometry_test
+  "tests/attached_magpie_surface_geometry_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_magpie_surface_geometry_test)
+target_compile_definitions(fushi_windows_attached_magpie_surface_geometry_test PRIVATE
+  "NOMINMAX")
+target_link_libraries(fushi_windows_attached_magpie_surface_geometry_test PRIVATE
+  dwrite)
+add_custom_target(fushi_windows_attached_magpie_surface_geometry_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_magpie_surface_geometry_test>"
+  DEPENDS fushi_windows_attached_magpie_surface_geometry_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME}
+  fushi_windows_attached_magpie_surface_geometry_gate)
+
+# 直连覆盖窗的画布→客户区映射决定卡片贴在哪、以及它是否还留在游戏画面内。这段几何
+# 一旦回归就表现为「卡片偏位/跑到画面外」，故保持纯函数且可执行。
+#
+# 注意：1:1 下 scale==1、信箱边为 0 只是**这三个映射函数**的恒等性质；整条直连路径在
+# 1:1 下的落点已经随 GlyphAnchoredCardOrigin 一起变了（水平由左对齐改中心对齐、垂直由
+# 优先下方改优先上方），是有意的策略变更。对照表在 gal_direct_card_geometry.h 头部。
+add_executable(fushi_windows_gal_direct_card_geometry_test
+  "tests/gal_direct_card_geometry_test.cpp"
+)
+apply_standard_settings(fushi_windows_gal_direct_card_geometry_test)
+target_compile_definitions(fushi_windows_gal_direct_card_geometry_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_gal_direct_card_geometry_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_gal_direct_card_geometry_test>"
+  DEPENDS fushi_windows_gal_direct_card_geometry_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_gal_direct_card_geometry_gate)
+
+# Attached catch pixels are useful only while the mapped presentation HWND is
+# actually composable above the game.  Keep the fail-closed decision pure and
+# executable so borderless/Magpie admission cannot regress into a fullscreen
+# rectangle heuristic, and exclusive/unknown VidPN ownership remains rejected.
+add_executable(fushi_windows_attached_overlayability_test
+  "tests/attached_overlayability_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_overlayability_test)
+target_compile_definitions(fushi_windows_attached_overlayability_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_overlayability_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_overlayability_test>"
+  DEPENDS fushi_windows_attached_overlayability_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_overlayability_gate)
+
+# The pure decision is insufficient if the production path publishes LL glyph
+# boxes before consulting it.  Pin the target-specific VidPN/DWM probes and the
+# final pre-publication ordering on every runner build.
+add_executable(fushi_windows_attached_overlayability_source_test
+  "tests/attached_overlayability_source_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_overlayability_source_test)
+target_compile_definitions(
+  fushi_windows_attached_overlayability_source_test PRIVATE
+  "NOMINMAX"
+  "FUSHI_RUNNER_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+add_custom_target(fushi_windows_attached_overlayability_source_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_overlayability_source_test>"
+  DEPENDS fushi_windows_attached_overlayability_source_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME}
+  fushi_windows_attached_overlayability_source_gate)
+
+# WH_MOUSE_LL runs synchronously in the system input path. Lock regressions in
+# the attached down/up path can freeze all desktop mouse delivery, so guard the
+# non-blocking source contract in addition to the pure transaction reducer.
+add_executable(fushi_windows_attached_mouse_hook_nonblocking_source_test
+  "tests/attached_mouse_hook_nonblocking_source_test.cpp"
+)
+apply_standard_settings(
+  fushi_windows_attached_mouse_hook_nonblocking_source_test)
+target_compile_definitions(
+  fushi_windows_attached_mouse_hook_nonblocking_source_test PRIVATE
+  "NOMINMAX"
+  "FUSHI_RUNNER_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+add_custom_target(fushi_windows_attached_mouse_hook_nonblocking_source_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_mouse_hook_nonblocking_source_test>"
+  DEPENDS fushi_windows_attached_mouse_hook_nonblocking_source_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME}
+  fushi_windows_attached_mouse_hook_nonblocking_source_gate)
+
+# The configured surface can be smaller than the calibration surface that
+# produced the old cluster boxes. Keep the production DIB clipping helper
+# executable with guarded pixels so stale, negative and crossing rectangles
+# cannot write outside the current surface.
+add_executable(fushi_windows_attached_bitmap_bounds_test
+  "tests/attached_bitmap_bounds_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_bitmap_bounds_test)
+target_compile_definitions(fushi_windows_attached_bitmap_bounds_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_bitmap_bounds_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_bitmap_bounds_test>"
+  DEPENDS fushi_windows_attached_bitmap_bounds_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_bitmap_bounds_gate)
+
+# A same-PID game window may be destroyed and recreated while the injected
+# mapping survives. Keep shield status target/transaction/epoch attribution
+# executable so a new HWND cannot borrow an old fault or verified conclusion,
+# while active/unacknowledged tails still block the re-handshake.
+add_executable(fushi_windows_attached_shield_status_policy_test
+  "tests/attached_shield_status_policy_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_shield_status_policy_test)
+target_compile_definitions(
+  fushi_windows_attached_shield_status_policy_test PRIVATE
+  "NOMINMAX"
+  "FUSHI_RUNNER_SOURCE_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}\"")
+add_custom_target(fushi_windows_attached_shield_status_policy_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_shield_status_policy_test>"
+  DEPENDS fushi_windows_attached_shield_status_policy_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME}
+  fushi_windows_attached_shield_status_policy_gate)
+
+# Shift+hover lookup on the attached calibrated glyph surface: the polling
+# timer must fire once per distinct cluster while Shift is held and never
+# without Shift. Keep the de-dup/anchor-release seam executable so a hover
+# storm (one lookup per 60ms tick) or a dead anchor cannot regress silently.
+add_executable(fushi_windows_attached_hover_tracker_test
+  "tests/attached_hover_tracker_test.cpp"
+)
+apply_standard_settings(fushi_windows_attached_hover_tracker_test)
+target_compile_definitions(fushi_windows_attached_hover_tracker_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_attached_hover_tracker_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_attached_hover_tracker_test>"
+  DEPENDS fushi_windows_attached_hover_tracker_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_attached_hover_tracker_gate)
+
+# 桌面应用外悬浮球的几何与动画曲线（floating_ball_geometry.h）必须与 Dart
+# ReaderFloatingBallLayout / Android FloatingBallGeometry 逐项同一套公式：一旦漂移，
+# 球就会停错位置、按钮列排错或越出屏幕。纯头文件，随每次 runner 构建执行一遍。
+add_executable(fushi_windows_floating_ball_geometry_test
+  "tests/floating_ball_geometry_test.cpp"
+)
+apply_standard_settings(fushi_windows_floating_ball_geometry_test)
+target_compile_definitions(fushi_windows_floating_ball_geometry_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_floating_ball_geometry_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_floating_ball_geometry_test>"
+  DEPENDS fushi_windows_floating_ball_geometry_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_floating_ball_geometry_gate)
+
+# A layered window routes alpha-zero pixels to the window below it, even if
+# ButtonAt accepts the point. Exercise the production D2D renderer in memory
+# at 100/150/200% DPI, including e-ink without shadows, and keep the rest of the
+# menu transparent. This gate creates no HWND and sends no user input.
+add_executable(fushi_windows_floating_ball_hit_region_test
+  "tests/floating_ball_hit_region_test.cpp"
+)
+apply_standard_settings(fushi_windows_floating_ball_hit_region_test)
+target_compile_definitions(fushi_windows_floating_ball_hit_region_test PRIVATE
+  "NOMINMAX" "_WIN32_WINNT=0x0A00" "WINVER=0x0A00")
+target_include_directories(fushi_windows_floating_ball_hit_region_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/floating_ball_stubs")
+target_link_libraries(fushi_windows_floating_ball_hit_region_test PRIVATE
+  d2d1 dwrite windowscodecs gdi32 user32 ole32 comctl32 uuid)
+add_custom_target(fushi_windows_floating_ball_hit_region_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_floating_ball_hit_region_test>"
+  DEPENDS fushi_windows_floating_ball_hit_region_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_floating_ball_hit_region_gate)
+
+# HBK-AUDIT-051: the native ball must honor the host's reduced-motion policy
+# for expand/collapse/snap and live config updates, while preserving callbacks.
+# The test intercepts HWND/timer/monitor boundaries and renders only to memory.
+add_executable(fushi_windows_floating_ball_motion_test
+  "tests/floating_ball_motion_test.cpp"
+)
+apply_standard_settings(fushi_windows_floating_ball_motion_test)
+target_compile_definitions(fushi_windows_floating_ball_motion_test PRIVATE
+  "NOMINMAX" "_WIN32_WINNT=0x0A00" "WINVER=0x0A00")
+target_include_directories(fushi_windows_floating_ball_motion_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/tests/floating_ball_stubs")
+target_link_libraries(fushi_windows_floating_ball_motion_test PRIVATE
+  d2d1 dwrite windowscodecs gdi32 user32 ole32 comctl32 uuid)
+add_custom_target(fushi_windows_floating_ball_motion_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_floating_ball_motion_test>"
+  DEPENDS fushi_windows_floating_ball_motion_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_floating_ball_motion_gate)
+
+# 桌面应用外悬浮球「截屏识字」与 Windows 系统 OCR 的纯逻辑（screen_ocr_logic.h）：
+# OCR 词拼接（CJK 不插空格）、识别语言挑选、OCR 最大边长缩放、截哪块显示器、
+# 冻结层提示条布局与点击归类；以及 system_ocr 工作线程回话队列（worker_reply_queue.h）。
+# 拼错了 Dart 查的后缀就和截图对不上，挑错语言就是「装了日语却报没装」。
+add_executable(fushi_windows_screen_ocr_logic_test
+  "tests/screen_ocr_logic_test.cpp"
+)
+apply_standard_settings(fushi_windows_screen_ocr_logic_test)
+target_compile_definitions(fushi_windows_screen_ocr_logic_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_screen_ocr_logic_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_screen_ocr_logic_test>"
+  DEPENDS fushi_windows_screen_ocr_logic_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_screen_ocr_logic_gate)
+
+# 截屏识字在 HDR 显示器上的 scRGB(FP16) → 8bit sRGB 色调映射（hdr_tone_map.h）：
+# SDR 内容必须逐级还原（否则整屏发白 / 发灰），HDR 高光平滑压缩不能断层；
+# 以及取帧路径判据（hdr_capture_policy.h：只有 Windows 10 的 HDR 显示器走 DXGI）。
+add_executable(fushi_windows_hdr_tone_map_test
+  "tests/hdr_tone_map_test.cpp"
+)
+apply_standard_settings(fushi_windows_hdr_tone_map_test)
+target_compile_definitions(fushi_windows_hdr_tone_map_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_hdr_tone_map_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_hdr_tone_map_test>"
+  DEPENDS fushi_windows_hdr_tone_map_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_hdr_tone_map_gate)
+
+# Rolling window recording for galgame video cards: the fps keep decision, the
+# max_seconds / byte-cap eviction, the export range (to<=0 = now) and the box
+# downscale are pure STL and run on every Windows runner build, so a regression
+# cannot silently turn the ring into an unbounded buffer or export the wrong
+# frames.
+add_executable(fushi_windows_window_recorder_ring_test
+  "tests/window_recorder_ring_test.cpp"
+)
+apply_standard_settings(fushi_windows_window_recorder_ring_test)
+target_compile_definitions(fushi_windows_window_recorder_ring_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_windows_window_recorder_ring_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_window_recorder_ring_test>"
+  DEPENDS fushi_windows_window_recorder_ring_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_window_recorder_ring_gate)
+
+# Capture replies are published by a worker and drained on the UI thread. Keep
+# the completion/teardown contract executable without linking the full runner.
+add_executable(fushi_windows_capture_reply_test
+  "tests/window_capture_reply_queue_test.cpp"
+)
+apply_standard_settings(fushi_windows_capture_reply_test)
+target_compile_definitions(fushi_windows_capture_reply_test PRIVATE
+  "NOMINMAX")
+add_custom_target(fushi_window_capture_reply_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_capture_reply_test>"
+  DEPENDS fushi_windows_capture_reply_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_window_capture_reply_gate)
+
+# PrintWindow runs in a killable copy of the runner because a target window can
+# synchronously block the caller. Keep the helper IPC, timeout termination, and
+# retry lifecycle executable without Flutter initialization; real user32 smoke
+# remains a separate native probe because this gate uses an offscreen synthetic
+# target and deterministic helper-owned pixels.
+add_executable(fushi_windows_printwindow_helper_test
+  "tests/window_capture_printwindow_helper_test.cpp"
+)
+apply_standard_settings(fushi_windows_printwindow_helper_test)
+target_compile_definitions(fushi_windows_printwindow_helper_test PRIVATE
+  "NOMINMAX")
+target_link_libraries(fushi_windows_printwindow_helper_test PRIVATE
+  user32 gdi32 dwmapi d3d11 dxgi runtimeobject windowscodecs Shlwapi.lib
+  ole32 shell32)
+add_custom_target(fushi_windows_printwindow_helper_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_printwindow_helper_test>"
+  DEPENDS fushi_windows_printwindow_helper_test
+  VERBATIM
+)
+add_dependencies(${BINARY_NAME} fushi_windows_printwindow_helper_gate)
+
+add_executable(fushi_update_launcher WIN32
+  "update_launcher.cpp"
+)
+apply_standard_settings(fushi_update_launcher)
+target_compile_definitions(fushi_update_launcher PRIVATE "NOMINMAX")
+target_link_libraries(fushi_update_launcher PRIVATE shell32)
+
+# BUG-2726: game-stream input regression (window-targeted input, SGRE native
+# gamepad channel, release-without-visibility). Unlike the gates above it is
+# not a build dependency of the runner: it creates real HWNDs and reads the
+# system cursor, which a developer moving the mouse during a local build could
+# disturb. CI builds and runs it explicitly after `flutter build windows`
+# (cmake --build ... --target fushi_windows_game_stream_input_gate); locally use
+# tool/run_game_stream_input_test.ps1.
+add_executable(fushi_windows_game_stream_input_test EXCLUDE_FROM_ALL
+  "game_stream_input.cpp"
+  "tests/game_stream_input_release_test.cpp"
+)
+target_compile_features(fushi_windows_game_stream_input_test PRIVATE cxx_std_17)
+target_compile_options(fushi_windows_game_stream_input_test PRIVATE /EHsc)
+target_compile_definitions(fushi_windows_game_stream_input_test PRIVATE
+  "NOMINMAX" "UNICODE" "_UNICODE")
+# Header-only use of flutter::EncodableValue; nothing links the engine DLL.
+target_include_directories(fushi_windows_game_stream_input_test PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}"
+  "$<TARGET_PROPERTY:flutter_wrapper_app,INTERFACE_INCLUDE_DIRECTORIES>")
+target_link_libraries(fushi_windows_game_stream_input_test PRIVATE user32)
+add_custom_target(fushi_windows_game_stream_input_gate
+  COMMAND "$<TARGET_FILE:fushi_windows_game_stream_input_test>"
+  DEPENDS fushi_windows_game_stream_input_test
+  VERBATIM
+)

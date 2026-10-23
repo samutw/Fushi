@@ -1,0 +1,64 @@
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+// 文案走 i18n（模块里 tr() 读全局 fushiT）：测试按 zh-CN 字典断言。
+globalThis.fushiT = require('./scripts/i18n-fixture.js').makeFushiT();
+
+const diagnostics = require('./connection-diagnostics.js');
+
+test('Fushi status endpoint wins when it is ready', () => {
+  assert.equal(
+    diagnostics.classify({ status: 200, body: { app: 'fushi', ready: true } }),
+    diagnostics.states.connected,
+  );
+});
+
+test("retired 'hibiki' wire value is no longer accepted (extension was never published)", () => {
+  // 故意保留 'hibiki' 字面量：钉死已退役 wire 值被拒绝，防双值兼容回潮。
+  assert.equal(
+    diagnostics.classify({ status: 200, body: { app: 'hibiki', ready: true } }),
+    diagnostics.states.wrongService,
+  );
+});
+
+test('an unknown app value on the port is still wrong-service', () => {
+  assert.equal(
+    diagnostics.classify({ status: 200, body: { app: 'other' } }),
+    diagnostics.states.wrongService,
+  );
+});
+
+test('old Fushi lookup endpoint is recognised as a legacy connection', () => {
+  assert.equal(
+    diagnostics.classify(
+      { status: 404 },
+      { status: 200, body: { type: 'dictionaryResult' } },
+    ),
+    diagnostics.states.legacy,
+  );
+});
+
+test('Yomitan API on the same port is reported as an actionable conflict', () => {
+  assert.equal(
+    diagnostics.classify(
+      { status: 404 },
+      { status: 404 },
+      { status: 200, body: { version: '0.2.0' } },
+    ),
+    diagnostics.states.yomitanConflict,
+  );
+  const message = diagnostics.copy(diagnostics.states.yomitanConflict, 19633);
+  assert.match(message.detail, /Enable Yomitan API/);
+  assert.match(message.detail, /Fushi/);
+  assert.match(message.detail, /19633/);
+});
+
+test('authentication and offline failures stay distinguishable', () => {
+  assert.equal(
+    diagnostics.classify({ ok: false, status: 401 }),
+    diagnostics.states.unauthorized,
+  );
+  assert.equal(
+    diagnostics.classify(null, null, null, new Error('ECONNREFUSED')),
+    diagnostics.states.offline,
+  );
+});

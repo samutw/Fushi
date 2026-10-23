@@ -1,0 +1,173 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+// BUG-345 / TODO-620: in the dictionary popup, glossary bodies that carry
+// per-character furigana (明鏡-style 逐字 ruby, e.g. 顔(かお)を洗(あら)う…) rendered
+// with ragged horizontal spacing. popup.js's postProcessRuby wraps each
+// <ruby>'s base text node in a <span> so the ruby text stays selectable
+// (BUG-110/123/125/129 must not regress), but that <span> is still a ruby base
+// box: Blink sizes every ruby base box to max(base, rt). With rt{font-size:0.5em}
+// a reading of >=3 kana is wider than its 1em kanji, so each base is stretched
+// to its own annotation width and the line goes ragged. The fix takes the <rt>
+// out of the inline flow (position:absolute) so it no longer widens the base
+// box, while keeping the furigana centred above the kanji.
+//
+// BUG-722 then moved that base box (and the reserve below) from the bare <ruby>
+// onto a per-base <span class="ruby-unit">, so the absolutely-positioned <rt>
+// anchors to its OWN kanji: a multi-kanji word is one <ruby> with several
+// base+<rt> pairs, and anchoring the rt to the whole <ruby> made every rt
+// stretch to the full word width and superimpose. So the compaction + reserve
+// invariants now live on `.ruby-unit`; the bare `ruby` keeps display:inline-block
+// + position:relative only as a fallback anchor.
+//
+// Ruby geometry can't render headless in a WebView, so guard the CSS rules'
+// presence (the headless-Chromium repro proved horizontal spread 18.25px -> 0px
+// and the multi-kanji superimposition -40px -> 0px). The Windows popup inlines
+// this same popup.css via _winCss, so one guard covers all platforms.
+void main() {
+  final String css = File('assets/popup/popup.css').readAsStringSync();
+
+  final RegExp rubyUnitRule = RegExp(
+    r':where\([^)]*\bglossary-group\b[^)]*,[^)]*\bglossary-content\b[^)]*\)\s*\.ruby-unit\s*\{([^}]*)\}',
+  );
+
+  test(
+      'per-base .ruby-unit is inline-block + relative so rt cannot stretch the '
+      'base box and anchors to its own kanji (BUG-345 / BUG-722)', () {
+    final RegExpMatch? match = rubyUnitRule.firstMatch(css);
+    expect(
+      match,
+      isNotNull,
+      reason:
+          'popup.css must scope a .ruby-unit block to the glossary surfaces '
+          '(.glossary-group / .glossary-content) — that per-base box is the '
+          'anchor for the absolute <rt> (BUG-722)',
+    );
+    final String body = match!.group(1)!;
+    expect(
+      RegExp(r'display\s*:\s*inline-block').hasMatch(body),
+      isTrue,
+      reason: '.ruby-unit must be display:inline-block so the base box '
+          'collapses to the kanji width instead of being stretched to the '
+          'rt width (BUG-345)',
+    );
+    expect(
+      RegExp(r'position\s*:\s*relative').hasMatch(body),
+      isTrue,
+      reason: '.ruby-unit must be position:relative so the absolutely '
+          'positioned <rt> anchors to its own kanji, not the full-width '
+          '<ruby> — otherwise multi-kanji-word readings superimpose (BUG-722)',
+    );
+  });
+
+  test(
+      'the glossary reading is taken out of the inline flow (absolute, anchored '
+      'to the unit top) so it cannot widen the base box (BUG-345 / BUG-363)',
+      () {
+    // BUG-1487: the positioned box is the `.ruby-rt` wrapper, not the <rt> —
+    // WebKit force-resets `position` to static on <rt>, so declaring it there
+    // silently did nothing on iOS/macOS and the reading fell back into the
+    // inline flow (exactly the BUG-345 widening this guard exists to prevent).
+    final RegExp rtBoxRule = RegExp(
+      r':where\([^)]*\bglossary-group\b[^)]*,[^)]*\bglossary-content\b[^)]*\)\s*\.ruby-rt\s*\{([^}]*)\}',
+    );
+    final RegExpMatch? match = rtBoxRule.firstMatch(css);
+    expect(
+      match,
+      isNotNull,
+      reason: 'popup.css must scope a .ruby-rt block to the glossary surfaces',
+    );
+    final String body = match!.group(1)!;
+    expect(
+      RegExp(r'position\s*:\s*absolute').hasMatch(body),
+      isTrue,
+      reason: 'the glossary reading box must be position:absolute so it leaves '
+          'the inline flow and stops dictating the ruby base box width (BUG-345)',
+    );
+    expect(
+      RegExp(r'top\s*:\s*0\b').hasMatch(body),
+      isTrue,
+      reason: 'the glossary reading box must anchor to the unit top (top:0) '
+          'inside the em padding-top reserve, so its position scales cleanly '
+          'with the popup zoom instead of drifting (BUG-363)',
+    );
+  });
+
+  test(
+      'the vertical furigana reserve is an em padding-top on the per-base '
+      '.ruby-unit, not the old line-height:2 leading (BUG-108 reserve '
+      'preserved, zoom-immune for BUG-363)', () {
+    final String body = rubyUnitRule.firstMatch(css)!.group(1)!;
+    expect(
+      RegExp(r'padding-top\s*:\s*[\d.]+em').hasMatch(body),
+      isTrue,
+      reason: 'glossary .ruby-unit must reserve furigana room with an '
+          'em-relative padding-top — the absolutely positioned furigana relies '
+          'on that reserve to clear the line above, and the em unit keeps it '
+          'correct under any popup zoom (BUG-108 reserve + BUG-363 zoom-immunity)',
+    );
+  });
+
+  // BUG-1778 reverses BUG-850's horizontal reserve trade-off: widening every
+  // base unit to max(base, reading) prevents annotation collisions, but pulls
+  // ordinary正文 apart (体/からだ visibly inserts space around 体). Reference ruby
+  // keeps the base run compact and lets annotation ink overhang. Keep the
+  // historical twin out of flow so it cannot dictate base spacing.
+  test(
+      'popup.css keeps .ruby-reserve out of flow so furigana cannot widen the '
+      'base run (BUG-1778)', () {
+    final RegExp reserveRule = RegExp(
+      r':where\([^)]*\bglossary-group\b[^)]*,[^)]*\bglossary-content\b[^)]*\)\s*\.ruby-reserve\s*\{([^}]*)\}',
+    );
+    final RegExpMatch? match = reserveRule.firstMatch(css);
+    expect(match, isNotNull,
+        reason: 'popup.css must scope the legacy .ruby-reserve twin to the '
+            'glossary surfaces');
+    final String body = match!.group(1)!;
+    expect(RegExp(r'position\s*:\s*absolute').hasMatch(body), isTrue,
+        reason: '.ruby-reserve must be removed from inline flow; otherwise its '
+            'reading width separates the surrounding正文 (BUG-1778)');
+    expect(RegExp(r'width\s*:\s*(-webkit-)?max-content').hasMatch(body), isTrue,
+        reason: 'the inert twin may retain its intrinsic reading geometry');
+    expect(RegExp(r'height\s*:\s*0\b').hasMatch(body), isTrue,
+        reason: '.ruby-reserve must be height:0 so it reserves horizontal room '
+            'without shifting the base off its baseline');
+    // BUG-1655: 不再硬编码 0.5em —— 振假名尺寸是可调的产品值（已调到 0.6em）。
+    // 真正的不变量是「孪生体与注音盒同字号」：一旦分叉，预留的宽度就不等于注音实际
+    // 渲染的宽度，汉字会被撑开（预留偏大）或相邻注音重叠（预留偏小）。
+    final RegExp rtBoxRule2 = RegExp(
+      r':where\([^)]*\bglossary-group\b[^)]*,[^)]*\bglossary-content\b[^)]*\)\s*\.ruby-rt\s*\{([^}]*)\}',
+    );
+    final RegExp fontSize = RegExp(r'font-size\s*:\s*([^;]+);');
+    final String? reserveSize = fontSize.firstMatch(body)?.group(1)?.trim();
+    final String? boxSize = fontSize
+        .firstMatch(rtBoxRule2.firstMatch(css)!.group(1)!)
+        ?.group(1)
+        ?.trim();
+    expect(reserveSize, isNotNull,
+        reason: '.ruby-reserve must declare a font-size (BUG-850)');
+    expect(RegExp(r'^[\d.]+em$').hasMatch(reserveSize!), isTrue,
+        reason: '.ruby-reserve 的字号必须是 em，才能随 popupContentZoom 等比缩放（BUG-363）');
+    expect(reserveSize, equals(boxSize),
+        reason: '.ruby-reserve must match the .ruby-rt font-size for DOM '
+            'geometry parity — 现为 '
+            'reserve=$reserveSize / box=$boxSize');
+  });
+
+  test(
+      'postProcessRuby injects a .ruby-reserve twin of the reading into each '
+      'unit, hidden from selection (BUG-850)', () {
+    final String js = File('assets/popup/popup.js').readAsStringSync();
+    expect(js.contains("className = 'ruby-reserve'"), isTrue,
+        reason: 'postProcessRuby must create the .ruby-reserve twin (BUG-850)');
+    expect(js.contains('reserve.textContent = sib.textContent'), isTrue,
+        reason:
+            'the reserve must copy the reading text so its width equals the '
+            'rt width (BUG-850)');
+    expect(js.contains("setAttribute('aria-hidden', 'true')"), isTrue,
+        reason:
+            'the reserve must be aria-hidden so it never affects ruby lookup '
+            'selection or accessibility (BUG-110/123/125/129)');
+  });
+}

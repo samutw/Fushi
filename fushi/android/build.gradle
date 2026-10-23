@@ -1,0 +1,122 @@
+allprojects {
+    repositories {
+        // The Flutter integration_test plugin requests dynamic test deps
+        // (androidx.test:runner/rules:1.2+, espresso-core:3.3+). Listing a
+        // dynamic version needs maven-metadata.xml. In the dev (CN) network
+        // dl.google.com / repo.maven.apache.org answer that with 405, aborting
+        // the whole resolution, so those groups are routed EXCLUSIVELY to the
+        // Aliyun Google mirror (directly reachable, proper metadata). On CI
+        // (GitHub US runners) dl.google.com works AND the "Remove aliyun mirrors"
+        // step deletes the mirror line below — leaving an empty forRepository
+        // would make androidx.test unresolvable. So pick the exclusive source by
+        // environment: real google() on CI, the Aliyun mirror locally.
+        exclusiveContent {
+            forRepository {
+                if (System.getenv('CI') == 'true') {
+                    google()
+                } else {
+                    maven { url 'https://maven.aliyun.com/repository/google' }
+                }
+            }
+            filter {
+                includeGroup 'androidx.test'
+                includeGroup 'androidx.test.espresso'
+            }
+        }
+        google()
+        mavenCentral()
+        maven { url "https://jitpack.io" }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/central' }
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        maven { url 'https://maven.aliyun.com/repository/apache-snapshots' }
+    }
+}
+
+// Fix for old Flutter plugins that don't declare namespace (required by AGP 8.x)
+// Also fix Kotlin JVM target to match Java target and avoid mismatch errors
+subprojects {
+    // Force all subprojects (including buildscript classpath) to use Kotlin 2.2.20,
+    // overriding old plugins that ship older Kotlin versions
+    buildscript {
+        configurations.all {
+            resolutionStrategy.eachDependency { details ->
+                if (details.requested.group == 'org.jetbrains.kotlin') {
+                    details.useVersion '2.2.20'
+                }
+            }
+        }
+    }
+    configurations.all {
+        resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == 'org.jetbrains.kotlin') {
+                details.useVersion '2.2.20'
+            }
+        }
+    }
+
+    afterEvaluate { proj ->
+        if (proj.plugins.hasPlugin('com.android.library') || proj.plugins.hasPlugin('com.android.application')) {
+            def android = proj.extensions.findByName('android')
+            if (android != null) {
+                // Force compileSdk for all subprojects so Material You attrs (lStar etc.) resolve
+                // App uses 36; plugins stay at 34 to avoid null-safety breakage.
+                // Exception: bonsoir_android references API-36 symbols
+                // (NsdServiceInfo.hostname / hostAddresses) behind runtime SDK guards, so it must be
+                // compiled against 36 or it fails with "Unresolved reference 'hostname'".
+                if (proj.plugins.hasPlugin('com.android.application') ||
+                        proj.name == 'bonsoir_android') {
+                    android.compileSdkVersion 36
+                } else {
+                    android.compileSdkVersion 34
+                }
+
+                // Fix missing namespace
+                if (!android.namespace) {
+                    def manifestFile = android.sourceSets?.main?.manifest?.srcFile
+                    if (manifestFile?.exists()) {
+                        try {
+                            def pkg = new XmlParser().parse(manifestFile)?.attribute('package')
+                            if (pkg) {
+                                android.namespace = pkg
+                            }
+                        } catch (Exception e) {
+                            // ignore parse errors
+                        }
+                    }
+                }
+            }
+        }
+        // Set Kotlin JVM target for plugin subprojects.
+        // kotlin.jvm.target.validation.mode=WARNING suppresses mismatch errors.
+        if (proj.name != 'app') {
+            proj.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+                kotlinOptions {
+                    jvmTarget = '1.8'
+                }
+            }
+        }
+        // Remove -Werror from Java compilation so deprecated API warnings don't fail the build
+        proj.tasks.withType(JavaCompile).configureEach {
+            options.compilerArgs.removeAll { it == '-Werror' }
+            options.compilerArgs += ['-Xlint:-deprecation', '-Xlint:-unchecked']
+        }
+    }
+}
+
+rootProject.buildDir = '../build'
+subprojects {
+    project.buildDir = "${rootProject.buildDir}/${project.name}"
+}
+subprojects {
+    project.evaluationDependsOn(':app')
+}
+
+tasks.register("clean", Delete) {
+    delete rootProject.buildDir
+}
+
+ext {
+    flutterFFmpegPackage = "full-gpl-lts"
+}

@@ -1,0 +1,684 @@
+import 'dart:io';
+
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi_core/fushi_core.dart' show ProfileMediaKind;
+import 'package:fushi/pages.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/profile/profile_repository.dart';
+import 'package:fushi/src/profile/profile_view_model.dart';
+import 'package:fushi/src/settings/settings_schema_widgets.dart'
+    show SettingsSectionFooter;
+import 'package:fushi/src/utils/misc/collection_exporter.dart';
+import 'package:fushi/src/media/import/real_path_directory_picker.dart';
+import 'package:path/path.dart' as p;
+
+/// Full-screen page for managing profiles, media-type bindings,
+/// and per-profile settings.
+///
+/// 薄壳：只负责套上脚手架与标题；正文全在 [ProfileManagementBody]，以便同一份
+/// 正文既能作为独立路由页（`AppModel.showProfilesMenu`），又能直接平铺进「配置
+/// 方案」设置 destination（见 `SettingsDestination.body`），消掉一层子菜单跳转。
+class ProfileManagementPage extends BasePage {
+  const ProfileManagementPage({super.key});
+
+  @override
+  BasePageState<ProfileManagementPage> createState() =>
+      _ProfileManagementPageState();
+}
+
+class _ProfileManagementPageState extends BasePageState<ProfileManagementPage> {
+  @override
+  Widget build(BuildContext context) {
+    return AdaptiveSettingsScaffold(
+      title: Text(t.profile_management),
+      children: const [ProfileManagementBody()],
+    );
+  }
+}
+
+/// Profile 管理正文（无脚手架）。返回一个 [Column]，自身不带 `Scaffold` / 独立
+/// 滚动——外层（脚手架或设置渲染器）已提供滚动与内边距。
+///
+/// 原页面的 AppBar「+新建」操作在这里下沉成正文顶部的「新建配置」行，使内嵌进
+/// 设置页时也能新建（设置详情页没有 AppBar 操作槽）。
+class ProfileManagementBody extends ConsumerStatefulWidget {
+  const ProfileManagementBody({super.key});
+
+  @override
+  ConsumerState<ProfileManagementBody> createState() =>
+      _ProfileManagementBodyState();
+}
+
+class _ProfileManagementBodyState extends ConsumerState<ProfileManagementBody> {
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final uiState = ref.watch(profileViewModelProvider);
+    final vm = ref.read(profileViewModelProvider.notifier);
+
+    if (uiState.isLoading) {
+      return Padding(
+        padding: EdgeInsets.symmetric(vertical: tokens.spacing.page * 3),
+        // 统一加载占位（MD3 Expressive 指示器 / Apple 系统菊花）。
+        child: const FushiLoadingView(),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 标题留空：内嵌进「配置方案」设置页时，上方 schema 的「配置」picker 节
+        // 已带「配置」标题，这里再挂一次会重复；作为独立路由页（showProfilesMenu）
+        // 时脚手架标题已是「配置管理」，本节作为其延续也无需再重复表头。
+        AdaptiveSettingsSection(
+          children: [
+            _buildCreateRow(vm),
+            _buildImportRow(vm),
+            ..._buildProfileRows(uiState, vm),
+          ],
+        ),
+        AdaptiveSettingsSection(
+          title: t.profile_media_type_bindings,
+          children: [
+            _buildMediaTypeRow(
+              t.profile_media_epub,
+              ProfileMediaKind.epub,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_srtbook,
+              ProfileMediaKind.srtbook,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_audiobook,
+              ProfileMediaKind.audiobook,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_lyrics,
+              ProfileMediaKind.lyrics,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_video,
+              ProfileMediaKind.video,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_manga,
+              ProfileMediaKind.manga,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_game,
+              ProfileMediaKind.game,
+              uiState,
+              vm,
+            ),
+            _buildMediaTypeRow(
+              t.profile_media_browser,
+              ProfileMediaKind.browser,
+              uiState,
+              vm,
+            ),
+          ],
+        ),
+        // 语言绑定的优先级高于上面的媒体类型绑定、低于书架上的单条目绑定
+        // （book > language > mediaType > 当前激活）。
+        AdaptiveSettingsSection(
+          title: t.profile_language_bindings,
+          children: [
+            for (final String tag in _languageBindingTags(uiState))
+              _buildLanguageRow(tag, uiState, vm),
+          ],
+        ),
+        // 说明不再伪装成分组里的第一行（标题被截断、还带行高 / 分隔线语义），
+        // 改成与 schema section footer 同款的分组脚注（样式按设计系统由
+        // SettingsSectionFooter 自己取：Apple footnote 灰字 / MD3 bodySmall
+        // onVariant）。
+        SettingsSectionFooter(t.profile_language_bindings_hint),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Create row (replaces the original AppBar "+" action)
+  // ---------------------------------------------------------------------------
+
+  Widget _buildCreateRow(ProfileViewModel vm) {
+    final bool cupertino = isCupertinoPlatform(context);
+    return AdaptiveSettingsRow(
+      icon: cupertino ? CupertinoIcons.add : FushiIcons.add,
+      showIcon: true,
+      title: t.profile_create,
+      onTap: () => _showCreateDialog(vm),
+    );
+  }
+
+  Widget _buildImportRow(ProfileViewModel vm) {
+    final bool cupertino = isCupertinoPlatform(context);
+    return AdaptiveSettingsRow(
+      icon: cupertino ? CupertinoIcons.square_arrow_down : FushiIcons.download,
+      showIcon: true,
+      title: t.profile_import,
+      onTap: () => _importProfile(vm),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Profile tiles
+  // ---------------------------------------------------------------------------
+
+  List<Widget> _buildProfileRows(
+    ProfileUiState uiState,
+    ProfileViewModel vm,
+  ) {
+    final isOnly = uiState.profiles.length <= 1;
+    final bool cupertino = isCupertinoPlatform(context);
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return [
+      for (final profile in uiState.profiles)
+        AdaptiveSettingsRow(
+          icon: profile.id == uiState.activeProfileId
+              ? (cupertino
+                  ? CupertinoIcons.check_mark_circled_solid
+                  : FushiIcons.filled(FushiIcons.success))
+              : (cupertino ? CupertinoIcons.circle : FushiIcons.profiles),
+          // 行首的实心 / 空心圆就是「当前激活」的唯一信号——不 showIcon 的话
+          // 共享行根本不画它，列表里看不出哪个方案在用。
+          showIcon: true,
+          title: profile.name,
+          onTap: () {
+            if (profile.id != uiState.activeProfileId) {
+              vm.switchProfile(profile.id);
+            }
+          },
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _ProfileActionButton(
+                materialIcon: FushiIcons.upload,
+                cupertinoIcon: CupertinoIcons.square_arrow_up,
+                tooltip: t.profile_export,
+                onPressed: () => _exportProfile(vm, profile.id, profile.name),
+              ),
+              SizedBox(width: tokens.spacing.gap / 2),
+              _ProfileActionButton(
+                materialIcon: FushiIcons.copy,
+                cupertinoIcon: CupertinoIcons.doc_on_doc,
+                tooltip: t.profile_copy,
+                onPressed: () => _showCopyDialog(vm, profile.id, profile.name),
+              ),
+              SizedBox(width: tokens.spacing.gap / 2),
+              _ProfileActionButton(
+                materialIcon: FushiIcons.rename,
+                cupertinoIcon: CupertinoIcons.pencil,
+                tooltip: t.profile_rename,
+                onPressed: () =>
+                    _showRenameDialog(vm, profile.id, profile.name),
+              ),
+              if (!isOnly) ...[
+                SizedBox(width: tokens.spacing.gap / 2),
+                _ProfileActionButton(
+                  materialIcon: FushiIcons.delete,
+                  cupertinoIcon: CupertinoIcons.delete,
+                  tooltip: t.profile_delete,
+                  destructive: true,
+                  onPressed: () =>
+                      _showDeleteDialog(vm, profile.id, profile.name),
+                ),
+              ],
+            ],
+          ),
+        ),
+    ];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Media-type binding rows
+  // ---------------------------------------------------------------------------
+
+  // ---------------------------------------------------------------------------
+  // Language binding rows
+  // ---------------------------------------------------------------------------
+
+  /// 要铺出来的语言标签：内容语言选择器的标准候选（用户能在条目上设的那几个）
+  /// 打头，后面接「已绑定但不在标准候选里」的标签。
+  ///
+  /// 后半段不是多余的：`EpubBooks.language` 是从 EPUB 的 `dc:language` 自动回填
+  /// 的，值域是整个 BCP-47（一本法语书就会写进 `fr`）。少了这一段，用户给这类
+  /// 语言建的绑定会在 UI 上彻底消失——看不见、也改不掉，只能观察到「Profile 莫名
+  /// 其妙自己切了」。
+  List<String> _languageBindingTags(ProfileUiState uiState) {
+    final List<String> standard = <String>[
+      for (final ({String? tag, String label}) option
+          in kContentLanguageOptions)
+        if (option.tag != null) option.tag!,
+    ];
+    final List<String> extras = uiState.languageBindings.keys
+        .where((String tag) => !standard.contains(tag))
+        .toList()
+      ..sort();
+    return <String>[...standard, ...extras];
+  }
+
+  Widget _buildLanguageRow(
+    String languageTag,
+    ProfileUiState uiState,
+    ProfileViewModel vm,
+  ) {
+    final int? boundId = uiState.languageBindings[languageTag];
+    return AdaptiveSettingsPickerRow<int?>(
+      title: contentLanguageLabelOf(languageTag),
+      selected: boundId,
+      materialWidth: 176,
+      options: [
+        AdaptiveSettingsPickerOption<int?>(
+          value: null,
+          label: t.profile_media_none,
+        ),
+        for (final p in uiState.profiles)
+          AdaptiveSettingsPickerOption<int?>(
+            value: p.id,
+            label: p.name,
+          ),
+      ],
+      onChanged: (int? id) => vm.setLanguageBinding(languageTag, id),
+    );
+  }
+
+  Widget _buildMediaTypeRow(
+    String label,
+    ProfileMediaKind mediaType,
+    ProfileUiState uiState,
+    ProfileViewModel vm,
+  ) {
+    final boundId = uiState.mediaTypeBindings[mediaType.dbValue];
+    return AdaptiveSettingsPickerRow<int?>(
+      title: label,
+      selected: boundId,
+      materialWidth: 176,
+      options: [
+        AdaptiveSettingsPickerOption<int?>(
+          value: null,
+          label: t.profile_media_none,
+        ),
+        for (final p in uiState.profiles)
+          AdaptiveSettingsPickerOption<int?>(
+            value: p.id,
+            label: p.name,
+          ),
+      ],
+      onChanged: (id) => vm.setMediaTypeBinding(mediaType, id),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Dialogs
+  // ---------------------------------------------------------------------------
+
+  Future<void> _showCreateDialog(ProfileViewModel vm) async {
+    final name = await showAppDialog<String>(
+      context: context,
+      builder: (ctx) => ProfileNameDialog(
+        title: t.profile_create,
+        initialName: '',
+        submitLabel: t.dialog_create,
+      ),
+    );
+    if (name != null && name.isNotEmpty) {
+      await vm.createProfile(name);
+    }
+  }
+
+  Future<void> _showCopyDialog(
+    ProfileViewModel vm,
+    int sourceId,
+    String sourceName,
+  ) async {
+    final name = await showAppDialog<String>(
+      context: context,
+      builder: (ctx) => ProfileNameDialog(
+        title: t.profile_copy,
+        initialName: '$sourceName ${t.profile_copy_suffix}',
+        submitLabel: t.dialog_create,
+      ),
+    );
+    if (name != null && name.isNotEmpty) {
+      await vm.copyProfile(sourceId, name);
+    }
+  }
+
+  Future<void> _showRenameDialog(
+    ProfileViewModel vm,
+    int id,
+    String currentName,
+  ) async {
+    final name = await showAppDialog<String>(
+      context: context,
+      builder: (ctx) => ProfileNameDialog(
+        title: t.profile_rename,
+        initialName: currentName,
+        submitLabel: t.dialog_save,
+      ),
+    );
+    if (name != null && name.isNotEmpty) {
+      await vm.renameProfile(id, name);
+    }
+  }
+
+  Future<void> _showDeleteDialog(
+    ProfileViewModel vm,
+    int id,
+    String name,
+  ) async {
+    final confirmed = await showAppDialog<bool>(
+      context: context,
+      builder: (ctx) => ProfileDeleteDialog(
+        profileName: name,
+        onConfirm: () => Navigator.pop(ctx, true),
+      ),
+    );
+    if (confirmed == true) {
+      await vm.deleteProfile(id);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Export / Import（单 Profile JSON）
+  // ---------------------------------------------------------------------------
+
+  void _notify(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(FushiSnackBar(content: Text(message)));
+  }
+
+  /// 文件名安全化：去掉路径分隔符与控制字符，保证可落盘。
+  String _sanitizeFileName(String name) {
+    final String cleaned = safeWindowsFileName(name).trim();
+    return cleaned.isEmpty ? 'profile' : cleaned;
+  }
+
+  Future<void> _exportProfile(
+    ProfileViewModel vm,
+    int profileId,
+    String profileName,
+  ) async {
+    final AppModel appModel = ref.read(appProvider);
+    final String fontsRoot = p.join(appModel.appDirectory.path, 'custom_fonts');
+    String content;
+    try {
+      content = await vm.exportProfile(
+        profileId,
+        fontsRootDirectory: fontsRoot,
+      );
+    } catch (_) {
+      _notify(t.profile_export_failed);
+      return;
+    }
+    if (!mounted) return;
+    await saveOrShareExport(
+      context: context,
+      content: content,
+      // 导入侧按 allowedExtensions: ['json'] 过滤，不认中间这段，所以改名不会
+      // 让用户已导出的 .hibikiprofile.json 变得无法导入。
+      fileName: '${_sanitizeFileName(profileName)}.fushiprofile.json',
+      mimeType: 'application/json',
+      subject: profileName,
+    );
+  }
+
+  Future<void> _importProfile(ProfileViewModel vm) async {
+    final String? path = await pickSystemFilePath(
+      context: context,
+      allowedExtensions: <String>{'json'},
+    );
+    if (path == null) return;
+
+    String json;
+    try {
+      json = await File(path).readAsString();
+    } catch (_) {
+      if (mounted) _notify(t.profile_import_failed);
+      return;
+    }
+
+    try {
+      await vm.importProfile(json);
+      _notify(t.profile_import_success);
+    } on ProfileImportException {
+      // 坏文件 / 魔数不符 / 版本不兼容：DB 未被触碰（事务零破坏）。
+      _notify(t.profile_import_invalid);
+    } catch (_) {
+      _notify(t.profile_import_failed);
+    }
+  }
+}
+
+class _ProfileActionButton extends StatelessWidget {
+  const _ProfileActionButton({
+    required this.materialIcon,
+    required this.cupertinoIcon,
+    required this.tooltip,
+    required this.onPressed,
+    this.destructive = false,
+  });
+
+  final IconData materialIcon;
+  final IconData cupertinoIcon;
+  final String tooltip;
+  final VoidCallback onPressed;
+  final bool destructive;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool cupertino = isCupertinoPlatform(context);
+    // Apple：行内操作字形是强调色（iOS 列表行里的可点图标口径），删除用系统
+    // destructive 红；MD3 维持中性 onSurfaceVariant / error。
+    final bool glass = !cupertino && isGlassDesign(context);
+    final Color color = destructive
+        ? (cupertino
+            ? CupertinoColors.destructiveRed.resolveFrom(context)
+            : glass
+                ? appleColorsOf(context).destructive
+                : Theme.of(context).colorScheme.error)
+        : (cupertino
+            ? CupertinoTheme.of(context).primaryColor
+            : glass
+                ? appleColorsOf(context).accent
+                : Theme.of(context).colorScheme.onSurfaceVariant);
+
+    if (cupertino) {
+      return CupertinoButton(
+        padding: EdgeInsets.zero,
+        minSize: 36,
+        onPressed: onPressed,
+        child: Semantics(
+          button: true,
+          label: tooltip,
+          child: FushiIcon(cupertinoIcon, size: 20, color: color),
+        ),
+      );
+    }
+
+    return FushiIconButton(
+      icon: materialIcon,
+      size: 20,
+      tooltip: tooltip,
+      enabledColor: color,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+      padding: EdgeInsets.zero,
+      onTap: onPressed,
+    );
+  }
+}
+
+@visibleForTesting
+class ProfileDeleteDialog extends StatelessWidget {
+  const ProfileDeleteDialog({
+    required this.profileName,
+    required this.onConfirm,
+    super.key,
+  });
+
+  final String profileName;
+  final VoidCallback onConfirm;
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+
+    return FushiDialogFrame(
+      maxWidth: 420,
+      maxHeightFactor: 0.9,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: tokens.spacing.card,
+        vertical: tokens.spacing.card,
+      ),
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        title: t.profile_delete,
+        leadingIcon: FushiIcons.delete,
+        scrollable: true,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: Text(
+          t.profile_confirm_delete(name: profileName),
+          style: tokens.type.listSubtitle,
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: [
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.pop(context, false),
+              child: Text(t.dialog_close),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              isDestructiveAction: true,
+              onPressed: onConfirm,
+              child: Text(t.profile_delete),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+@visibleForTesting
+class ProfileNameDialog extends StatefulWidget {
+  const ProfileNameDialog({
+    required this.title,
+    required this.initialName,
+    required this.submitLabel,
+    super.key,
+  });
+
+  final String title;
+  final String initialName;
+  final String submitLabel;
+
+  @override
+  State<ProfileNameDialog> createState() => _ProfileNameDialogState();
+}
+
+class _ProfileNameDialogState extends State<ProfileNameDialog> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialName);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+
+    return FushiDialogFrame(
+      maxWidth: 420,
+      maxHeightFactor: 0.9,
+      insetPadding: EdgeInsets.symmetric(
+        horizontal: tokens.spacing.card,
+        vertical: tokens.spacing.card,
+      ),
+      scrollable: false,
+      child: FushiModalSheetFrame(
+        title: widget.title,
+        leadingIcon: FushiIcons.profiles,
+        bodyPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          0,
+          tokens.spacing.card,
+          tokens.spacing.gap,
+        ),
+        footerPadding: EdgeInsets.fromLTRB(
+          tokens.spacing.card,
+          tokens.spacing.gap,
+          tokens.spacing.card,
+          tokens.spacing.card,
+        ),
+        body: FushiTextField(
+          controller: _controller,
+          autofocus: true,
+          hintText: t.profile_name_hint,
+          onSubmitted: (value) => _submit(context, value),
+        ),
+        footer: Wrap(
+          alignment: WrapAlignment.end,
+          spacing: tokens.spacing.gap,
+          runSpacing: tokens.spacing.gap,
+          children: [
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => Navigator.pop(context),
+              child: Text(t.dialog_close),
+            ),
+            adaptiveDialogAction(
+              context: context,
+              onPressed: () => _submit(context, _controller.text),
+              child: Text(widget.submitLabel),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _submit(BuildContext context, String value) {
+    Navigator.pop(context, value.trim());
+  }
+}

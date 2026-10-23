@@ -1,0 +1,112 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+/// PR#914 阻塞②：per-book 统计（`statistics_*.json`）的两条调用点必须与全量 sweep
+/// 一样分通道。
+///
+/// 统计有两条互相独立的通道：聚合快照（sweep，PR#914 已裁）+ per-book
+/// `statistics_*.json`（PR#914 没管）。互联后端**真的实现了**后者
+/// （`InterconnectSyncBackend.updateStatsFile` / `findSyncFileByPrefix(files,
+/// 'statistics_')`），所以「关掉共享统计后 sweep 停了，可每次退出一本书仍把该书统计
+/// PUT 给互联 host 再 merge 回本地」是真实可达的失败路径，且与 sweep 互相打架
+/// （同一份 per-book 统计，sweep 听互联键、退出书听云键）。
+///
+/// 修法与 BUG-1566 的 `interconnect_channel_consumers_test` 同源：消费方一律走
+/// [resolveChannelSyncFlags]，不再各自读单个 `repo.isXxxEnabled()`。本文件用源码扫描
+/// 钉住两个调用点。
+///
+/// 断言用到的生产代码字面量（改名要同步改这里）：
+///   'resolveChannelSyncFlags'      —— 同源分通道门控
+///   'flags.syncStats'              —— per-book 统计必须取自分通道解析结果
+///   'repo.isSyncStatsEnabled()'    —— 云备份一刀切读法，两处都不得再出现
+///   'isInterconnectSyncStatsEnabled' —— 也不得在消费方重抄分通道三元式
+void main() {
+  group('PR#914 ② per-book 统计分通道（源码守卫）', () {
+    test('退出书同步（_runAutoSync）按通道解析统计开关', () {
+      final String body = _functionSource(
+        _readSource('lib/src/sync/sync_auto_trigger.dart'),
+        'Future<void> _runAutoSync({',
+        "    'Auto-sync failed for \$mediaIdentifier',",
+      );
+
+      expect(body, contains('resolveChannelSyncFlags('),
+          reason: '门控必须复用同一份分通道解析，不得在这里重抄');
+      expect(body, contains('syncStats: flags.syncStats'),
+          reason: 'per-book 统计必须取自分通道解析结果');
+      expect(body, isNot(contains('repo.isSyncStatsEnabled()')),
+          reason: '云备份共享开关不得对互联通道的 per-book 统计一刀切（PR#914 ②）');
+      expect(body, isNot(contains('isInterconnectSyncStatsEnabled')),
+          reason: '别在消费方重抄三元式——那正是当年 content 分了、stats 忘了的形状');
+    });
+
+    test('手动「解决冲突并应用」（applySyncCompareChoices）按通道解析统计开关', () {
+      // 应用逻辑已从对话框 State 的 _applyChoices 抽成顶层
+      // applySyncCompareChoices，供设置页对话框与控制通道（`fushi_cli sync
+      // compare`）共用。守卫跟着走两段：对话框必须委托给它，门控断言落在它身上。
+      final String source =
+          _readSource('lib/src/sync/sync_compare_dialog.dart');
+      final String dialogApply = _functionSource(
+        source,
+        '  Future<void> _applyChoices() async {',
+        '  Future<void> _downloadRemoteOnlyFromRow(',
+      );
+      expect(dialogApply, contains('await applySyncCompareChoices('),
+          reason: '对话框的应用必须走共享实现，不得在 State 里另抄一份门控');
+      final String body = _functionSource(
+        source,
+        'Future<SyncCompareApplyResult> applySyncCompareChoices({',
+        'Future<bool> _applyLiveProgressChoice({',
+      );
+
+      expect(body, contains('resolveChannelSyncFlags('),
+          reason: '手动应用与自动同步必须同一份门控');
+      expect(body, contains('flags.syncStats'),
+          reason: 'per-book 统计必须取自分通道解析结果');
+      expect(body, isNot(contains('repo.isSyncStatsEnabled()')),
+          reason: '关掉互联「共享统计」后，手动应用一本书也不得再推该书统计（PR#914 ②）');
+      expect(body, isNot(contains('isInterconnectSyncContentEnabled')),
+          reason: '内容也一并归 resolveChannelSyncFlags，不留手抄三元式');
+    });
+
+    test('互联后端确有 per-book 统计通道（否则本守卫在守一个不存在的路径）', () {
+      final String backend =
+          _readSource('lib/src/sync/interconnect_sync_backend.dart');
+      expect(backend, contains('updateStatsFile'));
+
+      // `statistics_` 前缀的解析在 A2 之后搬进了 WebDavPathBackendMixin（WebDAV 与
+      // 互联 client 共用的三件套）。通道还在，只是不再由单个文件独占——所以断言得
+      // 跟到组合面上，而不是继续扫一个已经不含该字面量的文件。两半都要：后端不
+      // mix in 它就没有这条通道，mixin 不解这个前缀则通道是空的。
+      final int classAt = backend.indexOf('class InterconnectSyncBackend ');
+      expect(classAt, isNonNegative, reason: '类改名了，守卫需更新');
+      final int braceAt = backend.indexOf('{', classAt);
+      expect(braceAt, greaterThan(classAt), reason: '扫不到类头结尾，守卫需更新');
+      expect(backend.substring(classAt, braceAt),
+          contains('WebDavPathBackendMixin'),
+          reason: 'per-book 统计的文件解析由该 mixin 提供，'
+              '后端的 with 列表里没有它 = 这条通道根本不存在');
+
+      final String mixin =
+          _readSource('lib/src/sync/webdav_path_backend_mixin.dart');
+      expect(mixin, contains("findSyncFileByPrefix(files, 'statistics_')"),
+          reason: 'mixin 必须把 statistics_ 前缀解成三件套的 statistics 槽');
+    });
+  });
+}
+
+String _readSource(String relativePath) {
+  final File file = File(relativePath);
+  expect(file.existsSync(), isTrue, reason: '源文件不存在：$relativePath');
+  return file.readAsStringSync().replaceAll('\r\n', '\n');
+}
+
+/// 切出 [start] 到 [end] 之间的函数体。两个标记都必须存在，否则守卫会静默扫空区间、
+/// 让负向断言真空通过（与 `interconnect_channel_consumers_test` 同一范式）。
+String _functionSource(String source, String start, String end) {
+  final int startIndex = source.indexOf(start);
+  expect(startIndex, isNonNegative, reason: '缺起始标记：$start');
+  final int endIndex = source.indexOf(end, startIndex + start.length);
+  expect(endIndex, isNonNegative, reason: '缺结束标记：$end');
+  return source.substring(startIndex, endIndex);
+}

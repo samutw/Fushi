@@ -1,0 +1,1548 @@
+import 'dart:io';
+
+import 'package:drift/drift.dart' hide isNull;
+import 'package:drift/native.dart';
+import 'package:cupertino_ui/cupertino_ui.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/media/sources/reader_fushi_source.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/models/theme_notifier.dart';
+import 'package:fushi/src/reader/reader_settings.dart';
+import 'package:fushi/src/settings/cupertino_settings_renderer.dart';
+import 'package:fushi/src/settings/material_settings_renderer.dart';
+import 'package:fushi/src/settings/settings_context.dart';
+import 'package:fushi/src/settings/settings_detail_page.dart';
+import 'package:fushi/src/settings/settings_destination.dart';
+import 'package:fushi/src/settings/settings_home_page.dart';
+import 'package:fushi/src/settings/settings_schema.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+import '../helpers/test_platform_services.dart';
+
+FushiDatabase _testDb() {
+  return FushiDatabase.forTesting(DatabaseConnection(NativeDatabase.memory()));
+}
+
+SettingsDestination _fixtureDestination() {
+  return SettingsDestination(
+    id: SettingsDestinationId.appearance,
+    title: 'Appearance',
+    icon: Icons.palette_outlined,
+    summary: 'Visual style',
+    sections: <SettingsSection>[
+      SettingsSection(
+        title: 'Controls',
+        items: <SettingsItem>[
+          SettingsNavigationItem(
+            id: 'advanced',
+            title: 'Advanced',
+            icon: Icons.tune_outlined,
+            builder: (_) => const SizedBox.shrink(),
+          ),
+          SettingsNavigationItem(
+            id: 'advanced_with_icon',
+            title: 'Advanced with icon',
+            icon: Icons.settings_suggest_outlined,
+            showIcon: true,
+            builder: (_) => const SizedBox.shrink(),
+          ),
+          SettingsActionItem(
+            id: 'action',
+            title: 'Action',
+            icon: Icons.play_arrow_outlined,
+            onTap: (_) {},
+          ),
+          SettingsSwitchItem(
+            id: 'toggle',
+            title: 'Toggle',
+            icon: Icons.toggle_on_outlined,
+            value: (_) => true,
+            onChanged: (_, __) {},
+          ),
+          SettingsSegmentedItem<String>(
+            id: 'segmented',
+            title: 'Mode',
+            options: <SettingsSegmentOption<String>>[
+              const SettingsSegmentOption<String>(
+                value: 'auto',
+                label: 'Auto',
+                icon: Icons.brightness_auto_outlined,
+              ),
+              const SettingsSegmentOption<String>(
+                value: 'on',
+                label: 'On',
+                icon: Icons.check_outlined,
+              ),
+            ],
+            selected: (_) => 'auto',
+            onChanged: (_, __) {},
+          ),
+          SettingsSliderItem(
+            id: 'slider',
+            title: 'Slider',
+            icon: Icons.linear_scale_outlined,
+            value: (_) => 0.5,
+            divisions: 4,
+            label: (double value) => value.toStringAsFixed(1),
+            onChanged: (_, __) {},
+          ),
+          SettingsStepperItem(
+            id: 'stepper',
+            title: 'Stepper',
+            icon: Icons.exposure_outlined,
+            value: (_) => 2,
+            step: 1,
+            min: 0,
+            max: 4,
+            format: (double value) => value.toStringAsFixed(0),
+            onChanged: (_, __) {},
+          ),
+          SettingsCustomItem(
+            id: 'custom',
+            title: 'Custom',
+            builder: (_) => const Text('Custom builder content'),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+Widget _buildHome(
+  CupertinoThemeData? cupertinoTheme,
+  Widget Function(SettingsContext) builder,
+  TextScaler? textScaler,
+) {
+  Widget child = Consumer(
+    builder: (BuildContext context, WidgetRef ref, _) {
+      return builder(
+        SettingsContext(
+          context: context,
+          appModel: ref.read(appProvider),
+          ref: ref,
+          readerSource: ReaderFushiSource.instance,
+          refresh: () {},
+        ),
+      );
+    },
+  );
+  if (textScaler != null) {
+    final Widget inner = child;
+    child = Builder(
+      builder: (BuildContext context) => MediaQuery(
+        data: MediaQuery.of(context).copyWith(textScaler: textScaler),
+        child: inner,
+      ),
+    );
+  }
+  if (cupertinoTheme != null) {
+    child = CupertinoTheme(data: cupertinoTheme, child: child);
+  }
+  return child;
+}
+
+Widget _harness({
+  required TargetPlatform platform,
+  required Widget Function(SettingsContext) builder,
+  CupertinoThemeData? cupertinoTheme,
+  String designSystem = 'auto',
+  FushiDesignSystemTheme? designSystemTheme,
+  AppModel? appModel,
+  FushiDatabase? database,
+  Map<String, String> extraThemePrefs = const <String, String>{},
+  TextScaler? textScaler,
+}) {
+  final FushiDatabase db = database ?? _testDb();
+  final ThemeNotifier themeNotifier = ThemeNotifier(db, () => const TextTheme())
+    ..loadFromPrefsSnapshot(<String, String>{
+      'design_system': PrefCodec.encode(designSystem),
+      'app_theme_key': PrefCodec.encode('system-theme'),
+      'brightness_mode': PrefCodec.encode('system'),
+      'custom_theme_seed': PrefCodec.encode(0xFF1F4959),
+      ...extraThemePrefs,
+    });
+  final AppModel resolvedAppModel = appModel ?? _RendererTestAppModel();
+  resolvedAppModel.themeNotifier = themeNotifier;
+  addTearDown(() async {
+    themeNotifier.dispose();
+    if (database == null) await db.close();
+  });
+
+  return ProviderScope(
+    overrides: <Override>[
+      appProvider.overrideWith((Ref ref) => resolvedAppModel),
+    ],
+    child: TranslationProvider(
+      child: MaterialApp(
+        theme: ThemeData(
+          useMaterial3: true,
+          platform: platform,
+          colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF386A58)),
+          extensions: <ThemeExtension<dynamic>>[
+            designSystemTheme ??
+                FushiDesignSystemTheme(themeNotifier.designSystemTheme),
+          ],
+        ),
+        home: _buildHome(cupertinoTheme, builder, textScaler),
+      ),
+    ),
+  );
+}
+
+Future<AppModel> _prefsBackedAppModel(
+  FushiDatabase db, {
+  PackageInfo? packageInfo,
+  AppModel? instance,
+}) async {
+  final PreferencesRepository prefsRepo = PreferencesRepository(db);
+  await prefsRepo.loadFromDb();
+  final Directory tempDir = Directory.systemTemp.createTempSync(
+    'fushi_settings_renderer_',
+  );
+  addTearDown(() async {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  final AppModel appModel =
+      instance ??
+      (packageInfo == null
+          ? _RendererTestAppModel()
+          : _VersionedRendererTestAppModel(packageInfo));
+  return appModel
+    ..wireLocalAudioForTesting(prefsRepo: prefsRepo, databaseDirectory: tempDir)
+    ..wireDatabaseForTesting(db);
+}
+
+void main() {
+  // 部分 section（如系统「诊断」）现在默认折叠会把行移出树；这些渲染器测试直查
+  // 具体行，强制全展开以还原折叠前的渲染（见 debugSettingsForceExpandAllSections）。
+  setUp(() => debugSettingsForceExpandAllSections = true);
+  tearDown(() => debugSettingsForceExpandAllSections = false);
+
+  testWidgets('material renderer maps schema to Material controls', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        builder: (SettingsContext settingsContext) {
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: _fixtureDestination(),
+          );
+        },
+      ),
+    );
+
+    expect(find.byType(Scaffold), findsOneWidget);
+    expect(find.byType(AppBar), findsNothing);
+    expect(find.text('Action'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (Widget widget) =>
+            widget is AdaptiveSettingsRow &&
+            widget.title == 'Action' &&
+            widget.icon == Icons.play_arrow_outlined &&
+            widget.showIcon,
+      ),
+      findsOneWidget,
+    );
+    expect(find.byType(Switch), findsOneWidget);
+    expect(find.byIcon(Icons.tune_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.settings_suggest_outlined), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (Widget widget) =>
+            widget is AdaptiveSettingsSwitchRow &&
+            widget.title == 'Toggle' &&
+            widget.icon == Icons.toggle_on_outlined,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate((Widget widget) => widget is SegmentedButton),
+      findsOneWidget,
+    );
+    expect(find.byType(Slider), findsOneWidget);
+    expect(find.text('Stepper'), findsOneWidget);
+    expect(find.text('Custom builder content'), findsOneWidget);
+    expect(find.byType(CupertinoPageScaffold), findsNothing);
+  });
+
+  testWidgets(
+    'material renderer keeps long CJK settings rows bounded at 2x text scale',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(360, 760));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      final SettingsDestination narrowDestination = SettingsDestination(
+        id: SettingsDestinationId.appearance,
+        title: '表示',
+        icon: Icons.palette_outlined,
+        sections: <SettingsSection>[
+          SettingsSection(
+            title: '表示と操作',
+            items: <SettingsItem>[
+              SettingsSwitchItem(
+                id: 'long_toggle',
+                title: '辞書ポップアップを開いたときに現在の単語を自動的に読み上げる',
+                subtitle: '長い日本語の説明文でも右端のスイッチを押し出さない',
+                value: (_) => true,
+                onChanged: (_, __) {},
+              ),
+              SettingsSegmentedItem<String>(
+                id: 'long_segmented',
+                title: '閱讀方向和雙頁顯示模式',
+                subtitle: '選項文字很長時預設下置，必要時水平捲動',
+                options: const <SettingsSegmentOption<String>>[
+                  SettingsSegmentOption<String>(value: 'auto', label: '自動判定'),
+                  SettingsSegmentOption<String>(
+                    value: 'vertical',
+                    label: '縦書き優先',
+                  ),
+                  SettingsSegmentOption<String>(
+                    value: 'spread',
+                    label: '見開きページ表示',
+                  ),
+                ],
+                selected: (_) => 'auto',
+                onChanged: (_, __) {},
+              ),
+              SettingsSliderItem(
+                id: 'long_slider',
+                title: 'インターフェイスの表示倍率',
+                subtitle: '大きい文字でもスライダーは下段で全幅を使う',
+                value: (_) => 1.2,
+                min: 0.5,
+                max: 2,
+                divisions: 15,
+                label: (_) => '120%',
+                onChanged: (_, __) {},
+              ),
+              SettingsCustomItem(
+                id: 'long_picker',
+                title: '既定の単語帳',
+                builder: (_) => AdaptiveSettingsPickerRow<String>(
+                  title: '既定の単語帳',
+                  subtitle: '短い選択肢は行内ドロップダウンのまま親幅に合わせて縮む',
+                  selected: 'deck_a',
+                  options: const <AdaptiveSettingsPickerOption<String>>[
+                    AdaptiveSettingsPickerOption<String>(
+                      value: 'deck_a',
+                      label: '日本語学習・長文カード',
+                    ),
+                    AdaptiveSettingsPickerOption<String>(
+                      value: 'deck_b',
+                      label: '読書メモ',
+                    ),
+                  ],
+                  onChanged: (_) {},
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _harness(
+          platform: TargetPlatform.android,
+          textScaler: const TextScaler.linear(2),
+          builder: (SettingsContext settingsContext) {
+            return SizedBox(
+              width: 320,
+              child: MaterialSettingsRenderer().buildDetailContent(
+                settingsContext: settingsContext,
+                destination: narrowDestination,
+              ),
+            );
+          },
+        ),
+      );
+      await tester.pump();
+
+      expect(
+        tester.takeException(),
+        isNull,
+        reason:
+            'renderer output must not overflow narrow 2x-text settings panes',
+      );
+      expect(find.byType(Switch), findsOneWidget);
+      // MD3 重设计（Android 16 设置）：长选项 / 窄行放不下分段控件时不再横向
+      // 滚动分段条，而是退回「当前值写进说明行、点整行弹菜单」的选择行
+      // （settingsChoiceUsesSegments 判据）。契约不变：选项仍可达且不溢出。
+      expect(
+        find.byWidgetPredicate(
+          (Widget widget) => widget is SettingsChoiceMenuRow,
+        ),
+        findsOneWidget,
+        reason: '长 CJK 选项在窄行 2x 字号下退回菜单选择行',
+      );
+      expect(find.byType(Slider), findsOneWidget);
+      expect(find.byType(DropdownMenu<int>), findsOneWidget);
+    },
+  );
+
+  testWidgets('cupertino renderer maps schema to Cupertino controls', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        designSystemTheme: const FushiDesignSystemTheme(
+          FushiDesignSystem.cupertino,
+        ),
+        builder: (SettingsContext settingsContext) {
+          return CupertinoSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: _fixtureDestination(),
+          );
+        },
+      ),
+    );
+
+    expect(find.byType(CupertinoPageScaffold), findsOneWidget);
+    expect(find.byType(CupertinoSliverNavigationBar), findsOneWidget);
+    expect(find.byType(AdaptiveSettingsSection), findsOneWidget);
+    expect(find.text('Action'), findsOneWidget);
+    expect(find.byIcon(Icons.play_arrow_outlined), findsNothing);
+    expect(find.byType(CupertinoSwitch), findsOneWidget);
+    expect(find.byIcon(Icons.tune_outlined), findsNothing);
+    expect(find.byIcon(Icons.settings_suggest_outlined), findsOneWidget);
+    expect(find.byIcon(Icons.toggle_on_outlined), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (Widget widget) => widget is CupertinoSlidingSegmentedControl,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.byWidgetPredicate((Widget widget) => widget is SegmentedButton),
+      findsNothing,
+    );
+    expect(find.byType(CupertinoSlider), findsOneWidget);
+    expect(find.text('Stepper'), findsOneWidget);
+    expect(find.text('Custom builder content'), findsOneWidget);
+  });
+
+  testWidgets('material design system keeps Material rows on iOS', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        designSystem: 'material',
+        builder: (SettingsContext settingsContext) {
+          expect(isCupertinoPlatform(settingsContext.context), isFalse);
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: _fixtureDestination(),
+          );
+        },
+      ),
+    );
+
+    expect(find.byType(Scaffold), findsOneWidget);
+    expect(
+      find.byWidgetPredicate((Widget widget) => widget is SegmentedButton),
+      findsOneWidget,
+    );
+    expect(find.byType(CupertinoPageScaffold), findsNothing);
+    expect(find.byType(CupertinoSlidingSegmentedControl<String>), findsNothing);
+  });
+
+  testWidgets('cupertino switch uses theme primary color', (
+    WidgetTester tester,
+  ) async {
+    const Color customPrimary = Color(0xFFE91E63);
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        cupertinoTheme: const CupertinoThemeData(primaryColor: customPrimary),
+        designSystemTheme: const FushiDesignSystemTheme(
+          FushiDesignSystem.cupertino,
+        ),
+        builder: (SettingsContext settingsContext) {
+          return CupertinoSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: _fixtureDestination(),
+          );
+        },
+      ),
+    );
+
+    final CupertinoSwitch sw = tester.widget<CupertinoSwitch>(
+      find.byType(CupertinoSwitch),
+    );
+    expect(sw.activeTrackColor, customPrimary);
+  });
+
+  testWidgets('cupertino destination icons use theme primary color', (
+    WidgetTester tester,
+  ) async {
+    const Color customPrimary = Color(0xFFE91E63);
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        cupertinoTheme: const CupertinoThemeData(primaryColor: customPrimary),
+        designSystemTheme: const FushiDesignSystemTheme(
+          FushiDesignSystem.cupertino,
+        ),
+        builder: (SettingsContext settingsContext) {
+          return CupertinoSettingsRenderer().buildDestinationList(
+            settingsContext: settingsContext,
+            destinations: <SettingsDestination>[_fixtureDestination()],
+            selectedDestinationId: SettingsDestinationId.appearance,
+            onDestinationSelected: (_) {},
+          );
+        },
+      ),
+    );
+
+    final Icon icon = tester.widget<Icon>(find.byIcon(Icons.palette_outlined));
+    expect(icon.color, customPrimary);
+  });
+
+  testWidgets('material master-detail destinations use fixed groups with '
+      'pill selection', (WidgetTester tester) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        builder: (SettingsContext settingsContext) {
+          return MaterialSettingsRenderer().buildDestinationList(
+            settingsContext: settingsContext,
+            destinations: <SettingsDestination>[
+              _fixtureDestination(),
+              const SettingsDestination(
+                id: SettingsDestinationId.video,
+                title: 'Video',
+                icon: Icons.movie_outlined,
+                sections: <SettingsSection>[],
+              ),
+            ],
+            selectedDestinationId: SettingsDestinationId.appearance,
+            onDestinationSelected: (_) {},
+            pushRoutes: false,
+          );
+        },
+      ),
+    );
+
+    // MD3 Expressive 重设计（Android 16 平板设置）：宽屏左栏是导航抽屉式
+    // Md3SettingsNavList / Md3SettingsNavRow（选中 = secondaryContainer 全圆角
+    // 胶囊），不再是 AdaptiveSettingsSection + FushiListItem(pill)。契约不变：
+    // 固定分组（组标题）、当前项胶囊选中、行尾没有 chevron。
+    expect(find.byType(Md3SettingsNavList), findsOneWidget);
+    expect(find.text(t.settings_group_interface), findsOneWidget);
+    expect(find.text(t.settings_group_content), findsOneWidget);
+    expect(find.widgetWithText(Md3SettingsNavRow, 'Video'), findsOneWidget);
+    final Md3SettingsNavRow selectedRow = tester.widget<Md3SettingsNavRow>(
+      find.widgetWithText(Md3SettingsNavRow, 'Appearance'),
+    );
+    expect(selectedRow.selected, isTrue);
+    expect(
+      tester
+          .widget<Md3SettingsNavRow>(
+            find.widgetWithText(Md3SettingsNavRow, 'Video'),
+          )
+          .selected,
+      isFalse,
+    );
+    final BuildContext rowContext = tester.element(
+      find.widgetWithText(Md3SettingsNavRow, 'Appearance'),
+    );
+    final Material pill = tester.widget<Material>(
+      find
+          .descendant(
+            of: find.widgetWithText(Md3SettingsNavRow, 'Appearance'),
+            matching: find.byType(Material),
+          )
+          .first,
+    );
+    expect(pill.shape, isA<StadiumBorder>(), reason: '选中项是全圆角胶囊');
+    expect(pill.color, Theme.of(rowContext).colorScheme.secondaryContainer);
+    expect(find.byIcon(Icons.chevron_right), findsNothing);
+  });
+
+  testWidgets(
+    'material push destination list rows sit in group cards and open details',
+    (WidgetTester tester) async {
+      SettingsDestinationId? tapped;
+      await tester.pumpWidget(
+        _harness(
+          platform: TargetPlatform.android,
+          builder: (SettingsContext settingsContext) {
+            return MaterialSettingsRenderer().buildDestinationList(
+              settingsContext: settingsContext,
+              destinations: <SettingsDestination>[_fixtureDestination()],
+              selectedDestinationId: SettingsDestinationId.appearance,
+              onDestinationSelected: (SettingsDestinationId id) => tapped = id,
+            );
+          },
+        ),
+      );
+
+      // MD3 重设计（Android 16 设置，用户 2026-10-04）：窄屏 push 列表的行
+      // = 单色图标 + 标题，不再画选中填充与 chevron（push 列表没有「当前项」，
+      // 点进去就是详情页）。契约：分类仍在分组卡里、可点、点了 push 详情页。
+      expect(find.byType(AdaptiveSettingsSection), findsOneWidget);
+      final FushiListItem item = tester.widget<FushiListItem>(
+        find.widgetWithText(FushiListItem, 'Appearance'),
+      );
+      expect(item.leading, isA<Widget>(), reason: '分类行带图标');
+      expect(item.onTap, isA<Function>(), reason: '分类行可点进详情');
+      // 只验证点击把分类交给选择回调（push 的详情页需要完整 app 上下文才能
+      // 构建，这里不 pump 它）。
+      item.onTap!();
+      expect(tapped, SettingsDestinationId.appearance);
+    },
+  );
+
+  testWidgets('settings schema keeps icons on destinations', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        builder: (SettingsContext settingsContext) {
+          final List<SettingsDestination> destinations = buildSettingsSchema(
+            settingsContext,
+          );
+          final List<String> missingDestinationIcons = <String>[];
+          for (final SettingsDestination destination in destinations) {
+            if (destination.icon == Icons.help_outline) {
+              missingDestinationIcons.add(destination.id.name);
+            }
+          }
+
+          expect(missingDestinationIcons, isEmpty);
+          return const SizedBox.shrink();
+        },
+      ),
+    );
+  });
+
+  testWidgets('system settings exposes the runtime app version', (
+    WidgetTester tester,
+  ) async {
+    final FushiDatabase db = _testDb();
+    addTearDown(db.close);
+    final AppModel appModel = await _prefsBackedAppModel(
+      db,
+      packageInfo: PackageInfo(
+        appName: 'Fushi',
+        packageName: 'jp.fushi.test',
+        version: '9.8.7',
+        buildNumber: '654',
+      ),
+    );
+
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        database: db,
+        appModel: appModel,
+        builder: (SettingsContext settingsContext) {
+          final SettingsDestination system =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.system,
+              );
+          final List<SettingsItem> versionItems = system.sections
+              .expand((SettingsSection section) => section.items)
+              .where((SettingsItem item) => item.id == 'system.app_version')
+              .toList(growable: false);
+          final SettingsDestination versionOnly = SettingsDestination(
+            id: system.id,
+            title: system.title,
+            icon: system.icon,
+            sections: <SettingsSection>[SettingsSection(items: versionItems)],
+          );
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: versionOnly,
+          );
+        },
+      ),
+    );
+
+    expect(find.text('App version'), findsOneWidget);
+    // TODO-772: versionName 与 versionCode 用括号并列展示，不再用 semver `+`
+    // 把 versionCode 拼进 versionName（旧 `9.8.7+654` 会渲染畸形版本号）。
+    expect(find.text('9.8.7 (654)'), findsOneWidget);
+    expect(find.text('9.8.7+654'), findsNothing);
+    expect(
+      find.byWidgetPredicate(
+        (Widget widget) =>
+            widget is AdaptiveSettingsRow &&
+            widget.title == 'App version' &&
+            widget.subtitle == '9.8.7 (654)' &&
+            widget.onTap == null,
+      ),
+      findsOneWidget,
+      reason: 'version must be displayed as a read-only settings row',
+    );
+  });
+
+  test('system app version row is sourced from runtime PackageInfo', () {
+    final String source = File(
+      'lib/src/settings/settings_schema_system.dart',
+    ).readAsStringSync();
+
+    expect(source, contains("id: 'system.app_version'"));
+    expect(source, contains('settingsContext.appModel.packageInfo'));
+    expect(source, isNot(contains('pubspec.yaml')));
+  });
+
+  testWidgets('pushed settings detail refreshes dynamic log row counts', (
+    WidgetTester tester,
+  ) async {
+    final FushiDatabase db = _testDb();
+    addTearDown(db.close);
+    final AppModel appModel = await _prefsBackedAppModel(db);
+    await ErrorLogService.instance.clear();
+    addTearDown(() => ErrorLogService.instance.clear());
+    ErrorLogService.instance.log('SettingsDetailPage.test', 'boom');
+
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        database: db,
+        appModel: appModel,
+        builder: (SettingsContext settingsContext) {
+          final SettingsDestination system =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.system,
+              );
+          return SettingsDetailPage(destination: system);
+        },
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Error Log (1)'), findsOneWidget);
+
+    await ErrorLogService.instance.clear();
+    await tester.pumpAndSettle();
+
+    expect(find.text('Error Log (1)'), findsNothing);
+    expect(find.text('Error Log (0)'), findsOneWidget);
+  });
+
+  // TODO-323: 自动/自定义不再是独立全权重行，而是「界面大小」标题行尾的内联切换；
+  // 自动模式不再渲染无用滑条，只读展示当前自动百分比。
+  Widget interfaceSettingsHarness({
+    Map<String, String> extraThemePrefs = const <String, String>{},
+  }) {
+    return _harness(
+      platform: TargetPlatform.android,
+      extraThemePrefs: extraThemePrefs,
+      builder: (SettingsContext settingsContext) {
+        final SettingsDestination appearance =
+            buildSettingsSchema(settingsContext).firstWhere(
+              (SettingsDestination destination) =>
+                  destination.id == SettingsDestinationId.appearance,
+            );
+        final SettingsDestination interfaceOnly = SettingsDestination(
+          id: appearance.id,
+          title: appearance.title,
+          icon: appearance.icon,
+          sections: <SettingsSection>[appearance.sections.first],
+        );
+        return MaterialSettingsRenderer().buildDetailPage(
+          settingsContext: settingsContext,
+          destination: interfaceOnly,
+        );
+      },
+    );
+  }
+
+  testWidgets(
+    'TODO-374: app UI size has no auto/custom toggle, only the slider',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        interfaceSettingsHarness(
+          extraThemePrefs: <String, String>{
+            'app_ui_scale': PrefCodec.encode(1.5),
+          },
+        ),
+      );
+
+      // 界面大小已无模式概念：不存在任何 auto/custom 分段切换行（标题为界面大小的
+      // AdaptiveSettingsSegmentedRow）。
+      expect(
+        find.byWidgetPredicate(
+          (Widget widget) =>
+              widget is AdaptiveSettingsSegmentedRow<String> &&
+              widget.title == t.app_ui_scale,
+        ),
+        findsNothing,
+        reason: 'TODO-374 删除了界面大小的自动/自定义模式切换',
+      );
+
+      // 恒渲染一条可拖的具体百分比滑条。
+      expect(
+        find.byWidgetPredicate(
+          (Widget widget) =>
+              widget is AdaptiveSettingsSliderRow &&
+              widget.title == t.app_ui_scale &&
+              widget.value == 1.5 &&
+              widget.min == 0.3 &&
+              widget.max == 3.0 &&
+              widget.divisions == 27,
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('lookup settings can edit the Yomitan API key', (
+    WidgetTester tester,
+  ) async {
+    final FushiDatabase db = _testDb();
+    addTearDown(db.close);
+    final _YomitanRendererTestAppModel appModel =
+        _YomitanRendererTestAppModel();
+    await _prefsBackedAppModel(db, instance: appModel);
+    await appModel.setFushiApiServerEnabled(true);
+
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        database: db,
+        appModel: appModel,
+        builder: (SettingsContext settingsContext) {
+          final SettingsDestination lookup =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.lookup,
+              );
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: lookup,
+          );
+        },
+      ),
+    );
+
+    final Finder field = find.descendant(
+      of: find.widgetWithText(AdaptiveSettingsRow, t.fushi_api_key),
+      matching: find.byType(TextFormField),
+    );
+    expect(field, findsOneWidget);
+    final EditableText editable = tester.widget<EditableText>(
+      find.descendant(of: field, matching: find.byType(EditableText)),
+    );
+    expect(editable.obscureText, isTrue);
+
+    await tester.enterText(field, 'mpv-token');
+    await tester.pump(const Duration(milliseconds: 600));
+    await tester.pumpAndSettle();
+
+    expect(appModel.fushiApiKey, 'mpv-token');
+    final PreferencesRepository reloaded = PreferencesRepository(db);
+    await reloaded.loadFromDb();
+    expect(reloaded.fushiApiKey, 'mpv-token');
+    expect(appModel.serverStops, 1);
+    expect(appModel.serverStarts, 1);
+  });
+
+  testWidgets('lookup settings exposes lookup audio volume slider', (
+    WidgetTester tester,
+  ) async {
+    final FushiDatabase db = _testDb();
+    addTearDown(db.close);
+    final AppModel appModel = await _prefsBackedAppModel(db);
+    final ReaderSettings readerSettings = ReaderSettings(db);
+    await readerSettings.refreshFromDb();
+    ReaderFushiSource.readerSettings = readerSettings;
+    addTearDown(() => ReaderFushiSource.readerSettings = null);
+
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        database: db,
+        appModel: appModel,
+        builder: (SettingsContext settingsContext) {
+          final SettingsDestination lookup =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.lookup,
+              );
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: lookup,
+          );
+        },
+      ),
+    );
+
+    Finder sliderFinder() => find.byWidgetPredicate(
+      (Widget widget) =>
+          widget is AdaptiveSettingsSliderRow &&
+          widget.title == t.lookup_audio_volume,
+    );
+
+    // 行内带实时百分比读数（与有声书音量行同款）；row.title 保持裸标题作身份。
+    // MD3 重设计后读数常驻在滑条右侧读数槽，不再拼进标题。
+    expect(find.text(t.lookup_audio_volume), findsOneWidget);
+    expect(find.text('100%'), findsOneWidget);
+    expect(sliderFinder(), findsOneWidget);
+    AdaptiveSettingsSliderRow row = tester.widget<AdaptiveSettingsSliderRow>(
+      sliderFinder(),
+    );
+    expect(row.value, 100);
+    expect(row.min, 0);
+    expect(row.max, 100);
+    expect(
+      row.divisions,
+      100,
+      reason: '0–100% 共 100 档 = 拖动 1% 一档（旧 20 档 = 5% 太粗）',
+    );
+    expect(row.step, 5, reason: '键盘/手柄左右键 5% 一步，与拖动档位解耦');
+    expect(row.readout, '100%');
+    expect(row.label, '100%');
+
+    // 27a62a0（commitOnRelease）：拖动只跟手预览，不逐 tick 写穿——否则每帧写库
+    // + 推正文 WebView 重注样式；松手 onChangeEnd 才一次性提交。
+    row.onChanged(35);
+    await tester.pump();
+    expect(
+      ReaderFushiSource.instance.lookupAudioVolume,
+      100,
+      reason: '拖动期间不得写穿查词音量',
+    );
+    row = tester.widget<AdaptiveSettingsSliderRow>(sliderFinder());
+    expect(row.value, 35, reason: '滑条显示跟手到本地拖动值');
+
+    row.onChangeEnd!(35);
+    await tester.pump();
+
+    expect(ReaderFushiSource.instance.lookupAudioVolume, 35);
+  });
+
+  testWidgets('app UI scale slider commits only on drag end, not during drag', (
+    WidgetTester tester,
+  ) async {
+    late AppModel appModel;
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        // TODO-374: 滑条恒渲染；以一个具体值起步即可驱动其拖动语义。
+        extraThemePrefs: <String, String>{
+          'app_ui_scale': PrefCodec.encode(1.0),
+        },
+        builder: (SettingsContext settingsContext) {
+          appModel = settingsContext.appModel;
+          final SettingsDestination appearance =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.appearance,
+              );
+          final SettingsDestination interfaceOnly = SettingsDestination(
+            id: appearance.id,
+            title: appearance.title,
+            icon: appearance.icon,
+            sections: <SettingsSection>[appearance.sections.first],
+          );
+          return MaterialSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: interfaceOnly,
+          );
+        },
+      ),
+    );
+
+    AdaptiveSettingsSliderRow row() => tester.widget<AdaptiveSettingsSliderRow>(
+      find.byType(AdaptiveSettingsSliderRow),
+    );
+
+    expect(appModel.appUiScale, 1.0);
+
+    // 拖动中：onChanged 只更新本地显示值，绝不提交真实缩放——否则全局
+    // FushiAppUiScale 的 Transform 会实时重排，滑块在手指下被缩放位移导致
+    // 拖动断裂（本次修复的根因）。
+    row().onChanged(2.0);
+    await tester.pump();
+    expect(appModel.appUiScale, 1.0, reason: '拖动期间不得提交真实缩放');
+    expect(row().value, 2.0, reason: '滑条显示跟手到本地拖动值');
+
+    // 松手：onChangeEnd 一次性提交真实缩放并回落到已提交值。
+    row().onChangeEnd!(2.0);
+    await tester.pump();
+    expect(appModel.appUiScale, 2.0, reason: '松手提交真实缩放');
+    expect(row().value, 2.0);
+  });
+
+  testWidgets('appearance custom rows omit Cupertino leading icons', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        designSystemTheme: const FushiDesignSystemTheme(
+          FushiDesignSystem.cupertino,
+        ),
+        builder: (SettingsContext settingsContext) {
+          final SettingsDestination appearance =
+              buildSettingsSchema(settingsContext).firstWhere(
+                (SettingsDestination destination) =>
+                    destination.id == SettingsDestinationId.appearance,
+              );
+          final SettingsDestination firstSectionOnly = SettingsDestination(
+            id: appearance.id,
+            title: appearance.title,
+            icon: appearance.icon,
+            sections: <SettingsSection>[appearance.sections.first],
+          );
+
+          return CupertinoSettingsRenderer().buildDetailPage(
+            settingsContext: settingsContext,
+            destination: firstSectionOnly,
+          );
+        },
+      ),
+    );
+
+    expect(find.byIcon(Icons.devices_outlined), findsNothing);
+    expect(find.byIcon(Icons.color_lens_outlined), findsNothing);
+    expect(find.byIcon(Icons.contrast_outlined), findsNothing);
+  });
+
+  test('settings renderers route schema rows through shared component', () {
+    final String material = File(
+      'lib/src/settings/material_settings_renderer.dart',
+    ).readAsStringSync();
+    final String cupertino = File(
+      'lib/src/settings/cupertino_settings_renderer.dart',
+    ).readAsStringSync();
+    // schema section/item/footer 的渲染收口在共享 settings_schema_widgets，行控件
+    // 全部走 settings_shared 的自适应组件（不再两个渲染器各复制一份）。
+    final String shared = File(
+      'lib/src/settings/settings_schema_widgets.dart',
+    ).readAsStringSync();
+
+    expect(shared, contains('AdaptiveSettingsNavigationRow('));
+    for (final String row in <String>[
+      'AdaptiveSettingsRow(',
+      'AdaptiveSettingsSwitchRow(',
+      'AdaptiveSettingsSegmentedRow<',
+      'AdaptiveSettingsSliderRow(',
+      'AdaptiveSettingsStepperRow(',
+    ]) {
+      expect(shared, contains(row));
+    }
+
+    // 两渲染器复用共享 SettingsSchemaSection/Item，不再各自渲染行。
+    for (final String src in <String>[material, cupertino]) {
+      expect(src, contains('SettingsSchemaSection('));
+      expect(src, contains('SettingsSchemaItem('));
+    }
+
+    // segmented 派发用类型安全的 SettingsSegmentedItem.dispatchChange（在共享 widget
+    // 里），renderer / 共享文件都不再用 `(segmented as dynamic).onChanged` 绕过泛型逆变。
+    expect(shared, contains('.dispatchChange('));
+    for (final String src in <String>[material, cupertino, shared]) {
+      expect(src, isNot(contains('as dynamic).onChanged')));
+      expect(src, isNot(contains('segmented.onChanged as Function')));
+      expect(
+        src,
+        isNot(contains('SettingsNavigationItem navigation => _navigation')),
+      );
+    }
+    final String destination = File(
+      'lib/src/settings/settings_destination.dart',
+    ).readAsStringSync();
+    expect(
+      destination,
+      contains('dispatchChange('),
+      reason: 'SettingsSegmentedItem 应提供类型安全的 dispatchChange 方法',
+    );
+  });
+
+  // 回归：改 String 型 segmented 设置时，渲染器派发处把 SettingsSegmentedItem
+  // <String> 经 `as SettingsSegmentedItem<Object>` 转型，闭包静态读
+  // `segmented.onChanged` 会因函数参数逆变抛 _TypeError（书写方向/视图模式/振
+  // 假名等改一下就崩）。两个渲染器都用 dynamic 调用绕开。
+  SettingsDestination segmentedFixture(void Function(String) onValue) {
+    return SettingsDestination(
+      id: SettingsDestinationId.appearance,
+      title: 'Appearance',
+      icon: Icons.palette_outlined,
+      sections: <SettingsSection>[
+        SettingsSection(
+          items: <SettingsItem>[
+            SettingsSegmentedItem<String>(
+              id: 'mode',
+              title: 'Mode',
+              options: const <SettingsSegmentOption<String>>[
+                SettingsSegmentOption<String>(value: 'auto', label: 'Auto'),
+                SettingsSegmentOption<String>(value: 'on', label: 'On'),
+              ],
+              selected: (_) => 'auto',
+              onChanged: (_, String value) => onValue(value),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  testWidgets('material segmented change fires onChanged without _TypeError', (
+    WidgetTester tester,
+  ) async {
+    String received = '';
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.android,
+        builder: (SettingsContext sctx) =>
+            MaterialSettingsRenderer().buildDetailPage(
+              settingsContext: sctx,
+              destination: segmentedFixture((String v) => received = v),
+            ),
+      ),
+    );
+    await tester.tap(find.text('On'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.takeException(),
+      isNull,
+      reason: '改 String 型 segmented 设置不得抛 _TypeError',
+    );
+    expect(received, 'on', reason: 'onChanged 必须以正确的 String 值触发');
+  });
+
+  testWidgets('cupertino segmented change fires onChanged without _TypeError', (
+    WidgetTester tester,
+  ) async {
+    String received = '';
+    await tester.pumpWidget(
+      _harness(
+        platform: TargetPlatform.iOS,
+        designSystemTheme: const FushiDesignSystemTheme(
+          FushiDesignSystem.cupertino,
+        ),
+        builder: (SettingsContext sctx) =>
+            CupertinoSettingsRenderer().buildDetailPage(
+              settingsContext: sctx,
+              destination: segmentedFixture((String v) => received = v),
+            ),
+      ),
+    );
+    await tester.tap(find.text('On'));
+    await tester.pumpAndSettle();
+    expect(
+      tester.takeException(),
+      isNull,
+      reason: '改 String 型 segmented 设置不得抛 _TypeError',
+    );
+    expect(received, 'on', reason: 'onChanged 必须以正确的 String 值触发');
+  });
+
+  // BUG-009 R1：宽屏 master-detail 的 primary 是有限高度的 Expanded；cupertino
+  // 详情过去返回裸 Column，内容超高 → RenderFlex 溢出（真机右下角黄黑条纹）。
+  // 详情必须像 Material 渲染器一样自带滚动视口。
+  testWidgets(
+    'BUG-009: cupertino detail content scrolls in a bounded pane instead of '
+    'overflowing',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        _harness(
+          platform: TargetPlatform.iOS,
+          designSystemTheme: const FushiDesignSystemTheme(
+            FushiDesignSystem.cupertino,
+          ),
+          builder: (SettingsContext settingsContext) {
+            // 模拟宽屏 primary：固定矮高度面板，内容远超其高度。
+            return Align(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                height: 250,
+                width: 600,
+                child: const CupertinoSettingsRenderer().buildDetailContent(
+                  settingsContext: settingsContext,
+                  destination: _fixtureDestination(),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: 'cupertino 详情在有限高度面板里必须可滚动，不得 RenderFlex 溢出（BUG-009 R1）',
+      );
+      // 详情自身提供可滚动视口（宽屏 primary 与 reader 设置弹窗都复用此路径）。
+      expect(find.byType(Scrollable), findsWidgets);
+    },
+  );
+
+  // BUG-009 R2：Windows 桌面把外观切到 iOS(Cupertino) 后，设置标签曾退化成
+  // 「3 图标 rail + 嵌入 Cupertino 设置」三栏混排、无返回出口、详情溢出。修复后
+  // cupertino 桌面复用 Material 全屏外壳：宽屏二栏 + 顶部返回箭头出口，不溢出。
+  testWidgets(
+    'BUG-009 R2: cupertino desktop embedded settings expose a back-arrow exit '
+    'and do not overflow',
+    (WidgetTester tester) async {
+      // 默认选中分类改为「外观」后，首屏详情会渲染读 prefsRepo 的开关行
+      //（反转导航栏/启动词典 tab），故 harness 需要 prefs-backed AppModel
+      //（轻量 _RendererTestAppModel 无 prefsRepo 会空指针）。
+      final FushiDatabase db = _testDb();
+      addTearDown(db.close);
+      final AppModel appModel = await _prefsBackedAppModel(db);
+      await tester.pumpWidget(
+        _harness(
+          // 复现用户场景：Windows 主机 + 外观强制 iOS(Cupertino) 覆盖。
+          platform: TargetPlatform.windows,
+          designSystemTheme: const FushiDesignSystemTheme(
+            FushiDesignSystem.cupertino,
+          ),
+          appModel: appModel,
+          builder: (SettingsContext _) =>
+              SettingsHomePage(embedded: true, onBack: () {}),
+        ),
+      );
+      await tester.pump();
+
+      expect(
+        tester.takeException(),
+        isNull,
+        reason: 'cupertino 桌面嵌入设置不得 RenderFlex 溢出（BUG-009）',
+      );
+      // 退化态完全没有出口；修复后必须有返回箭头（由统一嵌入页头提供）。
+      expect(
+        find.byIcon(Icons.arrow_back),
+        findsOneWidget,
+        reason: 'cupertino 桌面全屏设置必须提供返回箭头出口（BUG-009 R2）',
+      );
+    },
+  );
+
+  // BUG-3039：底部导航直达的根设置页没有返回出口，标题上方不能空一整行。
+  // 2026-10 settings kit：窄屏页头换成 M3E 浮动页头（返回 + 标题胶囊，随滚动
+  // 收缩）。根页标题直接在页头一行里、无返回钮；带返回出口的设置在同一行左侧
+  // 出返回钮。
+  for (final bool root in <bool>[true, false]) {
+    testWidgets(
+      'M3E narrow settings home: floating header ${root ? 'without' : 'with'} '
+      'a back button',
+      (WidgetTester tester) async {
+        await tester.binding.setSurfaceSize(const Size(400, 800));
+        addTearDown(() => tester.binding.setSurfaceSize(null));
+        final FushiDatabase db = _testDb();
+        addTearDown(db.close);
+        final AppModel appModel = await _prefsBackedAppModel(db);
+        await tester.pumpWidget(
+          _harness(
+            platform: TargetPlatform.android,
+            appModel: appModel,
+            builder: (SettingsContext _) =>
+                SettingsHomePage(onBack: root ? null : () {}),
+          ),
+        );
+        await tester.pump();
+
+        expect(
+          find.byKey(const ValueKey<String>('settings_home_header')),
+          findsOneWidget,
+        );
+        final Finder title = find.text(t.settings);
+        expect(title, findsWidgets);
+        expect(
+          tester.getTopLeft(title.first).dy,
+          lessThan(kToolbarHeight),
+          reason: '标题就在页头这一行，上方没有空行',
+        );
+        // 浮动页头的返回钮走语义图标 FushiIcons.back（765b65f 页头图标迁移）。
+        expect(
+          find.descendant(
+            of: find.byKey(const ValueKey<String>('settings_home_header')),
+            matching: find.byIcon(FushiIcons.back),
+          ),
+          root ? findsNothing : findsOneWidget,
+        );
+      },
+    );
+  }
+
+  // 宽屏设置在**第一帧**就已经选中并渲染了 destinations.first（= 外观）的详情
+  // 面板：settings_home_page.dart 在 _selectedDestinationId 为 null 时无条件落到
+  // destinations.first.id，material_settings_renderer 的 `selected:` 也不区分窄/
+  // 宽屏。
+  //
+  // 这条事实是 integration_test/navigation_stability_test.dart 的地雷：任何形如
+  // 「外观这一行被高亮」/「外观的详情面板存在」的等待条件，在 activate() 什么都
+  // 没做的情况下同样成立，整条外观用例会退化成「这一行存在且能聚焦」。那边因此
+  // 必须先把选中项挪走、再要求「打开前目标不在显示」。这里把机制钉住：哪天默认
+  // 预选被改掉，这条会红，届时那边的 priming 才可以撤。
+  testWidgets(
+    'wide settings preselects and renders destinations.first before any '
+    'navigation (why navigation_stability primes the selection)',
+    (WidgetTester tester) async {
+      final FushiDatabase db = _testDb();
+      addTearDown(db.close);
+      final AppModel appModel = await _prefsBackedAppModel(db);
+      SettingsContext? captured;
+      await tester.pumpWidget(
+        _harness(
+          // 默认 800x600 测试画布 > 720，走宽屏二栏（settings_home_page.dart 的
+          // `wide = constraints.maxWidth >= 720`）。
+          platform: TargetPlatform.windows,
+          appModel: appModel,
+          builder: (SettingsContext settingsContext) {
+            captured = settingsContext;
+            return SettingsHomePage(embedded: true, onBack: () {});
+          },
+        ),
+      );
+      await tester.pump();
+
+      final SettingsContext? settingsContext = captured;
+      if (settingsContext == null) fail('settings harness did not build');
+      final SettingsDestination first = buildSettingsSchema(
+        settingsContext,
+      ).first;
+      expect(
+        first.id,
+        SettingsDestinationId.appearance,
+        reason: 'schema 第一项变了的话，下面两条与 itest 的 priming 都要重估',
+      );
+
+      // ① 详情面板身份：第一帧就是 destinations.first 的面板，没有任何导航发生。
+      // 左栏导航行也以同一个 destination id 作 key，这里只认详情面板的
+      // KeyedSubtree。
+      expect(
+        find.byWidgetPredicate(
+          (Widget widget) =>
+              widget is KeyedSubtree &&
+              widget.key == ValueKey<SettingsDestinationId>(first.id),
+        ),
+        findsOneWidget,
+        reason: '宽屏首帧就渲染了第一分类的详情面板 —— 「面板存在」本身不构成导航证据',
+      );
+
+      // ② 行高亮：第一帧就为 true，所以「这一行 selected」更不是导航证据。
+      final Finder firstRow = find.ancestor(
+        of: find.text(first.title),
+        matching: find.byWidgetPredicate(
+          (Widget widget) => widget is Md3SettingsNavRow && widget.selected,
+        ),
+      );
+      expect(
+        firstRow,
+        findsWidgets,
+        reason: '宽屏首帧第一分类行已是 selected —— itest 不能拿它当「打开成功」',
+      );
+    },
+  );
+
+  // TODO-1143：master-detail 左父菜单在最窄布局（supportingPaneWidthForLayout
+  // clamp 280..360，下界 280px）下曾把长分类标签（如「同步与备份（实验性）」）用
+  // FushiListItem 默认 titleMaxLines:1 + ellipsis 截成「同步与…」。修复给
+  // buildDestinationList 的分类项传 titleMaxLines: 2（全宽本不换行，无害）。
+  testWidgets(
+    'TODO-1143: narrow (280px) master-detail destination rows allow two title '
+    'lines so long CJK category labels are not truncated',
+    (WidgetTester tester) async {
+      const String longTitle = '同步与备份（实验性）';
+      final SettingsDestination longDestination = SettingsDestination(
+        id: SettingsDestinationId.syncBackup,
+        title: longTitle,
+        icon: Icons.cloud_sync_outlined,
+        sections: const <SettingsSection>[],
+      );
+
+      await tester.pumpWidget(
+        _harness(
+          platform: TargetPlatform.android,
+          builder: (SettingsContext settingsContext) {
+            return Align(
+              alignment: Alignment.topLeft,
+              child: SizedBox(
+                width: 280, // 左父菜单最窄宽度（clamp 下界）。
+                child: MaterialSettingsRenderer().buildDestinationList(
+                  settingsContext: settingsContext,
+                  destinations: <SettingsDestination>[longDestination],
+                  selectedDestinationId: SettingsDestinationId.syncBackup,
+                  onDestinationSelected: (_) {},
+                  pushRoutes: false,
+                ),
+              ),
+            );
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 机制（字体无关）：MD3 导航行（Md3SettingsNavRow）的标题放行第二行。
+      expect(
+        find.widgetWithText(Md3SettingsNavRow, longTitle),
+        findsOneWidget,
+        reason: 'TODO-1143 左父菜单分类项是 MD3 导航行',
+      );
+
+      // 效果：标题 RenderParagraph 允许两行，长标签在 280px 内不再被单行 ellipsis
+      // 截断。
+      final RenderParagraph paragraph = tester.renderObject<RenderParagraph>(
+        find.text(longTitle),
+      );
+      expect(
+        paragraph.maxLines,
+        2,
+        reason: 'titleMaxLines: 2 必须真透传到标题的 RenderParagraph',
+      );
+      expect(
+        paragraph.didExceedMaxLines,
+        isFalse,
+        reason: '两行内「同步与备份（实验性）」应完整显示，不触发 ellipsis',
+      );
+    },
+  );
+
+  testWidgets(
+    'explicit presentation distinguishes core, expanded and collapsed groups',
+    (WidgetTester tester) async {
+      // 核心设置常驻，进阶组显式声明默认展开/收起，无标题组不可折叠。
+      // 关掉全展开钩子，才能同时验「默认收起」这一半（setUp 默认置 true）。
+      debugSettingsForceExpandAllSections = false;
+
+      final SettingsDestination destination = SettingsDestination(
+        id: SettingsDestinationId.appearance,
+        title: 'Folding',
+        icon: Icons.palette_outlined,
+        sections: <SettingsSection>[
+          SettingsSection(
+            title: 'Expanded group',
+            presentation: SettingsSectionPresentation.expanded,
+            items: <SettingsItem>[
+              SettingsSwitchItem(
+                id: 'alpha',
+                title: 'Alpha row',
+                value: (_) => true,
+                onChanged: (_, __) {},
+              ),
+            ],
+          ),
+          SettingsSection(
+            title: 'Collapsed group',
+            collapsedByDefault: true, // 默认收起。
+            items: <SettingsItem>[
+              SettingsSwitchItem(
+                id: 'bravo',
+                title: 'Bravo row',
+                value: (_) => true,
+                onChanged: (_, __) {},
+              ),
+            ],
+          ),
+          SettingsSection(
+            // 无标题 → 不可折叠。
+            items: <SettingsItem>[
+              SettingsSwitchItem(
+                id: 'charlie',
+                title: 'Charlie row',
+                value: (_) => true,
+                onChanged: (_, __) {},
+              ),
+            ],
+          ),
+        ],
+      );
+
+      await tester.pumpWidget(
+        _harness(
+          platform: TargetPlatform.android,
+          builder: (SettingsContext settingsContext) {
+            return MaterialSettingsRenderer().buildDetailPage(
+              settingsContext: settingsContext,
+              destination: destination,
+            );
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // 两个带标题分区各有一个折叠头；无标题分区没有。
+      expect(
+        find.byIcon(Icons.expand_more),
+        findsNWidgets(2),
+        reason: '每个带标题 section 都必须长出折叠头；无标题 section 不出',
+      );
+
+      // collapsedByDefault 决定默认态：展开组的行在树内，收起组的行不入树。
+      expect(
+        find.text('Alpha row'),
+        findsOneWidget,
+        reason: 'collapsedByDefault:false 的分区默认展开，行应可见',
+      );
+      expect(
+        find.text('Bravo row'),
+        findsNothing,
+        reason: 'collapsedByDefault:true 的分区默认收起，行应不入树',
+      );
+
+      // 无标题分区永远平铺，行始终可见。
+      expect(
+        find.text('Charlie row'),
+        findsOneWidget,
+        reason: '无标题 section 不可折叠，行始终平铺可见',
+      );
+    },
+  );
+}
+
+/// 渲染器测试用的轻量 AppModel：未跑 initialise()、prefsRepo 为空。阅读设置里
+/// 「反转阅读器底栏」开关读 appModel.reverseReaderBottomBar（→ prefsRepo），故显式
+/// 后备，避免渲染该开关时 _prefsRepo! 空指针（同 _SettingsDialogTestAppModel）。
+class _RendererTestAppModel extends AppModel {
+  _RendererTestAppModel() : super(testPlatformServices());
+
+  @override
+  Locale get appLocale => const Locale('en', 'US');
+
+  @override
+  PackageInfo get packageInfo => PackageInfo(
+    appName: 'Fushi',
+    packageName: 'jp.fushi.test',
+    version: '1.0.0',
+    buildNumber: '1',
+  );
+
+  @override
+  bool get reverseReaderBottomBar => false;
+}
+
+class _VersionedRendererTestAppModel extends _RendererTestAppModel {
+  _VersionedRendererTestAppModel(this._packageInfo);
+
+  final PackageInfo _packageInfo;
+
+  @override
+  PackageInfo get packageInfo => _packageInfo;
+}
+
+/// Keep this test on real preference writes while replacing the HTTP listener.
+class _YomitanRendererTestAppModel extends _RendererTestAppModel {
+  int serverStarts = 0;
+  int serverStops = 0;
+
+  @override
+  Future<void> startFushiApiServer() async {
+    serverStarts++;
+  }
+
+  @override
+  Future<void> stopFushiApiServer() async {
+    serverStops++;
+  }
+}

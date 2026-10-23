@@ -1,0 +1,465 @@
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi_anki/fushi_anki.dart';
+import 'package:fushi/src/anki/anki_mined_card_action_sheet.dart';
+import 'package:fushi/utils.dart';
+import '../helpers/glass_unwrap.dart';
+
+/// TODO-1007/1008：点 ✓ 操作选择 + note viewer 的 widget 行为守卫。
+///
+/// 决策②：命中多张时列出全部供选择（不默默取最近一张）。
+/// 决策③：每次点 ✓ 都让用户选——至少 [覆写] / [新增重复卡] / [查看·在 Anki 中打开]。
+/// 决策⑤：note viewer 只读展示字段 + 覆写 + 在 Anki 中打开。
+
+/// 受控假 repo：findMatchingNotes / noteFields / openNoteInAnki 走内存数据。
+class _FakeRepo extends BaseAnkiRepository {
+  _FakeRepo(this.matches, {this.fields = const {}});
+
+  final List<MinedNoteRef> matches;
+  final Map<String, String> fields;
+  int openedNoteId = -1;
+
+  @override
+  Future<List<MinedNoteRef>> findMatchingNotes(
+          String expression, String reading) async =>
+      matches;
+
+  @override
+  Future<Map<String, String>?> noteFields(int noteId) async => fields;
+
+  @override
+  Future<bool> openNoteInAnki(int noteId) async {
+    openedNoteId = noteId;
+    return true;
+  }
+
+  @override
+  Future<AnkiFetchResult> fetchConfiguration() async =>
+      const AnkiFetchResult.error('unused');
+  @override
+  Future<MineOutcome> mineEntry(
+          {required String rawPayloadJson,
+          required AnkiMiningContext context}) async =>
+      const MineOutcome.success();
+  @override
+  Future<bool> isDuplicate(String expression, String reading) async => true;
+  @override
+  Future<bool> createNoteType(AnkiNoteTypeTemplate template) async => false;
+  @override
+  Future<bool> createDeck(String name) async => false;
+}
+
+/// 回读不了 Anki 的后端（AnkiMobile）：反查恒空，但那**不代表**卡不在库里。
+class _UnverifiableRepo extends _FakeRepo {
+  _UnverifiableRepo() : super(const []);
+
+  final List<String> forgotten = <String>[];
+
+  @override
+  bool get canVerifyExistingCards => false;
+
+  @override
+  Future<bool> forgetMinedCard(String expression) async {
+    forgotten.add(expression);
+    return true;
+  }
+}
+
+Widget _host(Future<void> Function(BuildContext) onTapBody) {
+  return TranslationProvider(
+    child: MaterialApp(
+      home: Scaffold(
+        body: Builder(
+          builder: (context) => Center(
+            child: ElevatedButton(
+              onPressed: () => onTapBody(context),
+              child: const Text('open'),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+void main() {
+  // 回读不了 Anki 的后端（AnkiMobile）上点 ✓：反查恒空，既不能当「卡还在」（用户
+  // 可能早就在 Anki 里删了，那 ✓ 是谎），也不能当「卡没了」直接重制（卡还在时就
+  // 默默多出第二张）。用户报「卡片删掉也不会检测是否还存在」——iOS 没有任何自动
+  // 核对的通道，只能把这个判断交还给唯一知道答案的人。
+  testWidgets('回读不了 Anki 的后端：反查为空时让用户裁决，而不是默默重制', (tester) async {
+    final repo = _UnverifiableRepo();
+    var mineNewCalls = 0;
+    AnkiCardMutationResult? result;
+
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '見物',
+        reading: 'けんぶつ',
+        mineNew: () async {
+          mineNewCalls++;
+          return (ankiConnect: true, noteId: 111);
+        },
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    expect(mineNewCalls, 0, reason: '反查为空不得直接重制，先问用户');
+    expect(find.text(t.anki_mined_unverified_title), findsOneWidget);
+    expect(find.text(t.anki_mined_action_add_duplicate), findsOneWidget);
+    expect(find.text(t.anki_mined_action_forget), findsOneWidget);
+
+    // 「我已在 Anki 里删了」→ 划掉本地记录，✓ 变回 +。
+    await tester
+        .tap(find.byKey(const ValueKey('anki-mined-unverified-forget')));
+    await tester.pumpAndSettle();
+    expect(repo.forgotten, <String>['見物']);
+    expect(mineNewCalls, 0, reason: '纠正记录不该顺手再制一张卡');
+    expect(result, isNotNull);
+    expect(result!.ankiConnect, isFalse);
+    expect(result!.noteId, isNull);
+  });
+
+  testWidgets('回读不了 Anki 的后端：选「再加一张」才走制卡链路', (tester) async {
+    final repo = _UnverifiableRepo();
+    var mineNewCalls = 0;
+    AnkiCardMutationResult? result;
+
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '見物',
+        reading: 'けんぶつ',
+        mineNew: () async {
+          mineNewCalls++;
+          return (ankiConnect: true, noteId: 222);
+        },
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('anki-mined-unverified-add')));
+    await tester.pumpAndSettle();
+
+    expect(mineNewCalls, 1);
+    expect(repo.forgotten, isEmpty);
+    expect(result!.noteId, 222);
+  });
+
+  testWidgets('能回读 Anki 的后端：反查为空仍按旧路直接重制（不多一次弹窗）', (tester) async {
+    // AnkiConnect / AnkiDroid 每次都真问 Anki，反查不到就是真的没有——这条路
+    // 一步都不许多（Never break userspace）。
+    final repo = _FakeRepo(const []);
+    var mineNewCalls = 0;
+    AnkiCardMutationResult? result;
+
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '見物',
+        reading: 'けんぶつ',
+        mineNew: () async {
+          mineNewCalls++;
+          return (ankiConnect: true, noteId: 333);
+        },
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    expect(find.text(t.anki_mined_unverified_title), findsNothing);
+    expect(mineNewCalls, 1);
+    expect(result!.noteId, 333);
+  });
+
+  testWidgets('lists every matching card (decision 2) + three options',
+      (tester) async {
+    final repo = _FakeRepo(const [
+      MinedNoteRef(noteId: 300, preview: '日本語 A'),
+      MinedNoteRef(noteId: 200, preview: '日本語 B'),
+    ]);
+    AnkiCardMutationResult? result;
+
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '日本語',
+        reading: 'にほんご',
+        mineNew: () async => (ankiConnect: true, noteId: 999),
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    // Both matching cards are listed (multi-match selection).
+    expect(find.text('日本語 A'), findsOneWidget);
+    expect(find.text('日本語 B'), findsOneWidget);
+    // The "add as a new card" option is always present (decision 3).
+    expect(find.text(t.anki_mined_action_add_duplicate), findsOneWidget);
+    // Per-card overwrite + view affordances exist (two cards -> two each).
+    expect(find.byIcon(FushiIcons.edit), findsNWidgets(2));
+    expect(find.byIcon(FushiIcons.openInNew), findsNWidgets(2));
+
+    // Choosing "add as a new card" runs mineNew.
+    await tester.tap(find.text(t.anki_mined_action_add_duplicate));
+    await tester.pumpAndSettle();
+    expect(result, isNotNull);
+    expect(result!.noteId, 999);
+    expect(result!.ankiConnect, isTrue);
+  });
+
+  testWidgets('overwriting a specific card targets that note id',
+      (tester) async {
+    final repo = _FakeRepo(const [
+      MinedNoteRef(noteId: 300, preview: 'A'),
+      MinedNoteRef(noteId: 200, preview: 'B'),
+    ]);
+    AnkiCardMutationResult? result;
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: 'x',
+        reading: '',
+        mineNew: () async => (ankiConnect: true, noteId: 999),
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    // Overwrite the SECOND card (note 200) via its edit icon.
+    await tester.tap(find.byIcon(FushiIcons.edit).last);
+    await tester.pumpAndSettle();
+    expect(result, isNotNull);
+    expect(result!.noteId, 200,
+        reason: 'overwrite targets the user-chosen card, not the newest');
+  });
+
+  testWidgets('no matches falls back to mineNew (deleted since detection)',
+      (tester) async {
+    final repo = _FakeRepo(const []);
+    AnkiCardMutationResult? result;
+    await tester.pumpWidget(_host((context) async {
+      result = await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: 'gone',
+        reading: '',
+        mineNew: () async => (ankiConnect: true, noteId: 42),
+        overwrite: (noteId) async => (ankiConnect: false, noteId: null),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    // No sheet shown; mined fresh directly.
+    expect(result, isNotNull);
+    expect(result!.noteId, 42);
+  });
+
+  testWidgets('note viewer shows fields read-only + open in Anki (decision 5)',
+      (tester) async {
+    final repo = _FakeRepo(
+      const [MinedNoteRef(noteId: 300, preview: 'A')],
+      fields: const {'Expression': '日本語', 'Meaning': 'language'},
+    );
+    await tester.pumpWidget(_host((context) async {
+      await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '日本語',
+        reading: '',
+        mineNew: () async => (ankiConnect: true, noteId: 999),
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    // Open the viewer via the view icon.
+    await tester.tap(find.byIcon(FushiIcons.openInNew));
+    await tester.pumpAndSettle();
+    // BUG-2503: the viewer replaces candidate content in the same dialog route.
+    expect(find.byType(AlertDialog, skipOffstage: false), findsOneWidget);
+    expect(
+        find.text(t.anki_mined_card_title, skipOffstage: false), findsNothing);
+    // Field names + values are shown read-only.
+    expect(find.text('Expression'), findsOneWidget);
+    expect(find.text('日本語'), findsWidgets);
+    expect(find.text('Meaning'), findsOneWidget);
+    expect(find.text('language'), findsOneWidget);
+    // "Open in Anki" triggers repo.openNoteInAnki for this note.
+    await tester.tap(find.text(t.anki_note_viewer_open_in_anki));
+    await tester.pumpAndSettle();
+    expect(repo.openedNoteId, 300);
+    // Closing the viewer must finish this action, not reveal a second modal.
+    await tester.tap(find.text(t.dialog_close));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog, skipOffstage: false), findsNothing);
+  });
+
+  testWidgets(
+      'source field changes expose complete values and return only explicitly selected fields',
+      (WidgetTester tester) async {
+    final String original =
+        '${List<String>.filled(1000, 'original ').join()}original end';
+    final String candidate =
+        '${List<String>.filled(1000, 'candidate ').join()}candidate end';
+    Map<String, String>? selected;
+    await tester.pumpWidget(_host((BuildContext context) async {
+      selected = await showAnkiSourceNoteChanges(
+          context: context,
+          original: <String, String>{
+            'Sentence': original,
+            'Meaning': 'manual meaning'
+          },
+          candidate: <String, String>{
+            'Sentence': candidate,
+            'Meaning': 'automatic meaning',
+            'Unknown': 'ignored'
+          });
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog, skipOffstage: false), findsOneWidget);
+    expect(find.text('Unknown'), findsNothing);
+    expect(find.text(t.card_source_review_conflict_warning), findsOneWidget);
+    expect(find.byType(TextField), findsNothing);
+    expect(
+        tester
+            .widget<FilledButton>(glassUnwrap<FilledButton>(find.widgetWithText(FilledButton, t.card_source_review_save)))
+            .onPressed,
+        isNull);
+    await tester
+        .tap(find.byKey(const ValueKey<String>('anki-source-change-Sentence')));
+    await tester.tap(find.text('Sentence'));
+    await tester.pumpAndSettle();
+    expect(find.text(original), findsOneWidget);
+    expect(find.text(candidate), findsOneWidget);
+    await tester.tap(find.text(t.card_source_review_save));
+    await tester.pumpAndSettle();
+    expect(selected, <String, String>{'Sentence': candidate});
+  });
+
+  // TODO-1007 健壮性：宿主回调抛错时，action sheet 不能卡在 _busy 进度条无反馈。
+  // 这三个用例构造抛错的 mineNew/overwrite，断言：异常不逃逸（无 takeException）、
+  // 弹窗仍在（未 pop 关闭）、操作可重试（_busy 已复位 → 按钮重新可点）。
+
+  testWidgets('回归复现：mineNew 抛错时复位 busy + 弹窗保留可重试（不卡进度条）', (tester) async {
+    final repo = _FakeRepo(const [MinedNoteRef(noteId: 300, preview: 'A')]);
+    int mineNewCalls = 0;
+    await tester.pumpWidget(_host((context) async {
+      await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: 'x',
+        reading: '',
+        mineNew: () async {
+          mineNewCalls++;
+          throw StateError('host channel failed');
+        },
+        overwrite: (noteId) async => (ankiConnect: true, noteId: noteId),
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    // 点「新增重复卡」→ mineNew 抛错。
+    await tester.tap(find.text(t.anki_mined_action_add_duplicate));
+    await tester.pumpAndSettle();
+
+    // 异常被吞在 action sheet 内，不向 widget 树逃逸。
+    expect(tester.takeException(), isNull);
+    expect(mineNewCalls, 1);
+    // 弹窗未关闭（仍能看到选项），说明没误 pop。
+    expect(find.text(t.anki_mined_action_add_duplicate), findsOneWidget);
+    // _busy 已复位：再次点击会再次调用 mineNew（若仍 busy 则 onTap=null 不触发）。
+    await tester.tap(find.text(t.anki_mined_action_add_duplicate));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(mineNewCalls, 2, reason: '_busy 必须在失败后复位，否则按钮卡死无法重试');
+  });
+
+  testWidgets('回归复现：overwrite 抛错时复位 busy + 弹窗保留可重试', (tester) async {
+    final repo = _FakeRepo(const [MinedNoteRef(noteId: 200, preview: 'B')]);
+    int overwriteCalls = 0;
+    await tester.pumpWidget(_host((context) async {
+      await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: 'x',
+        reading: '',
+        mineNew: () async => (ankiConnect: true, noteId: 999),
+        overwrite: (noteId) async {
+          overwriteCalls++;
+          throw StateError('host channel failed');
+        },
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(FushiIcons.edit));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(overwriteCalls, 1);
+    expect(find.byIcon(FushiIcons.edit), findsOneWidget);
+    // 复位后可重试。
+    await tester.tap(find.byIcon(FushiIcons.edit));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(overwriteCalls, 2, reason: '_busy 必须在失败后复位');
+  });
+
+  testWidgets('回归复现：note viewer overwrite 抛错时复位 busy + 对话框保留', (tester) async {
+    final repo = _FakeRepo(
+      const [MinedNoteRef(noteId: 300, preview: 'A')],
+      fields: const {'Expression': '日本語'},
+    );
+    int overwriteCalls = 0;
+    await tester.pumpWidget(_host((context) async {
+      await runAnkiMinedCardAction(
+        context: context,
+        repo: repo,
+        expression: '日本語',
+        reading: '',
+        mineNew: () async => (ankiConnect: true, noteId: 999),
+        overwrite: (noteId) async {
+          overwriteCalls++;
+          throw StateError('host channel failed');
+        },
+      );
+    }));
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    // 打开 note viewer。
+    await tester.tap(find.byIcon(FushiIcons.openInNew));
+    await tester.pumpAndSettle();
+    // 点对话框里的「覆写」→ overwrite 抛错。
+    await tester.tap(find.text(t.anki_mined_action_overwrite));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(overwriteCalls, 1);
+    // 对话框仍在（未误 pop），覆写按钮还在 → 可重试。
+    expect(find.text(t.anki_mined_action_overwrite), findsOneWidget);
+    await tester.tap(find.text(t.anki_mined_action_overwrite));
+    await tester.pumpAndSettle();
+    expect(tester.takeException(), isNull);
+    expect(overwriteCalls, 2, reason: '_busy 必须在失败后复位');
+  });
+
+  // BUG-2051：↗「在 Anki 中打开」的编排已从本文件删除——它不再是 Flutter 层的
+  // 事（没有对话框、没有多卡选择框），而是仓库层的一次调用。新的行为守卫在
+  // packages/fushi_anki/test/open_word_in_anki_test.dart：判据与查重同源、三态结局。
+}

@@ -1,0 +1,2990 @@
+// TODO-617 global lookup overlay — orchestration (Windows).
+//
+// End-to-end trigger: select text in ANY app, press the global hotkey
+// (Ctrl+Alt+D), and the real dictionary card pops up at the cursor without
+// stealing focus. Selection is captured by injecting a clean Ctrl+C
+// (SelectionCapture); re-pressing the hotkey looks up the new selection (close
+// is Esc / click-outside, handled natively).
+//
+// The main Dart engine owns the dictionary, so this controller does the lookup
+// (AppModel.searchDictionary -> popupJson), pushes it to the native overlay
+// (GlobalLookupChannel), resolves gaiji bytes (image:// via FushiDicts) and the
+// deferred audio bridge calls (resolveWordAudio / queryLocalAudio).
+
+import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart' hide ModifierKey;
+import 'package:fushi/src/lookup/overlay_auto_read.dart';
+import 'package:fushi/src/lookup/effective_lookup_size.dart';
+import 'package:fushi/src/lookup/global_lookup_channel.dart';
+import 'package:fushi/src/lookup/global_lookup_layout.dart';
+import 'package:fushi/src/lookup/global_lookup_log.dart';
+import 'package:fushi/src/lookup/global_lookup_render.dart';
+import 'package:fushi/src/lookup/global_lookup_stack.dart';
+import 'package:fushi/src/lookup/overlay_bridge_handlers.dart';
+import 'package:fushi/src/lookup/overlay_stat_source.dart';
+import 'package:fushi/src/lookup/selection_capture_ffi.dart';
+import 'package:fushi/src/media/sources/reader_fushi_source.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/models/module_id.dart';
+import 'package:fushi/src/pages/implementations/stat_activity.dart';
+import 'package:fushi/src/reader/popup_swipe_close_script.dart'
+    show popupSideSwipeDismissAllowed, popupTopPullDismissAllowed;
+import 'package:fushi/src/utils/misc/dictionary_external_link.dart';
+import 'package:fushi/src/utils/misc/error_log_service.dart';
+import 'package:fushi/src/utils/misc/swipe_dismiss_wrapper.dart'
+    show swipeDismissThreshold;
+import 'package:fushi/src/shortcuts/global_external_lookup_route.dart';
+import 'package:fushi/src/shortcuts/input_binding.dart';
+import 'package:fushi/src/shortcuts/shortcut_action.dart';
+import 'package:fushi/src/shortcuts/shortcut_registry.dart';
+import 'package:fushi/src/sync/desktop_lookup_service.dart';
+import 'package:fushi_core/fushi_core.dart'
+    show kStatSourceBook, kStatSourceGame, mimeTypeForFilePath;
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:hotkey_manager/hotkey_manager.dart';
+import 'package:path/path.dart' as p;
+
+/// Per-lookup placement facts supplied by a native hit surface.
+///
+/// Both rectangles are screen physical pixels. Keeping them in one immutable
+/// value makes a lookup self-contained: an attached desktop lookup cannot
+/// observe a stale global physical cap from a previous galCard
+/// session, and the native anchor is never reinterpreted with the main
+/// Flutter view's DPR.
+@immutable
+class GlobalLookupPhysicalPlacement {
+  const GlobalLookupPhysicalPlacement({
+    required this.anchorScreenRect,
+    this.destinationViewportScreenRect,
+  });
+
+  /// The hit glyph rectangle in screen physical pixels.
+  final Rect anchorScreenRect;
+
+  /// The presentation client viewport in screen physical pixels.
+  final Rect? destinationViewportScreenRect;
+
+  bool get isValid {
+    final Rect? viewport = destinationViewportScreenRect;
+    return anchorScreenRect.isFinite &&
+        !anchorScreenRect.isEmpty &&
+        (viewport == null ||
+            (viewport.isFinite &&
+                !viewport.isEmpty &&
+                viewport.intersect(anchorScreenRect) == anchorScreenRect));
+  }
+}
+
+/// Single global overlay per process.
+class GlobalLookupController {
+  GlobalLookupController._();
+  static final GlobalLookupController instance = GlobalLookupController._();
+
+  /// 测试缝，与 [GalHookTextOverlayChannel.platformOverride] 同形：平台门描述的是
+  /// 「这台机器有没有覆盖窗」，与覆盖窗之上的路由 / 代数生命周期逻辑正交。
+  ///
+  /// 两半门只有一半可覆盖是不够的：游戏内查词的门是
+  /// `GalHookTextOverlayChannel.supportsCurrentPlatform && isSupported`，测试把前
+  /// 者覆盖成 true、后者仍钉死在 Windows，控制器在非 Windows 的 CI 上就整个空转
+  /// （`start` 早退、`_started` 恒 false、`handleHit` 直接 return），断言全落在
+  /// null 上——本机 Windows 恒绿、Linux CI 恒红。
+  @visibleForTesting
+  static bool? platformOverride;
+
+  /// Windows: runner GlobalLookupWindow (WebView2). macOS: Runner
+  /// GlobalLookupOverlay.swift (NSPanel + WKWebView) on the SAME channel
+  /// contract. Linux has no native overlay yet.
+  static bool get isSupported =>
+      platformOverride ?? (Platform.isWindows || Platform.isMacOS);
+
+  /// 覆盖窗此刻能否接查词（平台支持且 [start] 已跑）。悬浮字幕点词以此决定走
+  /// 覆盖窗还是退回主窗 tab，请求不丢。
+  bool get isAvailable => isSupported && _started;
+
+  /// 当前 root 卡的引擎匹配长度（UTF-16 code unit，`bestLength`）。
+  ///
+  /// 引擎按查询串做最长匹配并回报它——这是全 app 统一的「命中跨度」真值（弹窗高亮、
+  /// 剪贴板面板横幅高亮、扩展 originalTextLength 都用它）。游戏内查词据此把台词上的
+  /// 高亮铺成整词而不是一个字。无结果 / 尚未查词时为 0。
+  int get rootBestLength =>
+      _frameResults[kGlobalLookupRootFrameId]?.bestLength ?? 0;
+
+  AppModel? _appModel;
+
+  /// 本进程当前已注册到 OS 的热键，按动作索引。表驱动而不是每个动作一个字段：
+  /// 撤销/重注册只有一条路径，加动作不必再抄一遍生命周期。
+  final Map<ShortcutAction, HotKey> _hotKeys = <ShortcutAction, HotKey>{};
+
+  /// 热键(重)注册的串行链。见 [_registerHotKeysFromRegistry] 的重入说明。
+  Future<void> _hotKeyRegistration = Future<void>.value();
+  // TODO-1066 — the live shortcut registry we read the global-lookup hotkey
+  // from (was a hard-coded Ctrl+Alt+D). Listened to so a user remapping the
+  // key in settings (or a profile switch that reloads bindings) re-registers
+  // the OS hotkey immediately, instead of the key being a compile-time const.
+  FushiShortcutRegistry? _registry;
+  bool _started = false;
+  // macOS cannot read another app's selection until the user grants
+  // Accessibility access. The first explicit global-lookup trigger opens the
+  // system permission pane; do that once per process and let the user return
+  // to the source app before we try to capture its selection.
+  bool _macAccessibilityPrompted = false;
+  // TODO-1233 -- optional consumer notified when the overlay is GENUINELY
+  // dismissed (foreground hook / click-outside / JS dismiss), so a caller can
+  // hang a resume-on-dismiss. The video subtitle lookup (path A) would use this
+  // for BUG-072 pause/resume IF it routed through the overlay; today it stays
+  // in-app to keep the rich screenshot + sentence-audio mining context the
+  // app-agnostic overlay cannot provide (see the TODO-1233 decision). Wired now
+  // (the 872 prerequisite) so a future mining-preserving switch can hook it. Not
+  // fired for the between-lookups reset (that hide passes notify=false).
+  void Function()? onHidden;
+  void Function(GlobalLookupRoute route)? onRoutedHidden;
+  // KiriKiri 游戏内查词 — 卡片「内容已渲染、尺寸已定」的**唯一可靠**信号。
+  //
+  // 真值来自 host 自测量回报的 union bbox（_applyOverlayBox）：那一刻 popup.js 已
+  // 把这次查词的内容画完并量出真实尺寸，覆盖窗才据此 reveal/resize。游戏内查词必须
+  // 等到这里才把帧投进游戏——早一步投就抓到上一帧或空白（这正是不能用固定延时兜的
+  // 原因：冷 WebView2 的首帧耗时跨两个数量级）。
+  //
+  // 参数是**物理像素**的卡片尺寸（与投给游戏的位图逐像素一致），供调用方算锚点。
+  // 首帧 reveal 与后续 resize（嵌套子卡 / Ctrl+滚轮改字号）都会回调，所以游戏里的
+  // 卡片会跟着内容长大，而不是停在首帧尺寸。READY-SAFETY 兜底 reveal 也会回调——
+  // 那是「真渲染失败」的最后一招，此时投的确实可能是空白卡，但比卡在不可见强。
+  void Function(int physicalWidth, int physicalHeight)? onRevealed;
+  // BUG-2128 — [physicalRootHeight] is the ROOT card's own rendered height
+  // (physical px, 0 when the host did not report it), distinct from the union
+  // [physicalHeight] once nested children extend the bbox.
+  void Function(
+    GlobalLookupRoute route,
+    int physicalWidth,
+    int physicalHeight,
+    int physicalDx,
+    int physicalDy,
+    int physicalRootHeight,
+  )?
+  onRoutedRevealed;
+
+  /// Interactive gal-card pixels changed after the first reveal.  The route
+  /// owner coalesces these notifications into bitmap recaptures.
+  void Function(GlobalLookupRoute route)? onRoutedDirty;
+  GlobalLookupRoute? _activeRoute;
+  // BUG-1833 — static popup settings already installed in each physical host
+  // (desktop and galCard are different WebView2 realms). A configured custom
+  // font can make this payload ~13 MB, so only revisions not yet acknowledged
+  // by the current host ride the render call. The host can demand a resend after
+  // a whole-WebView recovery via `staticSettingsRequired`.
+  final PopupStaticRevisionCache _hostStaticRevisions =
+      PopupStaticRevisionCache();
+  int _desktopLookupEpoch = 0;
+  // Last physical size pushed to the overlay; used to converge the page's
+  // resize -> re-measure loop (see _onJsMessage 'overlaySize'). Reset per
+  // lookup so a new card re-sizes from scratch.
+  int _lastSentWidth = -1;
+  int _lastSentHeight = -1;
+  // Renderer-owned geometry identity. Width/height/offset alone are not a
+  // sufficient acknowledgement key: shell regions can change and later return
+  // to byte-identical bounds (A -> B -> A). Keep the last sent epoch in the
+  // per-lookup de-dup key. The host owns the monotonic sequence for the
+  // lifetime of its current document; a WebView2 recovery may start a new one.
+  int _lastSentGeometryEpoch = -1;
+  // TODO-1231 P2 — the last window offset (physical px) pushed via revealStack.
+  // The bbox ORIGIN (dx/dy) can change while the SIZE (w/h) stays equal (a
+  // left/up cascade that shifts the window without growing it), so the resize
+  // de-dup must also fire on a dx/dy change — otherwise the window would not move
+  // and the host's commitLayerShift (which pins the root) would never run.
+  int _lastSentDx = 0;
+  int _lastSentDy = 0;
+  // The geometry belonging to the most recent galCard resize.  Unlike desktop,
+  // galCard does not notify its owner until the host has presented two frames at
+  // this size and posts the route-stamped `captureReady` message.
+  ({
+    GlobalLookupRoute route,
+    int generation,
+    int width,
+    int height,
+    int geometryEpoch,
+    int dx,
+    int dy,
+    int rootHeight,
+    double left,
+    double top,
+    int attempt,
+  })?
+  _pendingGalCapture;
+  Timer? _galCaptureReadySafety;
+  int _galCaptureGeneration = 0;
+  // TODO-1231 (BUG-583) — the overlay window's min-corner (bbox origin, CSS px)
+  // only ever moves OUTWARD (up/left) within one lookup session, never back
+  // inward. Moving it inward on a nested CLOSE slides the window top-left back
+  // toward the cursor while the host's compensating commitLayerShift lands ~1
+  // frame later (cross DWM/WebView2 boundary), so the pinned root card visibly
+  // lurches then snaps back ("消失第二个弹窗时闪"). Holding the origin at its
+  // outermost keeps the window top-left + layer shift fixed on close; only the
+  // far (bottom/right) edges shrink, which never moves the root card. Reset to
+  // "no constraint" (infinity) per fresh hotkey lookup and on dismiss. A
+  // down-right cascade keeps the origin at (0,0), so the ratchet is a no-op
+  // there (identical to the pre-fix geometry).
+  double _ratchetLeft = double.infinity;
+  double _ratchetTop = double.infinity;
+  // TODO-1345 (BUG-583 深层根因续) — the reserved cascade origin FLOOR for THIS
+  // lookup (window-local CSS px, <= 0), computed once from the real screen edges
+  // right after showAt and pushed to the host on every renderStack payload. It
+  // reserves headroom toward the screen interior so a subsequent up/left child
+  // lands inside the window origin committed at the first reveal — the origin then
+  // never moves when the child appears, so the pinned parent card has ZERO
+  // displacement (the true root fix for the residual BUG-583 parent lurch, which
+  // rounds 1-4 could only mask). 0 = no reservation (down-right / cursor at an edge
+  // / no work area) -> pre-fix origin. Reset to 0 on a genuine dismiss.
+  double _originFloorLeft = 0;
+  double _originFloorTop = 0;
+  // The overlay renders off-screen until the first self-measurement, then is
+  // revealed once at its final size (no on-screen jitter). False = still
+  // off-screen / awaiting reveal. Reset per lookup.
+  bool _revealed = false;
+  Timer? _revealSafety;
+  // TODO-1079 (B) — ready-driven reveal safety cadence. Each tick re-checks
+  // isWebViewReady before revealing; a not-yet-ready surface reschedules up to
+  // _kReadySafetyMaxAttempts times (~450ms each) then reveals as a last resort.
+  static const Duration _kReadySafetyStep = Duration(milliseconds: 450);
+  static const int _kReadySafetyMaxAttempts = 6;
+
+  // TODO-867 P3b nested stack. The ordered lookup-popup stack (index 0 root
+  // ... last = deepest child) drives the host renderStack payload. Each
+  // frame's own DictionarySearchResult is held alongside (the pure stack
+  // model only carries identity/linkage). _frameSeq mints stable per-frame
+  // ids (the stack model never generates random/clock ids, see its docs).
+  // TODO-1030 M0 — the current sentence for THIS lookup (UIA 前台句 / 悬浮字幕行 /
+  // galgame 台词). Sole consumer: mining `{sentence}` context (sentenceContext,
+  // BUG-730). The card itself never renders it. Empty when no sentence was
+  // captured. Reset per lookup in _lookupExternal.
+  String _currentSentence = '';
+  OverlayMiningHandler? _currentMiningHandler;
+
+  GlobalLookupStack _stack = GlobalLookupStack.empty;
+  final Map<String, DictionarySearchResult> _frameResults =
+      <String, DictionarySearchResult>{};
+  int _frameSeq = 0;
+  // BUG-1834 — nested searches share one route and may complete out of order.
+  // The latest valid source-frame intent wins, matching the app-in popup's
+  // _searchGeneration gate instead of letting an older result append later.
+  int _nestedLookupGeneration = 0;
+
+  // TODO-867 P3c C2 — per-frame anchor rect (window-local CSS px). The root
+  // anchor is null (placeholder cascade at window-local origin, the window is
+  // already positioned at the cursor); a child's anchor is the clicked word's
+  // rect, re-anchored to window-local CSS px by the host shim (global_lookup_
+  // host.js anchorRectToScreen) and delivered via onLinkClick args[1]. Fed to
+  // computeFrameRect so each child card cascades off its word.
+  final Map<String, Rect?> _frameAnchors = <String, Rect?>{};
+  // BUG-2054 — in-flight whole-word anchor requests, keyed by the token the host
+  // echoes back in its `nestedWordAnchor` report. The token (not the stack
+  // position) is what routes a report to its waiter, so a late answer from a
+  // superseded lookup completes nothing instead of moving an unrelated card.
+  final Map<int, Completer<Rect?>> _pendingWordAnchors =
+      <int, Completer<Rect?>>{};
+  int _wordAnchorToken = 0;
+  // One highlight eval round-trip inside an already-loaded iframe realm. Kept
+  // short: this sits between the dictionary result and the child card appearing,
+  // and its failure mode (fall back to the first-character anchor) is the exact
+  // behaviour that shipped before this fix.
+  static const Duration _kWordAnchorReportTimeout = Duration(milliseconds: 400);
+  // TODO-867 P3c E1/D2 — the cascade layout bounds (window-local CSS px) the
+  // off-screen measurement window is sized to. Children cascade WITHIN these
+  // bounds; D2's union bbox then reveals/resizes the window to the real extent.
+  double _layoutBoundsW = 0;
+  double _layoutBoundsH = 0;
+  // TODO-893 — the cursor MONITOR work area (CSS px) reported by the native
+  // showAt. computeFrameRect's showBelow / clamp must reason about the REAL
+  // display, not the off-screen measurement canvas (boundsW/boundsH). Feeding
+  // the 2x card canvas made every child cascade up and shoved the parent off
+  // the top. 0 = native did not report a work area (fall back to the canvas).
+  double _screenWorkW = 0;
+  double _screenWorkH = 0;
+  // TODO-893 v2 (symptom 3) — the overlay window-local origin's offset from the
+  // cursor monitor work-area origin (CSS px). Child anchor rects from the host
+  // are window-local; computeFrameRect's screenW/H are work-area dimensions.
+  // Adding this offset lifts the anchor into the SAME work-area-absolute domain
+  // (same zero point as screenW/H) so showBelow / clamp decide correctly near
+  // the screen bottom edge; the render builder shifts the result back to
+  // window-local for the host shell. 0 = native did not report a work area.
+  double _cursorWorkX = 0;
+  double _cursorWorkY = 0;
+  // BUG-2921 — the monitor dpr that converted the work area above to CSS px.
+  // [adoptGalDirectLayoutViewport] reuses it so the client-domain viewport the
+  // runner reports later lands in the SAME CSS scale the cards render in.
+  double _workDpr = 0;
+
+  /// 让覆盖窗跟随查词模块：现在开着就起；会话中途才打开查词模块也沿同一条
+  /// [start] 补起（此前只在启动时判一次，中途打开模块要等下次启动，桌面悬浮球
+  /// 的「应用外查词」等入口在这段时间里点了什么都不发生）。[start] 自带
+  /// `_started` 闩，重复触发不会重复建窗。
+  ///
+  /// 关模块不停：沿用启动链「不切断进行中的任务」的取舍（见 main.dart），钩子
+  /// 要到下次启动才不再装。启动链在首帧后调用一次。
+  Future<void> followLookupModule(AppModel appModel) async {
+    appModel.addListener(() => unawaited(_startFromModuleChange(appModel)));
+    await startIfLookupModuleEnabled(appModel);
+  }
+
+  /// 查词模块开着、平台支持且覆盖窗还没起：起它。
+  Future<void> startIfLookupModuleEnabled(AppModel appModel) async {
+    // 先判闩再调 start：AppModel 通知很频繁，别每次都往 glog 里记一条 start。
+    if (!isSupported || _started) return;
+    if (!appModel.moduleVisibility.isEnabled(ModuleId.lookup)) return;
+    await start(appModel: appModel);
+  }
+
+  /// [followLookupModule] 的监听路径：失败与启动链一样落盘，不静默。
+  Future<void> _startFromModuleChange(AppModel appModel) async {
+    try {
+      await startIfLookupModuleEnabled(appModel);
+    } catch (error, stack) {
+      glog('start (module enabled mid-session) FAILED: $error');
+      ErrorLogService.instance.log('global_lookup.start', error, stack);
+    }
+  }
+
+  /// Wires the overlay assets + reverse handlers + the global trigger hotkey.
+  /// Safe to call once after AppModel.initialise() on desktop.
+  Future<void> start({required AppModel appModel}) async {
+    glog('start: called (supported=$isSupported started=$_started)');
+    if (!isSupported || _started) {
+      return;
+    }
+    _started = true;
+    _appModel = appModel;
+
+    final String assetsDir = _popupAssetsDir();
+    glog('start: assetsDir=$assetsDir');
+    await GlobalLookupChannel.prepare(assetsDir);
+    GlobalLookupChannel.setHandlers(
+      onGetMedia: _resolveMedia,
+      onJsMessage: _onJsMessage,
+      onOverlayHidden: _onOverlayHidden,
+      onRoutedJsMessage: _onRoutedJsMessage,
+      onRoutedOverlayHidden: _onRoutedOverlayHidden,
+      // TODO-1066 — 全局鼠标侧键：与键盘热键、手柄按钮同一执行体。
+      onGlobalMouseTrigger: () =>
+          unawaited(triggerSelectionLookup(source: 'mouse')),
+    );
+
+    // 防截屏初值（pref lookupBlockCapture，默认关）。native GlobalLookupWindow
+    // 记住该值并在每次窗口（重）建时重应用（ApplyBlockCapture），故启动推一次即可
+    // 覆盖此后每次弹出；pref 变更时设置页经 [applyBlockCapture] 即时重推。
+    // best-effort：失败不打断启动链（热键注册等）。
+    try {
+      await GlobalLookupChannel.setBlockCapture(appModel.lookupBlockCapture);
+    } catch (e) {
+      glog('start: setBlockCapture FAILED (non-fatal): $e');
+    }
+
+    // TODO-1066 — read the trigger hotkey from the shortcut registry (was a
+    // hard-coded Ctrl+Alt+D that bypassed the whole registry, so it never showed
+    // up in the settings page and could not be remapped). Register it now and
+    // re-register whenever the registry changes (user remap / profile switch).
+    _registry = appModel.shortcutRegistry;
+    _registry!.addListener(_onRegistryChanged);
+    await _registerHotKeysFromRegistry();
+
+    // TODO-1066 — 另外两条非键盘触发源（手柄按钮 / 鼠标侧键）。它们与上面的键盘
+    // 热键是**同一个执行体、不同的 OS 机制**（见 ShortcutScope.globalExternal 的
+    // channels 注释）：手柄经 shortcuts 层的进程级登记处拿到入口，鼠标侧键在
+    // native 侧按绑定注册 RawInput 监听。两者都随注册表变更重推（_onRegistryChanged）。
+    GlobalExternalLookupRoute.set(
+      () => triggerSelectionLookup(source: 'gamepad'),
+    );
+    await _registerMouseTriggerFromRegistry();
+
+    // TODO-1079 — root-cause fix: PREWARM the overlay WebView2 off-screen now,
+    // so the first hotkey lookup hits a WARM surface instead of racing a cold
+    // create chain (>450ms) against the reveal. Sized to the current card size ×
+    // dpr so its off-screen self-measure is at a sane size; the real geometry is
+    // applied on the first showAt/reveal. Non-fatal on failure (the lazy create
+    // path in showAt still works, just cold). Semantics mirror the in-app
+    // keepWebViewWarm hot slot, but for THIS bare overlay window (which
+    // webview_prewarm.dart never warmed — that gap was the root cause).
+    unawaited(_prewarmOverlay(appModel));
+  }
+
+  /// 「防截屏」pref（lookupBlockCapture）即时重应用到覆盖窗。设置页开关是唯一
+  /// 调用点；本方法只管把值推到本窗的 native 通道；native 侧记值并在窗口
+  /// 重建后自动重加（global_lookup_window.cpp ApplyBlockCapture），故无需在每次
+  /// 查词路径上重推。不依赖 [_started]——native 通道随主窗注册即存在，[start]
+  /// 时还会按 pref 再推一次初值兜底。
+  Future<void> applyBlockCapture(bool block) async {
+    if (!isSupported) return;
+    await GlobalLookupChannel.setBlockCapture(block);
+  }
+
+  /// TODO-1079 — off-screen prewarm of the overlay WebView2 (see [start]).
+  Future<void> _prewarmOverlay(AppModel model) async {
+    try {
+      final double dpr = _devicePixelRatio();
+      // 弹窗尺寸精细化：app 外覆盖窗默认跟随 app 内，解锁后用 overlay 自己的键。
+      final LookupSize overlaySize = _clampToPhysicalCap(
+        _effectiveLookupSizeForCurrentRoute(model),
+        model,
+        dpr,
+      );
+      final int w = (overlaySize.width * model.appUiScale * dpr).round();
+      final int h = (overlaySize.height * model.appUiScale * dpr).round();
+      await GlobalLookupChannel.prewarmWebView(width: w, height: h);
+      glog('start: overlay prewarm requested w=$w h=$h');
+    } catch (e) {
+      glog('start: overlay prewarm FAILED (non-fatal): $e');
+    }
+  }
+
+  /// globalExternal scope 每个动作的**执行体登记处**——这个 scope 的动作不经
+  /// resolveKeyboard / 页面派发，全部由本控制器读绑定注册进 OS 级 hotkey_manager，
+  /// 于是「谁执行」在别处无处可查，只能在这里登记。
+  ///
+  /// ⚠️ 新增 globalExternal 动作必须在此登记一条，否则设置页照样渲染出可改键行、
+  /// 用户照样能录键保存，按下去却什么都不发生（本文件反复警告的那种病）。守卫
+  /// `global_external_lookup_hotkey_test` 按 scope 枚举核对这张表的完整性。
+  Map<ShortcutAction, Future<void> Function()> get _osHotKeyActions =>
+      <ShortcutAction, Future<void> Function()>{
+        // 取前台程序的选中文本 → 不抢焦点的覆盖窗出词卡（主窗一动不动）。
+        ShortcutAction.globalExternalLookup: () =>
+            triggerSelectionLookup(source: 'hotkey'),
+        // 相反的取舍：不取任何文本，把主窗唤到前台并落在查词页上。
+        ShortcutAction.globalExternalOpenLookupPage: openLookupPageInMainWindow,
+      };
+
+  /// TODO-1066 — (un)registers the OS-level hotkeys from the current
+  /// [_osHotKeyActions] bindings in the registry. Unregisters everything
+  /// previously registered first so a remap does not leak the old combo. For
+  /// each action the first keyboard binding is used (there is at most one
+  /// meaningful global hotkey per action); when an action has no keyboard
+  /// binding (e.g. the user cleared it, or a platform with no default) nothing
+  /// is registered for it and that one action is simply off until a key is
+  /// assigned — the others still register. Non-fatal on failure.
+  Future<void> _registerHotKeysFromRegistry() {
+    // 串行化：本方法从「同步清空 _hotKeys」到「逐个 register 完」之间有多个 await，
+    // 而调用方 [_onRegistryChanged] 是 fire-and-forget、registry 每次 notifyListeners
+    // 都触发一次（改键 + 恢复默认 + 切 profile 可以连着来）。若第二次调用在第一次的
+    // await 缝里进来，它看到的 _hotKeys 已被清空 ⇒ **跳过注销**，同一组合键被注册两
+    // 遍，而表里只留得下最后一个 —— 另一个再也注销不掉（旧键继续生效 / 一次按键触发
+    // 两遍）。接在上一轮尾巴上跑，缝就不存在了。
+    final Future<void> next = _hotKeyRegistration
+        .then((_) => _registerHotKeysNow())
+        // 上一轮失败不能卡死整条链（内部已逐条 catch，这里只兜底）。
+        .catchError(
+          (Object e) => glog('hotkey: registration round FAILED: $e'),
+        );
+    _hotKeyRegistration = next;
+    return next;
+  }
+
+  /// 串行链上的一轮实际注册，只由 [_registerHotKeysFromRegistry] 调用。
+  Future<void> _registerHotKeysNow() async {
+    // Drop everything registered last round (idempotent: safe when empty).
+    final List<MapEntry<ShortcutAction, HotKey>> previous = _hotKeys.entries
+        .toList(growable: false);
+    _hotKeys.clear();
+    for (final MapEntry<ShortcutAction, HotKey> entry in previous) {
+      try {
+        await hotKeyManager.unregister(entry.value);
+      } catch (e) {
+        glog(
+          'hotkey: unregister previous ${entry.key.key} '
+          'FAILED (non-fatal): $e',
+        );
+      }
+    }
+    final FushiShortcutRegistry? registry = _registry;
+    if (registry == null) {
+      return;
+    }
+    for (final MapEntry<ShortcutAction, Future<void> Function()> entry
+        in _osHotKeyActions.entries) {
+      await _registerOneHotKey(registry, entry.key, entry.value);
+    }
+  }
+
+  /// 注册单个 OS 热键。失败只影响这一个动作，其余照常注册。
+  Future<void> _registerOneHotKey(
+    FushiShortcutRegistry registry,
+    ShortcutAction action,
+    Future<void> Function() run,
+  ) async {
+    final ShortcutBindingSet set = registry.bindingsFor(action);
+    if (set.keyboardBindings.isEmpty) {
+      glog(
+        'hotkey: no keyboard binding for ${action.key} — not '
+        'registered (feature off until a key is assigned)',
+      );
+      return;
+    }
+    final HotKey? hotKey = _hotKeyFromBinding(set.keyboardBindings.first);
+    if (hotKey == null) {
+      glog(
+        'hotkey: ${action.key} binding has no mappable physical key — '
+        'not registered',
+      );
+      return;
+    }
+    _hotKeys[action] = hotKey;
+    try {
+      await hotKeyManager.register(
+        hotKey,
+        keyDownHandler: (_) => unawaited(run()),
+      );
+      glog(
+        'hotkey: registered ${action.key} = '
+        '${set.keyboardBindings.first.displayLabel} from registry OK',
+      );
+    } catch (e, st) {
+      // 注册失败要能被撤销逻辑之外的人看见：本表已记下它，但 OS 侧其实没接上，
+      // 下一轮 unregister 对未注册的 HotKey 是无害 no-op，故不必回滚这条记录。
+      glog('hotkey: register ${action.key} FAILED: $e');
+      // TODO-1086 可见化：全局查词热键注册失败过去只写进 glog 临时诊断文件，用户/开发者
+      // 都看不到「应用外查词唤不出来」的真正原因（热键没注册上）。这里额外把失败记进
+      // ErrorLogService（用户可见的错误日志页 + 随复制/上传链路带走），让此失败成为可诊断
+      // 项而不是静默吞掉。别的注册/系统热键冲突（另一个 app 已占用同一组合键）也会经此暴露。
+      ErrorLogService.instance.log(
+        'GlobalLookupController.registerHotKey',
+        'Failed to register global hotkey ${action.key} = '
+            '${set.keyboardBindings.first.displayLabel}: $e',
+        st,
+      );
+    }
+  }
+
+  /// 用户请求：一个键把 Fushi 主窗**唤到前台**并直接落在**查词页**上
+  /// （[ShortcutAction.globalExternalOpenLookupPage] 的执行体）。
+  ///
+  /// 与 [triggerSelectionLookup] 是**相反**的产品取舍，别合并成一个动作：那条刻意
+  /// 不碰主窗（覆盖窗 `WS_EX_NOACTIVATE`，绝不抢前台程序的焦点），这条要的恰恰是把
+  /// 主窗抢到前台。它也不读任何选中文本，故在任何时刻按都有确定行为。
+  ///
+  /// 两步都复用既有出口，不新增 native：
+  ///  ① [DesktopLookupService.bringMainWindowToFront] —— 已含「已在前台就整个
+  ///     no-op」（对前台窗调 SetForegroundWindow 会退化成任务栏闪烁，TODO-341）与
+  ///     闪烁清理（TODO-615）。别绕过它直接调 windowManager。
+  ///  ② [AppModel.requestHomeDictionaryTab] —— HomePage 侧走
+  ///     `_revealDictionary(carryingPendingLookup: true)`：查词 tab 在就切 tab，被
+  ///     「功能模块 → 查词」关掉时推独立查词路由承载同一个 HomeDictionaryPage。这是
+  ///     一次**用户显式发起**的查词，绝不能被模块门静默吞掉（吞掉的表现是窗口弹到
+  ///     前台却什么都没变，比没有这个热键更糟）。
+  ///     `focusSearch: true`：用户按这个键就是为了打字（Flow Launcher 式用法），页面
+  ///     弹出来还得先点一下搜索框等于热键只做了一半——与携带待查词的悬浮字幕点词
+  ///     不同，本动作不取任何文本，抢焦点不会打断任何事。
+  Future<void> openLookupPageInMainWindow() async {
+    final AppModel? model = _appModel;
+    if (model == null) {
+      glog('openLookupPage: no AppModel (start() not run) — ignored');
+      return;
+    }
+    await DesktopLookupService.instance.bringMainWindowToFront();
+    model.requestHomeDictionaryTab(focusSearch: true);
+    glog('openLookupPage: main window fronted + dictionary tab requested');
+  }
+
+  /// TODO-1066 — DOM `MouseEvent.button` 号里**允许**当全局触发的那两个：
+  /// 3=侧键后退（XBUTTON1）/ 4=侧键前进（XBUTTON2）。理由与真相源都在
+  /// [ShortcutAction.allowedMouseButtons]——设置页的录制门读同一份，否则会出现
+  /// 「设置里能录、按下去没反应」。
+  static Set<int> get _globalMouseTriggerButtons =>
+      ShortcutAction.globalExternalLookup.allowedMouseButtons ?? const <int>{};
+
+  /// 当前已推给 native 的触发按钮号（0 = 未注册）。用来避免注册表每次变更都
+  /// 无谓地重推一次 native 注册。
+  int _mouseTriggerButton = 0;
+
+  /// TODO-1066 — 按注册表里的鼠标绑定，让 native 侧开始/停止监听全局鼠标侧键。
+  ///
+  /// **没绑就不注册**：native 侧一个 RawInput 监听都不留（见
+  /// global_mouse_trigger.cpp）。这是刻意的——BUG-1077 立的契约是「不查词不留
+  /// 全局钩子」，这里沿用同样的纪律：不用这个功能的用户，不该为它付任何常驻代价。
+  Future<void> _registerMouseTriggerFromRegistry() async {
+    final FushiShortcutRegistry? registry = _registry;
+    int button = 0;
+    if (registry != null) {
+      final ShortcutBindingSet set = registry.bindingsFor(
+        ShortcutAction.globalExternalLookup,
+      );
+      for (final MouseBinding binding in set.mouseBindings) {
+        if (_globalMouseTriggerButtons.contains(binding.button)) {
+          button = binding.button;
+          break;
+        }
+      }
+      if (button == 0 && set.mouseBindings.isNotEmpty) {
+        glog(
+          'mouseTrigger: bound button(s) '
+          '${set.mouseBindings.map((MouseBinding b) => b.button).toList()} '
+          'are not side buttons (only 3/4 supported) — not registered',
+        );
+      }
+    }
+    if (button == _mouseTriggerButton) {
+      return;
+    }
+    _mouseTriggerButton = button;
+    try {
+      await GlobalLookupChannel.setGlobalMouseTrigger(button);
+      glog(
+        button == 0
+            ? 'mouseTrigger: unregistered (no side-button binding)'
+            : 'mouseTrigger: registered button=$button',
+      );
+    } catch (e, st) {
+      glog('mouseTrigger: register FAILED: $e');
+      ErrorLogService.instance.log(
+        'GlobalLookupController.registerMouseTrigger',
+        'Failed to register global mouse trigger (button=$button): $e',
+        st,
+      );
+    }
+  }
+
+  /// TODO-1066 — re-registers the OS hotkey when the registry changes (user
+  /// remaps the key in settings, or a profile switch reloads bindings). Fire and
+  /// forget; failures are logged inside [_registerHotKeysFromRegistry].
+  ///
+  /// 鼠标侧键触发同样跟着重推（手柄那条不用：它每次按下都现查注册表，没有需要
+  /// 同步的 OS 侧状态）。
+  void _onRegistryChanged() {
+    unawaited(_registerHotKeysFromRegistry());
+    unawaited(_registerMouseTriggerFromRegistry());
+  }
+
+  /// TODO-1066 — maps a registry keyboard [binding] to a hotkey_manager [HotKey].
+  /// hotkey_manager keys off the USB-HID [PhysicalKeyboardKey]; the registry
+  /// stores a logical key + [ModifierKey] set. [InputBinding.physicalKey] reuses
+  /// the same logical→physical table the IME fallback uses (US-QWERTY). Returns
+  /// null when the logical key has no physical mapping (e.g. game* / numpad keys
+  /// that are not valid global hotkeys anyway).
+  HotKey? _hotKeyFromBinding(InputBinding binding) {
+    final PhysicalKeyboardKey? physical = binding.physicalKey;
+    if (physical == null) {
+      return null;
+    }
+    final List<HotKeyModifier> modifiers = <HotKeyModifier>[];
+    for (final ModifierKey mod in binding.modifiers) {
+      switch (mod) {
+        case ModifierKey.ctrl:
+          modifiers.add(HotKeyModifier.control);
+          break;
+        case ModifierKey.shift:
+          modifiers.add(HotKeyModifier.shift);
+          break;
+        case ModifierKey.alt:
+          modifiers.add(HotKeyModifier.alt);
+          break;
+        case ModifierKey.meta:
+          modifiers.add(HotKeyModifier.meta);
+          break;
+      }
+    }
+    return HotKey(
+      key: physical,
+      modifiers: modifiers,
+      scope: HotKeyScope.system,
+    );
+  }
+
+  /// Absolute folder that holds popup.html — see [popupAssetsDirFor].
+  String _popupAssetsDir() =>
+      popupAssetsDirFor(Platform.resolvedExecutable, isMacOS: Platform.isMacOS);
+
+  /// Absolute popup assets folder for the native overlay to serve:
+  ///   · Windows / Linux: `<exeDir>/data/flutter_assets/assets/popup`;
+  ///   · macOS: `<App>.app/Contents/Frameworks/App.framework/Resources/
+  ///     flutter_assets/assets/popup` (the executable lives in Contents/MacOS;
+  ///     same bundle layout webview_asset_url.dart probes for in-app assets).
+  ///
+  /// [context] is the path style to resolve with (defaults to the running
+  /// platform's); tests pass `p.windows` / `p.posix` explicitly so the
+  /// Windows layout can be asserted on a Linux CI runner and vice versa.
+  @visibleForTesting
+  static String popupAssetsDirFor(
+    String resolvedExecutable, {
+    required bool isMacOS,
+    p.Context? context,
+  }) {
+    final p.Context ctx = context ?? p.context;
+    final String exeDir = ctx.dirname(resolvedExecutable);
+    if (isMacOS) {
+      return ctx.normalize(
+        ctx.join(
+          exeDir,
+          '..',
+          'Frameworks',
+          'App.framework',
+          'Resources',
+          'flutter_assets',
+          'assets',
+          'popup',
+        ),
+      );
+    }
+    return ctx.join(exeDir, 'data', 'flutter_assets', 'assets', 'popup');
+  }
+
+  /// TODO-1066 — app 外查词的**触发源无关**入口：抓前台程序当前选中的文本，
+  /// 查词，弹出覆盖窗卡片。
+  ///
+  /// 三个触发源共用这一个方法，语义完全一致，不各自复制一条链路（route 铸造、
+  /// epoch 作废、prewarm、隐藏时序都在这条链上，复制一份必然漂移）：
+  ///   · 键盘：OS 级热键（win32 `RegisterHotKey`，见 [_registerHotKeysFromRegistry]）；
+  ///   · 手柄：`GamepadService` 的后台分支（不经 Flutter 焦点树，app 失焦时仍有效）；
+  ///   · 鼠标侧键：native RawInput 监听（见 windows/runner/global_mouse_trigger.cpp）。
+  ///
+  /// 方法体里没有任何键盘/修饰键相关的逻辑——它本来就是触发源无关的，改成公开
+  /// 是零行为变更。[source] 只进诊断日志，用来区分是哪个触发源点的火。
+  Future<void> triggerSelectionLookup({String source = 'hotkey'}) async {
+    final GlobalLookupRoute route = GlobalLookupRoute.desktop(
+      lookupEpoch: ++_desktopLookupEpoch,
+    );
+    return GlobalLookupChannel.runWithRoute(
+      route,
+      () => _onHotKeyRouted(route, source),
+    );
+  }
+
+  Future<void> _onHotKeyRouted(GlobalLookupRoute route, String source) async {
+    _activateRoute(route);
+    glog('hotkey: FIRED (source=$source)');
+    try {
+      // Re-press ALWAYS does a fresh lookup of the current selection (no
+      // toggle): the user selects a new word and presses the hotkey expecting
+      // the new word, not for the card to vanish. Closing is Esc / click
+      // outside (handled natively by the foreground + mouse hooks).
+      final AppModel? model = _appModel;
+      if (model == null) {
+        glog('hotkey: appModel null — abort');
+        return;
+      }
+      if (Platform.isMacOS && !await _ensureMacAccessibilityForSelection()) {
+        // Showing the permission pane changes the foreground application, so
+        // capturing now would read the wrong app. The user can press the same
+        // hotkey again after granting access.
+        if (_isCurrentRoute) {
+          glog('hotkey: macOS Accessibility permission required — abort');
+        }
+        return;
+      }
+      // TODO-1079 (D) — collapse native + Dart reveal state to known-hidden
+      // BEFORE the (possibly slow) selection capture, so a re-press makes the
+      // previous card vanish immediately. _lookupExternal hides again right
+      // before showAt (idempotent + cheap: SW_HIDE + unhook), which is what
+      // keeps the programmatic lookupText path equally clean.
+      // TODO-1233 — notify:false: this is the between-lookups reset, NOT a user
+      // dismissal, so it must not fire overlayHidden (which would resume a paused
+      // video mid re-lookup).
+      await GlobalLookupChannel.hide(notify: false);
+      if (!_isCurrentRoute) return;
+      // TODO-1030 M0 — when the user opted into context capture, try UI
+      // Automation first: it yields the selected term PLUS the sentence it sits
+      // in. On any miss (no UIA text element, non-Windows, channel unavailable)
+      // fall back to the clipboard capture (inject Ctrl+C), which yields only
+      // the bare selection — never break the existing path.
+      String text = '';
+      String sentence = '';
+      if (model.globalContextCaptureEnabled) {
+        final ForegroundSelectionContext? ctx =
+            await SelectionCapture.captureForegroundContext();
+        if (!_isCurrentRoute) return;
+        if (ctx != null) {
+          text = ctx.selectedText.trim();
+          sentence = ctx.sentence;
+        }
+      }
+      if (text.isEmpty) {
+        // No context (or feature off): fall back to the clipboard selection.
+        // stillWanted：剪贴板捕获是串行的全局事务（见 SelectionCapture 的闸门）。
+        // 手柄按钮/鼠标侧键比键盘热键容易连击，排队期间本次若已被新触发取代，就
+        // 别再去动一次剪贴板——反正结果下一行就会被丢弃。
+        text =
+            (await SelectionCapture.captureForegroundSelection(
+                      stillWanted: () => _isCurrentRoute,
+                    ) ??
+                    '')
+                .trim();
+        if (!_isCurrentRoute) return;
+        sentence = '';
+      }
+      if (text.isEmpty) {
+        glog('hotkey: empty selection — abort');
+        return;
+      }
+      // 整句只进制卡 `{sentence}` 兜底（sentenceContext），卡上不显示。
+      await _lookupExternal(
+        text,
+        sentence: sentence,
+        physicalPlacement: null,
+        autoRead: true,
+        miningHandler: null,
+      );
+    } catch (e, st) {
+      glog('hotkey: EXCEPTION $e\n$st');
+    }
+  }
+
+  /// Returns whether macOS can read/capture the foreground app's selection.
+  /// The permission request is only made after an explicit global-lookup
+  /// trigger, never during app startup or silently in the capture fallback.
+  ///
+  /// 未授权时**每次**触发都要留下用户看得见的痕迹：授权面板只开一次（再开一次
+  /// 也只是把同一个系统设置页翻到前台，徒增骚扰），但之后每一次热键 / 手柄 /
+  /// 鼠标侧键触发都往 [ErrorLogService] 记一条——这条链路的失败形态是「按了键
+  /// 什么都没发生」，只写 glog 临时诊断文件等于静默吞掉（TODO-1086 已为热键注册
+  /// 失败立过同一条规矩）。
+  Future<bool> _ensureMacAccessibilityForSelection() async {
+    if (!Platform.isMacOS) return true;
+    if (await SelectionCapture.isAccessibilityTrusted()) return true;
+    if (!_macAccessibilityPrompted) {
+      _macAccessibilityPrompted = true;
+      final bool granted = await SelectionCapture.requestAccessibilityTrust();
+      glog('hotkey: macOS Accessibility request granted=$granted');
+      if (granted && await SelectionCapture.isAccessibilityTrusted()) {
+        return true;
+      }
+    }
+    glog('hotkey: macOS Accessibility not granted, selection capture skipped');
+    ErrorLogService.instance.log(
+      'GlobalLookupController.macAccessibility',
+      'Global lookup could not read the foreground selection: Fushi is not '
+          'trusted for Accessibility. Grant it in System Settings > Privacy & '
+          'Security > Accessibility, then trigger the lookup again.',
+    );
+    return false;
+  }
+
+  /// TODO-872 — programmatic app-external lookup (desktop floating-lyric word
+  /// tap etc.). [text] is the already-segmented term; [sentence] is the line it
+  /// came from, fed to mining's `{sentence}` field only (the card never renders
+  /// it; '' = no sentence). Opens the SAME overlay card as the global
+  /// hotkey, at the OS cursor (the click that triggered this just happened
+  /// there — the native floating-lyric strip reports text+index only, no
+  /// coordinates). Returns false when the overlay cannot take the lookup
+  /// (unsupported platform / [start] never ran / blank term) so the caller
+  /// falls back to its existing in-app route — a tap is never silently lost.
+  /// [anchorScreenRect]（屏幕逻辑 px）：给出时卡片放在该矩形上/下侧、不压字（台词浮窗
+  /// 点词=被点文字处），null 保持 OS 光标语义。
+  /// 游戏内查词的**物理像素**尺寸上限（宽, 高）。null = 不限（桌面浮窗）。
+  ///
+  /// 为什么必须有：游戏内卡片要塞进两个硬约束——游戏视口，以及共享内存的位图预算
+  /// （3 MiB / 4 字节 = 786432 像素）。不夹的话卡片按桌面工作区排版，真机上量到
+  /// 2555x2160（22 MB），既超预算，又让 anchor 的 `clamp(0, viewW - cardW)` 上界
+  /// 变负、整个塌成 (0,0)——卡片钉在左上角不跟着字走，正是这个原因。
+  ({int w, int h})? _physicalCap;
+  // BUG-1835 — the single-card bitmap cap above and the cascade layout work
+  // area are different constraints. A gal card is capped to ~60% of the game,
+  // while its children may use the WHOLE game viewport. Keeping the root origin
+  // alongside that viewport also puts computeFrameRect in the same coordinate
+  // domain as the glyph/game view instead of pretending the root starts at 0,0.
+  ({int w, int h, int x, int y})? _physicalLayoutWorkArea;
+
+  /// 设置/清除物理像素上限。游戏内会话开始时按视口与位图预算设，结束时清。
+  void setPhysicalCap({
+    int? width,
+    int? height,
+    int? workWidth,
+    int? workHeight,
+    int workOriginX = 0,
+    int workOriginY = 0,
+  }) {
+    _physicalCap =
+        (width == null || height == null || width <= 0 || height <= 0)
+        ? null
+        : (w: width, h: height);
+    _physicalLayoutWorkArea =
+        (workWidth == null ||
+            workHeight == null ||
+            workWidth <= 0 ||
+            workHeight <= 0)
+        ? null
+        : (w: workWidth, h: workHeight, x: workOriginX, y: workOriginY);
+  }
+
+  /// BUG-2921 — 游戏内查词卡直连上屏后，把嵌套子卡的布局视口换成**真实客户区**。
+  ///
+  /// [setPhysicalCap] 交来的视口与原点是**画布**域（位图回退按画布 1:1 贴卡，只能这么
+  /// 排）。直连路径的卡片却是屏幕物理 px 的真窗口，根卡由 runner 按字形在客户区里居中、
+  /// 零间隙地贴放：画布尺寸、画布里的根卡原点与真实画面在放大/缩小运行的游戏里都对不上。
+  /// 子卡按画布域排出的「上方空间」比真实的多，落到屏幕上就越出客户区顶边、标题栏被裁。
+  /// runner 在 present 回执里报回根卡在客户区里的真实左上角，这里把它和客户区尺寸换成
+  /// CSS px 写进级联布局域；之后的嵌套渲染就在真实画面里排版。
+  ///
+  /// 只对仍有效的 galCard route 生效；四个参数都是物理 px。
+  void adoptGalDirectLayoutViewport({
+    required GlobalLookupRoute route,
+    required int clientWidth,
+    required int clientHeight,
+    required int rootClientX,
+    required int rootClientY,
+  }) {
+    if (route.source != 'galCard' ||
+        !GlobalLookupChannel.isRouteValid(route) ||
+        clientWidth <= 0 ||
+        clientHeight <= 0 ||
+        _workDpr <= 0) {
+      return;
+    }
+    _screenWorkW = clientWidth / _workDpr;
+    _screenWorkH = clientHeight / _workDpr;
+    _cursorWorkX = rootClientX / _workDpr;
+    _cursorWorkY = rootClientY / _workDpr;
+  }
+
+  /// 嵌套布局当前使用的视口与根卡原点（CSS px）。
+  @visibleForTesting
+  ({double w, double h, double x, double y}) get debugCascadeLayoutDomain =>
+      (w: _screenWorkW, h: _screenWorkH, x: _cursorWorkX, y: _cursorWorkY);
+
+  @visibleForTesting
+  void debugSeedCascadeLayoutDomain({
+    required double workDpr,
+    required double width,
+    required double height,
+    required double originX,
+    required double originY,
+  }) {
+    _workDpr = workDpr;
+    _screenWorkW = width;
+    _screenWorkH = height;
+    _cursorWorkX = originX;
+    _cursorWorkY = originY;
+  }
+
+  /// 把逻辑尺寸夹到 [_physicalCap]。等比缩小而不是各轴独立裁剪：独立裁剪会改变
+  /// 卡片的宽高比，排版跟着变形；等比缩小只是变小。
+  /// 当前 route 所属形态的「有效最大宽高」。
+  ///
+  /// 游戏内查词卡与 app 外覆盖窗是**两个形态**：前者贴在游戏客户区里、不能压住正文，
+  /// 后者浮在整块桌面上；合适尺寸本就不同。两者曾共读 overlay 那一组键，于是只能
+  /// 二选一——真机上就是「游戏内过小、浮窗过大」。这里按 route 分流，形态各读各的键。
+  LookupSize _effectiveLookupSizeForCurrentRoute(AppModel model) =>
+      GlobalLookupChannel.currentRoute.source == 'galCard'
+      ? model.galCardLookupEffectiveSize
+      : model.overlayLookupEffectiveSize;
+
+  /// 卡片尺寸上界（物理像素）。真机上它决定「最大宽/高」这个设置到底生不生效。
+  @visibleForTesting
+  ({int w, int h})? get debugPhysicalCap => _physicalCap;
+
+  /// 级联布局工作区 + 根卡原点。四个分量**必须同域**，测试据此咬住。
+  @visibleForTesting
+  ({int w, int h, int x, int y})? get debugLayoutWorkArea =>
+      _physicalLayoutWorkArea;
+
+  /// 按当前 route 分流出来的「有效最大宽高」。galCard 与桌面覆盖窗读的是两组不同的
+  /// 偏好键，这条分流是「游戏内查词卡独立尺寸」整个功能的唯一开关点。
+  @visibleForTesting
+  LookupSize debugEffectiveLookupSizeForCurrentRoute(AppModel model) =>
+      _effectiveLookupSizeForCurrentRoute(model);
+
+  LookupSize _clampToPhysicalCap(LookupSize size, AppModel model, double dpr) {
+    // setPhysicalCap belongs to the galCard route. Desktop lookups, including
+    // attached hits, must not inherit a cap left behind by a previous game
+    // card session.
+    final ({int w, int h})? cap =
+        GlobalLookupChannel.currentRoute.source == 'galCard'
+        ? _physicalCap
+        : null;
+    if (cap == null) return size;
+    final double factor = model.appUiScale * dpr;
+    if (factor <= 0) return size;
+    final double physW = size.width * factor;
+    final double physH = size.height * factor;
+    if (physW <= cap.w && physH <= cap.h) return size;
+    final double scale = math.min(cap.w / physW, cap.h / physH);
+    return LookupSize(size.width * scale, size.height * scale);
+  }
+
+  /// [consumeOutsideClicksOwnerHwnd]：attached 校准字形表面（galgame 通用回退）
+  /// 打开的桌面弹窗必须带上游戏 HWND——「点卡外关闭」那一记 down/up 要成对
+  /// 吞掉，不得穿透到游戏推进台词（与 direct galCard 同一条消费策略）。null =
+  /// 普通桌面查词（热键 / 浮窗点词），不发这条 channel，点击照旧交给原应用。
+  Future<bool> lookupText(
+    String text, {
+    String sentence = '',
+    Rect? anchorScreenRect,
+    GlobalLookupPhysicalPlacement? physicalPlacement,
+    bool autoRead = true,
+    OverlayMiningHandler? miningHandler,
+    int? consumeOutsideClicksOwnerHwnd,
+  }) async {
+    final GlobalLookupRoute inherited = GlobalLookupChannel.currentRoute;
+    final GlobalLookupRoute route = inherited.source == 'galCard'
+        ? inherited
+        : GlobalLookupRoute.desktop(lookupEpoch: ++_desktopLookupEpoch);
+    return GlobalLookupChannel.runWithRoute(
+      route,
+      () => _lookupTextRouted(
+        text,
+        sentence: sentence,
+        anchorScreenRect: anchorScreenRect,
+        physicalPlacement: physicalPlacement,
+        autoRead: autoRead,
+        miningHandler: miningHandler,
+        consumeOutsideClicksOwnerHwnd: consumeOutsideClicksOwnerHwnd,
+      ),
+    );
+  }
+
+  Future<bool> _lookupTextRouted(
+    String text, {
+    required String sentence,
+    required Rect? anchorScreenRect,
+    required GlobalLookupPhysicalPlacement? physicalPlacement,
+    required bool autoRead,
+    required OverlayMiningHandler? miningHandler,
+    int? consumeOutsideClicksOwnerHwnd,
+  }) async {
+    final String term = text.trim();
+    if (!isSupported || !_started || _appModel == null || term.isEmpty) {
+      return false;
+    }
+    if (physicalPlacement != null && !physicalPlacement.isValid) return false;
+    _activateRoute(GlobalLookupChannel.currentRoute);
+    glog('lookupText: "$term"');
+    // TODO-1268 / BUG — mirror _onHotKey's TODO-1079(D) preamble on the
+    // programmatic (desktop floating-lyric tap) path: AWAIT a leading
+    // hide(notify:false) so the overlay collapses to a confirmed-hidden state
+    // (SW_HIDE + unhook done on the platform thread) BEFORE _lookupExternal
+    // re-shows + re-renders. The hotkey path got this reset — plus a real
+    // event-loop settle — for free from its async selection-capture round-trip;
+    // lookupText fired _lookupExternal with zero latency, so a floating-lyric
+    // re-tap (or a tap while a previous card was still revealing) raced the
+    // shared reveal state / host content-ready gate and the overlay never
+    // emitted overlaySize — the card revealed blank via the READY-SAFETY
+    // fallback ("点击悬浮字幕文字没有出现查词窗口"). notify:false so this
+    // between-lookups reset is not seen as a user dismissal (TODO-1233).
+    await GlobalLookupChannel.hide(notify: false);
+    if (!_isCurrentRoute) return false;
+    return _lookupExternal(
+      term,
+      sentence: sentence,
+      anchorScreenRect: anchorScreenRect,
+      physicalPlacement: physicalPlacement,
+      autoRead: autoRead,
+      miningHandler: miningHandler,
+      consumeOutsideClicksOwnerHwnd: consumeOutsideClicksOwnerHwnd,
+    );
+  }
+
+  void _activateRoute(GlobalLookupRoute route) {
+    final GlobalLookupRoute? previous = _activeRoute;
+    if (previous == route) {
+      return;
+    }
+    if (previous != null) {
+      GlobalLookupChannel.invalidateRoute(previous);
+    }
+    _activeRoute = route;
+  }
+
+  bool get _isCurrentRoute {
+    final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+    return route == _activeRoute && GlobalLookupChannel.isRouteValid(route);
+  }
+
+  void _notifyRevealed(
+    int width,
+    int height, {
+    int dx = 0,
+    int dy = 0,
+    int rootHeight = 0,
+  }) {
+    final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+    if (!_isCurrentRoute) {
+      return;
+    }
+    // The legacy callback predates routed surfaces and is a desktop-only
+    // compatibility hook. Broadcasting a galCard reveal through it reintroduces
+    // the exact cross-surface ambiguity immutable route tokens remove.
+    if (route.source == 'desktop') {
+      onRevealed?.call(width, height);
+    }
+    onRoutedRevealed?.call(route, width, height, dx, dy, rootHeight);
+  }
+
+  /// TODO-872 — the shared app-external lookup chain for BOTH triggers (the
+  /// global hotkey and the programmatic [lookupText] entry): unconditional
+  /// hide → searchDictionary → reset reveal state → seed the stack root →
+  /// showAt(atCursor) → renderStack → auto-read → ready-driven reveal safety.
+  /// Never throws (logs and returns false, matching the old _onHotKey contract).
+  ///
+  /// [anchorScreenRect]（屏幕逻辑 px）：台词浮窗点词给出被点文字的屏幕矩形，
+  /// 卡片放在文字正下方、下方放不下则翻到上方（同 in-app 嵌套卡观感），
+  /// 而不是光标点右下。
+  /// null = 原 atCursor 语义（热键/悬浮字幕路径零变化）。native
+  /// showAt 在 atCursor:false 时直接用传入点并以该点算工作区偏移，级联种子
+  /// （cursorWorkX/Y）自动对齐锚点，无需 native 改动。
+  /// [physicalPlacement] supplies attached hits in physical screen pixels;
+  /// its root anchor uses the existing above/below placement in the viewport.
+  Future<bool> _lookupExternal(
+    String text, {
+    required String sentence,
+    Rect? anchorScreenRect,
+    required GlobalLookupPhysicalPlacement? physicalPlacement,
+    required bool autoRead,
+    OverlayMiningHandler? miningHandler,
+    int? consumeOutsideClicksOwnerHwnd,
+  }) async {
+    final AppModel? model = _appModel;
+    if (model == null) {
+      glog('lookup: appModel null — abort');
+      return false;
+    }
+    try {
+      // TODO-1079 (D) — reset native + Dart reveal state from zero every
+      // lookup. The native visible_/revealed_ and this controller's
+      // _revealed used to drift out of sync across lookups (an in-flight
+      // Hide() could swallow the next window; a stale revealed_ let the
+      // foreground hook self-close the fresh card). An unconditional hide()
+      // up front collapses both sides to a known-hidden state before showAt
+      // re-arms them, so every lookup starts clean. Cheap (SW_HIDE + unhook)
+      // and the prewarmed WebView2 survives it.
+      // TODO-1233 — notify:false: same between-lookups reset as _onHotKey; must
+      // not look like a user dismissal.
+      await GlobalLookupChannel.hide(notify: false);
+      if (!_isCurrentRoute) return false;
+      // attached 表面打开的弹窗：hide 刚把 native 的 consume owner 清空，这里在
+      // showAt/reveal 之前重新记下游戏 HWND，reveal/revealStack 才会走同步吞点击
+      // Arm。普通桌面查词（null）不发这条 channel——非 Windows 也走本控制器。
+      if (consumeOutsideClicksOwnerHwnd != null &&
+          consumeOutsideClicksOwnerHwnd != 0) {
+        await GlobalLookupChannel.setOutsideClickOwner(
+          consumeOutsideClicksOwnerHwnd,
+        );
+        if (!_isCurrentRoute) return false;
+      }
+      _currentSentence = sentence;
+      _currentMiningHandler = miningHandler;
+      // Retire every acknowledgement belonging to the previous lookup before
+      // the asynchronous dictionary search yields. The renderer's epoch itself
+      // is host-global and is intentionally NOT reset here.
+      _resetGeometryHandshakeForLookup();
+
+      final DictionarySearchResult result = await model.searchDictionary(
+        searchTerm: text,
+        searchWithWildcards: false,
+      );
+      if (!_isCurrentRoute) return false;
+      glog('lookup: searched "$text" -> entries=${result.entries.length}');
+      // New card: forget the previous size + reveal state so the overlay
+      // re-measures and reveals from scratch.
+      _revealed = false;
+      _revealSafety?.cancel();
+      // TODO-1231 (BUG-583) — a fresh hotkey lookup starts a new session: drop
+      // the origin ratchet so the single root card re-anchors at the cursor
+      // (origin 0,0) instead of inheriting a previous cascade's outward min-corner.
+      _ratchetLeft = double.infinity;
+      _ratchetTop = double.infinity;
+
+      // TODO-867 P3c: a new hotkey lookup RESETS the whole stack to a single
+      // root frame. The single-frame card is now stack depth 1 rendered through
+      // the host iframe (window.__globalLookupHost.renderStack) — the top-level
+      // document is global_lookup_host.html (zero popup.js instance), so there
+      // is NO top-level direct render anymore (the old buildOverlayRenderScript
+      // path is retired). A no-result lookup still seeds a root frame so
+      // its iframe shows popup.js's own no-results card (see _resetStackRoot).
+      _resetStackRoot(text, result);
+      _recordLookupCount();
+
+      // TODO-1095 — a fresh lookup must reset the host route/bbox/content gate.
+      // Do not send beginLookup as a separate RenderJson call here: on a cold or
+      // recovering WebView the native side intentionally retains one complete
+      // pending render (last-wins), so a later renderStack would overwrite the
+      // route prelude and leave the host on desktop/0/0.  [_renderStack] prefixes
+      // both operations into one atomic script below.
+      final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+
+      // Render OFF-SCREEN at the reader-faithful size (popupMax* × appUiScale ×
+      // dpr) so the page measures at the correct width straight away; the card
+      // is revealed once via overlaySize. dpr is the main window's — the same
+      // monitor in the common case; the page reports the authoritative dpr in
+      // overlaySize and Reveal uses that. Position natively (GetCursorPos =
+      // physical px) to avoid the logical/physical DPI mismatch.
+      final double dpr = _devicePixelRatio();
+      // TODO-867 P3c E1 — the off-screen measurement window is sized to the
+      // cascade LAYOUT BOUNDS (window-local CSS px) so a nested child card has
+      // room to cascade beside the root during measurement; D2's union bbox
+      // (overlaySize) then reveals/resizes the window down to the real extent.
+      // Legacy roots stay anchorless (their anchor is null) and land at
+      // the window-local origin clamped into the work area (TODO-1231
+      // computeRootShellOffset), so a single-frame lookup still reveals exactly
+      // at the card size after the bbox trims the bounds — no regression.
+      final LookupSize overlaySize = _clampToPhysicalCap(
+        _effectiveLookupSizeForCurrentRoute(model),
+        model,
+        dpr,
+      );
+      final double cardW = overlaySize.width * model.appUiScale;
+      final double cardH = overlaySize.height * model.appUiScale;
+      _layoutBoundsW = cardW * kGlobalLookupLayoutBoundsWidthFactor;
+      _layoutBoundsH = cardH * kGlobalLookupLayoutBoundsHeightFactor;
+      final int w0 = (_layoutBoundsW * dpr).round();
+      final int h0 = (_layoutBoundsH * dpr).round();
+      // Both anchor kinds seed the window at the physical word origin; the
+      // anchored root frame handles above/below avoidance.
+      // Native chooses the monitor from this point; anchorless calls use cursor.
+      // 布局工作区上限：游戏内查词时可用空间是**游戏视口**，不是显示器工作区。
+      // 不传就会按 2560x1440 排版、排完再被裁（runner 超尺寸是裁不是缩）。
+      final bool usePhysicalAnchor = physicalPlacement != null;
+      final Rect? effectiveAnchor =
+          physicalPlacement?.anchorScreenRect ?? anchorScreenRect;
+      // 两种锚点统一到物理像素：逻辑锚点（台词浮窗 / 剪贴板面板点词）曾把窗口
+      // 种在词下方且根卡不带锚，下方放不下时根卡只被夹回工作区——整卡上推正好
+      // 压在被点的词上（浮窗贴屏幕底时必现）。现在与 attached 一样种在词左上角，
+      // 根卡带锚交给 computeFrameRect 择上/下侧。
+      final Rect? anchorPhysical = effectiveAnchor == null
+          ? null
+          : usePhysicalAnchor
+          ? effectiveAnchor
+          : Rect.fromLTRB(
+              effectiveAnchor.left * dpr,
+              effectiveAnchor.top * dpr,
+              effectiveAnchor.right * dpr,
+              effectiveAnchor.bottom * dpr,
+            );
+      final Rect? destinationViewport =
+          physicalPlacement?.destinationViewportScreenRect;
+      final int showX = anchorPhysical?.left.round() ?? 0;
+      final int showY = anchorPhysical?.top.round() ?? 0;
+      // A galCard lookup keeps using its session-owned layout viewport. An
+      // attached desktop lookup gets a viewport from the same native hit event;
+      // all other desktop lookups must use the monitor work area reported by
+      // showAt rather than a stale galCard value.
+      final ({int w, int h, int x, int y})? galWorkArea =
+          GlobalLookupChannel.currentRoute.source == 'galCard'
+          ? _physicalLayoutWorkArea
+          : null;
+      final int capW =
+          destinationViewport?.width.round() ?? galWorkArea?.w ?? 0;
+      final int capH =
+          destinationViewport?.height.round() ?? galWorkArea?.h ?? 0;
+      final int capX = destinationViewport == null
+          ? galWorkArea?.x ?? 0
+          : showX - destinationViewport.left.round();
+      final int capY = destinationViewport == null
+          ? galWorkArea?.y ?? 0
+          : showY - destinationViewport.top.round();
+      final GlobalLookupShowResult shown = effectiveAnchor == null
+          ? await GlobalLookupChannel.showAt(
+              x: 0,
+              y: 0,
+              width: w0,
+              height: h0,
+              atCursor: true,
+              capWidth: capW,
+              capHeight: capH,
+              capOriginX: capX,
+              capOriginY: capY,
+            )
+          : await GlobalLookupChannel.showAt(
+              x: showX,
+              y: showY,
+              width: w0,
+              height: h0,
+              atCursor: false,
+              capWidth: capW,
+              capHeight: capH,
+              capOriginX: capX,
+              capOriginY: capY,
+            );
+      // BUG-2372 诊断线 —— 「弹窗没锚在被点的词上」这类报告，光看截图量不出
+      // 锚点到卡片的真实偏移。把锚点坐标域、dpr、真正投给 native 的物理
+      // 坐标、以及 native 回报的工作区/原点一次记全；配合随后的 reveal(box)
+      // 就能把卡片的最终屏幕位置反算到像素，不必再让用户反复截图。
+      glog(
+        'lookup: anchor=${effectiveAnchor == null ? 'null(atCursor)' : '('
+                  '${effectiveAnchor.left},${effectiveAnchor.top},'
+                  '${effectiveAnchor.width}x${effectiveAnchor.height})'} '
+        'anchorSpace=${usePhysicalAnchor ? 'physical' : 'logical'} '
+        'dpr=$dpr appUiScale=${model.appUiScale} '
+        'showAt=(${effectiveAnchor == null ? 'cursor' : '$showX,$showY'}) '
+        'cardCss=${overlaySize.width}x${overlaySize.height} '
+        'cap=(${capW}x$capH @$capX,$capY) '
+        'reply=(work=${shown.workWidth}x${shown.workHeight} '
+        'origin=${shown.cursorWorkX},${shown.cursorWorkY} '
+        'monitorDpr=${shown.monitorDpr})',
+      );
+      if (!_isCurrentRoute) return false;
+      if (!shown.ok) {
+        glog('lookup: showAt rejected the current route');
+        await GlobalLookupChannel.hide(notify: false);
+        return false;
+      }
+      // TODO-893 / BUG-859 — convert the native physical-px work area to CSS px
+      // (the cascade layout domain) with the ANCHOR MONITOR's dpr reported by
+      // showAt. The main-window dpr (used for the initial off-screen size
+      // above) is only correct when the overlay lands on the same-scale
+      // monitor; on a mixed-scale setup the overlay WebView2 rasterizes at its
+      // own monitor's scale, so dividing by the main dpr put the work-area
+      // domain in the wrong CSS scale (mis-placed nested cards + broken
+      // reserve-to-edge clamp invariant). Fall back to the main dpr when the
+      // native monitor query failed (monitorDpr 0).
+      final double workDpr = shown.monitorDpr > 0 ? shown.monitorDpr : dpr;
+      _workDpr = workDpr;
+      if (anchorPhysical != null && _stack.frames.isNotEmpty) {
+        // The existing root-frame layout chooses above/below the hit and fits
+        // the card to that side. Its anchor is window-local CSS pixels; the
+        // viewport origin offset below lifts it into the common layout space.
+        final Rect hit = anchorPhysical;
+        _frameAnchors[_stack.frames.first.id] = Rect.fromLTWH(
+          (hit.left - showX) / workDpr,
+          (hit.top - showY) / workDpr,
+          hit.width / workDpr,
+          hit.height / workDpr,
+        );
+      }
+      _screenWorkW = shown.workWidth > 0 ? shown.workWidth / workDpr : 0;
+      _screenWorkH = shown.workHeight > 0 ? shown.workHeight / workDpr : 0;
+      // TODO-893 v2 (symptom 3) — same dpr boundary: the native cursor/work
+      // offset is physical px; convert to CSS px for the cascade layout domain.
+      _cursorWorkX = workDpr > 0 ? shown.cursorWorkX / workDpr : 0;
+      _cursorWorkY = workDpr > 0 ? shown.cursorWorkY / workDpr : 0;
+      // TODO-1345 (BUG-583) / TODO-1231 (BUG-670 deep cascade) — reserve cascade
+      // headroom ALL THE WAY to the cursor monitor's work-area edge so a subsequent
+      // up/left child at ANY depth (child / grandchild / a card taller than one
+      // card) lands INSIDE the window origin committed at THIS first reveal; the
+      // host then never moves the origin when a nested card appears -> the pinned
+      // parent card has ZERO displacement at any cascade depth. TODO-1345 reserved
+      // only ONE card, so a deep cascade beyond it still moved the origin once (the
+      // residual 1-frame parent lurch users kept seeing). Reserving to the edge is
+      // the deterministic worst case: computeFrameRect clamps every cascade card
+      // on-screen, so no card can ever reach past the work-area edge. It stays
+      // clamp-safe because the reserved origin sits exactly on the C++ RevealStack
+      // work-area clamp target (see computeCascadeHeadroomSeed). 0 near an edge / no
+      // work area -> pre-fix geometry.
+      // Desktop reserves the path to the monitor edge so later HWND moves cannot
+      // lurch a visible parent. The gal route now resizes its already-visible
+      // composition HWND in place; reserving from a non-zero game root to (0,0)
+      // would instead create a mostly-transparent near-viewport-sized union and
+      // recreate the fixed red range reported in BUG-1835.
+      final ({double left, double top}) floor = route.source == 'galCard'
+          ? (left: 0.0, top: 0.0)
+          : computeCascadeHeadroomSeed(
+              cursorWorkX: _cursorWorkX,
+              cursorWorkY: _cursorWorkY,
+              screenWorkW: _screenWorkW,
+              screenWorkH: _screenWorkH,
+            );
+      _originFloorLeft = floor.left;
+      _originFloorTop = floor.top;
+      await _renderStack(beginRoute: route);
+      if (!_isCurrentRoute) return false;
+      glog(
+        'lookup: showAt(atCursor)=${shown.ok} off-screen w0=$w0 h0=$h0 '
+        'workCss=${_screenWorkW}x$_screenWorkH rendered',
+      );
+      if (autoRead) {
+        _autoReadFirstEntry(model, result);
+      }
+      // TODO-1079 (B) — READY-DRIVEN reveal fallback (was a blind 450ms timeout).
+      // The real reveal is host-driven (overlaySize -> _applyOverlayBox). This
+      // safety only fires when that never arrives (true render failure), and it
+      // MUST NOT reveal a WebView2 that has not finished loading — that produced
+      // the 'window present but blank' flake when a cold create chain outran the
+      // 450ms budget. So the tick reveals only after confirming the surface is
+      // ready (webview_ready_ via isWebViewReady); if still loading it reschedules
+      // a bounded number of times, then reveals as a last resort so the card is
+      // never stuck invisible. Prewarm (A) makes the ready path the common case;
+      // this gate is the belt-and-braces for a cold/slow surface.
+      final int safeW = (cardW * dpr).round();
+      final int safeH = (cardH * dpr).round();
+      _scheduleReadyDrivenSafety(safeW, safeH, attempt: 0);
+      return true;
+    } catch (e, st) {
+      glog('lookup: EXCEPTION $e\n$st');
+      if (_isCurrentRoute) {
+        try {
+          await GlobalLookupChannel.hide(notify: false);
+        } catch (_) {
+          // The original failure remains authoritative. Cleanup is best effort
+          // and must not turn a rejected lookup into an unhandled exception.
+        }
+      }
+      return false;
+    }
+  }
+
+  /// TODO-1079 (B) — schedules the ready-driven reveal safety. On each 450ms
+  /// tick: if the host already revealed (overlaySize path), stop. Else confirm
+  /// the overlay WebView2 finished loading (isWebViewReady) before revealing at
+  /// the single-card size — a not-yet-ready surface would flash blank. While the
+  /// surface is still loading, reschedule up to [_kReadySafetyMaxAttempts] times
+  /// (~kReadySafetyStep each), then reveal as an absolute last resort so the card
+  /// is never stuck invisible. [attempt] is the current retry index.
+  void _scheduleReadyDrivenSafety(
+    int width,
+    int height, {
+    required int attempt,
+  }) {
+    _revealSafety?.cancel();
+    _revealSafety = Timer(_kReadySafetyStep, () async {
+      if (!_isCurrentRoute || _revealed) {
+        return;
+      }
+      bool ready;
+      try {
+        ready = await GlobalLookupChannel.isWebViewReady();
+      } catch (_) {
+        ready = false;
+      }
+      if (!_isCurrentRoute || _revealed) {
+        return; // Host revealed while we awaited the readiness check.
+      }
+      // A ready WebView is sufficient for a desktop safety reveal, but not for
+      // galCard.  The game route must first receive the host's versioned
+      // overlaySize so revealStack can commit that exact geometry and arm the
+      // captureReady handshake.  Falling back as soon as WebView2 reports ready
+      // races a slightly-late first overlaySize: epoch 0 resizes the surface,
+      // the host advances to epoch 1, and neither transaction can acknowledge
+      // the other.  Keep waiting for authoritative geometry on galCard and use
+      // the legacy epoch-0 fallback only after the existing bounded retries.
+      final bool awaitingGalGeometry =
+          GlobalLookupChannel.currentRoute.source == 'galCard';
+      if ((!awaitingGalGeometry && ready) ||
+          attempt >= _kReadySafetyMaxAttempts) {
+        _revealed = true;
+        glog(
+          'reveal: READY-SAFETY (ready=$ready attempt=$attempt) '
+          'w=$width h=$height',
+        );
+        if (GlobalLookupChannel.currentRoute.source == 'galCard') {
+          final int geometryEpoch = _fallbackGeometryEpochForCurrentRoute();
+          unawaited(
+            GlobalLookupChannel.revealStack(
+              dx: 0,
+              dy: 0,
+              width: width,
+              height: height,
+              geometryEpoch: geometryEpoch,
+            ),
+          );
+          _notifyAfterResizeReady(width, height, geometryEpoch: geometryEpoch);
+        } else {
+          unawaited(GlobalLookupChannel.reveal(width: width, height: height));
+          _notifyRevealed(width, height);
+        }
+        return;
+      }
+      // Surface still loading — defer instead of revealing blank.
+      glog(
+        'reveal: READY-SAFETY defer '
+        '(${awaitingGalGeometry && ready ? "galCard awaits geometry" : "not ready"}, '
+        'attempt=$attempt)',
+      );
+      _scheduleReadyDrivenSafety(width, height, attempt: attempt + 1);
+    });
+  }
+
+  /// The main window's device-pixel ratio (monitor scale). Used as the initial
+  /// off-screen render width; the page later reports the authoritative dpr.
+  double _devicePixelRatio() {
+    final BuildContext? ctx = _appModel?.navigatorKey.currentContext;
+    if (ctx != null) {
+      final double dpr = MediaQuery.maybeOf(ctx)?.devicePixelRatio ?? 0;
+      if (dpr > 0) return dpr;
+    }
+    return WidgetsBinding.instance.platformDispatcher.views.isNotEmpty
+        ? WidgetsBinding
+              .instance
+              .platformDispatcher
+              .views
+              .first
+              .devicePixelRatio
+        : 1.0;
+  }
+
+  /// Resolves the bytes for a dictionary media request from the overlay
+  /// WebView2. Both custom schemes are routed here (matching the in-app
+  /// InAppWebView): `image://?dictionary=..&path=..` (gaiji / <img>) and
+  /// `dictmedia://<encoded-path>?dictionary=..` (dictionary <link> stylesheets
+  /// and their relative font/bg resources). The two schemes carry the media
+  /// path in different positions, so parsing is scheme-aware (see
+  /// [resolveGlobalLookupMedia]). The Content-Type is derived natively from the
+  /// URL (see global_lookup_window.cpp MediaContentTypeHeader); this side only
+  /// supplies the bytes.
+  Future<Uint8List> _resolveMedia(String url) async {
+    try {
+      final GlobalLookupMediaRequest? request = resolveGlobalLookupMedia(url);
+      if (request == null) {
+        return Uint8List(0);
+      }
+      final Uint8List? bytes = FushiDicts.instance.getMediaFile(
+        request.dictionary,
+        request.path,
+      );
+      return bytes ?? Uint8List(0);
+    } catch (_) {
+      return Uint8List(0);
+    }
+  }
+
+  bool _acceptsRoute(GlobalLookupRoute route) {
+    final GlobalLookupRoute? active = _activeRoute;
+    if (active == null || !GlobalLookupChannel.isRouteValid(active)) {
+      return false;
+    }
+    if (route == active) {
+      return true;
+    }
+    // Older native builds sent raw desktop callbacks without an envelope.
+    // Keep that legacy surface usable, but never let an unstamped callback
+    // cross into a galCard session.
+    return route.source == 'desktop' &&
+        route.routeEpoch == 0 &&
+        route.lookupEpoch == 0 &&
+        active.source == 'desktop';
+  }
+
+  void _onRoutedJsMessage(OverlayReverseEvent event) {
+    if (!_acceptsRoute(event.route) || event.message == null) {
+      return;
+    }
+    final GlobalLookupRoute route = event.route.lookupEpoch == 0
+        ? _activeRoute!
+        : event.route;
+    GlobalLookupChannel.runWithRoute(route, () => _onJsMessage(event.message!));
+  }
+
+  void _onRoutedOverlayHidden(OverlayReverseEvent event) {
+    if (!_acceptsRoute(event.route)) {
+      return;
+    }
+    final GlobalLookupRoute route = event.route.lookupEpoch == 0
+        ? _activeRoute!
+        : event.route;
+    GlobalLookupChannel.runWithRoute(route, () => _onOverlayHidden(route));
+  }
+
+  /// TODO-1233 — the native overlay was GENUINELY dismissed (foreground hook /
+  /// click-outside / JS 'dismiss'/'tapOutside'). Resets this controller's
+  /// reveal/measurement state so the next lookup starts clean (the reveal-safety
+  /// timer is cancelled; a stale _revealed would otherwise let the ready-driven
+  /// fallback or the box de-dup misbehave on the next card), then notifies the
+  /// optional [onHidden] consumer (resume-on-dismiss). NOT called for the
+  /// between-lookups reset (that hide passes notify:false, so native suppresses
+  /// the callback) — only for a real user dismissal.
+  void _onOverlayHidden([GlobalLookupRoute? routed]) {
+    final GlobalLookupRoute route =
+        routed ?? _activeRoute ?? const GlobalLookupRoute.desktop();
+    _revealSafety?.cancel();
+    _nestedLookupGeneration++;
+    _revealed = false;
+    _resetGeometryHandshakeForLookup();
+    // TODO-1231 (BUG-583) — clear the origin ratchet on a genuine dismissal so
+    // the next session starts unconstrained.
+    _ratchetLeft = double.infinity;
+    _ratchetTop = double.infinity;
+    // TODO-1345 (BUG-583 深层根因续) — clear the reserved cascade floor too so the
+    // next lookup re-computes its own from the fresh cursor position.
+    _originFloorLeft = 0;
+    _originFloorTop = 0;
+    _currentMiningHandler = null;
+    glog('overlayHidden: dismissed — reveal state reset');
+    try {
+      // Notify the route owner while its token is still valid. Galgame's owner
+      // uses that validity check to accept the genuine-dismiss event and clear
+      // the corresponding in-game card.
+      onRoutedHidden?.call(route);
+      if (route.source == 'desktop') {
+        onHidden?.call();
+      }
+    } finally {
+      // A genuine dismissal ends this immutable lookup. Retiring it here makes
+      // every already-queued Future/Timer/JS callback inert immediately instead
+      // of leaving a hidden surface eligible to reveal itself again.
+      if (_activeRoute == route) {
+        GlobalLookupChannel.invalidateRoute(route);
+        _activeRoute = null;
+      }
+    }
+  }
+
+  /// Phase C（弹窗尺寸精细化 2026-07-13）— 覆盖窗拖角 resize 落库。native（模态
+  /// size 循环结束）回报的 [message] args = [left, top, width, height]（**窗口物理
+  /// px**）；只取 width/height 倒推 overlay 场景「基准最大宽高」（÷dpr ÷appUiScale +
+  /// 下取整 + clamp，见 [resolveOverlayResizeFromWindow]），再按「拖即解锁」好品味写
+  /// 真值：一动手定制 overlay 尺寸就脱钩「跟随 app 内」——
+  /// [AppModel.setOverlayLookupIndependentSize]`(true)` + 写 overlay 宽/高键。滑杆与
+  /// 拖拽写同一真值，下次查词沿用新尺寸（预期行为）。**绝不写 popupMaxWidth**——
+  /// 那是 app 内弹窗的真值，串台就破坏它。
+  void _onOverlayResized(Map<String, Object?> message) {
+    final AppModel? model = _appModel;
+    if (model == null) {
+      return;
+    }
+    // native（WM_EXITSIZEMOVE）回报 args=[left, top, width, height, startW, startH]
+    // 均为**窗口物理 px**：[2][3] 是拖拽结束尺寸、[4][5] 是拖拽起始尺寸。要 6 个字段——
+    // 只有真的拖过 grip 才有起始尺寸；用「结束−起始」增量折算抵消恒定级联余量（见
+    // [resolveOverlayResizeFromDelta]），绝不用绝对窗口尺寸倒推（会把余量算进去→暴涨乱跳）。
+    final Object? args = message['args'];
+    if (args is! List || args.length < 6) {
+      return;
+    }
+    double num2(Object? v) => (v is num) ? v.toDouble() : 0;
+    final double physW = num2(args[2]);
+    final double physH = num2(args[3]);
+    final double startW = num2(args[4]);
+    final double startH = num2(args[5]);
+    if (physW <= 0 || physH <= 0 || startW <= 0 || startH <= 0) {
+      return;
+    }
+    final double dpr = _devicePixelRatio();
+    final LookupSize current = _effectiveLookupSizeForCurrentRoute(model);
+    final LookupSize size = resolveOverlayResizeFromDelta(
+      currentWidth: current.width,
+      currentHeight: current.height,
+      deltaPhysWidth: physW - startW,
+      deltaPhysHeight: physH - startH,
+      dpr: dpr,
+      uiScale: model.appUiScale,
+    );
+    unawaited(model.setOverlayLookupIndependentSize(true));
+    model.setOverlayLookupMaxWidth(size.width);
+    model.setOverlayLookupMaxHeight(size.height);
+    glog(
+      'overlay resized -> unlock independent, ${size.width}x${size.height} '
+      '(phys=${physW}x$physH dpr=$dpr uiScale=${model.appUiScale})',
+    );
+    // 松手即时填充（2026-07-13）— setPref 同步更新 prefCache，故此刻
+    // [AppModel.overlayLookupEffectiveSize] 已是新尺寸；立即重排当前卡，复用嵌套卡
+    // 同款的 overlaySize→_applyOverlayBox→revealStack resize 分支把窗口长到位并填满
+    // 卡片，无需等下次查词、不重新查词（[_renderStack] 自守空栈）。右下角 resize 原点
+    // (top-left) 不动 → 棘轮 [ratchetOverlayOrigin] 天然 no-op，不碰脆弱 reveal 几何。
+    // 高度按内容封顶：拖高于内容会回落到内容高度（符合「最大高度」语义），宽度填满。
+    unawaited(_renderStack());
+  }
+
+  void _onJsMessage(Map<String, Object?> message) {
+    final Object? handler = message['handler'];
+    // BUG-1833 — galFrameDirty 可随滚动/异步 hydration 达到每秒几十次；glog 当前是
+    // writeAsStringSync + flush:true，把每个浏览器帧都变成 UI isolate 的同步磁盘刷写。
+    // dirty 只是调度信号，成功本身没有诊断价值；失败/呈现状态仍由 present 日志覆盖。
+    if (handler != 'galFrameDirty' &&
+        handler != 'popupRendered' &&
+        handler != 'favoriteCheck' &&
+        handler != 'duplicateCheck') {
+      glog('js: handler=$handler args=${message['args']}');
+    }
+    if (handler == 'staticSettingsRequired') {
+      final ({int? revision, int? hostGeometryEpoch}) req =
+          parseStaticSettingsRequired(message);
+      final int? revision = req.revision;
+      if (revision != null) {
+        final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+        final String hostKey = route.target.isEmpty ? 'desktop' : route.target;
+        _hostStaticRevisions.invalidate(hostKey, revision);
+        if (req.hostGeometryEpoch == 0) {
+          // A whole-WebView recovery restarts the host counter. Its first bbox
+          // can equal the retired document's epoch and bounds, so clear Dart's
+          // de-dup only for this fresh-realm signal. Ordinary child cache misses
+          // in a warm document keep their current capture handshake intact.
+          _resetGeometryHandshakeForLookup();
+        }
+        // The requesting shell remains content-gated in host.js. Rebuild the
+        // current descriptor with the missing static payload; the immutable
+        // route zone keeps a late recovery request out of a newer lookup.
+        unawaited(_renderStack());
+      }
+      return;
+    }
+    if (handler == 'captureReady') {
+      final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+      if (route.source == 'galCard') {
+        final pending = _pendingGalCapture;
+        final Object? args = message['args'];
+        final int? readyWidth =
+            args is List && args.isNotEmpty && args[0] is num
+            ? (args[0] as num).toInt()
+            : null;
+        final int? readyHeight =
+            args is List && args.length > 1 && args[1] is num
+            ? (args[1] as num).toInt()
+            : null;
+        final int? readyGeometryEpoch = args is List && args.length > 2
+            ? parseGlobalLookupGeometryEpoch(args[2])
+            : null;
+        if (pending != null &&
+            pending.route == route &&
+            globalLookupCaptureReadyMatches(
+              pendingWidth: pending.width,
+              pendingHeight: pending.height,
+              pendingGeometryEpoch: pending.geometryEpoch,
+              readyWidth: readyWidth,
+              readyHeight: readyHeight,
+              readyGeometryEpoch: readyGeometryEpoch,
+            )) {
+          _galCaptureReadySafety?.cancel();
+          _galCaptureReadySafety = null;
+          _pendingGalCapture = null;
+          _notifyRevealed(
+            pending.width,
+            pending.height,
+            dx: pending.dx,
+            dy: pending.dy,
+            rootHeight: pending.rootHeight,
+          );
+        }
+      }
+      return;
+    }
+    if (handler == 'galFrameDirty') {
+      final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+      // A resize has its own captureReady gate.  Ignore dirty notifications
+      // from DOM work during that interval; capturing with the previous card
+      // dimensions would crop the newly resized surface, and captureReady will
+      // publish the definitive frame immediately afterwards.
+      if (route.source == 'galCard' &&
+          _isCurrentRoute &&
+          _pendingGalCapture == null) {
+        onRoutedDirty?.call(route);
+      }
+      return;
+    }
+    // Phase C（弹窗尺寸精细化 2026-07-13）— 瞬态覆盖窗被用户拖右下角 grip 调整
+    // 尺寸：native 模态 size 循环结束后经 WM_EXITSIZEMOVE 回报最终窗口 rect（物理
+    // px，args=[left,top,width,height]），与剪贴板面板走同一 windowMoved 通道，但
+    // 本实例（global_lookup channel）的去向只落 overlay 键。见 _onOverlayResized。
+    if (handler == 'windowMoved') {
+      _onOverlayResized(message);
+      return;
+    }
+    // BUG-1139 — Ctrl+滚轮内容缩放：改「词典字号」这一唯一真值后整栈重渲。
+    // 字号最终落到注入 head 的 `documentElement.style.zoom`（CSS zoom，不是重排）。
+    // 几何跟得上靠 BUG-1139 ③：host 的 measureContentHeight 用 frameContentZoom
+    // 把 iframe 的 layout px 换算回 host CSS px，union bbox 的 maxBottom 与
+    // shellRects（→ window region）才是内容的真实视觉高度。宽度不需要补偿——
+    // iframe 是 shell 的 100%，z 只压缩它内部的布局视口再画回来，视觉上始终铺满。
+    if (maybeHandleOverlayZoomFontStep(
+      model: _appModel,
+      handler: handler,
+      message: message,
+      onFontSizeChanged: () => unawaited(_renderStack()),
+    )) {
+      return;
+    }
+    // BUG-1127 / BUG-1210 — 浮窗 iframe realm 回报自动发音 `audio.play()` 真实
+    // 结果（args = [token, ok, reason?]）。处理收口进共享 [OverlayAutoRead]。
+    if (_autoRead.maybeHandleWordAudioPlayed(handler, message)) {
+      return;
+    }
+    if (handler == 'tapOutside' || handler == 'dismiss') {
+      // TODO-867 P3c C3 — a tapOutside stamped with the source layer's frame id
+      // (by the host shim) means "tap inside layer L outside its glossary" ->
+      // close L's children (point a layer -> close the cards above it). Without
+      // a frame id (or when L is the root) fall back to hiding the whole overlay.
+      final String? frameId = message['__frameId'] as String?;
+      if (handler == 'tapOutside' && frameId != null) {
+        final int layerIndex = _layerIndexForFrameId(frameId);
+        if (layerIndex >= 0) {
+          _nestedLookupGeneration++;
+          _stack = closeChildPopupsAndClearSelection(_stack, layerIndex);
+          _pruneFrameResults();
+          if (_stack.isEmpty) {
+            GlobalLookupChannel.hide();
+          } else {
+            unawaited(_retainRenderedStack());
+          }
+          return;
+        }
+      }
+      _nestedLookupGeneration++;
+      GlobalLookupChannel.hide();
+      return;
+    }
+    // TODO-867 P3b nested stack: the host can request closing a specific
+    // layer. dismissPopupAt([index]) closes that popup + its children
+    // (root index 0 -> whole stack empty -> hide); closeChildPopups([parent])
+    // truncates children of a parent (+ clears that parent's selection). Both
+    // rebuild the stack via the pure model and re-render. (These are P3c-era
+    // host messages; wired now so the stack path is exercised end-to-end.)
+    if (handler == 'dismissPopupAt') {
+      final int? index = _firstIntArg(message);
+      if (index != null) {
+        _nestedLookupGeneration++;
+        _stack = dismissPopupAt(_stack, index);
+        _pruneFrameResults();
+        if (_stack.isEmpty) {
+          GlobalLookupChannel.hide();
+        } else {
+          unawaited(_retainRenderedStack());
+        }
+      }
+      return;
+    }
+    if (handler == 'closeChildPopups') {
+      final int? parentIndex = _firstIntArg(message);
+      if (parentIndex != null) {
+        _nestedLookupGeneration++;
+        _stack = closeChildPopupsAndClearSelection(_stack, parentIndex);
+        _pruneFrameResults();
+        unawaited(_retainRenderedStack());
+      }
+      return;
+    }
+    // TODO-854 M1a-2：顶部下滑关闭。覆盖窗的 kPopupTopPullReleaseJs 识别到顶部
+    // 下滑（桌面 pointer/mouse）后 callHandler('topPullReleased')；是否真正关闭
+    // 尊重用户「滑动关闭弹窗」(enableSwipeToClose) 偏好——关时忽略，与 in-app
+    // 弹窗一致（Windows 默认 false，鼠标框选与下滑同形）。
+    // BUG-2770：JS 带上指针种类，触摸 / 触控笔改看触摸半边
+    // （enableTouchSwipeToClose，未设置时默认开）——瞬态覆盖窗是 windowed WebView2，
+    // 触屏手指在这里就是真 touch 事件，此前却被鼠标默认值一并关掉。
+    if (handler == 'topPullReleased') {
+      final Object? args = message['args'];
+      if (popupTopPullDismissAllowed(
+        pointerKind: args is List && args.isNotEmpty ? args.first : null,
+        mouseSwipeEnabled: ReaderFushiSource.instance.enableSwipeToClose,
+        touchSwipeEnabled: ReaderFushiSource.instance.enableTouchSwipeToClose,
+      )) {
+        GlobalLookupChannel.hide();
+      }
+      return;
+    }
+    // BUG-2770：覆盖窗横滑关闭（kPopupTouchSideSwipeReleaseJs 只认单指触摸）。
+    // 与应用内正文横滑同口径：触摸半边开关 + swipeDismissThreshold(灵敏度)。
+    if (handler == 'sideSwipeReleased') {
+      final Object? args = message['args'];
+      final ReaderFushiSource source = ReaderFushiSource.instance;
+      if (popupSideSwipeDismissAllowed(
+        pointerKind: args is List && args.isNotEmpty ? args.first : null,
+        dx: args is List && args.length > 1 ? args[1] : null,
+        threshold: swipeDismissThreshold(source.dismissSwipeSensitivity),
+        mouseSwipeEnabled: source.enableSwipeToClose,
+        touchSwipeEnabled: source.enableTouchSwipeToClose,
+      )) {
+        GlobalLookupChannel.hide();
+      }
+      return;
+    }
+    // 九根 DEFERRED 桥（音频 ×3 / 收藏 ×2 / 制卡 ×2 / 覆写 ×2）统一走共享
+    // 权威 handler（spec 2026-07-10 抽取到 overlay_bridge_handlers.dart，与
+    // 常驻剪贴板面板共用同一实现——红线：两个表面绝不复制、绝不漂移）。
+    // 历史语义与决策记录（TODO-1188/1225：为何 deferred、minedCardAction 为何
+    // 保持即时 null 降级）随实现一并搬到该文件。
+    if (maybeHandleOverlayDeferredBridge(
+      model: _appModel,
+      handler: handler,
+      message: message,
+      resolveBridge: GlobalLookupChannel.resolveBridge,
+      // UIA 捕获的前台句即句子上下文：制卡 `{sentence}` 用它兜底（JS 不发
+      // sentence）。与句子横幅同一 `_currentSentence`（嵌套子查词无句 → ''）。
+      sentenceContext: _currentSentence,
+      miningHandler: _currentMiningHandler,
+    )) {
+      return;
+    }
+    // TODO-867 P3c D2 — size + place the overlay window from the host's stack
+    // self-measurement. The host reports overlaySize = [dpr, box] where box is
+    // the UNION bounding box of all card shells in window-local CSS px
+    // ({left, top, width, height}); the legacy single-card form [dpr, physH]
+    // (physH = physical scrollHeight) is still accepted as a fallback. The
+    // window is REVEALED/RESIZED to the bbox: it moves to (cursor + box.left,
+    // cursor + box.top) ×dpr and grows to box.width/height ×dpr, while the host
+    // shifts its layer by (-box.left, -box.top) so the ROOT card stays pinned at
+    // the cursor and the whole cascade fits inside the window (E1).
+    if (handler == 'overlaySize') {
+      final AppModel? model = _appModel;
+      final Object? args = message['args'];
+      if (model != null && args is List && args.length >= 2) {
+        final double dpr = (args[0] is num) ? (args[0] as num).toDouble() : 1.0;
+        if (dpr > 0) {
+          final Object? second = args[1];
+          if (second is Map) {
+            // D2 union bounding box (window-local CSS px) -> place + size window.
+            final Map<Object?, Object?> box = second.cast<Object?, Object?>();
+            final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+            final int? reportedEpoch = parseGlobalLookupGeometryEpoch(
+              box['geometryEpoch'],
+            );
+            if (reportedEpoch == null) {
+              // captureReady cannot safely acknowledge an unversioned galCard
+              // resize: an older frame with the same dimensions would satisfy
+              // the old width/height-only gate. Desktop retains a legacy epoch
+              // zero fallback because it has no bitmap capture handshake.
+              if (route.source == 'galCard') {
+                glog('overlaySize: ignored galCard box without geometryEpoch');
+                return;
+              }
+              _applyOverlayBox(model, dpr, box, geometryEpoch: 0);
+            } else {
+              _applyOverlayBox(model, dpr, box, geometryEpoch: reportedEpoch);
+            }
+          } else if (second is num && second > 0) {
+            // Legacy single-card form: physical scrollHeight, fixed width.
+            _applyOverlayScalar(model, dpr, second.toDouble());
+          }
+        }
+      }
+      return;
+    }
+    // popup.js still emits popupRendered/contentHeight; ignored — overlaySize
+    // (which carries the DPR the bare window needs) is the sizing source.
+    if (handler == 'popupRendered' || handler == 'contentHeight') {
+      return;
+    }
+    // Nested lookup: two popup.js triggers, IDENTICAL arg shape (args[0] =
+    // query, args[1] = clicked word's anchor rect in window-local CSS px, already
+    // re-anchored by the host shim global_lookup_host.js so the child cascades
+    // off the real word position):
+    //   - onLinkClick: headword / kanji-tag / kanji-character / structured href.
+    //   - textSelected: TAPPING PLAIN GLOSSARY TEXT — popup.js's
+    //     fushiSelection.selectText -> selection.js callHandler('textSelected',
+    //     text, rect). The in-app popup (dictionary_popup_webview) registers
+    //     BOTH; the app-external controller used to register only onLinkClick, so
+    //     a body tap was silently dropped and "clicking plain text never opens a
+    //     lookup" (TODO-893 v2 symptom 1). Both share one dispatch — no special
+    //     case.
+    if (handler == 'onLinkClick' || handler == 'textSelected') {
+      _dispatchNestedLookup(message);
+      return;
+    }
+    // BUG-2868 — popup.js hands every http(s) dictionary link (Pixiv
+    // 「pixivで読む」, MDX raw-HTML anchors, …) to `openLink` after
+    // preventDefault. Only the in-app popup registered it; here the message was
+    // dropped, so external links in the overlay / galgame card did nothing.
+    if (handler == 'openLink') {
+      final Object? args = message['args'];
+      if (args is List && args.isNotEmpty && args.first != null) {
+        unawaited(openDictionaryExternalLink(args.first.toString()));
+      }
+      return;
+    }
+    // BUG-2054 — the parent realm's whole-word bbox report; completes the wait
+    // `_lookupNested` is holding before it places the child card.
+    if (_maybeHandleNestedWordAnchor(handler, message)) {
+      return;
+    }
+  }
+
+  /// BUG-2054 — the parent realm's answer to a tokened [buildHighlightFrameScript]
+  /// request: the highlighted word's whole-word bbox (window-local CSS px, host
+  /// already applied the same `anchorRectToScreen` the original anchor took), or
+  /// null when the realm had nothing usable.
+  ///
+  /// args = [parentFrameIndex, rect|null, token]. Routing is by TOKEN, not by
+  /// stack position: the awaiting `_lookupNested` owns the token and re-checks
+  /// its own route/generation after the await, so a late or cross-route report
+  /// completes nothing (a stale token has already been removed) instead of
+  /// overwriting an unrelated card's anchor.
+  bool _maybeHandleNestedWordAnchor(
+    Object? handler,
+    Map<String, Object?> message,
+  ) {
+    if (handler != 'nestedWordAnchor') {
+      return false;
+    }
+    final Object? args = message['args'];
+    if (args is List && args.length >= 3) {
+      final Object? rawToken = args[2];
+      final int? token = rawToken is num
+          ? rawToken.toInt()
+          : int.tryParse('$rawToken');
+      if (token != null) {
+        final Completer<Rect?>? completer = _pendingWordAnchors.remove(token);
+        if (completer != null && !completer.isCompleted) {
+          completer.complete(_anchorRectFromArg(args[1]));
+        }
+      }
+    }
+    return true;
+  }
+
+  /// BUG-2054 — highlight the searched word in the parent realm and WAIT for the
+  /// whole-word bbox it reports back, so the child card can be placed against the
+  /// real word on its FIRST render.
+  ///
+  /// Why the wait instead of a re-anchor afterwards: unlike the in-app cards
+  /// (whose child sits behind `markPendingReveal` until its own WebView renders),
+  /// the overlay child is rendered and handed to the host's reveal gate by
+  /// `_renderStack()` immediately. Re-anchoring after that would move an already
+  /// visible card AND re-drive the whole overlay window geometry (union bbox ->
+  /// overlaySize -> native move/resize) on EVERY nested lookup — the word bbox
+  /// differs from the first-character rect even on a single-line selection.
+  ///
+  /// Returns null on timeout / no usable bbox / a retired route: the caller then
+  /// keeps the first-character anchor, exactly as before this fix.
+  Future<Rect?> _highlightAndAwaitWordAnchor(
+    int sourceIndex,
+    int highlightCount,
+  ) async {
+    final int token = ++_wordAnchorToken;
+    final Completer<Rect?> completer = Completer<Rect?>();
+    _pendingWordAnchors[token] = completer;
+    try {
+      await GlobalLookupChannel.render(
+        buildHighlightFrameScript(sourceIndex, highlightCount, token: token),
+      );
+      return await completer.future.timeout(_kWordAnchorReportTimeout);
+    } on TimeoutException {
+      glog('nested: word-anchor token=$token TIMEOUT');
+      return null;
+    } catch (e) {
+      glog('nested: word-anchor token=$token EXCEPTION $e');
+      return null;
+    } finally {
+      _pendingWordAnchors.remove(token);
+    }
+  }
+
+  /// TODO-893 v2 (symptom 1) — shared nested-lookup dispatch for the two popup.js
+  /// triggers (`onLinkClick`, `textSelected`) that carry the SAME arg shape:
+  /// args[0] = query, args[1] = the clicked word's window-local CSS px anchor
+  /// rect (re-anchored by the host shim). `__frameId` is the authoritative
+  /// source layer: truncate that layer's old descendants before searching, just
+  /// like the app-in popup's `prunePopupStack(index + 1)` path.
+  void _dispatchNestedLookup(Map<String, Object?> message) {
+    // Do not logically prune descendants unless a search owner exists. The
+    // physical host deliberately retains those descendants until the async
+    // replacement is ready, so pruning first would create visible ghost frames
+    // on this otherwise-harmless unavailable-model path.
+    if (_appModel == null) {
+      return;
+    }
+    final Object? args = message['args'];
+    if (args is! List || args.isEmpty) {
+      return;
+    }
+    final String query = args.first?.toString() ?? '';
+    if (query.isEmpty) {
+      return;
+    }
+    final Rect? anchor = (args.length >= 2)
+        ? _anchorRectFromArg(args[1])
+        : null;
+    final String? sourceFrameId = message['__frameId'] as String?;
+    final GlobalLookupNestedParent? source = resolveNestedLookupParent(
+      _stack,
+      sourceFrameId,
+    );
+    if (source == null) {
+      // A non-null but unknown id is a late message from an iframe already
+      // removed from the stack. Fail closed instead of attaching it to top.
+      return;
+    }
+
+    final bool descendantsClosed = !identical(source.stack, _stack);
+    _stack = source.stack;
+    _pruneFrameResults();
+    final int generation = ++_nestedLookupGeneration;
+    unawaited(
+      _lookupNested(
+        query,
+        anchor,
+        sourceFrameId: source.frameId,
+        sourceIndex: source.parentIndex,
+        generation: generation,
+        renderPrunedStack: descendantsClosed,
+      ),
+    );
+  }
+
+  /// TODO-1204 — records one lookup on every app-external hotkey / nested lookup
+  /// (source [overlayStatSourceType]: [kStatSourceGame] while an attributed
+  /// galgame hook session is running, else [kStatSourceBook]; no book locator —
+  /// the global overlay is not tied to a book, so it only feeds the stats page
+  /// "lookup" totals, never a per-book tile). Best-effort: any failure is logged
+  /// and swallowed.
+  void _recordLookupCount() {
+    final AppModel? model = _appModel;
+    if (model == null) {
+      return;
+    }
+    // best-effort：连同同步阶段（[AppModel.database] late 字段 getter 在 DB 未初始化时
+    // 会抛 LateInitializationError）一起吞掉——查词计数是旁路埋点，绝不打断查词回复。
+    try {
+      unawaited(
+        model.database
+            .addLookupCount(
+              sourceType: overlayStatSourceType(),
+              dateKey: statTodayKey(),
+            )
+            .catchError((Object e, StackTrace st) {
+              glog('lookup-count: EXCEPTION $e\n$st');
+            }),
+      );
+    } catch (e, st) {
+      glog('lookup-count: EXCEPTION (sync) $e\n$st');
+    }
+  }
+
+  /// BUG-1210 — 自动朗读收口到 [OverlayAutoRead]（app 外两个表面共用一份实现，
+  /// 与 overlay_bridge_handlers 同一条「绝不复制」红线）。本控制器只提供自己的
+  /// 渲染通道与就绪门控。
+  late final OverlayAutoRead _autoRead = OverlayAutoRead(
+    render: GlobalLookupChannel.render,
+    isWebViewReady: GlobalLookupChannel.isWebViewReady,
+    label: 'overlay',
+  );
+
+  void _autoReadFirstEntry(AppModel model, DictionarySearchResult result) =>
+      _autoRead.autoReadFirstEntry(model, result);
+
+  Future<void> _lookupNested(
+    String query,
+    Rect? anchorRect, {
+    required String sourceFrameId,
+    required int sourceIndex,
+    required int generation,
+    required bool renderPrunedStack,
+  }) async {
+    final AppModel? model = _appModel;
+    if (model == null) {
+      return;
+    }
+    try {
+      _recordLookupCount();
+      final Future<DictionarySearchResult> search = model.searchDictionary(
+        searchTerm: query,
+        searchWithWildcards: false,
+      );
+      // Keep the old physical descendants mounted while the dictionary Future
+      // is in flight, although the authoritative Dart stack is already pruned.
+      // A successful ancestor replacement can then commit old -> new child in
+      // ONE render/geometry transaction instead of flashing the root/prefix-only
+      // intermediate state. No-result still applies the lightweight prune below.
+      final DictionarySearchResult result = await search;
+      if (!_isCurrentRoute || generation != _nestedLookupGeneration) return;
+
+      // TODO-1190 — mark the searched word inside the PARENT card's popup.js
+      // realm (host.highlightFrame -> fushiSelection.highlightSelection). Only
+      // when the child search matched something; count = the matched char length
+      // (same source the in-app lookupHighlightCharCount reads). No-op host-side
+      // on a bad index / non-positive count.
+      //
+      // BUG-2054 — the same round-trip brings back the highlighted word's
+      // whole-word bbox, and it runs BEFORE the push/render below so the child
+      // card is placed against the real word on its FIRST render (see
+      // [_highlightAndAwaitWordAnchor] for why re-anchoring afterwards is worse
+      // here than it is for the in-app cards). Anything unusable leaves
+      // anchorRect untouched — the first-character anchor, as before. It stays
+      // ABOVE the source re-resolve below so every async boundary this lookup
+      // crosses is behind that one immutable-id check.
+      final int highlightCount = result.entries.isEmpty
+          ? 0
+          : JapaneseLanguage.instance.getFinalHighlightLength(
+              result: result,
+              searchTerm: query,
+            );
+      Rect? effectiveAnchor = anchorRect;
+      if (sourceIndex >= 0 && highlightCount > 0) {
+        final Rect? wordAnchor = await _highlightAndAwaitWordAnchor(
+          sourceIndex,
+          highlightCount,
+        );
+        if (!_isCurrentRoute || generation != _nestedLookupGeneration) return;
+        if (wordAnchor != null && !wordAnchor.isEmpty) {
+          effectiveAnchor = wordAnchor;
+        }
+      }
+
+      // The query crossed an async boundary. Re-resolve the immutable source id:
+      // an ancestor close/root replacement must make this result inert, while a
+      // valid source is truncated again before push in case another side effect
+      // appended descendants without starting a newer nested generation.
+      final GlobalLookupNestedParent? liveSource = resolveNestedLookupParent(
+        _stack,
+        sourceFrameId,
+      );
+      if (liveSource == null || liveSource.parentIndex != sourceIndex) {
+        return;
+      }
+      _stack = liveSource.stack;
+      _pruneFrameResults();
+      _lastSentWidth = -1;
+      _lastSentHeight = -1;
+      // TODO-867 P3c: push a CHILD frame whose parent is the message's source
+      // layer. pushLookupFrame drops a no-result nested lookup (resultCount<=0),
+      // so an empty nested search leaves the stack unchanged (identical object)
+      // after the old descendants were already removed — no empty child card is
+      // stacked. Rendering goes through the host stack (renderStack); there is no
+      // top-level direct render anymore.
+      final bool childPushed = _pushChildFrame(
+        query,
+        result,
+        effectiveAnchor,
+        parentIndex: sourceIndex,
+      );
+      if (childPushed) {
+        await _renderStack();
+      } else if (renderPrunedStack) {
+        await _retainRenderedStack();
+      }
+      if (!_isCurrentRoute || generation != _nestedLookupGeneration) return;
+      glog(
+        'nested: source=$sourceFrameId[$sourceIndex] "$query" '
+        'entries=${result.entries.length}',
+      );
+      // (The parent-card highlight already ran above, together with the
+      // whole-word anchor round-trip it shares — BUG-2054.)
+      _autoReadFirstEntry(model, result);
+    } catch (e, st) {
+      // The ancestor-replacement fast path keeps old physical descendants only
+      // while its search is in flight. If that search fails, converge the host
+      // to the already-authoritative pruned Dart prefix instead of leaving
+      // visible iframe realms whose ids/results no longer exist in the model.
+      if (_isCurrentRoute &&
+          generation == _nestedLookupGeneration &&
+          renderPrunedStack &&
+          _stack.topFrameId == sourceFrameId) {
+        try {
+          await _retainRenderedStack();
+        } catch (retainError, retainStack) {
+          glog(
+            'nested: retain-after-error EXCEPTION '
+            '$retainError\n$retainStack',
+          );
+        }
+      }
+      glog('nested: EXCEPTION $e\n$st');
+    }
+  }
+
+  /// Resets the stack to a single root frame for a fresh hotkey lookup. The
+  /// root is ALWAYS seeded (even on a no-result lookup): the user explicitly
+  /// invoked the lookup, so its card must show — popup.js inside the root iframe
+  /// renders its own no-results state from window._noResultsMessage. Only NESTED
+  /// children drop on no result (see _pushChildFrame), so a click on a word with
+  /// no entries does not stack an empty child. [text] is the query, [result] its
+  /// search result. Builds the root frame directly (not via pushLookupFrame,
+  /// which would drop a no-result root). resultCount stays accurate for
+  /// diagnostics/linkage.
+  void _resetStackRoot(String text, DictionarySearchResult result) {
+    _nestedLookupGeneration++;
+    _frameResults.clear();
+    _frameAnchors.clear();
+    // TODO-1095 — the root frame keeps a STABLE id across hotkey lookups so the
+    // host REUSES the already-loaded root iframe (re-inject settingsJs, re-render
+    // in place) instead of tearing it down + rebuilding a cold iframe every
+    // lookup. beginLookup (sent in _onHotKey) re-gates the reused shell so the
+    // reveal still waits for the NEW card's render. Nested children keep minting
+    // monotonic ids (they are genuinely added/removed).
+    const String id = kGlobalLookupRootFrameId;
+    final GlobalLookupFrame root = GlobalLookupFrame(
+      id: id,
+      query: text,
+      parentIndex: -1,
+      resultCount: result.entries.length,
+    );
+    _stack = GlobalLookupStack(<GlobalLookupFrame>[root]);
+    _frameResults[id] = result;
+    // Root anchor stays null: the window is positioned at the cursor and the
+    // root card takes the anchorless branch of _frameRectMap (no cascade for
+    // the root). TODO-1231（BUG-583/670 续）: that branch now clamps the root
+    // into the work area via computeRootShellOffset (offset 0 away from the
+    // edges = the old window-local-origin geometry).
+    _frameAnchors[id] = null;
+  }
+
+  /// Pushes a child frame after its authoritative source parent has been made
+  /// the current top by [resolveNestedLookupParent].
+  /// pushLookupFrame drops a no-result lookup, so the stack is unchanged when
+  /// [result] is empty (identical object returned). [query] is the clicked
+  /// term; [result] its search result.
+  bool _pushChildFrame(
+    String query,
+    DictionarySearchResult result,
+    Rect? anchorRect, {
+    required int parentIndex,
+  }) {
+    if (parentIndex < 0 || parentIndex != _stack.length - 1) {
+      return false;
+    }
+    final String id = _nextFrameId();
+    final GlobalLookupFrame child = GlobalLookupFrame(
+      id: id,
+      query: query,
+      parentIndex: parentIndex,
+      resultCount: result.entries.length,
+    );
+    final GlobalLookupStack next = pushLookupFrame(_stack, child);
+    if (!identical(next, _stack)) {
+      _stack = next;
+      _frameResults[id] = result;
+      // The clicked word window-local CSS px rect (re-anchored by the host
+      // shim) so this child cascades off it via computeFrameRect.
+      _frameAnchors[id] = anchorRect;
+      return true;
+    }
+    return false;
+  }
+
+  /// Mints a stable, monotonic per-frame id. The pure stack model never
+  /// generates random/clock ids (so it stays testable); the controller owns
+  /// id minting here.
+  String _nextFrameId() => 'frame-${_frameSeq++}';
+
+  /// Drops cached results for frames no longer in the stack (after a close /
+  /// truncate), so the result map does not leak removed layers.
+  void _pruneFrameResults() {
+    final Set<String> live = _stack.frames
+        .map((GlobalLookupFrame f) => f.id)
+        .toSet();
+    _frameResults.removeWhere((String id, _) => !live.contains(id));
+    _frameAnchors.removeWhere((String id, _) => !live.contains(id));
+  }
+
+  /// Applies a close/back operation without rebuilding and serialising every
+  /// surviving dictionary result. This is only called from a reverse message
+  /// emitted by the live host, so those stable frame ids are guaranteed to own
+  /// mounted iframe realms; content/settings changes still use [_renderStack].
+  Future<void> _retainRenderedStack() {
+    if (_stack.isEmpty) {
+      return Future<void>.value();
+    }
+    return GlobalLookupChannel.render(
+      buildRetainStackScript(
+        _stack.frames.map((GlobalLookupFrame frame) => frame.id),
+      ),
+    );
+  }
+
+  /// Extracts the first int argument from a host JS message (args[0]).
+  /// Returns null when absent / non-numeric.
+  int? _firstIntArg(Map<String, Object?> message) {
+    final Object? args = message['args'];
+    if (args is List && args.isNotEmpty) {
+      final Object? first = args.first;
+      if (first is num) {
+        return first.toInt();
+      }
+      if (first is String) {
+        return int.tryParse(first);
+      }
+    }
+    return null;
+  }
+
+  /// Builds the host stack render payload from the current stack + per-frame
+  /// results and pushes it to the overlay (TODO-867 P3b). Inert until P3c
+  /// injects global_lookup_host.js (the script is guarded by
+  /// `window.__globalLookupHost &&`), so the live single-frame overlay is
+  /// unaffected today. Frames whose result was pruned are skipped.
+  Future<void> _renderStack({GlobalLookupRoute? beginRoute}) async {
+    final BuildContext? ctx = _appModel?.navigatorKey.currentContext;
+    final AppModel? model = _appModel;
+    if (ctx == null || model == null || _stack.isEmpty) {
+      return;
+    }
+    final List<GlobalLookupFramePayload> payloads =
+        <GlobalLookupFramePayload>[];
+    // BUG-859 — the cascade is ALWAYS horizontal. Every anchored frame in this
+    // stack is a word inside a popup CARD (whose content is always horizontal
+    // text); the root is anchorless (cursor-placed). The in-app reference forces
+    // exactly this (base_source_page._layerVerticalWriting: index == 0 && …—
+    // nested-from-popup layers never inherit the book's vertical writing), so
+    // the former TODO-938/BUG-453 wiring that fed the READER's writingMode into
+    // the overlay cascade mis-placed every nested card for vertical-book users
+    // (child popped left/right of the word at a fixed maxHeight instead of
+    // below/above it).
+    for (final GlobalLookupFrame frame in _stack.frames) {
+      final DictionarySearchResult? result = _frameResults[frame.id];
+      if (result == null) {
+        continue;
+      }
+      payloads.add(
+        GlobalLookupFramePayload(
+          frame: frame,
+          result: result,
+          anchorRect: _frameAnchors[frame.id],
+        ),
+      );
+    }
+    if (payloads.isEmpty) {
+      return;
+    }
+    // maxWidth/maxHeight are the single card size; children cascade and D2 bbox
+    // trims the window down to the real extent.
+    final double dpr = _devicePixelRatio();
+    final LookupSize overlaySize = _clampToPhysicalCap(
+      _effectiveLookupSizeForCurrentRoute(model),
+      model,
+      dpr,
+    );
+    final double cardW = overlaySize.width * model.appUiScale;
+    final double cardH = overlaySize.height * model.appUiScale;
+    // TODO-893 — screenWidth/screenHeight MUST be the real monitor work area
+    // (CSS px), NOT the off-screen measurement canvas (_layoutBounds*). The
+    // canvas is only ~2x the card, so computeFrameRect's showBelow (spaceBelow
+    // >= height) was almost always false -> every child cascaded UP and pushed
+    // the parent card off the top of the window. Feeding the true screen lets
+    // showBelow correctly decide whether the word's card fits below on screen.
+    // Fall back to the measurement canvas only when native reported no work
+    // area (e.g. monitor query failed).
+    final double screenW = pickScreenDim(_screenWorkW, _layoutBoundsW, cardW);
+    final double screenH = pickScreenDim(_screenWorkH, _layoutBoundsH, cardH);
+    final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+    final String hostKey = route.target.isEmpty ? 'desktop' : route.target;
+    final StackRenderScript stackRender = buildStackRenderScript(
+      context: ctx,
+      appModel: model,
+      payloads: payloads,
+      screenWidth: screenW,
+      screenHeight: screenH,
+      maxWidth: cardW,
+      maxHeight: cardH,
+      // TODO-893 v2 (symptom 3) — lift window-local child anchors into the
+      // work-area-absolute domain (shared zero point with screenW/H) before the
+      // cascade math, then the builder shifts the result back to window-local.
+      selectionScreenOffset: Offset(_cursorWorkX, _cursorWorkY),
+      // TODO-1345 (BUG-583 深层根因续) — this lookup's reserved cascade floor so the
+      // host commits the headroom-covered origin from the first reveal (an up/left
+      // child then never moves the origin -> zero parent displacement).
+      originFloorLeft: _originFloorLeft,
+      originFloorTop: _originFloorTop,
+      // BUG-1835 — only the game-card surface is constrained to the game
+      // viewport. Match the in-app child popup's above/below fitting there while
+      // preserving the desktop global-lookup cascade.
+      fitNestedHeightToAnchorSide: route.source == 'galCard',
+      // BUG-2921 — the game card's root is placed by the runner (glyph-anchored
+      // in the client area); the layout root is only the coordinate origin for
+      // the children and must not be nudged inside the window-local frame, or
+      // the runner's pinned root/bbox relationship would no longer hold.
+      clampRootShellToWorkArea: route.source != 'galCard',
+      staticRevisions: _hostStaticRevisions,
+      hostKey: hostKey,
+    );
+    // Cold-create and process-recovery paths cache exactly one complete script
+    // until NavigationCompleted.  Keep beginLookup + renderStack indivisible so
+    // last-wins caching cannot discard the immutable route epoch while retaining
+    // the pixels.  Subsequent nested/visual-only renders omit the prelude.
+    final String script = beginRoute == null
+        ? stackRender.script
+        : '${buildBeginLookupScript(kGlobalLookupRootFrameId, source: beginRoute.source, routeEpoch: beginRoute.routeEpoch, lookupEpoch: beginRoute.lookupEpoch)}${stackRender.script}';
+    await GlobalLookupChannel.render(script);
+    // Commit only after the platform call accepted the complete script. A
+    // thrown/invalidated send must leave the revision unknown so the next render
+    // remains self-contained.
+    //
+    // 🔴 光 await 是**不够**的：[OverlayWindowChannel._invoke] 在路由失效时直接
+    // `return Future.value()` 把整条调用丢掉（挡住旧 zone 里排队的 Future 复活
+    // 老窗口），await 它正常完成，看不出脚本压根没送出去。若就此记账，宿主会被
+    // 标成「已装载」而它其实什么都没收到——下一次渲染不再下发静态段，卡片停在
+    // 没主题/没字体/没词典样式的状态，正是这套去重最怕的那个方向。
+    // 所以记账前再确认一次路由：宁可漏记（下次重发，只多一次带宽），不可误记。
+    if (!_isCurrentRoute) return;
+    _hostStaticRevisions.commit(hostKey, stackRender.pendingRevisions);
+  }
+
+  /// TODO-867 P3c C2 — parses the onLinkClick anchor arg ({x,y,width,height} in
+  /// window-local CSS px, re-anchored by the host shim) into a [Rect]. Returns
+  /// null when the arg is absent/malformed (the render layer then falls back to
+  /// the placeholder cascade offset).
+  Rect? _anchorRectFromArg(Object? arg) {
+    if (arg is! Map) {
+      return null;
+    }
+    double? num2(Object? v) => (v is num) ? v.toDouble() : null;
+    final double? x = num2(arg['x']);
+    final double? y = num2(arg['y']);
+    final double? w = num2(arg['width']);
+    final double? h = num2(arg['height']);
+    if (x == null || y == null || w == null || h == null) {
+      return null;
+    }
+    return Rect.fromLTWH(x, y, w, h);
+  }
+
+  /// TODO-867 P3c C3 — insertion-order index (stack depth, 0 = root) of the frame
+  /// with [frameId], or -1 when unknown. The host stamps tapOutside with the
+  /// frame id; Dart maps it to the layer index for closeChildPopups.
+  int _layerIndexForFrameId(String frameId) {
+    final List<GlobalLookupFrame> frames = _stack.frames;
+    for (int i = 0; i < frames.length; i++) {
+      if (frames[i].id == frameId) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  /// TODO-867 P3c D2/E1 — reveals/resizes the window to the host union bounding
+  /// box [box] (window-local CSS px {left,top,width,height}). Converts to
+  /// physical px via [dpr] at this C++ window boundary (the layout math itself is
+  /// CSS px). The window moves by (box.left, box.top) x dpr off the cursor anchor
+  /// and grows to box.width/height x dpr; the host shifted its layer by
+  /// (-box.left, -box.top) so the root card stays pinned at the cursor.
+  void _applyOverlayBox(
+    AppModel model,
+    double dpr,
+    Map<Object?, Object?> box, {
+    required int geometryEpoch,
+  }) {
+    double? num2(Object? v) => (v is num) ? v.toDouble() : null;
+    final double left = num2(box['left']) ?? 0;
+    final double top = num2(box['top']) ?? 0;
+    final double width = num2(box['width']) ?? 0;
+    final double height = num2(box['height']) ?? 0;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    // BUG-2128 — root card height rides the same box; 0 = host did not report.
+    final double rootHeightCss = num2(box['rootHeight']) ?? 0;
+    final int rootHeight = rootHeightCss > 0
+        ? (rootHeightCss * dpr).round()
+        : 0;
+    // TODO-1231 (BUG-583) — ratchet the origin outward-only so a nested close
+    // never slides the window top-left back inward (which raced the host's
+    // compensating layer shift across the DWM/WebView2 boundary and lurched the
+    // pinned root card). The ratcheted box holds the outermost min-corner seen
+    // this session and recomputes width/height so the window still covers the
+    // real content extent (maxRight/maxBottom) from that held origin.
+    final RatchetedOverlayBox ratcheted = ratchetOverlayOrigin(
+      left: left,
+      top: top,
+      width: width,
+      height: height,
+      prevLeft: _ratchetLeft,
+      prevTop: _ratchetTop,
+    );
+    _ratchetLeft = ratcheted.left;
+    _ratchetTop = ratcheted.top;
+    final int dx = (ratcheted.left * dpr).round();
+    final int dy = (ratcheted.top * dpr).round();
+    final int w = (ratcheted.width * dpr).round();
+    final int h = (ratcheted.height * dpr).round();
+    if (!_revealed) {
+      _revealed = true;
+      _revealSafety?.cancel();
+      _lastSentWidth = w;
+      _lastSentHeight = h;
+      _lastSentDx = dx;
+      _lastSentDy = dy;
+      _lastSentGeometryEpoch = geometryEpoch;
+      glog(
+        'reveal(box): dpr=$dpr box=($left,$top,$width,$height) '
+        'ratchet=(${ratcheted.left},${ratcheted.top}) '
+        '-> dx=$dx dy=$dy w=$w h=$h root=$rootHeight epoch=$geometryEpoch',
+      );
+      unawaited(
+        GlobalLookupChannel.revealStack(
+          dx: dx,
+          dy: dy,
+          width: w,
+          height: h,
+          geometryEpoch: geometryEpoch,
+          left: ratcheted.left,
+          top: ratcheted.top,
+          rootHeight: rootHeight,
+        ),
+      );
+      _notifyAfterResizeReady(
+        w,
+        h,
+        geometryEpoch: geometryEpoch,
+        dx: dx,
+        dy: dy,
+        rootHeight: rootHeight,
+        left: ratcheted.left,
+        top: ratcheted.top,
+      );
+    } else if (globalLookupGeometryChanged(
+      lastWidth: _lastSentWidth,
+      lastHeight: _lastSentHeight,
+      lastDx: _lastSentDx,
+      lastDy: _lastSentDy,
+      lastGeometryEpoch: _lastSentGeometryEpoch,
+      width: w,
+      height: h,
+      dx: dx,
+      dy: dy,
+      geometryEpoch: geometryEpoch,
+    )) {
+      _lastSentWidth = w;
+      _lastSentHeight = h;
+      _lastSentDx = dx;
+      _lastSentDy = dy;
+      _lastSentGeometryEpoch = geometryEpoch;
+      glog(
+        'resize(box): dpr=$dpr box=($left,$top,$width,$height) '
+        'ratchet=(${ratcheted.left},${ratcheted.top}) '
+        '-> dx=$dx dy=$dy w=$w h=$h root=$rootHeight epoch=$geometryEpoch',
+      );
+      unawaited(
+        GlobalLookupChannel.revealStack(
+          dx: dx,
+          dy: dy,
+          width: w,
+          height: h,
+          geometryEpoch: geometryEpoch,
+          left: ratcheted.left,
+          top: ratcheted.top,
+          rootHeight: rootHeight,
+        ),
+      );
+      _notifyAfterResizeReady(
+        w,
+        h,
+        geometryEpoch: geometryEpoch,
+        dx: dx,
+        dy: dy,
+        rootHeight: rootHeight,
+        left: ratcheted.left,
+        top: ratcheted.top,
+      );
+    }
+  }
+
+  void _notifyAfterResizeReady(
+    int width,
+    int height, {
+    required int geometryEpoch,
+    int dx = 0,
+    int dy = 0,
+    int rootHeight = 0,
+    double left = 0,
+    double top = 0,
+  }) {
+    final GlobalLookupRoute route = GlobalLookupChannel.currentRoute;
+    if (route.source == 'galCard') {
+      final int generation = ++_galCaptureGeneration;
+      _pendingGalCapture = (
+        route: route,
+        generation: generation,
+        width: width,
+        height: height,
+        geometryEpoch: geometryEpoch,
+        dx: dx,
+        dy: dy,
+        rootHeight: rootHeight,
+        left: left,
+        top: top,
+        attempt: 0,
+      );
+      _scheduleGalCaptureReadySafety(generation);
+      return;
+    }
+    _notifyRevealed(width, height);
+  }
+
+  void _resetGeometryHandshakeForLookup() {
+    _lastSentWidth = -1;
+    _lastSentHeight = -1;
+    _lastSentDx = 0;
+    _lastSentDy = 0;
+    _lastSentGeometryEpoch = -1;
+    _cancelPendingGalCapture();
+  }
+
+  int _fallbackGeometryEpochForCurrentRoute() {
+    // Epoch zero is the legacy/last-resort path. A real bbox always supplies a
+    // positive renderer epoch; a WebView2 recovery may restart that renderer
+    // sequence, so Dart must not retain a cross-document high-water mark.
+    return 0;
+  }
+
+  void _cancelPendingGalCapture() {
+    _galCaptureReadySafety?.cancel();
+    _galCaptureReadySafety = null;
+    _pendingGalCapture = null;
+    _galCaptureGeneration++;
+  }
+
+  void _scheduleGalCaptureReadySafety(int generation) {
+    _galCaptureReadySafety?.cancel();
+    _galCaptureReadySafety = Timer(_kReadySafetyStep, () {
+      final pending = _pendingGalCapture;
+      if (pending == null ||
+          pending.generation != generation ||
+          pending.route != _activeRoute ||
+          !GlobalLookupChannel.isRouteValid(pending.route)) {
+        return;
+      }
+      if (pending.attempt >= _kReadySafetyMaxAttempts) {
+        final bool versionedGeometry = pending.geometryEpoch > 0;
+        glog(
+          'captureReady: bounded ${versionedGeometry ? 'hold' : 'fallback'} '
+          'after ${pending.attempt} retries '
+          'route=${pending.route.routeEpoch}/${pending.route.lookupEpoch} '
+          'size=${pending.width}x${pending.height} '
+          'epoch=${pending.geometryEpoch}',
+        );
+        _pendingGalCapture = null;
+        _galCaptureReadySafety = null;
+        if (versionedGeometry) {
+          // A positive epoch means the renderer explicitly gated nested shells
+          // on a successful native HWND + region commit. Publishing a bitmap
+          // without that ack captures the intentionally-hidden child and
+          // recreates the user's "missing while rendering" intermediate frame.
+          // Keep the last complete surface instead; a later interaction/render
+          // will announce a fresh transaction.
+          return;
+        }
+        GlobalLookupChannel.runWithRoute(
+          pending.route,
+          () => _notifyRevealed(
+            pending.width,
+            pending.height,
+            dx: pending.dx,
+            dy: pending.dy,
+            rootHeight: pending.rootHeight,
+          ),
+        );
+        return;
+      }
+      _pendingGalCapture = (
+        route: pending.route,
+        generation: pending.generation,
+        width: pending.width,
+        height: pending.height,
+        geometryEpoch: pending.geometryEpoch,
+        dx: pending.dx,
+        dy: pending.dy,
+        rootHeight: pending.rootHeight,
+        left: pending.left,
+        top: pending.top,
+        attempt: pending.attempt + 1,
+      );
+      GlobalLookupChannel.runWithRoute(
+        pending.route,
+        () => unawaited(
+          GlobalLookupChannel.revealStack(
+            dx: pending.dx,
+            dy: pending.dy,
+            width: pending.width,
+            height: pending.height,
+            geometryEpoch: pending.geometryEpoch,
+            left: pending.left,
+            top: pending.top,
+          ),
+        ),
+      );
+      _scheduleGalCaptureReadySafety(generation);
+    });
+  }
+
+  /// TODO-867 P3c — legacy single-card sizing (host reported [dpr, physH] rather
+  /// than a bbox): reveal/resize at the fixed card width x capped physical
+  /// scrollHeight, exactly as before D2. Kept as a fallback so a frame that
+  /// somehow reports the scalar form still sizes correctly.
+  void _applyOverlayScalar(AppModel model, double dpr, double physH) {
+    final LookupSize overlaySize = _effectiveLookupSizeForCurrentRoute(model);
+    final int width = (overlaySize.width * model.appUiScale * dpr).round();
+    final double maxHeight = overlaySize.height * model.appUiScale * dpr;
+    final int height = (physH > maxHeight ? maxHeight : physH).round();
+    final int geometryEpoch = _fallbackGeometryEpochForCurrentRoute();
+    if (!_revealed) {
+      _revealed = true;
+      _revealSafety?.cancel();
+      _lastSentWidth = width;
+      _lastSentHeight = height;
+      _lastSentDx = 0;
+      _lastSentDy = 0;
+      _lastSentGeometryEpoch = geometryEpoch;
+      glog('reveal(scalar): dpr=$dpr physH=$physH -> w=$width h=$height');
+      if (GlobalLookupChannel.currentRoute.source == 'galCard') {
+        unawaited(
+          GlobalLookupChannel.revealStack(
+            dx: 0,
+            dy: 0,
+            width: width,
+            height: height,
+            geometryEpoch: geometryEpoch,
+          ),
+        );
+        _notifyAfterResizeReady(width, height, geometryEpoch: geometryEpoch);
+      } else {
+        unawaited(GlobalLookupChannel.reveal(width: width, height: height));
+        _notifyRevealed(width, height);
+      }
+    } else if (width != _lastSentWidth ||
+        height != _lastSentHeight ||
+        geometryEpoch != _lastSentGeometryEpoch) {
+      _lastSentWidth = width;
+      _lastSentHeight = height;
+      _lastSentDx = 0;
+      _lastSentDy = 0;
+      _lastSentGeometryEpoch = geometryEpoch;
+      glog('resize(scalar): dpr=$dpr physH=$physH -> w=$width h=$height');
+      if (GlobalLookupChannel.currentRoute.source == 'galCard') {
+        unawaited(
+          GlobalLookupChannel.revealStack(
+            dx: 0,
+            dy: 0,
+            width: width,
+            height: height,
+            geometryEpoch: geometryEpoch,
+          ),
+        );
+        _notifyAfterResizeReady(width, height, geometryEpoch: geometryEpoch);
+      } else {
+        unawaited(GlobalLookupChannel.resize(width: width, height: height));
+        _notifyRevealed(width, height);
+      }
+    }
+  }
+}
+
+/// host.js `staticSettingsRequired` 的载荷解析（`args = [revision, geometryEpoch]`）。
+///
+/// 抽出来共享是因为它有**两个**消费方（桌面/galCard 的 GlobalLookupController 与剪贴板
+/// 面板），而两边原先各写了一份 num/String 兼容解析。同一条协议消息被解析成两份，等
+/// 协议再加一个参数时必然漂移——这正是本轮修的那个 bug 的形状（同一件事分散在多处各做
+/// 各的，漏掉一处就静默失效）。
+///
+/// [revision] 为 null 表示载荷不合法，调用方应整条忽略。
+/// [hostGeometryEpoch] 仅桌面路径消费（面板模式下 host.js 短路了 measureAndReport）。
+({int? revision, int? hostGeometryEpoch}) parseStaticSettingsRequired(
+  Map<String, Object?> message,
+) {
+  final Object? args = message['args'];
+  if (args is! List || args.isEmpty) {
+    return (revision: null, hostGeometryEpoch: null);
+  }
+  int? asInt(Object? v) {
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v);
+    return null;
+  }
+
+  return (
+    revision: asInt(args.first),
+    hostGeometryEpoch: args.length > 1
+        ? parseGlobalLookupGeometryEpoch(args[1])
+        : null,
+  );
+}
+
+/// Parses one non-negative renderer geometry epoch from a MethodChannel value.
+/// Integral doubles are accepted because native JSON bridges may materialise a
+/// JavaScript integer as either an int or a double.
+int? parseGlobalLookupGeometryEpoch(Object? value) {
+  if (value is int) {
+    return value >= 0 ? value : null;
+  }
+  if (value is double &&
+      value.isFinite &&
+      value >= 0 &&
+      value == value.truncateToDouble()) {
+    return value.toInt();
+  }
+  return null;
+}
+
+/// Exact acknowledgement predicate for the galCard bitmap capture handshake.
+/// The epoch is intentionally part of the identity even when dimensions are
+/// equal, closing the geometry A -> B -> A ABA hole.
+bool globalLookupCaptureReadyMatches({
+  required int pendingWidth,
+  required int pendingHeight,
+  required int pendingGeometryEpoch,
+  required int? readyWidth,
+  required int? readyHeight,
+  required int? readyGeometryEpoch,
+}) =>
+    readyWidth == pendingWidth &&
+    readyHeight == pendingHeight &&
+    readyGeometryEpoch == pendingGeometryEpoch;
+
+/// Whether a renderer geometry transaction differs from the last one sent to
+/// native. Epoch participates even when the physical bounds return to the same
+/// values, because the shell region/pixels may belong to a newer A -> B -> A
+/// transaction.
+bool globalLookupGeometryChanged({
+  required int lastWidth,
+  required int lastHeight,
+  required int lastDx,
+  required int lastDy,
+  required int lastGeometryEpoch,
+  required int width,
+  required int height,
+  required int dx,
+  required int dy,
+  required int geometryEpoch,
+}) =>
+    width != lastWidth ||
+    height != lastHeight ||
+    dx != lastDx ||
+    dy != lastDy ||
+    geometryEpoch != lastGeometryEpoch;
+
+/// A parsed dictionary-media request from the overlay WebView2.
+///
+/// The overlay (app-external global lookup) registers the SAME two custom
+/// schemes the in-app InAppWebView does (see
+/// `dictionary_webview_media.dart` `dictionaryMediaCustomSchemes`):
+///   - `image://?dictionary=<name>&path=<path>` — gaiji / <img> bytes; the
+///     Content-Type is the image type for the path's extension.
+///   - `dictmedia://<encoded-path>?dictionary=<name>` — a dictionary's <link>
+///     stylesheet (and its relative font/bg resources); the path lives in the
+///     URL **host** (percent-encoded) and the Content-Type is `text/css`.
+///
+/// This is a pure, dependency-free parse so it can be unit-tested directly.
+class GlobalLookupMediaRequest {
+  const GlobalLookupMediaRequest({
+    required this.dictionary,
+    required this.path,
+    required this.contentType,
+  });
+
+  final String dictionary;
+  final String path;
+
+  /// The HTTP Content-Type the resource should be served as. Mirrors the in-app
+  /// `dictionary_webview_media.dart` MIME logic and the native overlay's
+  /// `MediaContentTypeHeader`, so the same bytes get the same type on every
+  /// surface.
+  final String contentType;
+}
+
+/// Normalises a dictionary media path the same way the in-app
+/// `dictionary_webview_media.dart` `_normalizeMediaPath` does: trims, converts
+/// back-slashes to forward, and strips any leading slashes.
+String _normalizeGlobalLookupMediaPath(String path) {
+  return path.trim().replaceAll('\\', '/').replaceFirst(RegExp(r'^/+'), '');
+}
+
+/// Returns the image MIME type for [path]'s extension.
+///
+/// 命名统一轮 G8：查 fushi_core 单一 MIME 映射表 [mimeTypeForFilePath]（旧本地
+/// switch 副本之一），与 app 内 `dictionary_media_types.dart` 自动同源。
+String _globalLookupImageMime(String path) => mimeTypeForFilePath(path);
+
+/// Parses an overlay media [url] into (dictionary, path, contentType),
+/// scheme-aware, matching the in-app `dictionary_webview_media.dart` parsing
+/// exactly. Returns null when the scheme is unsupported or the required fields
+/// are missing/empty (the caller then serves a 404 by returning no bytes).
+GlobalLookupMediaRequest? resolveGlobalLookupMedia(String url) {
+  final Uri uri;
+  try {
+    uri = Uri.parse(url);
+  } catch (_) {
+    return null;
+  }
+
+  if (uri.scheme == 'image') {
+    final String dictionary = uri.queryParameters['dictionary'] ?? '';
+    final String path = _normalizeGlobalLookupMediaPath(
+      uri.queryParameters['path'] ?? '',
+    );
+    if (dictionary.isEmpty || path.isEmpty) {
+      return null;
+    }
+    return GlobalLookupMediaRequest(
+      dictionary: dictionary,
+      path: path,
+      contentType: _globalLookupImageMime(path),
+    );
+  }
+
+  if (uri.scheme == 'dictmedia') {
+    final String dictionary = uri.queryParameters['dictionary'] ?? '';
+    // The path is the percent-encoded URL host (matching the in-app
+    // `Uri.decodeComponent(url.host)` parse).
+    final String path = _normalizeGlobalLookupMediaPath(
+      Uri.decodeComponent(uri.host),
+    );
+    if (dictionary.isEmpty || path.isEmpty) {
+      return null;
+    }
+    return GlobalLookupMediaRequest(
+      dictionary: dictionary,
+      path: path,
+      contentType: 'text/css',
+    );
+  }
+
+  return null;
+}

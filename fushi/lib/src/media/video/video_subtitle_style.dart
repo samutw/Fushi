@@ -1,0 +1,772 @@
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/utils/app_ui_scale.dart';
+
+/// media_kit 默认底部控制条的**进度条（seek bar）上缘**距视频底边的清空高度（逻辑像素）。
+///
+/// TODO-171（抄 B站）：字幕避让只需让出**进度条本身那一条**，不是整条底部按钮行。
+/// media_kit 底部控制条在同一个 `Stack(bottomCenter)` 里自底向上堆：按钮行
+/// （`buttonBarHeight: 56`，播放/快进/时间/全屏图标），进度条（seek bar）骑在按钮行
+/// 上沿（桌面用 `Transform.translate(Offset(0, 16))` 把进度条下压、与按钮行顶部重叠）。
+/// 真正会遮住字幕的只有进度条那一条，它落在距视频底约一个按钮行高（`buttonBarHeight`）
+/// 处。故避让高度取 [_kButtonBarHeight]=56：字幕底缘抬到进度条上方一点点恰骑其顶，
+/// 不再多抬整条按钮行 + 离底 margin（旧 `42 + 56 = 98` 把字幕顶过整条按钮行、飞进
+/// 画面中上部，用户报「进度条出来把字幕往上顶太高很怪」）。
+///
+/// 旧值的 `42` 是 media_kit 导出常量 [kDefaultMaterialVideoControlsThemeData] 那套含
+/// `bottomButtonBarMargin.bottom: 42` 的整体离底留白——它是控制条离屏幕底边的空白，
+/// 不是遮挡字幕的实体，叠进避让只会凭空多抬一个 margin。Fushi 实际 new 的桌面主题
+/// （`MaterialDesktopVideoControlsThemeData`）走构造器默认（`bottomButtonBarMargin`
+/// 只有左右、vertical=0），本就没有这 42px，故去掉它也更贴合 Fushi 真实几何。
+///
+/// Fushi 用自绘 `VideoSubtitleOverlay`（非 media_kit 内置字幕视图）。TODO-129 起字幕
+/// **动态**避让：控制条出现时把字幕在用户位置之上抬到 `max(用户位置, 本值)`、隐藏时
+/// 落回用户位置（由 [VideoSubtitleOverlay] 的 `controlsVisible` 驱动 `AnimatedPadding`，
+/// TODO-161 取下限而非加法），不再像 TODO-089 那样把本值恒加进默认
+/// [VideoSubtitleStyle.bottomPadding]。本常量是「控制条可见时字幕底缘骑到的进度条上缘
+/// 高度」。
+const double _kButtonBarHeight = 56;
+const double kVideoControlsBottomReserve = _kButtonBarHeight;
+
+/// 控制条可见时**顶部锚字幕**要让出的「顶栏下缘距视频顶边的高度」（逻辑像素）。与
+/// [kVideoControlsBottomReserve] 对称：顶部内嵌 chrome（标题栏 + 右上角菜单，替代被删
+/// 的 AppBar，BUG-102）占据视频顶部一个按钮行高；此前只有底部锚字幕避让进度条，顶部锚
+/// 字幕无避让 → 控制条可见时顶部字幕与标题栏/菜单重叠、把 UI 盖住（BUG-1069）。默认取
+/// 一个按钮行高（桌面顶栏贴 y=0、无系统 inset），移动端由页面按真实几何加总覆盖。
+const double kVideoControlsTopReserve = _kButtonBarHeight;
+
+/// 控制条可见时字幕要让出的「进度条上缘距视频底边的高度」（逻辑像素），由真实控制条
+/// 几何加总而成，并随界面缩放（`uiScale`）放大（BUG-238）。
+///
+/// 背景（BUG-226/228 的失效区间）：避让用 `max(bottomPadding, reserve)`（取下限，
+/// 非加法——加法会把高位字幕顶飞，BUG-226），但旧 reserve 是**常量** 56：
+/// - 不随界面缩放（放大界面后控制条变高、reserve 不变 → 盖不住）；
+/// - 桌面进度条骑按钮行上沿（约一个按钮行高）56 够用，但**移动端**进度条被抬到
+///   `底部留白 + 按钮行 + 间距 + 进度条热区` 之上，上缘 ≈ 140px，远高于默认基线 75，
+///   `max(75, 56)=75` 把字幕留在进度条**下面**被遮（用户报「只动了一点点」=实际 0）。
+///
+/// 故 reserve 必须 = 进度条上缘真实高度（按平台几何加总）×缩放，且 > 默认基线 75 才能
+/// 让取下限真正抬升字幕盖过进度条。本函数把这套几何收敛成纯函数（页面与测试同源调用）：
+/// - 桌面：进度条骑按钮行上沿（再被下压 [seekBarBottomButtonBarOverlap]）→ reserve =
+///   `[buttonBarHeight] − overlap + [seekBarContainerHeight] + [subtitleBreathingGap]`
+///   （= 触摸热区上缘 + 呼吸，BUG-1224；旧版只让一个按钮行高 = 压住热区上半截误触）。
+///   仍守 BUG-228「不抬过整条按钮行 + 离底 margin（旧 98）」：scale=1.0 时为 84 < 98；
+/// - 移动：进度条整体被抬到按钮行上方 → reserve = [bottomChromeBaseline] + 系统底部
+///   inset + [buttonBarHeight] + [seekBarButtonGap] + **进度条触摸热区全高**
+///   [seekBarContainerHeight] + 字幕呼吸间距 [subtitleBreathingGap]（= 进度条**触摸热区
+///   上缘** + 一点点呼吸距离，字幕命中区整体骑在进度条整段可点区上方）。
+///
+/// BUG-901（字幕点击与进度条点击挨太近 / 误触）——推翻 TODO-568 的取舍：TODO-568 当初为
+/// 消「字幕顶飞」把移动 reserve 从触摸热区全高改成**可见轨道高** [seekBarTrackHeight] +
+/// 呼吸，让字幕底缘骑在可见进度条上方一点点。但 media_kit `MaterialSeekBar` 把可见轨道放在
+/// 触摸热区容器底缘（`Alignment.bottomCenter`），容器上方 ~35×缩放 全是**透明但可点**的
+/// seek 命中区。字幕只避让可见轨道 → 字幕命中区（含逐字符兜底扩边）落进那段透明热区里，与
+/// 进度条 seek 命中区在同一手势竞技场重叠，手指差几像素就把字幕点误判成 seek、seek 误判成
+/// 字幕（用户报「点字幕/点进度条太容易点错」）。
+///
+/// 修正：移动 reserve 改回用**触摸热区全高** [seekBarContainerHeight]（进度条真正的可点
+/// 目标，非只可见轨道）+ 呼吸间距，让字幕命中区整体清出进度条整段 seek 命中区、两者不再
+/// 重叠。代价是控制条可见时字幕比可见轨道高出约一个热区高（用户明确要求「让他们远一点」，
+/// 这段离底距离正是要的分隔；控制条会自动隐藏、字幕随即落回用户基线）。若真机上此分隔过大，
+/// 收窄 `_videoSeekBarContainerHeight`（进度条可点热区）或 [subtitleBreathingGap] 即可，
+/// 但不能退回只让可见轨道高——那会重新让两命中区重叠（本 bug 根因）。
+///
+/// BUG-1224（桌面同源缺口）：BUG-901 只修了移动分支，桌面分支仍 `return buttonBarHeight`
+/// ——那是**可见轨道**所在高度，不是进度条**可点热区**的上缘。桌面 seek bar 的透明命中容器
+/// 高 `seekBarContainerHeight`（fork 默认 36），且被 `Transform.translate` 向下压
+/// [seekBarBottomButtonBarOverlap]（默认 16）骑到按钮行上沿，于是热区实际占
+/// `[buttonBarHeight - overlap, buttonBarHeight - overlap + containerHeight]`——**上缘比
+/// 按钮行高再高 20px**。字幕底缘停在 `buttonBarHeight` 就恰好压住这段热区的上半截，而字幕层
+/// 在 Stack 上层且对 glyph 命中主动吸收指针（`_GlyphPriorityHitTest`，BUG-838），指针根本
+/// 到不了 seek 的裸 `Listener` → 用户点进度条上缘那条带 = 弹查词、seek 被吞（悬停缩略图
+/// 预览却照常出现，因为 hover 走 non-opaque MouseRegion 不被吸收，「看得见能点、点下去
+/// 却是查词」）。故桌面分支与移动分支同一口径：让出**热区上缘** + 呼吸间距。
+///
+/// 几何项均来自 `video_fushi_page.dart` 的同名控制条 getter（已 ×uiScale）；本函数不再
+/// 二次乘 uiScale，由调用方传入已缩放值，避免双重缩放。[bottomChromeBaseline] 是不随
+/// 缩放的离底基线常量（与页面 `_videoBottomChromeBaseline` 一致），故在此显式加上而非
+/// 乘缩放。[seekBarContainerHeight] / [seekBarBottomButtonBarOverlap] 必须传**当前平台
+/// 控制主题真实生效**的值（两套 theme 取值不同，见页面 `_activeSeekBarContainerHeight`）。
+double videoSubtitleControlsReserve({
+  required bool isDesktop,
+  required double buttonBarHeight,
+  required double seekBarButtonGap,
+  required double seekBarContainerHeight,
+  required double seekBarBottomButtonBarOverlap,
+  required double subtitleBreathingGap,
+  required double bottomChromeBaseline,
+  required double bottomSystemInset,
+}) {
+  // 进度条**触摸热区下缘**离视频底边的高度：桌面 seek bar 直接骑按钮行上沿（再下压
+  // overlap），移动端被 `seekBarMargin.bottom` 整体抬到按钮行上方。这是两平台唯一真正的
+  // 布局差异；差异之上的安全不变量（字幕必须清出整段热区）无分支、两平台同一条。
+  final double hotzoneBottom = isDesktop
+      ? buttonBarHeight - seekBarBottomButtonBarOverlap
+      : bottomChromeBaseline +
+          bottomSystemInset +
+          buttonBarHeight +
+          seekBarButtonGap;
+  // 热区上缘 + 呼吸间距：字幕命中区整体骑在进度条整段可点区上方，不与 seek 命中区重叠
+  // （BUG-901 移动 / BUG-1224 桌面）。
+  return hotzoneBottom + seekBarContainerHeight + subtitleBreathingGap;
+}
+
+/// 控制条可见时**顶部锚字幕**要让出的「顶栏下缘距视频顶边的高度」（逻辑像素），与
+/// [videoSubtitleControlsReserve]（底部）对称。顶部内嵌 chrome（标题栏 + 右上角菜单）位于
+/// 视频顶部：桌面贴 y=0、无系统 inset；移动端顶栏抬离状态栏/刘海（`_videoTopBarMargin`）。
+/// 顶栏下缘 = 顶部系统 inset + 一个按钮行高；再加字幕呼吸间距让顶部字幕与顶栏留一点分隔。
+/// 顶部锚字幕顶缘对本值取下限（`max(用户顶距, 本值)`，见 [VideoSubtitleOverlay._paddingFor]），
+/// 控制条可见时整体下移到顶栏下方、不再被标题栏/菜单遮（BUG-1069）；隐藏时落回用户基线。
+/// 几何项均已 ×uiScale（由调用方传入已缩放值，本函数不二次缩放）。
+double videoSubtitleControlsTopReserve({
+  required double buttonBarHeight,
+  required double topSystemInset,
+  required double subtitleBreathingGap,
+}) {
+  return topSystemInset + buttonBarHeight + subtitleBreathingGap;
+}
+
+/// 进度条**热区容器底缘**离控制条区域底边的高度（BUG-3062）。纯函数，页面主题、
+/// 章节刻度层、暗角、玻璃胶囊与测试同源——移动端主题的 `seekBarMargin.bottom` 就是
+/// 本函数的返回值，叠在进度条上的兄弟层不得另写一套近似公式。
+///
+/// 入参均为**最终生效值**（已 ×界面缩放 ×密度档缩放；[bottomChromeBaseline] 为不随缩放
+/// 的离底常量）：
+/// - **移动**：media_kit 把进度条与按钮行放进同一个 bottomCenter Stack，进度条靠
+///   `seekBarMargin.bottom` 抬到按钮行上方 → 离底基线 + 系统 inset + 浮动底栏抬升 +
+///   按钮行高 + 进度条/按钮间距。
+/// - **桌面**：按钮行离底 [floatingLift]，进度条骑在按钮行上沿、被 fork 下压
+///   [desktopButtonBarOverlap] → 浮动抬升 + 按钮行高 − 下压量。
+double videoSeekBarContainerBottom({
+  required bool isDesktop,
+  required double buttonBarHeight,
+  required double seekBarButtonGap,
+  required double floatingLift,
+  required double bottomChromeBaseline,
+  required double bottomSystemInset,
+  required double desktopButtonBarOverlap,
+}) {
+  if (isDesktop) {
+    return floatingLift + buttonBarHeight - desktopButtonBarOverlap;
+  }
+  return bottomChromeBaseline +
+      bottomSystemInset +
+      floatingLift +
+      buttonBarHeight +
+      seekBarButtonGap;
+}
+
+/// seek bar 章节刻度层（TODO-432）相对**控制条区域底边**的竖直锚定：以轨道中线
+/// [trackCenter]（离控制条区底边的高度）为中心展开 [tickHeight]，返回刻度带的
+/// `bottom`（带底缘离控制条区底边）与 `height`。纯函数，页面与测试同源。
+///
+/// [trackCenter] 必须来自真实轨道几何：热区容器底缘（[videoSeekBarContainerBottom]）
+/// + 轨道在容器内的中线（M3E 轨道走 `videoM3eSeekTrackCenterFromBottom`）。BUG-3062：
+/// 此处原本自带一套「容器底缘 + 轨道半高」近似，按钮行高 / 间距不乘密度档、轨道中线
+/// 按旧 media_kit 贴底轨道算（M3E 轨道实际在底缘之上 10×缩放），移动端刻度整条落在
+/// 轨道下方、compact 档还会整体偏高。
+({double bottom, double height}) videoSeekBarTrackBand({
+  required double trackCenter,
+  required double tickHeight,
+}) {
+  return (bottom: trackCenter - tickHeight / 2, height: tickHeight);
+}
+
+/// media_kit 控制条自身的**外层 padding**（BUG-1783）。叠在控制条 Stack 上的兄弟层
+/// （章节刻度、缩略图预览浮层……）必须用**同一个**值做水平基准，否则刻度与轨道分叉。
+///
+/// 真相源是 fork `third_party/media_kit_video/.../controls/material.dart` 的
+/// `_theme(context).padding ?? (isFullscreen(context) ? MediaQuery.padding : EdgeInsets.zero)`。
+/// Fushi 的移动 / 桌面 theme 都**没有**设 `padding` 字段，故恒走后半段。
+///
+/// **为什么不能图省事写 `SafeArea`**：`SafeArea` 恒吃 `MediaQuery.padding`，与上式只在
+/// 「真的处于 media_kit 全屏路由」时才等价。而移动端视频**永不进 media_kit 全屏路由**
+/// （BUG-221，`_toggleVideoFullscreen` 移动端 no-op），轨道恒走 `EdgeInsets.zero` 分支；
+/// 与此同时 Android 全局 `windowLayoutInDisplayCutoutMode=shortEdges`
+/// （`fushi/android/app/src/main/res/values*/styles.xml`）让横屏刘海落在**左 / 右短边**、
+/// `padding.left/right` 非零。于是刻度层比轨道多缩一段，误差
+/// `Δ(f) = padding.left − f·(padding.left + padding.right)` 随比例线性变化——不是整体平移
+/// 而是**仿射斜切**：首章右偏、末章左偏、中间某点恰好蒙对，最难被一眼看出。用户报
+/// 「手机上的章节标记有问题」即此。
+///
+/// 纯函数（页面与测试同源）。[themePadding] 传 controls theme 的 `padding` 字段（当前两套
+/// 主题均为 null，留参数是为了主题哪天真设了值时两侧仍不分叉）。
+EdgeInsets videoControlsChromeInsets({
+  required bool isFullscreenRoute,
+  required EdgeInsets systemPadding,
+  EdgeInsets? themePadding,
+}) {
+  return themePadding ??
+      (isFullscreenRoute ? systemPadding : EdgeInsets.zero);
+}
+
+/// 字幕字号的**屏幕自适应因子**（TODO-1199）。
+///
+/// 问题：字幕字号此前把用户设置的固定值（[VideoSubtitleStyle.fontSize]）原样喂给
+/// overlay，不随屏幕尺寸换算。同一 36px 在小屏手机上占画面很大一块、在大屏平板 / 桌面
+/// 上却显得很小——同一字号在不同设备物理观感不一致（用户报「大屏字幕偏小、小屏偏大」）。
+///
+/// 方案（用户决策「A：自动缩放并且可以调整」）：用户设置的字号仍是**基准**，渲染时乘本
+/// 因子，使字幕占屏比例在不同屏幕上观感一致；用户的手动基准值不被改写（自动是叠加的乘数、
+/// 可调是保留手动基准），故无需额外开关——自动缩放恒开、基准始终可调。
+///
+/// 因子按**视口短边**相对参考短边 [referenceShortestSide] 线性缩放，并夹在
+/// [minFactor, maxFactor] 内防极端（超小 / 超大屏不会把字幕缩没 / 撑爆）：
+/// - 用短边（而非宽 / 高）使横竖屏一致：竖屏短边≈宽、横屏短边≈高，都代表「较小的那一维」，
+///   是字幕相对屏幕占比的稳定代理；
+/// - 参考短边默认 400（约一台手机的短边逻辑像素），故手机附近因子≈1（基准即所见），平板 /
+///   桌面短边更大→因子 > 1 放大，超小屏→因子 < 1 缩小。
+///
+/// 纯函数（页面与测试同源）：[screenSize] 传 `MediaQuery.sizeOf(context)`（逻辑像素、已
+/// 折算 DPI）。短边 <= 0（未布局）时返回 1.0（不缩放）。
+double subtitleScreenScaleFactor(
+  Size screenSize, {
+  double referenceShortestSide = 400.0,
+  double minFactor = 0.85,
+  double maxFactor = 1.6,
+}) {
+  final double shortest = screenSize.shortestSide;
+  if (shortest <= 0 || referenceShortestSide <= 0) return 1.0;
+  final double raw = shortest / referenceShortestSide;
+  return raw.clamp(minFactor, maxFactor).toDouble();
+}
+
+/// 字幕层的**用户垂直锚定**（TODO-2838）：决定该层 padding 基线量的是「离底距离」
+/// （[bottom]，历史默认）还是「离顶距离」（[top]）。
+///
+/// 此前顶部锚定只来自两处非用户源：ASS `\an`/`\pos` 标记（respectAssStyle 开时）与
+/// 纯 SRT 副字幕的自动置顶。用户想把**主字幕**放到画面顶部（动画字幕常在上 1/6 处）
+/// 没有任何入口。本枚举把「锚定边」提升成用户可选的一等状态：顶锚时
+/// [VideoSubtitleStyle.bottomPadding]（持久化名冻结）语义 = 离顶距离，镜像副字幕
+/// forceTop 的既有消费方式（`_paddingFor` 顶分支），不新造第二个距离字段。
+enum SubtitleLayerVAnchor { bottom, top }
+
+/// 字幕垂直位置（距锚定边的距离）的统一上限（逻辑像素，TODO-2838）：持久化 clamp、
+/// 设置滑条 max、拖拽落点 clamp 三处同一真相源。历史上滑条上限 240 < 存储上限 400，
+/// 用户想把字幕放到画面上 1/6 够不着；统一拉到 400（存储上限本就允许）。
+const double kVideoSubtitleMaxPadding = 400;
+
+/// 统一「层锚定解析」纯函数（TODO-2838）：返回该层要**强制**的垂直锚定边；null =
+/// 不强制（遵 cue 自带 ASS 位置，或主层历史底部基线路径）。
+///
+/// 优先级（高 → 低）：
+/// 1. cue 自带非底位置（`\pos` / `\move` / 非底 `\an`，[ownNonBottom]）——它只在
+///    「尊重 .ass 自带样式」开启时才存在（纯字幕模式 markup 恒空），代表作者明示的
+///    定位意图；用户已显式选择尊重 ASS，则各遵其位。**默认纯字幕模式下 markup 恒空，
+///    用户锚定事实上最高优先**。若让用户锚定越过 ASS 位置，多组异位 cue（\pos 招牌 +
+///    对白）会被折到同一顶部盒互相叠印——锚定是「层默认位置」，不是「压平一切」。
+/// 2. 用户显式锚定 [userAnchor]：主层只有选了顶部才算显式（底部即历史默认）；副层
+///    任何非 null 值（拖拽落点写入）都算显式。
+/// 3. 副字幕自动锚定：无显式选择时取主层锚定的**对侧**（[mainUserAnchor] 底 → 副顶，
+///    历史行为；主顶 → 副底）。双层各占一边，消除「主字幕顶锚后与自动置顶的副字幕
+///    同点叠印」的新特例——对侧规则让碰撞在结构上不可能。
+/// 4. 主层默认：null（不强制，底部基线路径，历史像素级不变）。
+SubtitleLayerVAnchor? resolveLayerForcedAnchor({
+  required bool isSecondary,
+  required SubtitleLayerVAnchor? userAnchor,
+  required SubtitleLayerVAnchor mainUserAnchor,
+  required bool ownNonBottom,
+}) {
+  if (ownNonBottom) return null;
+  if (userAnchor != null) return userAnchor;
+  if (isSecondary) {
+    return mainUserAnchor == SubtitleLayerVAnchor.top
+        ? SubtitleLayerVAnchor.bottom
+        : SubtitleLayerVAnchor.top;
+  }
+  return null;
+}
+
+/// 字幕背景盒的**默认底色**（TODO-1059 方案A）：固定半透明黑，而非跟随
+/// `ColorScheme.surface`。
+///
+/// 根因：字幕盒底色此前默认取当前主题 `surface`（[VideoSubtitleStyle.backgroundColor]
+/// 为 null 时由页面喂进 `cs.surface`）。浅色主题 `surface` 近白 → 字幕背景变成一块浅色
+/// 板，与白色字幕正文对比极低、观感违和（用户报「浅色主题下变浅色背景很违和」）。字幕
+/// 背景的语义是「在任意画面上给正文垫一层稳定的暗底提升可读性」，本就该像 ASS/播放器
+/// 惯例那样固定暗色、不跟随 App 主题（与固定白字 + 黑描边同源，TODO-051）。
+///
+/// 只在 `backgroundColor == null`（用户从未显式选过背景色）时生效：显式选过颜色的旧
+/// 用户数据（非 null）仍逐字尊重，不被本默认覆盖（Never break userspace）。透明度仍由
+/// [VideoSubtitleStyle.backgroundOpacity] 独立控制（0 = 完全无背景）。`0xFF000000`
+/// 纯黑，实际可见透明度由 opacity 决定。
+const Color kDefaultSubtitleBackgroundColor = Color(0xFF000000);
+
+/// 字幕**描边**的默认颜色（用户反馈 #xif6-gtSz7：描边颜色 / 粗细可自定义）。描边默认关
+/// （[VideoSubtitleStyle.outlineThickness] = 0，外观与历史一致）；用户第一次把粗细拉起来时
+/// 若没选过颜色就用纯黑——白字黑边是字幕描边的惯例。
+const Color kDefaultSubtitleOutlineColor = Color(0xFF000000);
+
+/// 描边粗细的上限（逻辑像素），持久化 clamp 与设置滑条 max 同一真相源。
+const double kVideoSubtitleMaxOutline = 8;
+
+/// 用户描边粗细（**向外可见**的宽度，与 ASS `\bord` 同义）→ Flutter 居中 stroke 的
+/// `strokeWidth`。居中描边内半边被上层填充盖住、可见只剩一半，故 ×2（与 ASS 路径的
+/// `assOutlineStrokeWidth` 同一换算）。<=0 返回 0 = 不画描边层。
+double subtitleOutlineStrokeWidth(double visiblePx) =>
+    visiblePx <= 0 ? 0 : visiblePx * 2;
+
+/// 字幕正文行高（`TextStyle.height`）。播放页 [VideoSubtitleOverlay] 与设置页的
+/// 字幕样式预览（`SubtitleStylePreview`）读同一个常量——预览要和真字幕同一套几何，
+/// 不能各写一份字面量后慢慢漂开。
+const double kVideoSubtitleLineHeight = 1.3;
+
+/// 字幕盒（背景底色那一块）的内边距与圆角，overlay 与设置预览同源（理由同上）。
+const EdgeInsets kVideoSubtitleBoxPadding = EdgeInsets.symmetric(
+  horizontal: 12,
+  vertical: 6,
+);
+const double kVideoSubtitleBoxRadius = 6;
+
+/// CSS 数字字重（100..900）→ [FontWeight]，越界夹到两端。overlay 的默认外观与
+/// 设置预览共用这一个换算。
+FontWeight videoSubtitleFontWeight(int value) {
+  final int index = ((value.clamp(100, 900) ~/ 100).clamp(1, 9)) - 1;
+  return FontWeight.values[index];
+}
+
+/// 字幕样式的**未落盘预览态**：设置里拖动字号 / 阴影 / 位置等滑条时，松手前样式
+/// 只经 `previewVideoSubtitleStyle` 发给播放页，不写偏好；设置页的字幕样式预览
+/// 没有播放页可问，就听这里。非 null = 正在拖动中的样式；落盘后清回 null，预览
+/// 回到读偏好（偏好仓库的通知会带它重建）。
+final ValueNotifier<VideoSubtitleStyle?> videoSubtitleStyleDraft =
+    ValueNotifier<VideoSubtitleStyle?>(null);
+
+/// Video subtitle appearance persisted as app preferences.
+///
+/// The default is a high-contrast caption look: fixed white text with a thick
+/// black outline/shadow so it stays readable on any video regardless of the
+/// active app theme (TODO-051). Weight and shadow thickness stay nullable so the
+/// default thickness can follow the global UI size, while explicit user choices
+/// remain fixed. [textColor]/[shadowColor] left null means "follow the theme"
+/// (legacy data persisted before TODO-051), resolved via [resolveTextColor] /
+/// [resolveShadowColor]. [backgroundColor] left null means "use the fixed
+/// [kDefaultSubtitleBackgroundColor] translucent black" (TODO-1059 方案A), NOT
+/// the theme surface — so a light theme no longer washes the subtitle box pale.
+@immutable
+class VideoSubtitleStyle {
+  const VideoSubtitleStyle({
+    required this.fontSize,
+    required this.textColor,
+    required this.fontWeight,
+    required this.shadowColor,
+    required this.shadowThickness,
+    required this.backgroundColor,
+    required this.backgroundOpacity,
+    required this.bottomPadding,
+    this.secondaryBottomPadding,
+    this.mainAnchor = SubtitleLayerVAnchor.bottom,
+    this.secondaryAnchor,
+    this.outlineColor,
+    this.outlineThickness = 0,
+  });
+
+  /// 默认字重 400（常规），与 mpv 默认（`--sub-bold=no` → Regular）对齐：同一字体
+  /// SRT/无样式表字幕在 fushi 与 mpv 里不再一边粗体一边常规（用户报「字重差异大」）。
+  /// ASS 有 cueStyle 时字重恒以 ASS 为准（Bold 标志/命名面字重，BUG-819），本默认值
+  /// 只管非 ASS / 样式失配路径。历史默认曾是 700，v1 迁移锚点见 [_v1LegacyFontWeight]。
+  static const int defaultFontWeight = 400;
+
+  /// v1 持久化时代硬编码的默认字重（700）。仅供 [decode] 把 v1 存的该值迁移成 null
+  /// （跟随缩放/新默认）用；与当前 [defaultFontWeight] 解耦，与
+  /// [_v1LegacyShadowThickness] 同一模式——改默认不破坏旧数据迁移语义。
+  static const int _v1LegacyFontWeight = 700;
+
+  /// 默认阴影/投影**半径**（模糊强度），抄 Niratan（mac 原生日语沉浸 app）字幕默认的
+  /// `shadowRadius = 3`（其设置滑杆范围 0..10）。BUG-323 时代这里是 5px「硬描边粗细」；
+  /// 现按用户要求改回 Niratan 的柔和投影观感——渲染改为单层高斯 drop shadow（见
+  /// [buildSubtitleSoftShadow] 与 [VideoSubtitleOverlay._buildSubtitleChar]），3 就是那层
+  /// 软阴影的模糊半径。仍跟随 UI scale（[resolveShadowThickness]）。
+  static const double defaultShadowThickness = 3;
+
+  /// v1 持久化时代硬编码的默认阴影粗细（3px）。仅供 [decode] 把 v1 存的该值迁移成 null
+  /// （跟随 UI scale）用。用独立字面量与当前 [defaultShadowThickness] 解耦：即便两者当前
+  /// 同为 3，语义不同（此值是历史迁移锚点），后续改默认也不破坏旧数据迁移。
+  static const double _v1LegacyShadowThickness = 3;
+
+  /// High-contrast caption defaults (TODO-051): 36px WHITE text with a soft
+  /// translucent-BLACK drop shadow, no box. Fixed white/black instead of theme
+  /// colors so subtitles stay legible on any video and don't wash out on
+  /// low-contrast themes. [fontWeight]/[shadowThickness] stay null to follow the
+  /// global UI scale ([defaultFontWeight] / [defaultShadowThickness] at 1.0).
+  ///
+  /// [shadowColor] 默认取 `0xE6000000`（黑 @ 0.9 alpha），抄 Niratan 字幕投影
+  /// `Color.black.opacity(0.9)`：配合 [defaultShadowThickness]=3 的模糊半径与
+  /// [buildSubtitleSoftShadow] 的向下 1px 偏移，得到「字后一层柔和黑影」的观感（不再是
+  /// BUG-323 的锐利硬描边）。旧用户显式存的 `0xFF000000` 仍逐字尊重、不被本默认覆盖。
+  ///
+  /// [bottomPadding] is the user's subtitle position only (default 75). It no
+  /// longer bakes in the controls-bar clearance: TODO-129 made the self-drawn
+  /// [VideoSubtitleOverlay] dodge the bar *dynamically* — when the controls show
+  /// it lifts the subtitle to `max(this position, [kVideoControlsBottomReserve])`
+  /// (the progress-bar upper edge) and drops back when they hide (driven by
+  /// `controlsVisible`, lower-bound not addition — TODO-161). So the default
+  /// stays at the natural 75 and is only nudged just above the progress bar
+  /// while it is on screen, instead of being permanently raised (TODO-089) or
+  /// lifted over the whole button row (TODO-171). Users who manually pick a
+  /// position keep their value verbatim (no "is-manual" branch — it's the same
+  /// field; the dynamic dodge takes the lower bound on top of it).
+  static const VideoSubtitleStyle defaults = VideoSubtitleStyle(
+    fontSize: 36,
+    textColor: Color(0xFFFFFFFF),
+    fontWeight: null,
+    // 黑 @ 0.9 alpha（抄 Niratan `.black.opacity(0.9)`）：柔和投影而非纯黑硬边。
+    shadowColor: Color(0xE6000000),
+    shadowThickness: null,
+    backgroundColor: null,
+    backgroundOpacity: 0,
+    // 用户位置基线（不含控制条避让）：避让在控制条可见时由 overlay 动态叠加（TODO-129）。
+    bottomPadding: 75,
+  );
+
+  final double fontSize;
+  final Color? textColor;
+  final int? fontWeight;
+  final Color? shadowColor;
+  final double? shadowThickness;
+  final Color? backgroundColor;
+  final double backgroundOpacity;
+  final double bottomPadding;
+
+  /// 副字幕层的**独立**位置基线（距其锚点边的距离；纯 SRT 副字幕强制置顶时即顶距）。
+  ///
+  /// null = 跟随 [bottomPadding]（历史行为、旧数据零迁移）：此前主副两层共用同一个
+  /// [bottomPadding] 字段——主字幕拿它当底距、副字幕（强制置顶）拿它当顶距，调一个
+  /// 必然把另一个也拽走，用户没法把主字幕压低同时把副字幕抬高。分成两条基线后，
+  /// [VideoSubtitleOverlay] 按层取值（见 `_layerBaseline`），两层各自独立。
+  ///
+  /// 只有用户真正拖过「副字幕垂直位置」才写具体值；没拖过恒为 null、逐字沿用主字幕
+  /// 位置（Never break userspace：老用户外观像素级不变）。
+  final double? secondaryBottomPadding;
+
+  /// 主字幕层的用户垂直锚定（TODO-2838）。默认 [SubtitleLayerVAnchor.bottom] =
+  /// 历史行为（底距基线）；[SubtitleLayerVAnchor.top] 时 [bottomPadding] 语义变为
+  /// **离顶距离**（镜像副字幕 forceTop 的既有消费路径）。旧 JSON 无本字段 → 底锚，
+  /// 零迁移零破坏。
+  final SubtitleLayerVAnchor mainAnchor;
+
+  /// 副字幕层的用户垂直锚定（TODO-2838）。null = 自动（历史行为：取主层锚定的对侧，
+  /// 主底 → 副顶）；非 null = 用户显式选择（播放器内拖拽落点写入），从此不再自动跟随。
+  /// 锚定解析优先级见 [resolveLayerForcedAnchor]。
+  final SubtitleLayerVAnchor? secondaryAnchor;
+
+  /// 统一外观下的**真描边**颜色（沿字形轮廓的硬边，与 [shadowColor] 的柔和投影是两层）。
+  /// null = 用默认 [kDefaultSubtitleOutlineColor]。只在「尊重 .ass 自带样式」关、或 cue
+  /// 不带 ASS 样式时生效——尊重 ASS 时描边由文件的 \bord / \3c 决定。
+  final Color? outlineColor;
+
+  /// 统一外观下的描边粗细（逻辑像素，0..[kVideoSubtitleMaxOutline]）。默认 0 = 不描边，
+  /// 旧数据缺字段也是 0，外观像素级不变。
+  final double outlineThickness;
+
+  Color resolveOutlineColor() => outlineColor ?? kDefaultSubtitleOutlineColor;
+
+  VideoSubtitleStyle copyWith({
+    double? fontSize,
+    Color? textColor,
+    int? fontWeight,
+    Color? shadowColor,
+    double? shadowThickness,
+    Color? backgroundColor,
+    double? backgroundOpacity,
+    double? bottomPadding,
+    // null = 不改（保持当前值，含「仍跟随主字幕」的 null 态）。设置面板拖动副字幕位置
+    // 时才传具体值；无「改回跟随」的入口，故不需要 backgroundColor 那样的 reset 标志。
+    double? secondaryBottomPadding,
+    // null = 不改。锚定选择器 / 拖拽落点才传具体值。
+    SubtitleLayerVAnchor? mainAnchor,
+    // null = 不改（保持当前值，含「仍自动对侧」的 null 态）。仅拖拽副字幕落点写入；
+    // 无「改回自动」的入口，与 secondaryBottomPadding 同款单向语义。
+    SubtitleLayerVAnchor? secondaryAnchor,
+    Color? outlineColor,
+    double? outlineThickness,
+    // [backgroundColor] 与 null 语义冲突：`null` 既是「不改」又是「显式清空跟随默认黑」。
+    // 用显式 [resetBackgroundColor] 标志区分——true 时把 [backgroundColor] 强制清成 null
+    // （回到 [kDefaultSubtitleBackgroundColor] 固定默认），供设置面板「默认（黑）」选项用。
+    bool resetBackgroundColor = false,
+  }) {
+    return VideoSubtitleStyle(
+      fontSize: fontSize ?? this.fontSize,
+      textColor: textColor ?? this.textColor,
+      fontWeight: fontWeight ?? this.fontWeight,
+      shadowColor: shadowColor ?? this.shadowColor,
+      shadowThickness: shadowThickness ?? this.shadowThickness,
+      backgroundColor: resetBackgroundColor
+          ? null
+          : (backgroundColor ?? this.backgroundColor),
+      backgroundOpacity: backgroundOpacity ?? this.backgroundOpacity,
+      bottomPadding: bottomPadding ?? this.bottomPadding,
+      secondaryBottomPadding:
+          secondaryBottomPadding ?? this.secondaryBottomPadding,
+      mainAnchor: mainAnchor ?? this.mainAnchor,
+      secondaryAnchor: secondaryAnchor ?? this.secondaryAnchor,
+      outlineColor: outlineColor ?? this.outlineColor,
+      outlineThickness: outlineThickness ?? this.outlineThickness,
+    );
+  }
+
+  Color resolveTextColor(Color themeColor) => textColor ?? themeColor;
+  Color resolveShadowColor(Color themeColor) => shadowColor ?? themeColor;
+  Color resolveBackgroundColor(Color themeColor) =>
+      backgroundColor ?? themeColor;
+
+  int resolveFontWeight(double uiScale) {
+    if (fontWeight != null) return fontWeight!;
+    final double scale = _normalizeUiScale(uiScale);
+    final int rounded = (defaultFontWeight * scale / 100).round() * 100;
+    if (rounded < 100) return 100;
+    if (rounded > 900) return 900;
+    return rounded;
+  }
+
+  double resolveShadowThickness(double uiScale) {
+    if (shadowThickness != null) return shadowThickness!;
+    return (defaultShadowThickness * _normalizeUiScale(uiScale))
+        .clamp(0, 12)
+        .toDouble();
+  }
+
+  static String encode(VideoSubtitleStyle s) => jsonEncode(<String, dynamic>{
+        '_v': 2,
+        'fontSize': s.fontSize,
+        'textColor': s.textColor?.toARGB32(),
+        'fontWeight': s.fontWeight,
+        'shadowColor': s.shadowColor?.toARGB32(),
+        'shadowThickness': s.shadowThickness,
+        'backgroundColor': s.backgroundColor?.toARGB32(),
+        'backgroundOpacity': s.backgroundOpacity,
+        'bottomPadding': s.bottomPadding,
+        // null（从未单独调过副字幕位置）也照写：decode 侧 null → 继续跟随主字幕。
+        'secondaryBottomPadding': s.secondaryBottomPadding,
+        // 锚定（TODO-2838）：主层枚举名字符串（'bottom'/'top'）；副层 null（自动
+        // 对侧）也照写，decode 侧 null → 继续自动。
+        'mainAnchor': s.mainAnchor.name,
+        'secondaryAnchor': s.secondaryAnchor?.name,
+        'outlineColor': s.outlineColor?.toARGB32(),
+        'outlineThickness': s.outlineThickness,
+      });
+
+  static VideoSubtitleStyle decode(String? json) {
+    if (json == null || json.isEmpty) return defaults;
+    try {
+      final dynamic d = jsonDecode(json);
+      if (d is! Map) return defaults;
+      final int version = d['_v'] is num ? (d['_v'] as num).round() : 1;
+      double num2d(Object? v, double fallback) =>
+          v is num ? v.toDouble() : fallback;
+      int? colorArgb(Object? v) => v is num ? v.toInt() : null;
+      int normalizeWeight(Object? v) {
+        final int raw = v is num ? v.round() : defaultFontWeight;
+        final int rounded = (raw / 100).round() * 100;
+        if (rounded < 100) return 100;
+        if (rounded > 900) return 900;
+        return rounded;
+      }
+
+      int? readFontWeight(Object? v) {
+        if (v is! num) return null;
+        final int normalized = normalizeWeight(v);
+        // v1 数据存的是当时硬编码默认字重（700）=「跟随默认」，迁移成 null。对照 v1
+        // 时代字面量而非当前 [defaultFontWeight]（已改 400，mpv 对齐）：否则老用户的
+        // 未调整值会被钉死成显式 700、永远吃不到新默认（同 shadowThickness 的教训）。
+        return version < 2 && normalized == _v1LegacyFontWeight
+            ? null
+            : normalized;
+      }
+
+      double? readShadowThickness(Object? v) {
+        if (v is! num) return null;
+        final double normalized = v.toDouble().clamp(0, 12).toDouble();
+        // v1 数据存的是当时硬编码的默认阴影粗细（3px）= 「跟随 UI scale」，迁移成 null。
+        // 用 v1 时代的字面值对照，而非当前 [defaultShadowThickness]（TODO-051 已改为
+        // 5），否则改默认会把老用户的 3px 误当显式值钉死、不再跟随缩放。
+        return version < 2 && normalized == _v1LegacyShadowThickness
+            ? null
+            : normalized;
+      }
+
+      // Colors round-trip verbatim: a stored ARGB int is honoured as an explicit
+      // choice, a missing/null value stays null = "follow the theme" (legacy
+      // data persisted before TODO-051, when defaults were theme-following).
+      // White (0xFFFFFFFF) is the new default text color (TODO-051) and must
+      // persist as an explicit value — no longer folded back to null.
+      final int? argb = colorArgb(d['textColor']);
+      final int? shadowArgb = colorArgb(d['shadowColor']);
+      final int? backgroundArgb = colorArgb(d['backgroundColor']);
+      final int? outlineArgb = colorArgb(d['outlineColor']);
+      return VideoSubtitleStyle(
+        fontSize: num2d(d['fontSize'], defaults.fontSize).clamp(10, 72),
+        textColor: argb == null ? null : Color(argb),
+        fontWeight: readFontWeight(d['fontWeight']),
+        shadowColor: shadowArgb == null ? null : Color(shadowArgb),
+        shadowThickness: readShadowThickness(d['shadowThickness']),
+        backgroundColor: backgroundArgb == null ? null : Color(backgroundArgb),
+        backgroundOpacity: num2d(
+          d['backgroundOpacity'],
+          defaults.backgroundOpacity,
+        ).clamp(0.0, 1.0),
+        bottomPadding: num2d(d['bottomPadding'], defaults.bottomPadding)
+            .clamp(0, kVideoSubtitleMaxPadding),
+        // 缺字段（旧数据）/ 非数字 → null = 副字幕继续跟随主字幕位置（旧外观不变）。
+        secondaryBottomPadding: d['secondaryBottomPadding'] is num
+            ? (d['secondaryBottomPadding'] as num)
+                .toDouble()
+                .clamp(0, kVideoSubtitleMaxPadding)
+                .toDouble()
+            : null,
+        // 锚定（TODO-2838）：缺字段（旧数据）/ 未知值 → 主层底锚、副层自动（对侧），
+        // 旧外观像素级不变。
+        mainAnchor:
+            _decodeAnchor(d['mainAnchor']) ?? SubtitleLayerVAnchor.bottom,
+        secondaryAnchor: _decodeAnchor(d['secondaryAnchor']),
+        // 描边（#xif6-gtSz7）：缺字段（旧数据）→ 无描边、默认色，外观不变。
+        outlineColor: outlineArgb == null ? null : Color(outlineArgb),
+        outlineThickness: num2d(d['outlineThickness'], 0)
+            .clamp(0, kVideoSubtitleMaxOutline)
+            .toDouble(),
+      );
+    } catch (_) {
+      return defaults;
+    }
+  }
+
+  /// JSON 里的锚定字符串 → 枚举；未知/非字符串返回 null（调用方决定回退语义）。
+  static SubtitleLayerVAnchor? _decodeAnchor(Object? v) => switch (v) {
+        'top' => SubtitleLayerVAnchor.top,
+        'bottom' => SubtitleLayerVAnchor.bottom,
+        _ => null,
+      };
+
+  static double _normalizeUiScale(double uiScale) {
+    return FushiAppUiScale.normalize(uiScale);
+  }
+}
+
+/// 字幕正文的**柔和投影**：把 [thickness]（阴影半径）渲染成**单层**高斯 drop shadow，
+/// 挂在正文 fill [Text] 的 `style.shadows` 上（见
+/// [VideoSubtitleOverlay._buildSubtitleChar]）。[thickness] <= 0 返回空列表（无投影）。
+///
+/// **偏移恒为零（BUG-1603）**：投影环绕字形四周，观感是「字后面一团柔和黑影」。
+///
+/// 原本抄 Niratan `SubtitleOverlayView` 的 `.shadow(..., y: 1)` 带 1px 下偏。真机
+/// （iPhone SE，DPR=2）像素实测证明那 1 逻辑像素在**紧模糊**下被放大成明显的方向性：
+///
+/// | 配置 | 上方暗度 | 下方暗度 |
+/// |---|---|---|
+/// | `offset(0,1)` blur3 | 1 | 218 |
+/// | `offset.zero` blur3 | 54 | 61 |
+///
+/// 即偏移把上方光晕**几乎清零**、下方**放大 3.5 倍**——不再是「字后柔和黑影」，而是
+/// 「阴影整个掉到字下面」。用户报的「阴影错位/方向不对」就是这个。渲染本身没问题
+/// （零偏移那组上下 54/61 对称），所以根因在参数不在渲染层。
+///
+/// 为什么用**单层**而非 BUG-222/BUG-323 的 8 层 `Shadow`：那套残留黑字的根因是**8 份**
+/// 模糊 glyph 拷贝（`blurRadius=thickness` > 偏移 `thickness/2`）大面积重叠外溢成能看清
+/// 字形的第二个黑字。单层、零偏移的 drop shadow 只有一份拷贝、不产生位移重叠，结构上
+/// 不可能重现那个症状。[color] 是用户/主题阴影色，thickness=模糊强度，0=无投影。
+List<Shadow> buildSubtitleSoftShadow(Color color, double thickness) {
+  if (thickness <= 0) return const <Shadow>[];
+  return <Shadow>[
+    Shadow(color: color, blurRadius: thickness, offset: Offset.zero),
+  ];
+}
+
+/// 字幕**真描边**画笔（BUG-323 / TODO-569）：把宽度 [thickness] 渲染成沿字形轮廓的单层
+/// 描边，由底层 stroke [Text] 用本画笔描出、上层 fill [Text] 填正文（见
+/// [VideoSubtitleOverlay._buildSubtitleChar] 的 ASS 尊重分支）。[thickness] <= 0 返回 null。
+///
+/// 适用范围（TODO-1105 后收窄）：现仅供**「尊重 .ass 自带样式」路径**画 .ass 的 `\bord`/
+/// `Outline` 硬描边——那是 .ass 文件明示的描边语义，必须用沿轮廓的真描边忠实还原。**默认
+/// 统一外观**已按用户决策改回 Niratan 的柔和投影（[buildSubtitleSoftShadow]），不再走本
+/// 描边。保留真描边而非旧的 8 层模糊 `Shadow` 伪描边，是因为后者在大 thickness / 缩放下
+/// 会外溢成「残留黑字」（BUG-323 根因，见 [buildSubtitleShadows] 文档）；真描边单层、无
+/// 模糊、无偏移拷贝，任何 thickness 只是描边变粗变细，绝不产生第二个错位黑字。
+///
+/// [color] 是描边色（.ass \3c / OutlineColour），[thickness] = 描边宽（.ass \bord），
+/// 0 = 无描边。`strokeJoin/Cap.round` 让转角圆滑，贴合 ASS/asbplayer outline 观感。
+Paint? buildSubtitleStrokePaint(Color color, double thickness) {
+  if (thickness <= 0) return null;
+  return Paint()
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = thickness
+    ..strokeJoin = StrokeJoin.round
+    ..strokeCap = StrokeCap.round
+    ..color = color
+    ..isAntiAlias = true;
+}
+
+/// 字幕描边阴影：把粗细 [thickness] 渲染成**贴合文字四周的对称描边/光晕**，而非
+/// 单向下方的投影（BUG-222）。
+///
+/// 旧实现是一个 `Shadow(offset: Offset(0, thickness))` 纯向下位移的 drop shadow：
+/// thickness 越大阴影越往下「掉」，字幕移动/换句时阴影与字身分离，观感像「阴影没跟住、
+/// 总有残留」。字幕该有的是 ASS/asbplayer 式的 **outline**——阴影包住字身四周。
+///
+/// 做法：八个方向（上下左右 + 四对角）各放一个小偏移阴影，偏移半径取 `thickness/2`
+/// （对角乘 ~0.707 归一成圆形描边），`blurRadius=thickness` 让描边软化成贴合字身的
+/// 光晕。八向对称 → 合成结果围绕文字、无单向「掉落」感。thickness 仍是用户/缩放控制的
+/// 描边强度（0 = 无描边），[color] 仍是用户/主题阴影色，语义不变。
+///
+/// 历史：字幕**正文**字符早先用本函数的 8 向 `Shadow`（BUG-222），后因大 thickness /
+/// 缩放下 8 份模糊 glyph 拷贝外溢成「残留黑字」改成硬描边（BUG-323），现按用户决策再
+/// 换成 [buildSubtitleSoftShadow] 的单层柔和投影（抄 Niratan）。本函数仍保留给**收藏星
+/// 角标**那枚 [Icon] 用——图标尺寸小、四周对称光晕正合适，不在字幕文字残影范围内。
+///
+/// [thickness] <= 0 返回空列表（无描边，与旧 `shadowThickness<=0` 分支等价）。
+List<Shadow> buildSubtitleShadows(Color color, double thickness) {
+  if (thickness <= 0) return const <Shadow>[];
+  // 描边偏移半径：thickness 的一半，最小 0.5px 保证薄描边也成形。
+  final double r = (thickness / 2).clamp(0.5, double.infinity).toDouble();
+  final double diag = r * 0.70710678; // 对角归一成圆形描边（cos45°）。
+  const List<({double dx, double dy})> dirs = <({double dx, double dy})>[
+    (dx: 1, dy: 0),
+    (dx: -1, dy: 0),
+    (dx: 0, dy: 1),
+    (dx: 0, dy: -1),
+    (dx: 1, dy: 1),
+    (dx: 1, dy: -1),
+    (dx: -1, dy: 1),
+    (dx: -1, dy: -1),
+  ];
+  return <Shadow>[
+    for (final ({double dx, double dy}) d in dirs)
+      Shadow(
+        color: color,
+        blurRadius: thickness,
+        offset: Offset(
+          (d.dx.abs() == d.dy.abs() ? diag : r) * d.dx,
+          (d.dx.abs() == d.dy.abs() ? diag : r) * d.dy,
+        ),
+      ),
+  ];
+}
+
+/// 视频内顶栏（media_kit 控制条 [topButtonBar]）的外边距（BUG-463）。
+///
+/// 移动端视频永不进 media_kit 全屏路由（BUG-221），而 fork 的 [MaterialVideoControls]
+/// 只在**全屏**分支给顶栏 Column 套 `MediaQuery.padding` 顶部内缩、窗口分支恒
+/// `EdgeInsets.zero` → 顶栏按钮永远贴 `y=0`，被状态栏 / 刘海盖住、点不到（用户报「顶栏
+/// 的按钮会被挡住」）。本纯函数把系统安全区折成顶栏 margin：
+/// - `top`：由 [systemBarsVisible] 门控，系统栏真实可见时取 [systemViewPadding].top，
+///   隐栏时归零，避免 iOS 横竖屏切换 / 系统栏临时显隐期间残留的 `padding.top`
+///   过渡值把顶栏偶发下压。
+/// - `left` / `right`：与浮动侧栏 `_mergeRailSafeAreaPadding` 同款逐边取 `max(16, inset)`
+///   ——横屏短边刘海下顶栏左 / 右按钮也避开 cutout，又不在无刘海时把默认 16 叠成双重留白。
+///
+/// 调用方同时传 `MediaQuery.padding` 与 `MediaQuery.viewPadding`：top 与底栏
+/// `_videoBottomSystemInset` 一样由系统栏真实可见性决定；左右 cutout 则用更稳定的
+/// viewPadding 与 padding 逐边取 max。
+EdgeInsets videoTopBarMargin({
+  required EdgeInsets systemPadding,
+  required EdgeInsets systemViewPadding,
+  required bool systemBarsVisible,
+}) {
+  return EdgeInsets.only(
+    left: math.max(16.0, math.max(systemPadding.left, systemViewPadding.left)),
+    right:
+        math.max(16.0, math.max(systemPadding.right, systemViewPadding.right)),
+    top: systemBarsVisible ? systemViewPadding.top : 0.0,
+  );
+}

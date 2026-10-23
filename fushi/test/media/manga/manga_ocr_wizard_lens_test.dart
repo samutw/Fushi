@@ -1,0 +1,143 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/media/manga/manga_ocr_wizard_dialog.dart';
+import 'package:fushi/src/media/manga/manga_ocr_wizard_engines.dart';
+import 'package:fushi/src/media/manga/ocr/google_lens_ocr_service.dart';
+import 'package:fushi_engine/media/manga/mokuro_payload.dart';
+import 'package:fushi_engine/ocr/manga_ocr_service.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:path/path.dart' as p;
+import '../../helpers/glass_unwrap.dart';
+
+class _UnavailableLocalService implements MangaOcrService {
+  @override
+  bool get isSupportedPlatform => false;
+
+  @override
+  Future<MangaOcrModelStatus> modelStatus() async => const MangaOcrModelStatus(
+        detectorReady: false,
+        recognizerReady: false,
+        diskBytes: 0,
+        totalBytes: 1,
+      );
+
+  @override
+  Stream<MangaOcrDownloadEvent> downloadModels() =>
+      const Stream<MangaOcrDownloadEvent>.empty();
+
+  @override
+  Future<int> deleteModels() async => 0;
+
+  @override
+  Stream<MangaOcrVolumeEvent> ocrFolder({
+    required String imageDirPath,
+    String? volumeTitle,
+    int startPage = 0,
+  }) =>
+      const Stream<MangaOcrVolumeEvent>.empty();
+}
+
+class _FakeLensRunner implements GoogleLensMangaOcrRunner {
+  int requests = 0;
+  String? lastLanguage;
+
+  @override
+  Future<void> clearCache(String imageDirPath) async {}
+
+  @override
+  Stream<MangaOcrVolumeEvent> ocrFolder({
+    required String imageDirPath,
+    String? volumeTitle,
+    int startPage = 0,
+    bool onlyMissing = true,
+    String language = 'ja',
+    MangaOcrPageFocus? focus,
+  }) {
+    requests += 1;
+    lastLanguage = language;
+    return const Stream<MangaOcrVolumeEvent>.empty();
+  }
+
+  @override
+  Future<MokuroImage> recognizePageBytes(
+    Uint8List bytes, {
+    required String relativeUrl,
+    required String language,
+  }) =>
+      throw UnimplementedError();
+}
+
+void main() {
+  late Directory imageDir;
+  late FushiDatabase db;
+
+  setUp(() {
+    imageDir = Directory.systemTemp.createTempSync('lens_wizard_');
+    File(p.join(imageDir.path, 'page.png')).writeAsBytesSync(<int>[1]);
+    db = FushiDatabase.forTesting(NativeDatabase.memory());
+  });
+
+  tearDown(() async {
+    await db.close();
+    if (imageDir.existsSync()) imageDir.deleteSync(recursive: true);
+  });
+
+  testWidgets('declining first-use Lens disclosure performs zero Lens requests',
+      (WidgetTester tester) async {
+    final _FakeLensRunner lens = _FakeLensRunner();
+    await tester.pumpWidget(
+      ProviderScope(
+        child: TranslationProvider(
+          child: MaterialApp(
+            home: Scaffold(
+              body: Builder(
+                builder: (BuildContext context) => ElevatedButton(
+                  onPressed: () => showDialog<void>(
+                    context: context,
+                    builder: (_) => MangaOcrWizardDialog(
+                      engines: MangaOcrWizardEngines(
+                        service: _UnavailableLocalService(),
+                        lensRunner: lens,
+                        initialEnginePreference: 'google_lens',
+                      ),
+                      db: db,
+                      lensDisclosureGate: (_) async => false,
+                      initialImageDir: imageDir.path,
+                      importOverride: ({
+                        required String path,
+                        required bool external,
+                        String? title,
+                      }) async =>
+                          'unused',
+                    ),
+                  ),
+                  child: const Text('open'),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.text('open'));
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.widgetWithText(FilledButton, t.manga_ocr_wizard_run),
+    );
+    await tester.pumpAndSettle();
+
+    expect(lens.requests, 0);
+    expect(
+      tester
+          .widget<FilledButton>(glassUnwrap<FilledButton>(find.widgetWithText(FilledButton, t.manga_ocr_wizard_run)),)
+          .onPressed,
+      isNotNull,
+    );
+  });
+}

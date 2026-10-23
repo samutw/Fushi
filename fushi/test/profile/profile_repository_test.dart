@@ -1,0 +1,851 @@
+import 'dart:convert';
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/profile/profile_repository.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi_anki/fushi_anki.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+/// Hermetic in-process Anki repo: keeps settings in memory instead of
+/// SharedPreferences so ProfileRepository's snapshot/apply Anki round-trip runs
+/// without platform channels. ProfileRepository only ever calls
+/// loadSettings/saveSettings, so the network methods are never exercised.
+class _FakeAnkiRepository extends BaseAnkiRepository {
+  AnkiSettings _settings = const AnkiSettings();
+
+  @override
+  Future<AnkiSettings> loadSettings() async => _settings;
+
+  @override
+  Future<void> saveSettings(AnkiSettings settings) async {
+    _settings = settings;
+  }
+
+  @override
+  Future<AnkiFetchResult> fetchConfiguration() => throw UnimplementedError();
+
+  @override
+  Future<MineOutcome> mineEntry({
+    required String rawPayloadJson,
+    required AnkiMiningContext context,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<bool> isDuplicate(String expression, String reading) async => false;
+
+  @override
+  Future<bool> createNoteType(AnkiNoteTypeTemplate template) =>
+      throw UnimplementedError();
+
+  @override
+  Future<bool> createDeck(String name) => throw UnimplementedError();
+}
+
+Future<FushiDatabase> _openDb() async {
+  final db = FushiDatabase.forTesting(NativeDatabase.memory());
+  addTearDown(db.close);
+  return db;
+}
+
+ProfileRepository _repo(FushiDatabase db) =>
+    ProfileRepository(db, _FakeAnkiRepository());
+
+/// Collects the 'pref'-category keys of a profile's snapshot.
+Future<Set<String>> _prefKeys(FushiDatabase db, int profileId) async {
+  final rows = await db.getProfileSettings(profileId);
+  return rows.where((r) => r.category == 'pref').map((r) => r.key).toSet();
+}
+
+/// Seeds one dictionary_metadata row (TODO-1077 fixtures).
+Future<void> _seedDict(
+  FushiDatabase db, {
+  required String name,
+  required int order,
+  String formatKey = 'yomitan',
+  String type = 'term',
+  List<String> hidden = const <String>[],
+}) async {
+  await db.upsertDictionaryMeta(DictionaryMetadataCompanion(
+    name: Value(name),
+    formatKey: Value(formatKey),
+    order: Value(order),
+    type: Value(type),
+    metadataJson: const Value('{}'),
+    hiddenLanguagesJson: Value(jsonEncode(hidden)),
+    collapsedLanguagesJson: const Value('[]'),
+  ));
+}
+
+/// name -> row, keyed for stable assertions.
+Future<Map<String, DictionaryMetaRow>> _dictByName(FushiDatabase db) async {
+  final rows = await db.getAllDictionaryMetadata();
+  return {for (final r in rows) r.name: r};
+}
+
+void main() {
+  group('ProfileRepository orchestration', () {
+    test('snapshot + apply round-trips non-excluded prefs', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await db.setPref('font_size', '16');
+      await db.setPref('theme', 'dark');
+      await repo.snapshotCurrentSettings(pid);
+
+      // Clear live state, then restore from the snapshot.
+      await db.deletePref('font_size');
+      await db.deletePref('theme');
+      await repo.applyProfile(pid);
+
+      expect(await db.getPref('font_size'), '16');
+      expect(await db.getPref('theme'), 'dark');
+      expect(await _prefKeys(db, pid),
+          containsAll(<String>['font_size', 'theme']));
+    });
+
+    test('snapshot excludes app-state keys (active id, current_source/*)',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await db.setPref('active_profile_id', '5');
+      await db.setPref('current_source/reader', 'x');
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid);
+
+      final keys = await _prefKeys(db, pid);
+      expect(keys, contains('font_size'));
+      expect(keys, isNot(contains('active_profile_id')));
+      expect(keys, isNot(contains('current_source/reader')));
+    });
+
+    test(
+        'v63 obsolete galgame upscaling pref is not snapshotted and an old '
+        'snapshot cannot restore it', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('Legacy');
+      const String obsoleteKey = 'galgame_magpie_upscaling_mode';
+
+      await db.setPref(obsoleteKey, 's:auto');
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid);
+      expect(await _prefKeys(db, pid), isNot(contains(obsoleteKey)));
+
+      // Simulate a pre-v63 snapshot captured before the key became excluded.
+      await db.replaceProfileSettings(pid, <ProfileSettingsCompanion>[
+        ProfileSettingsCompanion.insert(
+          profileId: pid,
+          category: 'pref',
+          key: obsoleteKey,
+          value: 's:installed_only',
+        ),
+        ProfileSettingsCompanion.insert(
+          profileId: pid,
+          category: 'pref',
+          key: 'font_size',
+          value: '20',
+        ),
+      ]);
+      await db.deletePref(obsoleteKey);
+      await repo.applyProfile(pid);
+
+      expect(await db.getPref(obsoleteKey), isNull,
+          reason: '旧 Profile apply 不得把 v63 已删除的全局值写回 live prefs');
+      expect(await db.getPref('font_size'), '20', reason: '同一旧快照中的正常偏好仍照常恢复');
+    });
+
+    test('snapshot and apply keep app UI scale prefs device-local', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+      final legacyScale = PrefCodec.encode(1.5);
+      final legacyMode = PrefCodec.encode('custom');
+      final liveScale = PrefCodec.encode(2.0);
+      final liveMode = PrefCodec.encode('auto');
+
+      await db.setPref('app_ui_scale', legacyScale);
+      await db.setPref('app_ui_scale_mode', legacyMode);
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid);
+
+      final keys = await _prefKeys(db, pid);
+      expect(keys, contains('font_size'));
+      expect(keys, isNot(contains('app_ui_scale')));
+      expect(keys, isNot(contains('app_ui_scale_mode')));
+
+      await db.setPref('font_size', '99');
+      await db.setPref('app_ui_scale', liveScale);
+      await db.setPref('app_ui_scale_mode', liveMode);
+      await repo.applyProfile(pid);
+
+      expect(await db.getPref('font_size'), '16');
+      expect(await db.getPref('app_ui_scale'), liveScale);
+      expect(await db.getPref('app_ui_scale_mode'), liveMode);
+    });
+
+    test('apply prunes orphan live prefs but preserves excluded ones',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid); // snapshot = {font_size: 16}
+
+      // Mutate live state AFTER the snapshot so a no-op apply would fail.
+      await db.setPref('font_size', '99');
+      await db.setPref('stray_key', 'leftover');
+      await db.setPref('active_profile_id', '7');
+
+      await repo.applyProfile(pid);
+
+      expect(await db.getPref('font_size'), '16'); // restored over live 99
+      expect(await db.getPref('stray_key'), isNull); // pruned (not in snapshot)
+      expect(await db.getPref('active_profile_id'), '7'); // excluded → kept
+    });
+
+    test(
+        'BUG-1019: audiobook progress/speed + override_title survive a '
+        'profile switch (not snapshotted, not pruned, not restored stale)',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      const String overrideTitleKey =
+          'src:reader_fushi:override_title://reader_fushi/'
+          'reader_fushi/fushi://book/我的书';
+
+      final pid = await repo.createProfile('A');
+      await db.setPref('audiobook_pos_bookA', '111');
+      await db.setPref('audiobook_speed_bookA', '2.0');
+      await db.setPref(overrideTitleKey, '"新书名"');
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid);
+
+      // 1) snapshot never contains progress/override keys.
+      final keys = await _prefKeys(db, pid);
+      expect(keys, contains('font_size'));
+      expect(keys, isNot(contains('audiobook_pos_bookA')));
+      expect(keys, isNot(contains('audiobook_speed_bookA')));
+      expect(keys, isNot(contains(overrideTitleKey)));
+
+      // 2) live progress written AFTER the snapshot survives the apply —
+      //    neither pruned (the old "progress reset to 0") nor overwritten.
+      await db.setPref('audiobook_pos_bookA', '999');
+      await db.setPref('audiobook_speed_bookA', '1.25');
+      await repo.applyProfile(pid);
+      expect(await db.getPref('audiobook_pos_bookA'), '999');
+      expect(await db.getPref('audiobook_speed_bookA'), '1.25');
+      expect(await db.getPref(overrideTitleKey), '"新书名"');
+    });
+
+    test(
+        'BUG-1019: stale excluded keys inside an OLD snapshot are neither '
+        'restored nor allowed to delete live values', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('Old');
+
+      // Simulate a pre-fix snapshot that captured progress/speed rows.
+      await db.replaceProfileSettings(pid, <ProfileSettingsCompanion>[
+        ProfileSettingsCompanion.insert(
+          profileId: pid,
+          category: 'pref',
+          key: 'audiobook_speed_bookA',
+          value: '3.0', // months-old stale speed
+        ),
+        ProfileSettingsCompanion.insert(
+          profileId: pid,
+          category: 'pref',
+          key: 'font_size',
+          value: '20',
+        ),
+      ]);
+
+      await db.setPref('audiobook_speed_bookA', '1.5'); // live truth
+      await db.setPref('audiobook_pos_bookA', '4242'); // live progress
+      await repo.applyProfile(pid);
+
+      // Stale snapshot speed must NOT clobber the live one ("速度飞快" symptom)
+      // and the live position must NOT be pruned ("进度 0" symptom).
+      expect(await db.getPref('audiobook_speed_bookA'), '1.5');
+      expect(await db.getPref('audiobook_pos_bookA'), '4242');
+      expect(await db.getPref('font_size'), '20'); // normal restore still works
+    });
+
+    test('resolveProfileId precedence: book > language > mediaType > active',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final a = await repo.createProfile('A');
+      final b = await repo.createProfile('B');
+      final c = await repo.createProfile('C');
+      final l = await repo.createProfile('L');
+      await repo.setActiveProfileId(c);
+      // 命名统一 Phase 3.4：绑定 API 收口为 ProfileMediaKind（落库串不变）。
+      await repo.setMediaTypeBinding(ProfileMediaKind.epub, b);
+      await repo.setBookProfile('book/1', a);
+      await repo.setLanguageBinding('ja', l);
+
+      expect(
+          await repo.resolveProfileId(
+              bookUid: 'book/1',
+              languageTag: 'ja',
+              mediaType: ProfileMediaKind.epub),
+          a); // book binding wins over everything
+      expect(
+          await repo.resolveProfileId(
+              bookUid: 'book/none',
+              languageTag: 'ja',
+              mediaType: ProfileMediaKind.epub),
+          l); // language wins over mediaType
+      expect(
+          await repo.resolveProfileId(
+              bookUid: 'book/none', mediaType: ProfileMediaKind.epub),
+          b); // mediaType wins when no book/language binding
+      expect(
+          await repo.resolveProfileId(
+              bookUid: 'book/none',
+              languageTag: 'en',
+              mediaType: ProfileMediaKind.epub),
+          b); // unbound language falls through to mediaType
+      expect(await repo.resolveProfileId(bookUid: null, mediaType: null),
+          c); // active fallback
+      expect(
+          await repo.resolveProfileId(
+              bookUid: 'book/none', mediaType: ProfileMediaKind.lyrics),
+          c); // full fallthrough to active (kind bound to nothing)
+    });
+
+    test('语言级绑定按归一化键匹配：ja-JP / JA_jp / zh-Hant-TW 都命中', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final active = await repo.createProfile('Active');
+      final japanese = await repo.createProfile('日语');
+      final traditional = await repo.createProfile('繁中');
+      await repo.setActiveProfileId(active);
+
+      // 写侧传原始形态，落库的是归一化键。
+      await repo.setLanguageBinding('ja-JP', japanese);
+      await repo.setLanguageBinding('zh-Hant-TW', traditional);
+      expect(await repo.getAllLanguageBindings(),
+          <String, int>{'ja': japanese, 'zh-Hant': traditional});
+
+      // 读侧传各种形态都要命中同一个 Profile —— 这正是归一化存在的理由：
+      // 内容语言列里 `ja` / `ja-JP` / `ja_JP` 都可能出现。
+      for (final String tag in <String>['ja', 'ja-JP', 'JA', 'ja_jp', ' ja ']) {
+        expect(
+          await repo.resolveProfileId(
+              bookUid: null, languageTag: tag, mediaType: null),
+          japanese,
+          reason: '「$tag」应命中归一化键 ja 的绑定',
+        );
+      }
+
+      // 简繁不能塌成一个键。
+      expect(
+        await repo.resolveProfileId(
+            bookUid: null, languageTag: 'zh-Hans-CN', mediaType: null),
+        active,
+        reason: 'zh-Hans 未绑定，不能命中 zh-Hant 的绑定',
+      );
+    });
+
+    test('语言不可识别时整级跳过，行为与引入语言绑定前一致', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final active = await repo.createProfile('Active');
+      final byKind = await repo.createProfile('ByKind');
+      final byLanguage = await repo.createProfile('ByLanguage');
+      await repo.setActiveProfileId(active);
+      await repo.setMediaTypeBinding(ProfileMediaKind.epub, byKind);
+      await repo.setLanguageBinding('ja', byLanguage);
+
+      // null / 空串 / 纯空白 / und / 垃圾串一律跳过语言级，落到 mediaType。
+      for (final String? tag in <String?>[null, '', '   ', 'und', '!!', '123']) {
+        expect(
+          await repo.resolveProfileId(
+              bookUid: null,
+              languageTag: tag,
+              mediaType: ProfileMediaKind.epub),
+          byKind,
+          reason: '「$tag」不是可识别语言，必须落到 mediaType 级而不是别的地方',
+        );
+      }
+
+      // 归一化后为空的键也绝不能写进绑定表（否则会成为一个吃掉所有未标注内容的
+      // 幽灵绑定）。
+      await repo.setLanguageBinding('und', byLanguage);
+      await repo.setLanguageBinding('', byLanguage);
+      expect(await repo.getAllLanguageBindings(),
+          <String, int>{'ja': byLanguage});
+    });
+
+    test('删 Profile 时其语言绑定 cascade 清除', () async {
+      final db = await _openDb();
+      // 本文件的内存库走 `FushiDatabase.forTesting`，不经 `_openDbFile` 的
+      // `PRAGMA foreign_keys = ON`（那条只设在文件库路径上），所以默认 FK 是关的，
+      // cascade 一律不触发。生产库是文件库、FK 开着，这里显式对齐生产，否则这条
+      // 断言测的是「SQLite 关着外键时什么都不会发生」——恒真且毫无信息。
+      await db.customStatement('PRAGMA foreign_keys = ON');
+      final repo = _repo(db);
+      final keep = await repo.createProfile('Keep');
+      final drop = await repo.createProfile('Drop');
+      await repo.setActiveProfileId(keep);
+      await repo.setLanguageBinding('ja', drop);
+      await repo.setLanguageBinding('en', keep);
+
+      await repo.deleteProfile(drop);
+      expect(await repo.getAllLanguageBindings(), <String, int>{'en': keep});
+    });
+
+    test('TODO-2936: manga/game/browser kinds bind and resolve like the rest',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final active = await repo.createProfile('Active');
+      await repo.setActiveProfileId(active);
+      for (final ProfileMediaKind kind in <ProfileMediaKind>[
+        ProfileMediaKind.manga,
+        ProfileMediaKind.game,
+        ProfileMediaKind.browser,
+      ]) {
+        // 未绑定 → 落回 active。
+        expect(
+          await repo.resolveProfileId(bookUid: null, mediaType: kind),
+          active,
+        );
+        final bound = await repo.createProfile('P-${kind.dbValue}');
+        await repo.setMediaTypeBinding(kind, bound);
+        expect(
+          await repo.resolveProfileId(bookUid: null, mediaType: kind),
+          bound,
+        );
+        // 落库串就是 dbValue（冻结值域，UI/存储零字符串比较）。
+        expect(
+          (await repo.getAllMediaTypeBindings())[kind.dbValue],
+          bound,
+        );
+        await repo.removeMediaTypeBinding(kind);
+        expect(
+          await repo.resolveProfileId(bookUid: null, mediaType: kind),
+          active,
+        );
+      }
+    });
+
+    test('deleteProfile of the active profile reassigns AND applies remaining',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+
+      final a = await repo.createProfile('A');
+      await db.setPref('font_size', '10');
+      await repo.snapshotCurrentSettings(a);
+
+      final b = await repo.createProfile('B');
+      await db.setPref('font_size', '22');
+      await repo.snapshotCurrentSettings(b);
+      await repo.setActiveProfileId(b);
+
+      await repo.deleteProfile(b);
+
+      expect(await repo.getActiveProfileId(), a);
+      expect(await db.getProfileById(b), isNull);
+      // font_size == '10' proves applyProfile(a) ran, not just the id swap.
+      expect(await db.getPref('font_size'), '10');
+    });
+
+    test('deleteProfile is a no-op when only one profile remains', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final a = await repo.createProfile('Only');
+      await repo.setActiveProfileId(a);
+
+      await repo.deleteProfile(a);
+
+      expect(await db.getProfileById(a), isNotNull);
+      expect(await repo.getActiveProfileId(), a);
+    });
+
+    test('copyProfile duplicates snapshot rows under a new id', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final src = await repo.createProfile('Src');
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(src);
+
+      final dst = await repo.copyProfile(src, 'Dst');
+
+      expect(dst, isNot(src));
+      expect((await db.getProfileById(dst))!.name, 'Dst');
+      final fontRows = (await db.getProfileSettings(dst))
+          .where((r) => r.category == 'pref' && r.key == 'font_size');
+      expect(fontRows, hasLength(1));
+      expect(fontRows.single.value, '16');
+    });
+
+    test('ensureDefaultProfile bootstraps an empty DB from live settings',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      await db.setPref('font_size', '13');
+
+      await repo.ensureDefaultProfile();
+
+      final profiles = await db.getAllProfiles();
+      expect(profiles, hasLength(1));
+      expect(profiles.single.name, 'Default');
+      expect(await repo.getActiveProfileId(), profiles.single.id);
+      final fontRows = (await db.getProfileSettings(profiles.single.id))
+          .where((r) => r.category == 'pref' && r.key == 'font_size');
+      expect(fontRows.single.value, '13');
+    });
+  });
+
+  group('ProfileRepository invalid-id guard (HBK regression)', () {
+    test('snapshotCurrentSettings(-1) is a no-op, writes no orphan rows',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      await db.setPref('font_size', '16');
+
+      // Must not throw and must not write profile_settings for the sentinel id.
+      await repo.snapshotCurrentSettings(-1);
+
+      expect(await db.getProfileSettings(-1), isEmpty);
+    });
+
+    test('applyProfile(-1) must NOT wipe live prefs (data-loss guard)',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      await db.setPref('font_size', '16');
+      await db.setPref('theme', 'dark');
+
+      // Without the guard, the empty snapshot would prune every non-excluded
+      // pref, silently deleting the user's live settings.
+      await repo.applyProfile(-1);
+
+      expect(await db.getPref('font_size'), '16');
+      expect(await db.getPref('theme'), 'dark');
+    });
+  });
+
+  group('applyProfile bumps prefs_version (TODO-855)', () {
+    test(
+        'a profile switch increments the cross-process prefs-version so the '
+        'warm-reuse popup detects it', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+
+      // Profile A: font_size = 16, snapshot it.
+      final pidA = await repo.createProfile('A');
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pidA);
+
+      // Profile B: font_size = 24, snapshot it.
+      final pidB = await repo.createProfile('B');
+      await db.setPref('font_size', '24');
+      await repo.snapshotCurrentSettings(pidB);
+
+      Future<int> readVersion() async {
+        final String? raw =
+            await db.getPref(PreferencesRepository.prefsVersionKey);
+        return raw == null ? 0 : PrefCodec.decode<int>(raw, 0);
+      }
+
+      final int before = await readVersion();
+
+      // Switch to A: applyProfile writes prefs straight through _db.setPref,
+      // bypassing PreferencesRepository.setPref, so the bump must be done by
+      // applyProfile itself.
+      await repo.applyProfile(pidA);
+      expect(await db.getPref('font_size'), '16');
+
+      final int after = await readVersion();
+      expect(after, greaterThan(before),
+          reason:
+              'profile switch must bump prefs_version for :popup detection');
+
+      // A second switch bumps again (monotonic).
+      await repo.applyProfile(pidB);
+      final int after2 = await readVersion();
+      expect(after2, greaterThan(after));
+    });
+
+    test(
+        'prefs_version is NOT captured into a profile snapshot (stays '
+        'app-global and monotonic)', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await db.setPref('font_size', '16');
+      // Bump the version a few times via the repository write path.
+      final prefs = PreferencesRepository(db);
+      addTearDown(prefs.dispose);
+      await prefs.loadFromDb();
+      await prefs.setPref('font_size', '16');
+      await prefs.setPref('theme', 'dark');
+
+      await repo.snapshotCurrentSettings(pid);
+
+      final rows = await db.getProfileSettings(pid);
+      final hasVersion = rows.any((r) =>
+          r.category == 'pref' &&
+          r.key == PreferencesRepository.prefsVersionKey);
+      expect(hasVersion, isFalse,
+          reason: 'prefs_version must be excluded from profile snapshots');
+    });
+  });
+
+  group('dictionary_metadata follows profile (TODO-1077 / BUG-1994)', () {
+    test('snapshot + apply round-trips order / hidden onto installed rows',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pidA = await repo.createProfile('A');
+
+      await _seedDict(db, name: 'JMdict', order: 0);
+      await _seedDict(db, name: 'Daijirin', order: 1, hidden: ['en']);
+      await repo.snapshotCurrentSettings(pidA);
+
+      // A no-op apply would leave THIS mutated state in place. 只动 profile
+      // 拥有的列（order / hidden）——BUG-1994 之后「装了哪些」不再由 apply 改写，
+      // 所以这里不能再用 clearAllDictionaryMeta 来表达「另一个 profile 的状态」。
+      await _seedDict(db, name: 'JMdict', order: 7);
+      await _seedDict(db, name: 'Daijirin', order: 9);
+
+      await repo.applyProfile(pidA);
+
+      final byName = await _dictByName(db);
+      expect(byName.keys.toSet(), <String>{'JMdict', 'Daijirin'});
+      expect(byName['JMdict']!.order, 0);
+      expect(byName['Daijirin']!.order, 1);
+      expect(jsonDecode(byName['Daijirin']!.hiddenLanguagesJson), ['en'],
+          reason: 'hidden languages follow profile');
+    });
+
+    test(
+        'BUG-1994: a dictionary imported AFTER another profile was created '
+        'stays visible in that profile', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+
+      // T1: 只有明镜。T2: 建 B —— B 的快照就此定格在 {明镜}。
+      final pidA = await repo.createProfile('A');
+      await _seedDict(db, name: 'Meikyo', order: 0);
+      await repo.snapshotCurrentSettings(pidA);
+      final pidB = await repo.createProfile('B');
+      await repo.snapshotCurrentSettings(pidB);
+
+      // T3: 在 A 里导入牛津。导入路径只写全局 dictionary_metadata，
+      // 不碰任何 profile 快照 —— B 的快照永远不会知道它。
+      await repo.applyProfile(pidA);
+      await _seedDict(db, name: 'Oxford', order: 1);
+
+      // T4: 切到 B。改之前这里会把牛津整行删掉，B 的词典库里直接消失。
+      await repo.applyProfile(pidB);
+
+      final byName = await _dictByName(db);
+      expect(byName.containsKey('Oxford'), isTrue,
+          reason: 'BUG-1994: profile 只管顺序和开关，不管装了哪些词典');
+      expect(byName.containsKey('Meikyo'), isTrue);
+    });
+
+    test(
+        'BUG-1994: snapshot row for a dictionary that is no longer installed '
+        'must NOT be resurrected as a ghost row', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await _seedDict(db, name: 'Gone', order: 0);
+      await _seedDict(db, name: 'Kept', order: 1);
+      await repo.snapshotCurrentSettings(pid);
+
+      // 用户卸载了 'Gone'（磁盘目录连同元数据行一起没了）。
+      await db.deleteDictionaryMeta('Gone');
+
+      await repo.applyProfile(pid);
+
+      final byName = await _dictByName(db);
+      expect(byName.containsKey('Gone'), isFalse,
+          reason: 'insert 回来就是一行没有磁盘目录的幽灵元数据');
+      expect(byName.containsKey('Kept'), isTrue);
+    });
+
+    test(
+        'BUG-1994: a row destroyed by the OLD prune is restored when the '
+        'dictionary is still installed on disk (self-heal must survive)',
+        () async {
+      final db = await _openDb();
+      // 「装没装」只认磁盘目录：这里 Oxford 目录还在，Gone 已被卸载。
+      final repo = ProfileRepository(
+        db,
+        _FakeAnkiRepository(),
+        isDictionaryInstalled: (String name) => name == 'Oxford',
+      );
+      final pid = await repo.createProfile('A');
+
+      await _seedDict(db, name: 'Oxford', order: 3, hidden: <String>['en']);
+      await _seedDict(db, name: 'Gone', order: 4);
+      await repo.snapshotCurrentSettings(pid);
+
+      // 旧版本的 prune 在别的 profile 里把两行都删了（磁盘目录没动）。
+      await db.clearAllDictionaryMeta();
+
+      await repo.applyProfile(pid);
+
+      final byName = await _dictByName(db);
+      expect(byName.containsKey('Oxford'), isTrue,
+          reason: '磁盘上还装着 → 这是被旧 prune 删掉的真行，必须回插；'
+              '不回插就是把「切回去就有」变成「永远没有」');
+      expect(byName['Oxford']!.order, 3);
+      expect(jsonDecode(byName['Oxford']!.hiddenLanguagesJson), <String>['en']);
+      expect(byName.containsKey('Gone'), isFalse,
+          reason: '磁盘上没有 → 仍然是幽灵行，判据是磁盘不是快照');
+    });
+
+    test('BUG-1994: apply 写回 profile 拥有的四列，且不覆盖三列安装事实', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await db.upsertDictionaryMeta(const DictionaryMetadataCompanion(
+        name: Value('D'),
+        formatKey: Value('yomitan'),
+        order: Value(0),
+        type: Value('term'),
+        metadataJson: Value('{"snapshot":1}'),
+        hiddenLanguagesJson: Value('["en"]'),
+        collapsedLanguagesJson: Value('["ja"]'),
+        languageOverride: Value('ja'),
+      ));
+      await repo.snapshotCurrentSettings(pid);
+
+      // live 行整体变样：四列（profile 拥有）+ 三列（安装事实）全改掉。
+      await db.upsertDictionaryMeta(const DictionaryMetadataCompanion(
+        name: Value('D'),
+        formatKey: Value('mdx'),
+        order: Value(9),
+        type: Value('kanji'),
+        metadataJson: Value('{"live":2}'),
+        hiddenLanguagesJson: Value('[]'),
+        collapsedLanguagesJson: Value('[]'),
+        languageOverride: Value(null),
+      ));
+
+      await repo.applyProfile(pid);
+
+      final DictionaryMetaRow row = (await _dictByName(db))['D']!;
+      // profile 拥有的四列回滚到快照值。
+      expect(row.order, 0);
+      expect(row.hiddenLanguagesJson, '["en"]');
+      expect(row.collapsedLanguagesJson, '["ja"]');
+      expect(row.languageOverride, 'ja');
+      // 安装事实三列保持 live 值，绝不被旧快照盖回去。
+      expect(row.formatKey, 'mdx', reason: 'formatKey 是安装事实，唯一写者是导入路径');
+      expect(row.type, 'kanji', reason: 'type 是安装事实');
+      expect(row.metadataJson, '{"live":2}',
+          reason: 'metadataJson 会被重导/在线更新整体重建，快照不得回写');
+    });
+
+    test('order change follows profile switch', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+
+      final pidA = await repo.createProfile('A');
+      await _seedDict(db, name: 'D1', order: 0);
+      await _seedDict(db, name: 'D2', order: 1);
+      await repo.snapshotCurrentSettings(pidA);
+
+      final pidB = await repo.createProfile('B');
+      await db.clearAllDictionaryMeta();
+      await _seedDict(db, name: 'D1', order: 1);
+      await _seedDict(db, name: 'D2', order: 0);
+      await repo.snapshotCurrentSettings(pidB);
+
+      await repo.applyProfile(pidA);
+      var byName = await _dictByName(db);
+      expect(byName['D1']!.order, 0);
+      expect(byName['D2']!.order, 1);
+
+      await repo.applyProfile(pidB);
+      byName = await _dictByName(db);
+      expect(byName['D1']!.order, 1);
+      expect(byName['D2']!.order, 0);
+    });
+
+    test(
+        'GUARD: old snapshot without dictionary_meta category must NOT wipe '
+        'the shared dictionary table', () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('Legacy');
+
+      await db.setPref('font_size', '16');
+      await repo.snapshotCurrentSettings(pid);
+      // Strip any dictionary_meta rows to simulate a pre-TODO-1077 snapshot.
+      final legacyRows = (await db.getProfileSettings(pid))
+          .where((r) => r.category != 'dictionary_meta')
+          .map((r) => ProfileSettingsCompanion.insert(
+                profileId: pid,
+                category: r.category,
+                key: r.key,
+                value: r.value,
+              ))
+          .toList();
+      await db.replaceProfileSettings(pid, legacyRows);
+
+      await _seedDict(db, name: 'JMdict', order: 0);
+      await _seedDict(db, name: 'Daijirin', order: 1);
+
+      await repo.applyProfile(pid);
+
+      final byName = await _dictByName(db);
+      expect(byName.keys.toSet(), <String>{'JMdict', 'Daijirin'},
+          reason:
+              'no dictionary_meta snapshot => leave the shared table untouched');
+    });
+
+    test('corrupt dictionary_meta value row is skipped, apply still succeeds',
+        () async {
+      final db = await _openDb();
+      final repo = _repo(db);
+      final pid = await repo.createProfile('A');
+
+      await _seedDict(db, name: 'Good', order: 0);
+      await repo.snapshotCurrentSettings(pid);
+
+      final rows = await db.getProfileSettings(pid);
+      final rebuilt = rows.map((r) {
+        final value = (r.category == 'dictionary_meta' && r.key == 'Good')
+            ? 'not-json{{{'
+            : r.value;
+        return ProfileSettingsCompanion.insert(
+          profileId: pid,
+          category: r.category,
+          key: r.key,
+          value: value,
+        );
+      }).toList();
+      await db.replaceProfileSettings(pid, rebuilt);
+
+      await db.clearAllDictionaryMeta();
+      await _seedDict(db, name: 'Live', order: 0);
+      await repo.applyProfile(pid);
+
+      final byName = await _dictByName(db);
+      expect(byName.containsKey('Good'), isFalse,
+          reason: '损坏的快照行被跳过，不会把一本没装的词典造回来');
+      expect(byName.containsKey('Live'), isTrue,
+          reason: 'BUG-1994: apply 永远不删已安装的词典，哪怕快照里没有它');
+    });
+  });
+}

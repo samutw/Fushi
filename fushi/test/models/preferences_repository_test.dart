@@ -1,0 +1,1131 @@
+import 'package:drift/drift.dart' hide isNull;
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi/src/models/audio_source_config.dart';
+import 'package:fushi_engine/ai/ai_feature.dart';
+import 'package:fushi_engine/ai/ai_provider_config.dart';
+import 'package:fushi/src/models/module_id.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+
+FushiDatabase _testDb() {
+  return FushiDatabase.forTesting(
+    DatabaseConnection(NativeDatabase.memory()),
+  );
+}
+
+void main() {
+  late FushiDatabase db;
+  late PreferencesRepository repo;
+
+  setUp(() async {
+    db = _testDb();
+    repo = PreferencesRepository(db);
+    await repo.loadFromDb();
+  });
+
+  tearDown(() async {
+    repo.dispose();
+    await db.close();
+  });
+
+  // ── defaults ─────────────────────────────────────────────────────────
+
+  group('defaults', () {
+    test('autoSearchEnabled defaults to true', () {
+      expect(repo.autoSearchEnabled, true);
+    });
+
+    test('remoteLookupEnabled defaults to false', () {
+      expect(repo.remoteLookupEnabled, false);
+    });
+
+    test('isFirstTimeSetup defaults to true', () {
+      expect(repo.isFirstTimeSetup, true);
+    });
+
+    test(
+        'onboardingCompleted defaults to true (existing installs upgrade '
+        'without the wizard popping up)', () {
+      // 全新安装靠 HomePage 首帧在 first_time_setup 分支里显式写 false 触发引导；
+      // 键缺省必须是 true，否则老用户升级后会被强塞一次新手引导。
+      expect(repo.onboardingCompleted, true);
+    });
+
+    test('onboardingCompleted round-trips false then true', () async {
+      await repo.setOnboardingCompleted(value: false);
+      expect(repo.onboardingCompleted, false);
+      await repo.setOnboardingCompleted(value: true);
+      expect(repo.onboardingCompleted, true);
+    });
+
+    test('module toggles default per module and round-trip', () async {
+      // 「功能模块」显隐默认开——升级用户底栏不变（Never break userspace）。复习
+      // （ModuleId.srs）出厂默认同样开（所有者 2026-10-16），但本安装的老 / 新用户
+      // 判定（settleSrsMiningTargetInstallDefault）还没跑过时按关读（老用户不提醒）。
+      // 按 [ModuleId.values] 遍历而非手抄七个模块：加模块时本用例自动覆盖到它，
+      // 也钉住「一个模块一个键」（同键复用会在写全 false 后被读回暴露）。
+      for (final ModuleId module in ModuleId.values) {
+        expect(
+          repo.moduleEnabled(module),
+          module != ModuleId.srs,
+          reason: '${module.name} 的出厂默认不对',
+        );
+        expect(module.defaultEnabled, isTrue);
+      }
+      for (final ModuleId module in ModuleId.values) {
+        await repo.setModuleEnabled(module, false);
+      }
+      for (final ModuleId module in ModuleId.values) {
+        expect(
+          repo.moduleEnabled(module),
+          false,
+          reason: '${module.name} 关闭后应读回 false',
+        );
+      }
+      // 单个模块翻回开不得连带别人（键必须互不复用）。
+      await repo.setModuleEnabled(ModuleId.books, true);
+      expect(repo.moduleEnabled(ModuleId.books), true);
+      for (final ModuleId module in ModuleId.values) {
+        if (module == ModuleId.books) continue;
+        expect(
+          repo.moduleEnabled(module),
+          false,
+          reason: '${module.name} 不该跟着 books 一起被打开',
+        );
+      }
+    });
+
+    test(
+        'AI module off: every AiFeature resolves to no provider, '
+        'stored assignments survive and come back when turned on', () async {
+      final AiProviderConfig provider = AiProviderConfig(
+        id: 'p1',
+        presetId: 'openai',
+        name: 'OpenAI',
+        baseUrl: Uri.parse('https://api.openai.com/v1'),
+        apiKey: 'sk-secret',
+        model: 'gpt-4o-mini',
+      );
+      await repo.setAiProviders(<AiProviderConfig>[provider]);
+      await repo.setAiFeatureAssignments(
+        const AiFeatureAssignments(defaultProviderId: 'p1'),
+      );
+      for (final AiFeature feature in AiFeature.values) {
+        expect(repo.resolveAiFeatureProvider(feature)?.id, 'p1');
+      }
+
+      await repo.setModuleEnabled(ModuleId.ai, false);
+      for (final AiFeature feature in AiFeature.values) {
+        expect(
+          repo.resolveAiFeatureProvider(feature),
+          isNull,
+          reason: '$feature 在 AI 模块关闭时不该解析出提供商（缓存不得放水）',
+        );
+        expect(
+          repo.aiFeatureAssignments.resolve(feature, repo.aiProviders),
+          isNull,
+          reason: '$feature 经 AiSettingsSource 契约也不该解析出提供商',
+        );
+      }
+      // 用户真实存的指派原样保留：设置页编辑读它，关模块不能清空用户配置。
+      expect(repo.storedAiFeatureAssignments.defaultProviderId, 'p1');
+
+      await repo.setModuleEnabled(ModuleId.ai, true);
+      for (final AiFeature feature in AiFeature.values) {
+        expect(repo.resolveAiFeatureProvider(feature)?.id, 'p1');
+      }
+    });
+
+    test('currentHomeTabIndex defaults to 0', () {
+      expect(repo.currentHomeTabIndex, 0);
+    });
+
+    test('dictionaryFontSize defaults to 16.0', () {
+      expect(repo.dictionaryFontSize, 16.0);
+    });
+
+    test('popupMaxWidth defaults to 400.0', () {
+      expect(repo.popupMaxWidth, 400.0);
+    });
+
+    test('popupMaxHeight defaults to 360.0', () {
+      expect(repo.popupMaxHeight, 360.0);
+    });
+
+    test('popupInstantScroll defaults to false (smooth/animated scroll)', () {
+      // TODO-076: instant (no-animation) jump scrolling is an e-ink opt-in,
+      // so a fresh / never-toggled install must default to smooth scrolling.
+      expect(repo.popupInstantScroll, false);
+    });
+
+    test(
+        'popupInstantScroll step defaults match the former hard-coded fractions',
+        () {
+      // BUG-2284 / BUG-2415 hard-coded viewport x 0.5 (wheel) / x 0.25 (touch);
+      // a never-touched install must behave exactly as before.
+      expect(repo.popupInstantScrollWheelStep, 0.5);
+      expect(repo.popupInstantScrollTouchStep, 0.25);
+    });
+
+    test('popupDictionaryColumns defaults to 1 (classic single column)', () {
+      // TODO-776: a fresh install renders one dictionary per row (N=1), which
+      // is the untouched classic vertical layout.
+      expect(repo.popupDictionaryColumns, 1);
+    });
+
+    test('searchDebounceDelay defaults to 100', () {
+      expect(repo.searchDebounceDelay, 100);
+    });
+
+    test('playerHardwareAcceleration defaults to true', () {
+      expect(repo.playerHardwareAcceleration, true);
+    });
+
+    test('savedTags defaults to empty string', () {
+      expect(repo.savedTags, '');
+    });
+
+    test('lowMemoryMode defaults to false', () {
+      expect(repo.lowMemoryMode, false);
+    });
+
+    test('audioSources defaults to an empty list (no built-in remote source)',
+        () {
+      expect(repo.audioSources, isEmpty);
+    });
+
+    test(
+        'audioSourceConfigs on a fresh install ships NO third-party remote '
+        'audio source, and nothing enabled', () {
+      // 纯新装（两个 audio pref 都没写过）：不再内置任何第三方网络音频库
+      // （2026-09-13 拍板删掉 manhhaoo worker 默认源）；只有 fushiRemote 与 Anki
+      // 本地预设，且全部默认关闭。任何源都不应自动启用。
+      final List<AudioSourceConfig> configs = repo.audioSourceConfigs;
+      expect(
+        configs,
+        <AudioSourceConfig>[
+          AudioSourceConfig.fushiRemote(),
+          // 内置 Anki 本地音频服务器（5050）预设，追加在列尾、默认关闭。
+          AudioSourceConfig.remoteAudio(
+            url: PreferencesRepository.ankiLocalAudioUrl,
+            label: 'Anki',
+            enabled: false,
+          ),
+        ],
+      );
+      // 没有任何源默认启用。
+      expect(
+        configs.where((AudioSourceConfig s) => s.enabled),
+        isEmpty,
+      );
+    });
+
+    test(
+        'a configured user keeps their enabled legacy audio_sources '
+        '(backward compatible, TODO-083)', () async {
+      // 老用户曾保存过 legacy audio_sources（只存已启用的 URL）。即便没有
+      // typed audio_source_configs，这些 URL 必须仍然 enabled，不被新装默认关。
+      repo.setAudioSources(<String>[
+        'https://legacy.test/?term={term}&reading={reading}',
+      ]);
+      // setAudioSources 是 fire-and-forget（void async）：等一个微任务让落盘完成，
+      // 与本文件 'setAudioSources persists list' 用例同范式。
+      await Future<void>.delayed(Duration.zero);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      // 老用户的已启用 URL 必须仍在、仍 enabled；内置 Anki 预设会被回填但默认关闭，
+      // 故按「已启用的 remoteAudio」而非「全部 remoteAudio」定位老用户的源。
+      final List<AudioSourceConfig> enabledRemotes = repo2.audioSourceConfigs
+          .where((AudioSourceConfig s) =>
+              s.kind == AudioSourceKind.remoteAudio && s.enabled)
+          .toList();
+      expect(enabledRemotes, hasLength(1));
+      expect(
+        enabledRemotes.single.url,
+        'https://legacy.test/?term={term}&reading={reading}',
+      );
+      repo2.dispose();
+    });
+
+    test(
+        'retired built-in remote audio URL is purged from persisted typed '
+        'configs and legacy audio_sources', () async {
+      // 老用户列表里残留的已退役内置 worker URL（曾随新装默认写入、用户可能已
+      // 启用）必须在读取咽喉剔除；只删默认值不清持久化 = 只对新装生效。
+      // 用户自填的其它远端 URL 原样保留。
+      final String retired = PreferencesRepository.retiredAudioSourceUrls.first;
+      await repo.setAudioSourceConfigs(<AudioSourceConfig>[
+        AudioSourceConfig.fushiRemote(),
+        AudioSourceConfig.remoteAudio(url: retired, enabled: true),
+        AudioSourceConfig.remoteAudio(
+          url: 'https://mine.test/?term={term}',
+          enabled: true,
+        ),
+      ]);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      final List<String?> typedUrls = repo2.audioSourceConfigs
+          .where((AudioSourceConfig s) => s.kind == AudioSourceKind.remoteAudio)
+          .map((AudioSourceConfig s) => s.url)
+          .toList();
+      expect(typedUrls, isNot(contains(retired)));
+      expect(typedUrls, contains('https://mine.test/?term={term}'));
+      repo2.dispose();
+
+      // legacy 路径：typed config 为空、只有 audio_sources 的老用户同样剔除。
+      final PreferencesRepository repo3 = PreferencesRepository(db);
+      await repo3.loadFromDb();
+      await repo3.setPref('audio_source_configs', <Object?>[]);
+      repo3
+          .setAudioSources(<String>[retired, 'https://mine.test/?term={term}']);
+      await Future<void>.delayed(Duration.zero);
+      final PreferencesRepository repo4 = PreferencesRepository(db);
+      await repo4.loadFromDb();
+      final List<String?> legacyUrls = repo4.audioSourceConfigs
+          .where((AudioSourceConfig s) => s.kind == AudioSourceKind.remoteAudio)
+          .map((AudioSourceConfig s) => s.url)
+          .toList();
+      expect(legacyUrls, isNot(contains(retired)));
+      expect(legacyUrls, contains('https://mine.test/?term={term}'));
+      repo3.dispose();
+      repo4.dispose();
+    });
+
+    test(
+        'ankiLocalAudioUrl preset is back-filled DISABLED for existing users '
+        'who already have saved configs', () async {
+      // 已有 typed 配置但不含 Anki 源的用户：读取时必须回填一条 disabled 的 Anki
+      // 预设（标签 Anki），让所有用户都能在「管理音频来源」里打开这个开关即用。
+      await repo.setAudioSourceConfigs(<AudioSourceConfig>[
+        AudioSourceConfig.fushiRemote(enabled: true),
+      ]);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      final Iterable<AudioSourceConfig> anki = repo2.audioSourceConfigs.where(
+        (AudioSourceConfig s) =>
+            s.kind == AudioSourceKind.remoteAudio &&
+            s.url == PreferencesRepository.ankiLocalAudioUrl,
+      );
+      expect(anki, hasLength(1));
+      expect(anki.single.enabled, isFalse);
+      expect(anki.single.label, 'Anki');
+      repo2.dispose();
+    });
+
+    test('collapseDictionaries defaults to true', () {
+      expect(repo.collapseDictionaries, true);
+    });
+
+    test('maximumTerms defaults to 10', () {
+      expect(repo.maximumTerms, 10);
+    });
+
+    test('lastSelectedDeckName defaults to Default', () {
+      expect(repo.lastSelectedDeckName, 'Default');
+    });
+
+    test('lastSelectedModel defaults to null', () {
+      expect(repo.lastSelectedModel, isNull);
+    });
+
+    test('reverseNavigationBar defaults to false', () {
+      expect(repo.reverseNavigationBar, false);
+    });
+
+    test('startupModule defaults to null (first visible page)', () {
+      expect(repo.startupModule, isNull);
+    });
+
+    test('videoSubtitleListAutoScroll defaults to true (TODO-613)', () {
+      // 字幕列表「自动滚动到当前播放句」默认开，与历史面板纯内存默认 true 一致。
+      expect(repo.videoSubtitleListAutoScroll, true);
+    });
+
+    test('audiobookBackgroundPlay defaults to false (TODO-702 exit stops)', () {
+      // 有声书退出即停是默认：新装 / 从未切过开关的用户退出阅读页就停止播放。
+      expect(repo.audiobookBackgroundPlay, false);
+    });
+  });
+
+  // ── round-trip persistence ───────────────────────────────────────────
+
+  group('round-trip persistence', () {
+    test('toggleAutoSearchEnabled round-trips through DB', () async {
+      expect(repo.autoSearchEnabled, true);
+      repo.toggleAutoSearchEnabled();
+      await Future<void>.delayed(Duration.zero);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.autoSearchEnabled, false);
+      repo2.dispose();
+    });
+
+    test('setRemoteLookupEnabled round-trips through DB', () async {
+      await repo.setRemoteLookupEnabled(true);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.remoteLookupEnabled, true);
+      repo2.dispose();
+    });
+
+    test('setDictionaryFontSize round-trips through DB', () async {
+      repo.setDictionaryFontSize(24.0);
+      await Future<void>.delayed(Duration.zero);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.dictionaryFontSize, 24.0);
+      repo2.dispose();
+    });
+
+    test('setPopupMaxHeight round-trips through DB', () async {
+      repo.setPopupMaxHeight(560.0);
+      await Future<void>.delayed(Duration.zero);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.popupMaxHeight, 560.0);
+      repo2.dispose();
+    });
+
+    test('setPopupDictionaryColumns round-trips through DB', () async {
+      await repo.setPopupDictionaryColumns(3);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.popupDictionaryColumns, 3);
+      repo2.dispose();
+    });
+
+    test('setPopupDictionaryColumns clamps out-of-range writes to 1..4',
+        () async {
+      // TODO-776: an absurd column count must never reach the CSS grid. Both
+      // over- and under-range writes are clamped on the way into storage.
+      await repo.setPopupDictionaryColumns(99);
+      expect(repo.popupDictionaryColumns, 4);
+
+      await repo.setPopupDictionaryColumns(0);
+      expect(repo.popupDictionaryColumns, 1);
+
+      await repo.setPopupDictionaryColumns(-5);
+      expect(repo.popupDictionaryColumns, 1);
+
+      // The clamped value also survives a reload (storage holds the clamped
+      // number, not the raw out-of-range input).
+      await repo.setPopupDictionaryColumns(10);
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.popupDictionaryColumns, 4);
+      repo2.dispose();
+    });
+
+    test(
+        'setPopupInstantScroll round-trips and preserves a stored true '
+        '(backward compatibility after the default flip to false)', () async {
+      // An existing e-ink user enabled instant scroll before the default
+      // changed to false; their stored value must survive, not fall back to
+      // the new default.
+      await repo.setPopupInstantScroll(true);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.popupInstantScroll, true);
+      repo2.dispose();
+    });
+
+    test(
+        'setPopupInstantScroll{Wheel,Touch}Step round-trip and clamp to [0.1, 1]',
+        () async {
+      await repo.setPopupInstantScrollWheelStep(0.8);
+      await repo.setPopupInstantScrollTouchStep(0.4);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.popupInstantScrollWheelStep, 0.8);
+      expect(repo2.popupInstantScrollTouchStep, 0.4);
+      repo2.dispose();
+
+      // Out-of-range / non-finite input never reaches storage as-is: popup.js
+      // clamps to [0.1, 1] on its side too, and a stored garbage value would
+      // otherwise be re-clamped differently on every read.
+      await repo.setPopupInstantScrollWheelStep(5);
+      expect(repo.popupInstantScrollWheelStep, 1.0);
+      await repo.setPopupInstantScrollTouchStep(0.001);
+      expect(repo.popupInstantScrollTouchStep, 0.1);
+      await repo.setPopupInstantScrollWheelStep(double.nan);
+      expect(repo.popupInstantScrollWheelStep, 0.5);
+      await repo.setPopupInstantScrollTouchStep(double.infinity);
+      expect(repo.popupInstantScrollTouchStep, 0.25);
+    });
+
+    test('setAudioSources persists list', () async {
+      repo.setAudioSources(['https://a.com', 'https://b.com']);
+      await Future<void>.delayed(Duration.zero);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.audioSources, ['https://a.com', 'https://b.com']);
+      repo2.dispose();
+    });
+
+    test('setAudioSourceConfigs persists typed audio sources', () async {
+      await repo.setAudioSourceConfigs(<AudioSourceConfig>[
+        AudioSourceConfig.fushiRemote(enabled: true),
+        AudioSourceConfig.localAudio(
+          label: 'nhk16',
+          path: '/tmp/nhk16.db',
+          enabled: false,
+        ),
+        AudioSourceConfig.remoteAudio(url: 'https://a.com/{term}'),
+        AudioSourceConfig.remoteAudio(
+          label: 'B',
+          url: 'https://b.com/{reading}',
+          enabled: false,
+        ),
+      ]);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.audioSourceConfigs, <AudioSourceConfig>[
+        AudioSourceConfig.fushiRemote(enabled: true),
+        AudioSourceConfig.localAudio(
+          label: 'nhk16',
+          path: '/tmp/nhk16.db',
+          enabled: false,
+        ),
+        AudioSourceConfig.remoteAudio(url: 'https://a.com/{term}'),
+        AudioSourceConfig.remoteAudio(
+          label: 'B',
+          url: 'https://b.com/{reading}',
+          enabled: false,
+        ),
+        // 内置 Anki 本地音频服务器预设：保存的列表不含它 → 读取时回填（disabled）。
+        AudioSourceConfig.remoteAudio(
+          url: PreferencesRepository.ankiLocalAudioUrl,
+          label: 'Anki',
+          enabled: false,
+        ),
+      ]);
+      expect(repo2.audioSources, ['https://a.com/{term}']);
+      repo2.dispose();
+    });
+
+    test('setCustomCSSForDict persists JSON map', () async {
+      await repo.setCustomCSSForDict('myDict', 'body { color: red; }');
+      expect(repo.getCustomCSSForDict('myDict'), 'body { color: red; }');
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.getCustomCSSForDict('myDict'), 'body { color: red; }');
+      repo2.dispose();
+    });
+
+    test('setGlobalDictCSS persists string', () async {
+      await repo.setGlobalDictCSS('.entry { margin: 4px; }');
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.globalDictCSS, '.entry { margin: 4px; }');
+      repo2.dispose();
+    });
+
+    test('setCurrentHomeTabIndex persists int', () async {
+      await repo.setCurrentHomeTabIndex(2);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.currentHomeTabIndex, 2);
+      repo2.dispose();
+    });
+
+    test('bool toggles cycle correctly (autoSearchEnabled)', () async {
+      expect(repo.autoSearchEnabled, true);
+      repo.toggleAutoSearchEnabled();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.autoSearchEnabled, false);
+      repo.toggleAutoSearchEnabled();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.autoSearchEnabled, true);
+    });
+
+    test('setLastSelectedDeck persists', () async {
+      await repo.setLastSelectedDeck('MyDeck');
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.lastSelectedDeckName, 'MyDeck');
+      repo2.dispose();
+    });
+
+    test('setLastSelectedModelName persists', () async {
+      await repo.setLastSelectedModelName('BasicModel');
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.lastSelectedModel, 'BasicModel');
+      repo2.dispose();
+    });
+
+    test('toggleReverseNavigationBar cycles correctly', () async {
+      expect(repo.reverseNavigationBar, false);
+      repo.toggleReverseNavigationBar();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.reverseNavigationBar, true);
+      repo.toggleReverseNavigationBar();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.reverseNavigationBar, false);
+    });
+
+    test('setStartupModule persists module and default', () async {
+      await repo.setStartupModule(ModuleId.video);
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.startupModule, ModuleId.video);
+      repo2.dispose();
+
+      await repo.setStartupModule(null);
+      final repo3 = PreferencesRepository(db);
+      await repo3.loadFromDb();
+      expect(repo3.startupModule, isNull);
+      repo3.dispose();
+    });
+
+    test('startupModule migrates legacy "open lookup on startup" switch',
+        () async {
+      // 升级前开了「启动时打开查词」、从没写过新键：启动页 = 查词。
+      await repo.setPref(
+        PreferencesRepository.legacyStartupDictionaryTabKey,
+        true,
+      );
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.startupModule, ModuleId.lookup);
+      repo2.dispose();
+
+      // 新键一旦写过（哪怕写回默认），旧开关不再生效。
+      await repo.setStartupModule(null);
+      final repo3 = PreferencesRepository(db);
+      await repo3.loadFromDb();
+      expect(repo3.startupModule, isNull);
+      repo3.dispose();
+    });
+
+    test('startupModule ignores legacy switch when it is off', () async {
+      await repo.setPref(
+        PreferencesRepository.legacyStartupDictionaryTabKey,
+        false,
+      );
+      expect(repo.startupModule, isNull);
+    });
+
+    test('yomitan api server prefs round-trip', () async {
+      expect(repo.fushiApiServerEnabled, false);
+      expect(repo.fushiApiPort, 19633);
+      expect(repo.fushiApiKey, '');
+
+      await repo.setFushiApiServerEnabled(true);
+      await repo.setFushiApiPort(19999);
+      await repo.setFushiApiKey('k');
+
+      expect(repo.fushiApiServerEnabled, true);
+      expect(repo.fushiApiPort, 19999);
+      expect(repo.fushiApiKey, 'k');
+
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.fushiApiServerEnabled, true);
+      expect(repo2.fushiApiPort, 19999);
+      expect(repo2.fushiApiKey, 'k');
+      repo2.dispose();
+    });
+
+    test('texthooker prefs round-trip', () async {
+      expect(repo.texthookerEnabled, false);
+      expect(repo.texthookerUrls, [
+        'ws://localhost:6677',
+        'ws://localhost:9001',
+        'ws://localhost:2333',
+      ]);
+
+      await repo.setTexthookerEnabled(true);
+      await repo.setTexthookerUrls(['ws://localhost:6677']);
+
+      expect(repo.texthookerEnabled, true);
+      expect(repo.texthookerUrls, ['ws://localhost:6677']);
+
+      // 跨实例 reload，验换行编码经 DB 字符串往返后能正确 split 回 List
+      final repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      expect(repo2.texthookerEnabled, true);
+      expect(repo2.texthookerUrls, ['ws://localhost:6677']);
+      repo2.dispose();
+    });
+
+    test('lookupBlockCapture defaults false and round-trips on the frozen key',
+        () async {
+      // 存储键沿用历史名 clipboard_panel_block_capture（面板已删，键冻结）。
+      expect(repo.lookupBlockCapture, false);
+      await repo.setLookupBlockCapture(true);
+      expect(repo.lookupBlockCapture, true);
+      expect(repo.getPref('clipboard_panel_block_capture'), true);
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.lookupBlockCapture, true);
+    });
+
+    test('lookupBlockCapture defaults false and round-trips on the frozen key',
+        () async {
+      // 存储键沿用历史名 clipboard_panel_block_capture（面板已删，键冻结）。
+      expect(repo.lookupBlockCapture, false);
+      await repo.setLookupBlockCapture(true);
+      expect(repo.lookupBlockCapture, true);
+      expect(repo.getPref('clipboard_panel_block_capture'), true);
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.lookupBlockCapture, true);
+    });
+
+    test('reverseReaderBottomBar is independent of reverseNavigationBar',
+        () async {
+      expect(repo.reverseReaderBottomBar, false); // 默认关
+      expect(repo.reverseNavigationBar, false);
+
+      repo.toggleReverseReaderBottomBar();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.reverseReaderBottomBar, true);
+      expect(repo.reverseNavigationBar, false,
+          reason:
+              'toggling the reader bottom bar must not touch the nav-bar pref');
+
+      repo.toggleReverseNavigationBar();
+      await Future<void>.delayed(Duration.zero);
+      expect(repo.reverseNavigationBar, true);
+      expect(repo.reverseReaderBottomBar, true,
+          reason: 'the two prefs are decoupled');
+    });
+
+    test('setVideoSubtitleListAutoScroll round-trips through DB (TODO-613)',
+        () async {
+      // 默认 true；关掉后跨实例 reload 仍为 false（落 Drift preferences、记住设置）。
+      expect(repo.videoSubtitleListAutoScroll, true);
+      await repo.setVideoSubtitleListAutoScroll(false);
+      expect(repo.videoSubtitleListAutoScroll, false);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.videoSubtitleListAutoScroll, false,
+          reason: '自动滚动开关必须跨实例 reload 记住（TODO-613）');
+
+      // 再开回 true 也持久。
+      await repo.setVideoSubtitleListAutoScroll(true);
+      final PreferencesRepository repo3 = PreferencesRepository(db);
+      await repo3.loadFromDb();
+      addTearDown(repo3.dispose);
+      expect(repo3.videoSubtitleListAutoScroll, true);
+    });
+
+    test('setAudiobookBackgroundPlay round-trips through DB (TODO-702)',
+        () async {
+      // 默认 false；开启后跨实例 reload 仍为 true（落 Drift preferences、记住设置）。
+      expect(repo.audiobookBackgroundPlay, false);
+      await repo.setAudiobookBackgroundPlay(value: true);
+      expect(repo.audiobookBackgroundPlay, true);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.audiobookBackgroundPlay, true,
+          reason: '后台续播开关必须跨实例 reload 记住（TODO-702）');
+
+      // 关回 false 也持久。
+      await repo.setAudiobookBackgroundPlay(value: false);
+      final PreferencesRepository repo3 = PreferencesRepository(db);
+      await repo3.loadFromDb();
+      addTearDown(repo3.dispose);
+      expect(repo3.audiobookBackgroundPlay, false);
+    });
+  });
+
+  // ── jimaku per-series language memory (TODO-674) ──────────────────────
+
+  group('jimakuPreferredLanguages (TODO-674)', () {
+    test('defaults to empty map', () {
+      expect(repo.jimakuPreferredLanguages, isEmpty);
+    });
+
+    test('round-trips a single series language through DB', () async {
+      await repo.setJimakuPreferredLanguage('naruto', 'ja');
+      expect(repo.jimakuPreferredLanguages['naruto'], 'ja');
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.jimakuPreferredLanguages['naruto'], 'ja');
+    });
+
+    test('multiple series do not overwrite each other', () async {
+      await repo.setJimakuPreferredLanguage('naruto', 'ja');
+      await repo.setJimakuPreferredLanguage('one piece', 'zh');
+      await repo.setJimakuPreferredLanguage('naruto', 'en'); // 覆盖同系列
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      final Map<String, String> langs = repo2.jimakuPreferredLanguages;
+      expect(langs['naruto'], 'en');
+      expect(langs['one piece'], 'zh');
+      expect(langs, hasLength(2));
+    });
+
+    test('corrupted JSON falls back to empty map', () async {
+      await repo.setPref('jimaku_pref_langs', 'not-json');
+      expect(repo.jimakuPreferredLanguages, isEmpty);
+    });
+  });
+
+  // ── cache coherence ──────────────────────────────────────────────────
+
+  group('cache coherence', () {
+    test('getPref reads from cache without extra DB hit', () {
+      final v1 = repo.getPref('auto_search', defaultValue: true);
+      final v2 = repo.getPref('auto_search', defaultValue: true);
+      expect(v1, v2);
+    });
+
+    test('setPref updates cache immediately', () async {
+      await repo.setPref('test_key', 42);
+      expect(repo.getPref('test_key', defaultValue: 0), 42);
+    });
+
+    test('refreshFromDb picks up externally written prefs', () async {
+      // Write a known value directly to DB.
+      await db.setPref('custom_key_x', PrefCodec.encode(42));
+      // Cache doesn't have it yet.
+      expect(repo.getPref('custom_key_x'), isNull);
+      // Refresh reloads cache from DB.
+      await repo.refreshFromDb();
+      expect(repo.getPref('custom_key_x', defaultValue: 0), 42);
+    });
+
+    test('containsKey reports correctly', () async {
+      expect(repo.containsKey('nonexistent_key'), false);
+      await repo.setPref('some_key', 'val');
+      expect(repo.containsKey('some_key'), true);
+    });
+  });
+
+  // ── listener notifications ───────────────────────────────────────────
+
+  group('listener notifications', () {
+    test('toggleAutoSearchEnabled notifies listeners', () async {
+      int count = 0;
+      repo.addListener(() => count++);
+      repo.toggleAutoSearchEnabled();
+      await Future<void>.delayed(Duration.zero);
+      expect(count, greaterThan(0));
+    });
+
+    test('setDictionaryFontSize notifies listeners', () async {
+      int count = 0;
+      repo.addListener(() => count++);
+      repo.setDictionaryFontSize(20.0);
+      await Future<void>.delayed(Duration.zero);
+      expect(count, greaterThan(0));
+    });
+
+    test('refreshFromDb notifies listeners', () async {
+      int count = 0;
+      repo.addListener(() => count++);
+      await repo.refreshFromDb();
+      expect(count, greaterThan(0));
+    });
+  });
+
+  // ── customDictCSS edge cases ─────────────────────────────────────────
+
+  group('customDictCSS', () {
+    test('removing CSS for a dict clears it', () async {
+      await repo.setCustomCSSForDict('dict1', 'body { }');
+      expect(repo.getCustomCSSForDict('dict1'), 'body { }');
+
+      await repo.setCustomCSSForDict('dict1', '');
+      expect(repo.getCustomCSSForDict('dict1'), '');
+    });
+
+    test('customDictCSS handles corrupted JSON gracefully', () async {
+      await repo.setPref('custom_dict_css', 'not-json');
+      expect(repo.customDictCSS, isEmpty);
+    });
+
+    test('multiple dicts have independent CSS', () async {
+      await repo.setCustomCSSForDict('a', 'css-a');
+      await repo.setCustomCSSForDict('b', 'css-b');
+      expect(repo.getCustomCSSForDict('a'), 'css-a');
+      expect(repo.getCustomCSSForDict('b'), 'css-b');
+    });
+  });
+
+  // ── floatingLyricFontSize clamping ───────────────────────────────────
+
+  group('floatingLyricFontSize', () {
+    test('defaults to 20.0', () {
+      expect(repo.floatingLyricFontSize, 20.0);
+    });
+
+    test('clamps below 8', () async {
+      await repo.setFloatingLyricFontSize(2.0);
+      expect(repo.floatingLyricFontSize, 8.0);
+    });
+
+    test('clamps above 64', () async {
+      await repo.setFloatingLyricFontSize(100.0);
+      expect(repo.floatingLyricFontSize, 64.0);
+    });
+  });
+
+  group('floatingLyricClickLookup', () {
+    test('defaults to true so existing overlays keep lookup behavior', () {
+      expect(repo.floatingLyricClickLookup, true);
+    });
+
+    test('round-trips through DB', () async {
+      await repo.setFloatingLyricClickLookup(false);
+      expect(repo.floatingLyricClickLookup, false);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.floatingLyricClickLookup, false);
+    });
+  });
+
+  // TODO-370: 悬浮字幕透明度（文字 / 按钮底色），0..100%，默认 100=保持现观感。
+  group('floatingLyric opacity (TODO-370)', () {
+    test('text and button-bg opacity default to 100 (unchanged look)', () {
+      expect(repo.floatingLyricTextOpacity, 100);
+      expect(repo.floatingLyricButtonBgOpacity, 100);
+    });
+
+    test('clamps out-of-range values into 0..100', () async {
+      await repo.setFloatingLyricTextOpacity(140);
+      expect(repo.floatingLyricTextOpacity, 100);
+      await repo.setFloatingLyricTextOpacity(-20);
+      expect(repo.floatingLyricTextOpacity, 0);
+
+      await repo.setFloatingLyricButtonBgOpacity(999);
+      expect(repo.floatingLyricButtonBgOpacity, 100);
+      await repo.setFloatingLyricButtonBgOpacity(-1);
+      expect(repo.floatingLyricButtonBgOpacity, 0);
+    });
+
+    test('round-trip through DB', () async {
+      await repo.setFloatingLyricTextOpacity(60);
+      await repo.setFloatingLyricButtonBgOpacity(40);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.floatingLyricTextOpacity, 60);
+      expect(repo2.floatingLyricButtonBgOpacity, 40);
+    });
+  });
+
+  // ── prefs-version cross-process change signal (TODO-855) ──────────────
+  //
+  // The bump now lives at the single lowest write choke point
+  // [FushiDatabase.setPref], so EVERY writer advances it automatically. The
+  // authoritative value is the DB row (read via [readPrefsVersionFromDb]); the
+  // in-memory [prefsVersion] getter is only refreshed on a full [loadFromDb]
+  // reload, NOT by this process's own setPref calls — hence the assertions
+  // below read the DB, not the in-memory getter.
+  group('prefsVersion (TODO-855)', () {
+    // 这组钉的是**增量**而不是绝对数：`loadFromDb()` 自己就会写偏好
+    // （`_repairOpenSubtitlesEnabledOnce` 在全新库上也打一次标记，见那里的注释
+    // ——不打就得每次启动重解析），所以「新装 == 0」不是不变式，只是当年恰好成立
+    // 的一个数。真不变式是「每一次 setPref 让持久化版本号单调 +1，而进程内 getter
+    // 只在整体 reload 时跟上」，与起点是几无关。
+    //
+    // 唯一保留绝对数的是「直接写版本键」那条：它钉的本来就是「值就是你写的那个数」。
+    test('a fresh load leaves the counter consistent between DB and memory',
+        () async {
+      final int baseline = await repo.readPrefsVersionFromDb();
+      expect(repo.prefsVersion, baseline,
+          reason: 'loadFromDb 之后，进程内值必须等于 DB 值');
+    });
+
+    test('setPref bumps the persisted version monotonically', () async {
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await repo.setPref('k1', 'a');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 1);
+      await repo.setPref('k2', 'b');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 2);
+      // Same key written again still counts as a change.
+      await repo.setPref('k1', 'c');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 3);
+    });
+
+    test('the in-memory getter reflects the DB only after a full reload',
+        () async {
+      // A same-process write does NOT advance the in-memory getter (bump is
+      // in the DB layer); a reload picks it up.
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await repo.setPref('k1', 'a');
+      expect(repo.prefsVersion, baseline,
+          reason: 'in-memory getter is stale until the next loadFromDb');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 1);
+      await repo.refreshFromDb();
+      expect(repo.prefsVersion, baseline + 1);
+    });
+
+    test('the version itself is persisted to DB and survives a reload',
+        () async {
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await repo.setPref('k1', 'a');
+      await repo.setPref('k2', 'b');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 2);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      // A second process loading the same DB sees the persisted counter.
+      // 注意 repo2.loadFromDb() 自己不再写（修复标记已在上面打过），所以这里
+      // 仍是 baseline + 2。
+      expect(repo2.prefsVersion, baseline + 2);
+      expect(await repo2.readPrefsVersionFromDb(), baseline + 2);
+    });
+
+    test('writing the version key directly does NOT recurse / double-bump',
+        () async {
+      // The DB-layer choke point guards the version key against re-bumping
+      // itself. A direct write of prefsVersionKey must not increment further.
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await repo.setPref('k1', 'a');
+      expect(await repo.readPrefsVersionFromDb(), baseline + 1);
+      // The version key is a PrefCodec int; a direct int write of it must be
+      // parsed back correctly and must NOT trigger an extra bump on top.
+      await repo.setPref(PreferencesRepository.prefsVersionKey, 99);
+      expect(await repo.readPrefsVersionFromDb(), 99);
+    });
+
+    test('a direct DB write of an ordinary key also bumps (sunk into setPref)',
+        () async {
+      // Writers that bypass PreferencesRepository (ThemeNotifier, MediaSource,
+      // profile switch) go straight through FushiDatabase.setPref and must
+      // still bump — that is the whole point of sinking the bump down a layer.
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await db.setPref('app_ui_scale', PrefCodec.encode(1.25));
+      expect(await repo.readPrefsVersionFromDb(), baseline + 1);
+      await db.setPref('src:reader_fushi:font_size', PrefCodec.encode(20));
+      expect(await repo.readPrefsVersionFromDb(), baseline + 2);
+    });
+
+    test(
+        'readPrefsVersionFromDb sees a cross-process write the in-memory '
+        'cache has not yet observed', () async {
+      final int baseline = await repo.readPrefsVersionFromDb();
+      await repo.setPref('k1', 'a');
+      // In-memory cache is stale (no same-process bump tracking)...
+      expect(repo.prefsVersion, baseline);
+      // ...but the cheap DB read sees the write's bump.
+      expect(await repo.readPrefsVersionFromDb(), baseline + 1);
+
+      // Simulate the MAIN app process bumping the counter further while THIS
+      // (popup) process holds a stale cache: write straight to the DB row
+      // (PrefCodec int; the version key skips the recursion guard, so this is
+      // an exact value, no extra bump).
+      await db.setPref(
+        PreferencesRepository.prefsVersionKey,
+        PrefCodec.encode(7),
+      );
+      expect(repo.prefsVersion, baseline);
+      expect(await repo.readPrefsVersionFromDb(), 7);
+    });
+  });
+
+  // ── reading goals (TODO-1046) ─────────────────────────────────────────
+  group('reading goals (TODO-1046)', () {
+    test('daily goal defaults to 0 (unset/off)', () {
+      expect(repo.readingGoalDailyChars, 0);
+    });
+
+    test('setReadingGoalDailyChars round-trips through DB', () async {
+      await repo.setReadingGoalDailyChars(5000);
+      expect(repo.readingGoalDailyChars, 5000);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.readingGoalDailyChars, 5000);
+    });
+
+    test('daily goal clamps out-of-range writes into 0..1000000', () async {
+      await repo.setReadingGoalDailyChars(-5);
+      expect(repo.readingGoalDailyChars, 0);
+      await repo.setReadingGoalDailyChars(9999999);
+      expect(repo.readingGoalDailyChars, 1000000);
+    });
+  });
+
+  // ── TODO-1119: Windows 黑闪运行时提示「不再提示」偏好 ───────────────────
+
+  group('videoBlackFlickerNoticeSuppressed (TODO-1119)', () {
+    test('defaults to false (提示允许弹)', () {
+      expect(repo.videoBlackFlickerNoticeSuppressed, false);
+    });
+
+    test('set true 写穿并跨新实例从 DB 恢复', () async {
+      await repo.setVideoBlackFlickerNoticeSuppressed(true);
+      expect(repo.videoBlackFlickerNoticeSuppressed, true);
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.videoBlackFlickerNoticeSuppressed, true);
+    });
+
+    test('set false 可复位', () async {
+      await repo.setVideoBlackFlickerNoticeSuppressed(true);
+      expect(repo.videoBlackFlickerNoticeSuppressed, true);
+      await repo.setVideoBlackFlickerNoticeSuppressed(false);
+      expect(repo.videoBlackFlickerNoticeSuppressed, false);
+    });
+  });
+
+  group('remoteSubtitleSources（远端字幕持久化）', () {
+    test('remoteSubtitleKey：ep0 省略后缀，ep>0 加 #ep', () {
+      expect(PreferencesRepository.remoteSubtitleKey('bk', 0), 'bk');
+      expect(PreferencesRepository.remoteSubtitleKey('bk', 3), 'bk#ep3');
+    });
+
+    test('set/read 按 bookUid+episode 跨实例 reload 记住', () async {
+      expect(repo.remoteSubtitleSource('bk'), isNull);
+      await repo.setRemoteSubtitleSource('bk', 0, '/data/sub.ja.srt');
+      await repo.setRemoteSubtitleSource('bk', 2, 'off:');
+      expect(repo.remoteSubtitleSource('bk'), '/data/sub.ja.srt');
+      expect(repo.remoteSubtitleSource('bk', episodeIndex: 2), 'off:');
+
+      final PreferencesRepository repo2 = PreferencesRepository(db);
+      await repo2.loadFromDb();
+      addTearDown(repo2.dispose);
+      expect(repo2.remoteSubtitleSource('bk'), '/data/sub.ja.srt',
+          reason: '远端字幕选择必须跨实例记住（否则退出即丢）');
+      expect(repo2.remoteSubtitleSource('bk', episodeIndex: 2), 'off:');
+    });
+
+    test('source=null 删除该 key（不影响其它集）', () async {
+      await repo.setRemoteSubtitleSource('bk', 0, '/a.srt');
+      await repo.setRemoteSubtitleSource('bk', 1, '/b.srt');
+      await repo.setRemoteSubtitleSource('bk', 0, null);
+      expect(repo.remoteSubtitleSource('bk'), isNull);
+      expect(repo.remoteSubtitleSource('bk', episodeIndex: 1), '/b.srt');
+    });
+  });
+}

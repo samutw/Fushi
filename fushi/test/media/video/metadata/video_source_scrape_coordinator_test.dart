@@ -1,0 +1,3326 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/ai/ai_chat_client.dart' show AiChatFailure;
+import 'package:fushi_engine/foundation/engine_platform_hooks.dart';
+import 'package:fushi_engine/media/source_library/source_library_row.dart';
+import 'package:fushi_engine/media/video/metadata/anidb_video_metadata_provider.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_models.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_database_store.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_asset_downloader.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_provider.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_resolver.dart';
+import 'package:fushi_engine/media/video/metadata/video_scrape_ai_identity.dart';
+import 'package:fushi_engine/media/video/metadata/video_scrape_pending_note.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_metadata_indexer.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_scrape_config.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_scrape_coordinator.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_scrape_task.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_work_planner.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:path/path.dart' as p;
+
+void main() {
+  late FushiDatabase db;
+  late Directory root;
+
+  setUp(() async {
+    db = FushiDatabase.forTesting(NativeDatabase.memory());
+    root = await Directory.systemTemp.createTemp('fushi-source-scrape-');
+  });
+
+  tearDown(() async {
+    await db.close();
+    if (await root.exists()) await root.delete(recursive: true);
+  });
+
+  test('manual binding targets stable identity and rejects ambiguous titles',
+      () async {
+    final int sourceId =
+        await db.insertMediaSource(MediaSourcesCompanion.insert(
+      label: 'Same titles',
+      mediaKind: 'video',
+      rootPath: root.path,
+      createdAt: 1,
+    ));
+    for (final String uid in <String>['first', 'second']) {
+      final File video = File(p.join(root.path, '$uid.mkv'));
+      await video.writeAsBytes(const <int>[0]);
+      await db.upsertVideoBook(VideoBooksCompanion(
+        bookUid: Value<String>(uid),
+        title: const Value<String>('Same title'),
+        videoPath: Value<String>(video.path),
+        sourceId: Value<int?>(sourceId),
+      ));
+    }
+    final SourceLibraryRow source = (await db.getMediaSourceById(sourceId))!;
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(
+          <VideoMetadataProvider>[_ExactMovieProvider()]),
+    );
+    const VideoMetadataLookup lookup = VideoMetadataLookup(
+      provider: VideoMetadataProviderKind.anidb,
+      externalId: '4242',
+      mediaKind: VideoMetadataMediaKind.movie,
+    );
+    await expectLater(
+        coordinator.rescrapeWorkWithLookup(
+          source: source,
+          workTitle: 'Same title',
+          lookup: lookup,
+          cancellationToken: VideoSourceScrapeCancellationToken(),
+          onProgress: (_) {},
+        ),
+        throwsA(isA<VideoSourceScrapeWorkNotFound>()));
+    final SourceScrapeReport report = await coordinator.rescrapeWorkWithLookup(
+      source: source,
+      workTitle: 'Old display title',
+      workStableKey: 'book:second',
+      lookup: lookup,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(report.succeededWorks, 1);
+    expect(await File(p.join(root.path, 'second.nfo')).exists(), isTrue);
+    expect(await File(p.join(root.path, 'first.nfo')).exists(), isFalse);
+    await expectLater(
+        coordinator.rescrapeWorkWithLookup(
+          source: source,
+          workTitle: 'Same title',
+          workStableKey: 'book:missing',
+          lookup: lookup,
+          cancellationToken: VideoSourceScrapeCancellationToken(),
+          onProgress: (_) {},
+        ),
+        throwsA(isA<VideoSourceScrapeWorkNotFound>()));
+  });
+
+  test('手动搜索：作品不在当前计划时不抛异常，双形态搜索按身份合并（BUG-1998）', () async {
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Empty source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    final _FakeAniDbProvider provider = _FakeAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+    final SourceLibraryRow source = (await db.getMediaSourceById(sourceId))!;
+
+    // 旧行为：先按标题回查计划、查不到直接抛 VideoSourceScrapeWorkNotFound，
+    // 裸异常一路进 UI。现在搜索不依赖计划命中：电影+剧集各搜一次并按
+    // (mediaKind, externalId) 去重。
+    final List<VideoSourceScrapeConfirmationCandidate> candidates =
+        await coordinator.searchManualCandidates(
+      source: source,
+      workTitle: '哆啦A梦：大雄的秘密道具博物馆',
+      query: 'ドラえもん',
+    );
+
+    expect(candidates, hasLength(1));
+    expect(candidates.single.lookup.externalId, '42');
+    expect(provider.searchCount, 2, reason: '计划缺席时按 tv+movie 双形态各搜一次');
+  });
+
+  test('manual explicit AniDB ID previews without title search', () async {
+    final int sourceId =
+        await db.insertMediaSource(MediaSourcesCompanion.insert(
+      label: 'Manual',
+      mediaKind: 'video',
+      rootPath: root.path,
+      createdAt: 1,
+    ));
+    final SourceLibraryRow source = (await db.getMediaSourceById(sourceId))!;
+    final _FakeAniDbProvider provider = _FakeAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+    for (final String query in <String>[
+      'anidb=42',
+      'https://anidb.net/anime/42'
+    ]) {
+      final List<VideoSourceScrapeConfirmationCandidate> results =
+          await coordinator.searchManualCandidates(
+        source: source,
+        workTitle: 'Local work',
+        query: query,
+      );
+      expect(results.single.lookup.externalId, '42');
+      expect(provider.searchCount, 0);
+    }
+    // `tmdb=42` / `mal=42` 都是可选生产主源的身份，AniDB 主源下也直取（不换源
+    // 不重搜），不再报格式错误；这里只留真正非法的写法。
+    for (final String query in <String>[
+      'anidb=0',
+      'anidb=bad',
+      'https://fakeanidb.net/anime/42'
+    ]) {
+      await expectLater(
+          coordinator.searchManualCandidates(
+              source: source, workTitle: 'Local work', query: query),
+          throwsFormatException,
+          reason: 'Invalid identity query: $query');
+    }
+    await coordinator.searchManualCandidates(
+        source: source, workTitle: '86', query: '86');
+    expect(provider.searchCount, 2,
+        reason: 'Numeric titles remain title searches');
+  });
+
+  test('按作品抓取一次并写规范表、兼容投影和安全 TV NFO', () async {
+    final Directory seasonDir =
+        Directory(p.join(root.path, 'Show', 'Season 01'));
+    await seasonDir.create(recursive: true);
+    final File episode1 = File(p.join(seasonDir.path, 'Show S01E01.mkv'));
+    final File episode2 = File(p.join(seasonDir.path, 'Show S01E02.mkv'));
+    final File ncop = File(p.join(root.path, 'Show NCOP.mkv'));
+    await episode1.writeAsBytes(const <int>[0]);
+    await episode2.writeAsBytes(const <int>[0]);
+    await ncop.writeAsBytes(const <int>[0]);
+
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Show source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('e1'),
+      title: const Value<String>('Show S01E01'),
+      videoPath: Value<String>(episode1.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('ncop'),
+      title: const Value<String>('Show NCOP'),
+      videoPath: Value<String>(ncop.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('e2'),
+      title: const Value<String>('Show S01E02'),
+      videoPath: Value<String>(episode2.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    final int collectionId =
+        await db.createMediaCollection('Show', collectionType: 'playlist');
+    await db.addToCollection(collectionId, MediaKind.video, 'e1');
+    await db.addToCollection(collectionId, MediaKind.video, 'e2');
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        writeImages: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+
+    final _FakeAniDbProvider provider = _FakeAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+    final SourceLibraryRow source = (await db.getMediaSourceById(sourceId))!;
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(
+      report.succeededWorks,
+      1,
+      reason: report.errors
+          .map((SourceScrapeIssue issue) => issue.message)
+          .join('\n'),
+    );
+    expect(report.failedWorks, 0);
+    expect(report.totalWorks, 1, reason: 'NCOP/NCED 是作品附件，不应作为独立作品制造刮削失败');
+    expect(provider.searchCount, 1);
+    expect(report.nfoWritten, 4);
+    expect(File(p.join(root.path, 'Show', 'tvshow.nfo')).existsSync(), isTrue);
+    expect(File(p.join(seasonDir.path, 'season.nfo')).existsSync(), isTrue);
+    final String episodeXml =
+        await File(p.join(seasonDir.path, 'Show S01E01.nfo')).readAsString();
+    expect(episodeXml, contains('<episodedetails>'));
+    expect(episodeXml, contains('<title>Episode One</title>'));
+
+    final VideoMetadataWorkRow? work =
+        await db.getVideoMetadataWorkByCollection(collectionId);
+    expect(work?.title, 'Show');
+    final List<VideoMetadataSeasonRow> seasons =
+        await db.getVideoMetadataSeasons(work!.id);
+    expect(seasons, hasLength(1));
+    final List<VideoMetadataEpisodeRow> episodes =
+        await db.getVideoMetadataEpisodes(seasons.single.id);
+    expect(episodes.map((VideoMetadataEpisodeRow row) => row.bookUid),
+        <String?>['e1', 'e2']);
+    expect(await db.getCollectionScrapeMeta(collectionId), isNotNull);
+    expect((await db.getVideoScrapeMeta('e1'))?.title, 'Episode One');
+    expect((await db.getVideoBookByBookUid('e1'))?.title, 'Episode One',
+        reason: '只改应用内展示标题，不重命名磁盘视频文件');
+    expect(episode1.path, endsWith('Show S01E01.mkv'));
+    expect(await db.getVideoSidecarArtifacts(sourceId: sourceId), hasLength(4));
+    final List<VideoMetadataCreditRow> episodeCredits =
+        await db.getVideoMetadataCredits(episodeId: episodes.first.id);
+    expect(episodeCredits.single.creditKind, 'voice_actor');
+  });
+
+  test('已有 TMDB id 的补充请求失败时仍落地主源资料', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final _PrimaryMovieProvider primary = _PrimaryMovieProvider();
+    final _ThrowingTmdbProvider tmdb = _ThrowingTmdbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        primary,
+        tmdb,
+      ]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(report.failedWorks, 0);
+    expect(tmdb.fetchCount, 1);
+    expect(
+      report.warnings.map((SourceScrapeIssue issue) => issue.message).join(),
+      contains('TMDB 规范身份补充失败'),
+    );
+    final VideoMetadataWorkRow? stored =
+        await db.getVideoMetadataWorkByBook('movie-book');
+    expect(stored?.title, '主源电影');
+  });
+
+  test('AniDB 主源缺席时 TMDB 按兜底源识别（Shoko 形态：AniDB 主 + TMDB 补充）',
+      () async {
+    // 2026-09-20 起 AniDB 是可选主源且有兜底（AniDB → TMDB），不再是「单源、
+    // 缺席即 fail closed」的退役语义：主源不可用时按双源策略问兜底源。
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final _TwoBackdropTmdbProvider tmdb = _TwoBackdropTmdbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[tmdb]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(report.failedWorks, 0);
+    expect(tmdb.searchCount, greaterThan(0));
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(
+      (await db.getVideoMetadataProviderIdentities(workId: stored.id))
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}'),
+      contains('tmdb:700:true'),
+    );
+  });
+
+  test('movie NFO TMDB hint cannot enter the TV namespace', () async {
+    final fixture = await _createContinuationSource(db, root);
+    await File(p.join(root.path, 'movie.nfo')).writeAsString('''
+<movie>
+  <title>Show</title>
+  <uniqueid type="tmdb" default="true">99</uniqueid>
+</movie>
+''');
+    final _FakeAniDbProvider anidb = _FakeAniDbProvider();
+    final _ThrowingTmdbProvider tmdb = _ThrowingTmdbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        anidb,
+        tmdb,
+      ]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      fixture.source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(tmdb.searchCount, 0);
+    expect(tmdb.fetchCount, 0);
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByCollection(fixture.collectionId))!;
+    final List<VideoMetadataProviderIdentityRow> identities =
+        await db.getVideoMetadataProviderIdentities(workId: stored.id);
+    expect(
+      identities.map((VideoMetadataProviderIdentityRow row) => row.provider),
+      isNot(contains('tmdb')),
+    );
+  });
+
+  test('二次刮削复用持久 TMDB crossref 与 episode group 且不搜索', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final _PersistedCrossrefAniDbProvider firstAniDb =
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: true);
+    final _RecordingCrossrefTmdbProvider firstTmdb =
+        _RecordingCrossrefTmdbProvider();
+    final VideoSourceScrapeCoordinator firstCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        firstAniDb,
+        firstTmdb,
+      ]),
+    );
+
+    final SourceScrapeReport first = await firstCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(first.succeededWorks, 1, reason: '${first.errors}');
+    expect(firstTmdb.searchCount, 0);
+    expect(firstTmdb.fetchCount, 1);
+
+    final _PersistedCrossrefAniDbProvider secondAniDb =
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: false);
+    final _RecordingCrossrefTmdbProvider secondTmdb =
+        _RecordingCrossrefTmdbProvider();
+    final VideoSourceScrapeCoordinator secondCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        secondAniDb,
+        secondTmdb,
+      ]),
+    );
+
+    final SourceScrapeReport second = await secondCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(second.succeededWorks, 1, reason: '${second.errors}');
+    expect(secondAniDb.searchCount, 0);
+    expect(secondAniDb.fetchCount, 1);
+    expect(secondTmdb.searchCount, 0);
+    expect(secondTmdb.fetchCount, 1);
+    final VideoMetadataLookup lookup = secondTmdb.fetchedLookups.single;
+    expect(lookup.provider, VideoMetadataProviderKind.tmdb);
+    expect(lookup.externalId, '99');
+    expect(lookup.mediaKind, VideoMetadataMediaKind.movie);
+    expect(lookup.episodeGroupId, 'persisted-group');
+  });
+
+  test('changing confirmed AniDB identity discards old TMDB binding', () async {
+    final SourceLibraryRow source = await _createMovieSource(db, root,
+        provider: VideoMetadataProviderKind.anidb);
+    final VideoSourceScrapeCoordinator first = VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: true),
+        _RecordingCrossrefTmdbProvider(),
+      ]),
+    );
+    await first.scrapeSource(source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {});
+    final File externalNfo = File(p.join(root.path, 'Movie (2024).nfo'));
+    const String externalText =
+        '<movie><title>Old external work</title><uniqueid type="anidb" default="true">17617</uniqueid><uniqueid type="tmdb">99</uniqueid></movie>';
+    await externalNfo.writeAsString(externalText);
+    final _RecordingCrossrefTmdbProvider tmdb =
+        _RecordingCrossrefTmdbProvider();
+    final VideoSourceScrapeCoordinator second = VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: false),
+        tmdb,
+      ]),
+    );
+    final VideoSourceScrapeWork work =
+        (await VideoSourceWorkPlanner(db).plan(source)).single;
+    final SourceScrapeReport report = await second.rescrapeWorkWithLookup(
+      source: source,
+      workTitle: work.title,
+      lookup: const VideoMetadataLookup(
+          provider: VideoMetadataProviderKind.anidb,
+          externalId: '999',
+          mediaKind: VideoMetadataMediaKind.movie),
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(await externalNfo.readAsString(), externalText);
+    expect(
+        report.warnings.any(
+            (SourceScrapeIssue warning) => warning.message.contains('NFO')),
+        isTrue);
+    expect(tmdb.searchTitles.toSet(), <String>{'AniDB Movie'});
+    expect(tmdb.fetchedLookups.map((VideoMetadataLookup id) => id.externalId),
+        <String>['unexpected-search'],
+        reason:
+            'Only the fresh search candidate is hydrated; old TMDB 99 is not reused');
+    final List<VideoMetadataLookup> saved =
+        await VideoMetadataDatabaseStore(db).lookupsForWork(work);
+    expect(
+        saved
+            .where((VideoMetadataLookup id) =>
+                id.provider == VideoMetadataProviderKind.anidb)
+            .single
+            .externalId,
+        '999');
+    expect(
+        saved.where((VideoMetadataLookup id) =>
+            id.provider == VideoMetadataProviderKind.tmdb),
+        isEmpty);
+  });
+
+  test('二次 TMDB 直取失败仍保留持久 crossref 与 episode group', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final VideoSourceScrapeCoordinator firstCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: true),
+        _RecordingCrossrefTmdbProvider(),
+      ]),
+    );
+    final SourceScrapeReport first = await firstCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(first.succeededWorks, 1, reason: '${first.errors}');
+
+    final _PersistedCrossrefAniDbProvider secondAniDb =
+        _PersistedCrossrefAniDbProvider(includeTmdbCrossref: false);
+    final _ThrowingTmdbProvider secondTmdb = _ThrowingTmdbProvider();
+    final VideoSourceScrapeCoordinator secondCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        secondAniDb,
+        secondTmdb,
+      ]),
+    );
+
+    final SourceScrapeReport second = await secondCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(second.succeededWorks, 1, reason: '${second.errors}');
+    expect(second.failedWorks, 0);
+    expect(secondAniDb.searchCount, 0);
+    expect(secondAniDb.fetchCount, 1);
+    expect(secondTmdb.searchCount, 0);
+    expect(secondTmdb.fetchCount, 1);
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(stored.episodeGroupId, 'persisted-group');
+    final List<VideoMetadataProviderIdentityRow> identities =
+        await db.getVideoMetadataProviderIdentities(workId: stored.id);
+    expect(
+      identities.map(
+        (VideoMetadataProviderIdentityRow row) =>
+            '${row.provider}:${row.externalId}:${row.isPrimary}',
+      ),
+      unorderedEquals(<String>[
+        'anidb:17617:true',
+        'tmdb:99:false',
+      ]),
+    );
+  });
+
+  test('AniDB migration keeps retired provider ids as inert cross references',
+      () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final VideoBookRow book = (await db.getVideoBookByBookUid('movie-book'))!;
+    final File nfo = File(p.setExtension(book.videoPath, '.nfo'));
+    await nfo.writeAsString('''
+<movie>
+  <title>Movie</title>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+  <uniqueid type="bangumi" default="false">200</uniqueid>
+  <uniqueid type="anilist" default="false">300</uniqueid>
+</movie>
+''');
+    await VideoSourceMetadataIndexer(db).index(source);
+    await nfo.delete();
+    final _RecordingCrossrefTmdbProvider tmdb =
+        _RecordingCrossrefTmdbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _PrimaryMovieProvider(),
+        tmdb,
+      ]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(tmdb.fetchCount, 1);
+    expect(tmdb.fetchedLookups.single.externalId, '99');
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(
+      (await db.getVideoMetadataProviderIdentities(workId: stored.id))
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}')
+          .toSet(),
+      <String>{
+        'anidb:1:true',
+        'tmdb:99:false',
+        'bangumi:200:false',
+        'anilist:300:false',
+      },
+    );
+  });
+
+  test('AniDB 模糊目录候选只在人工确认后抓取选中项详情', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final _CatalogConfirmationAniDbProvider provider =
+        _CatalogConfirmationAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        provider,
+      ]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+      onConfirmation: (VideoSourceScrapeConfirmation confirmation) async {
+        expect(confirmation.candidates, hasLength(15));
+        return confirmation.candidates.last;
+      },
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(provider.fetchCount, 1);
+    expect(provider.fetchedIds, <String>['15']);
+    expect(
+      (await db.getVideoMetadataWorkByBook('movie-book'))?.title,
+      'Confirmed Anime',
+    );
+  });
+
+  test('AniDB 分集完整时即使 TMDB 失败仍可权威删除旧骨架', () async {
+    final fixture = await _createContinuationSource(db, root);
+    final SourceLibraryRow source = fixture.source;
+    final int collectionId = fixture.collectionId;
+    final _PrimaryContinuationProvider primary = _PrimaryContinuationProvider();
+    final VideoSourceScrapeCoordinator firstCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        primary,
+        _ContinuationTmdbProvider(),
+      ]),
+    );
+    final SourceScrapeReport first = await firstCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(first.succeededWorks, 1, reason: '${first.errors}');
+
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByCollection(collectionId))!;
+    List<VideoMetadataSeasonRow> seasons =
+        await db.getVideoMetadataSeasons(stored.id);
+    expect(
+      seasons.map((VideoMetadataSeasonRow row) => row.seasonNumber),
+      <int>[1, 2],
+    );
+    expect(
+      (await db.getVideoMetadataEpisodes(seasons.first.id)).single.title,
+      'TMDB S01E01',
+      reason: '续季主源 E01 不得覆盖 TMDB 的 S01E01',
+    );
+    List<VideoMetadataEpisodeRow> season2 =
+        await db.getVideoMetadataEpisodes(seasons.last.id);
+    expect(season2.first.title, '主源续季第一集');
+    expect(season2.last.title, 'TMDB S02E02');
+
+    final _ThrowingTmdbProvider failingTmdb = _ThrowingTmdbProvider();
+    final VideoSourceScrapeCoordinator secondCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        primary,
+        failingTmdb,
+      ]),
+    );
+    final SourceScrapeReport second = await secondCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(second.succeededWorks, 1, reason: '${second.errors}');
+    expect(failingTmdb.fetchCount, 1);
+
+    seasons = await db.getVideoMetadataSeasons(stored.id);
+    expect(
+      seasons.map((VideoMetadataSeasonRow row) => row.seasonNumber),
+      <int>[2],
+      reason: 'AniDB 完整响应拥有季集权威，TMDB 失败不能阻止删除旧季',
+    );
+    season2 = await db.getVideoMetadataEpisodes(seasons.single.id);
+    expect(
+      season2.map((VideoMetadataEpisodeRow row) => row.episodeNumber),
+      <int>[1],
+      reason: 'AniDB 完整响应可删除只来自旧 TMDB 补充的分集',
+    );
+  });
+
+  test('TMDB 分集完整不能把不完整 AniDB 响应提升为权威', () async {
+    final fixture = await _createContinuationSource(db, root);
+    final SourceLibraryRow source = fixture.source;
+    final int collectionId = fixture.collectionId;
+    final _AuthorityAniDbProvider completeAniDb = _AuthorityAniDbProvider(
+      episodeNumbers: const <int>[1, 2, 3],
+    );
+    final VideoSourceScrapeCoordinator firstCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        completeAniDb,
+      ]),
+    );
+
+    final SourceScrapeReport first = await firstCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(first.succeededWorks, 1, reason: '${first.errors}');
+    final VideoMetadataWorkRow stored =
+        (await db.getVideoMetadataWorkByCollection(collectionId))!;
+    VideoMetadataSeasonRow season =
+        (await db.getVideoMetadataSeasons(stored.id)).single;
+    expect(
+      (await db.getVideoMetadataEpisodes(season.id))
+          .map((VideoMetadataEpisodeRow row) => row.episodeNumber),
+      <int>[1, 2, 3],
+    );
+
+    final _AuthorityAniDbProvider incompleteAniDb = _AuthorityAniDbProvider(
+      episodeNumbers: const <int>[1],
+      throwEpisodeFetch: true,
+    );
+    final VideoSourceScrapeCoordinator secondCoordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        incompleteAniDb,
+        _ContinuationTmdbProvider(),
+      ]),
+    );
+    final SourceScrapeReport second = await secondCoordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(second.succeededWorks, 1, reason: '${second.errors}');
+    expect(
+      second.warnings.map((SourceScrapeIssue issue) => issue.message).join(),
+      contains('分集资料抓取失败'),
+    );
+    season = (await db.getVideoMetadataSeasons(stored.id)).firstWhere(
+      (VideoMetadataSeasonRow row) => row.seasonNumber == 2,
+    );
+    expect(
+      (await db.getVideoMetadataEpisodes(season.id))
+          .map((VideoMetadataEpisodeRow row) => row.episodeNumber),
+      <int>[1, 2, 3],
+      reason: 'TMDB 即使完整也只能补充，不能删除 AniDB 不完整响应遗漏的旧集',
+    );
+  });
+
+  test('年份识别不读取父与祖父之外的绝对路径片段', () async {
+    final Directory movieDir =
+        Directory(p.join(root.path, '1999', 'Library', 'Movie Folder'));
+    await movieDir.create(recursive: true);
+    final File video = File(p.join(movieDir.path, 'Movie.mkv'));
+    await video.writeAsBytes(const <int>[0]);
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Movie source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('year-boundary-movie'),
+      title: const Value<String>('Movie'),
+      videoPath: Value<String>(video.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        writeNfo: const Value<bool>(false),
+        writeImages: const Value<bool>(false),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+    final _YearCapturingAniDbProvider provider = _YearCapturingAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      (await db.getMediaSourceById(sourceId))!,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(provider.searchYears, isNotEmpty);
+    expect(provider.searchYears, everyElement(isNull));
+  });
+
+  test('Himouto 发布名的 1920x1080 不会被当成年份拒绝正确候选', () async {
+    final Directory showDir = Directory(p.join(root.path, 'Himouto'));
+    await showDir.create(recursive: true);
+    final List<String> names = <String>[
+      '[Kamigami] Himouto! Umaru-chan - 08 '
+          '[1920x1080 x264 AAC Sub(Chs,Cht,Jap)].mkv',
+      '[Kamigami] Himouto! Umaru-chan - 09 '
+          '[1920x1080 x264 AAC Sub(Chs,Cht,Jap)].mkv',
+    ];
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Himouto source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    for (int index = 0; index < names.length; index++) {
+      final File video = File(p.join(showDir.path, names[index]));
+      await video.writeAsBytes(const <int>[0]);
+      await db.upsertVideoBook(VideoBooksCompanion(
+        bookUid: Value<String>('himouto-${index + 8}'),
+        title: Value<String>(p.basenameWithoutExtension(names[index])),
+        videoPath: Value<String>(video.path),
+        sourceId: Value<int?>(sourceId),
+      ));
+    }
+    final int collectionId = await db.createMediaCollection(
+      'Himouto! Umaru-chan',
+      collectionType: 'playlist',
+    );
+    await db.addToCollection(collectionId, MediaKind.video, 'himouto-8');
+    await db.addToCollection(collectionId, MediaKind.video, 'himouto-9');
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        writeNfo: const Value<bool>(false),
+        writeImages: const Value<bool>(false),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+    final _HimoutoAniDbProvider provider = _HimoutoAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      (await db.getMediaSourceById(sourceId))!,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(provider.searchYears, isNotEmpty);
+    expect(provider.searchYears, everyElement(isNull));
+    expect(
+      (await db.getVideoMetadataWorkByCollection(collectionId))?.year,
+      2015,
+    );
+  });
+
+  test('re0 使用清洗后的父目录标题和第三季约束识别主剧', () async {
+    final Directory showDir = Directory(p.join(
+      root.path,
+      '[DBD-Raws][Re：从零开始的异世界生活 第三季]'
+      '[01-16TV全集+SP][1080P][BDRip]',
+    ));
+    await showDir.create(recursive: true);
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 're0',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    for (final int episode in <int>[1, 2]) {
+      final String uid = 're0-main-$episode';
+      final File video = File(p.join(
+        showDir.path,
+        '[DBD-Raws][Re Zero kara Hajimeru Isekai Seikatsu S3]'
+        '[${episode.toString().padLeft(2, '0')}][1080P][BDRip].mkv',
+      ));
+      await video.writeAsBytes(const <int>[0]);
+      await db.upsertVideoBook(VideoBooksCompanion(
+        bookUid: Value<String>(uid),
+        title: Value<String>(p.basenameWithoutExtension(video.path)),
+        videoPath: Value<String>(video.path),
+        sourceId: Value<int?>(sourceId),
+      ));
+    }
+    final Directory pvDir = Directory(p.join(showDir.path, 'PV'));
+    await pvDir.create(recursive: true);
+    final File pv = File(p.join(
+      pvDir.path,
+      '[DBD-Raws][Re Zero kara Hajimeru Isekai Seikatsu S3]'
+      '[PV][01][1080P][BDRip].mkv',
+    ));
+    await pv.writeAsBytes(const <int>[0]);
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('re0-pv-1'),
+      title: Value<String>(p.basenameWithoutExtension(pv.path)),
+      videoPath: Value<String>(pv.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    final int collectionId = await db.createMediaCollection(
+      'Re Zero kara Hajimeru Isekai Seikatsu',
+      collectionType: 'playlist',
+    );
+    for (final String uid in <String>[
+      're0-main-1',
+      're0-main-2',
+      're0-pv-1',
+    ]) {
+      await db.addToCollection(collectionId, MediaKind.video, uid);
+    }
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        writeNfo: const Value<bool>(false),
+        writeImages: const Value<bool>(false),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+    final _ReZeroAniDbProvider provider = _ReZeroAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry:
+          VideoMetadataProviderRegistry(<VideoMetadataProvider>[provider]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      (await db.getMediaSourceById(sourceId))!,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.totalWorks, 1,
+        reason: '${report.warnings}\n${report.errors}');
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(provider.searchTitles, contains('Re：从零开始的异世界生活'));
+    expect(provider.searchSeasons, everyElement(3));
+    expect(
+      (await db.getVideoMetadataWorkByCollection(collectionId))?.title,
+      'Re：从零开始的异世界生活',
+    );
+  });
+
+  test('缺少真实分集资料时生成的 episode NFO 不伪造文件名标题', () async {
+    final Directory seasonDir =
+        Directory(p.join(root.path, 'Unknown Show', 'Season 01'));
+    await seasonDir.create(recursive: true);
+    for (final String name in <String>[
+      'Unknown Show S01E01.mkv',
+      'Unknown Show S01E02.mkv',
+    ]) {
+      await File(p.join(seasonDir.path, name)).writeAsBytes(const <int>[0]);
+    }
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Unknown show source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    for (final (int number, String uid) in <(int, String)>[
+      (1, 'unknown-e1'),
+      (2, 'unknown-e2'),
+    ]) {
+      await db.upsertVideoBook(VideoBooksCompanion(
+        bookUid: Value<String>(uid),
+        title: Value<String>('Unknown Show E$number'),
+        videoPath: Value<String>(
+            p.join(seasonDir.path, 'Unknown Show S01E0$number.mkv')),
+        sourceId: Value<int?>(sourceId),
+      ));
+    }
+    final int collectionId = await db.createMediaCollection(
+      'Unknown Show',
+      collectionType: 'playlist',
+    );
+    await db.addToCollection(collectionId, MediaKind.video, 'unknown-e1');
+    await db.addToCollection(collectionId, MediaKind.video, 'unknown-e2');
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        writeNfo: const Value<bool>(true),
+        writeImages: const Value<bool>(false),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _NoEpisodeAniDbProvider(),
+      ]),
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      (await db.getMediaSourceById(sourceId))!,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    final String xml = await File(
+      p.join(seasonDir.path, 'Unknown Show S01E01.nfo'),
+    ).readAsString();
+    expect(xml, contains('<season>1</season>'));
+    expect(xml, contains('<episode>1</episode>'));
+    expect(xml, isNot(contains('<title>')));
+    expect(xml, isNot(contains('Unknown Show S01E01')));
+  });
+
+  test('同一 coordinator 的下一次 scrapeSource 会重新抓取而不复用旧批次缓存', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final _RefreshingAniDbProvider provider = _RefreshingAniDbProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+            primaryProvider: VideoMetadataProviderKind.anidb,
+            database: db,
+            config: const VideoSourceScrapeGlobalConfig(),
+            registry: VideoMetadataProviderRegistry(
+                <VideoMetadataProvider>[provider]));
+
+    final SourceScrapeReport first = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(first.succeededWorks, 1, reason: '${first.errors}');
+    expect(
+      (await db.getVideoMetadataWorkByBook('movie-book'))?.title,
+      'Movie metadata 1',
+    );
+
+    final SourceScrapeReport second = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+    expect(second.succeededWorks, 1, reason: '${second.errors}');
+    expect(provider.fetchCount, 2);
+    expect(
+      (await db.getVideoMetadataWorkByBook('movie-book'))?.title,
+      'Movie metadata 2',
+    );
+  });
+
+  test('同层级同图种只把排序后的首选图片写入 sidecar', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(source.id),
+        providerOverride: const Value<String?>('anidb'),
+        writeNfo: const Value<bool>(false),
+        writeImages: const Value<bool>(true),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 2,
+      ),
+    );
+    final _TwoBackdropTmdbProvider tmdb = _TwoBackdropTmdbProvider();
+    final _RecordingAssetDownloader downloader = _RecordingAssetDownloader();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+        _ImageAniDbProvider(),
+        tmdb,
+      ]),
+      assetDownloader: downloader,
+    );
+
+    final SourceScrapeReport report = await coordinator.scrapeSource(
+      source,
+      cancellationToken: VideoSourceScrapeCancellationToken(),
+      onProgress: (_) {},
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(downloader.urls, <String>['https://images.test/best.jpg']);
+    final Uint8List expected = downloader.bytesForBest;
+    expect(
+      await File(p.join(root.path, 'Movie (2024)-backdrop.jpg')).readAsBytes(),
+      expected,
+    );
+    expect(
+      await File(p.join(root.path, 'Movie (2024)-fanart.jpg')).readAsBytes(),
+      expected,
+    );
+  });
+
+  test('单作品精确刮削使用 AniDB confirmed lookup 且不进行标题搜索', () async {
+    final SourceLibraryRow source = await _createMovieSource(
+      db,
+      root,
+      provider: VideoMetadataProviderKind.anidb,
+    );
+    final VideoBookRow local = (await db.getVideoBookByBookUid('movie-book'))!;
+    final VideoSourceScrapeWork work = VideoSourceScrapeWork(
+      source: source,
+      title: local.title,
+      members: <VideoBookRow>[local],
+    );
+    final _ExactMovieProvider provider = _ExactMovieProvider();
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+            primaryProvider: VideoMetadataProviderKind.anidb,
+            database: db,
+            config: const VideoSourceScrapeGlobalConfig(),
+            registry: VideoMetadataProviderRegistry(
+                <VideoMetadataProvider>[provider]));
+
+    final SourceScrapeReport report = await coordinator.scrapeImportedWork(
+      work,
+      lookup: const VideoMetadataLookup(
+        provider: VideoMetadataProviderKind.anidb,
+        externalId: '4242',
+        mediaKind: VideoMetadataMediaKind.movie,
+      ),
+    );
+
+    expect(report.succeededWorks, 1, reason: '${report.errors}');
+    expect(provider.searchCount, 0);
+    expect(provider.fetchCount, 1);
+    expect(
+      (await db.getVideoMetadataWorkByBook('movie-book'))?.title,
+      'Exact Movie',
+    );
+    final List<VideoSourceScrapeRunRow> runs =
+        await db.getVideoSourceScrapeRuns(sourceId: source.id);
+    expect(runs.single.scope, 'work');
+  });
+
+  test('手动改绑身份重刮替换 Fushi 自己写下的旧封面并驱逐缓存，用户改过的 NFO 仍受保护（BUG-2737）', () async {
+    // 用户实报：独立电影被刮成同名度很低的别的片子，手动指定正确作品重刮后封面
+    // 还是错的那张。默认 missingOnly 下旧身份写下的 poster 会被原样跳过；图名只按
+    // 图种派生，换身份就是覆盖同一路径，还得驱逐宿主解码缓存。
+    final Future<void> Function(File) hostEvict = evictImageCacheForFile;
+    final List<String> evicted = <String>[];
+    evictImageCacheForFile = (File file) async => evicted.add(file.path);
+    addTearDown(() => evictImageCacheForFile = hostEvict);
+
+    final Directory movieDir =
+        await Directory(p.join(root.path, 'Liz')).create();
+    final File video = File(p.join(movieDir.path, 'Liz (2018).mkv'));
+    await video.writeAsBytes(const <int>[0]);
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Movies',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('liz'),
+      title: const Value<String>('Liz'),
+      videoPath: Value<String>(video.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    // 写 NFO + 图片，两者都是默认的 missingOnly。
+    await db.upsertVideoSourceScrapeSettings(
+      VideoSourceScrapeSettingsCompanion.insert(
+        sourceId: Value<int>(sourceId),
+        providerOverride: const Value<String?>('anidb'),
+        fanartEnabled: const Value<bool>(false),
+        updatedAt: 1,
+      ),
+    );
+    final SourceLibraryRow source = (await db.getMediaSourceById(sourceId))!;
+    final VideoSourceScrapeCoordinator coordinator =
+        VideoSourceScrapeCoordinator(
+      primaryProvider: VideoMetadataProviderKind.anidb,
+      database: db,
+      config: const VideoSourceScrapeGlobalConfig(),
+      registry: VideoMetadataProviderRegistry(
+          <VideoMetadataProvider>[_CoverPerIdentityAniDbProvider()]),
+      assetDownloader: _UrlEchoAssetDownloader(),
+    );
+    Future<SourceScrapeReport> bindTo(String anidbId) async {
+      final VideoSourceScrapeWork work =
+          (await VideoSourceWorkPlanner(db).plan(source)).single;
+      return coordinator.rescrapeWorkWithLookup(
+        source: source,
+        workTitle: work.title,
+        workStableKey: work.stableKey,
+        lookup: VideoMetadataLookup(
+          provider: VideoMetadataProviderKind.anidb,
+          externalId: anidbId,
+          mediaKind: VideoMetadataMediaKind.movie,
+        ),
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+    }
+
+    final File poster = File(p.join(movieDir.path, 'poster.jpg'));
+    final File nfo = File(p.join(movieDir.path, 'Liz (2018).nfo'));
+    final SourceScrapeReport wrong = await bindTo('1');
+    expect(wrong.succeededWorks, 1, reason: '${wrong.errors}');
+    expect(await poster.readAsString(), 'IMG https://images.test/1.jpg');
+    expect((await db.getVideoBookByBookUid('liz'))?.coverPath, poster.path);
+    expect(evicted, isEmpty, reason: '首次写入没有旧解码可清');
+    // 用户手改过的 NFO：不是 Fushi 未改动的生成物，换身份也不能动它。
+    await nfo.writeAsString('<movie><title>my notes</title></movie>');
+
+    final SourceScrapeReport fixed = await bindTo('2');
+
+    expect(fixed.succeededWorks, 1, reason: '${fixed.errors}');
+    expect(await poster.readAsString(), 'IMG https://images.test/2.jpg',
+        reason: '旧身份写下的 poster 必须被换掉，否则库页封面永远是错的那张');
+    expect(evicted, contains(poster.path));
+    expect((await db.getVideoBookByBookUid('liz'))?.coverPath, poster.path);
+    expect(await nfo.readAsString(), '<movie><title>my notes</title></movie>');
+    expect(fixed.protectedArtifacts, 1);
+  });
+
+  group('AI 歧义消解', () {
+    // 15 条目录候选（anidb:1..15）全部只剩待确认：与「AniDB 模糊目录候选只在
+    // 人工确认后抓取选中项详情」同一套假 provider，AI 只是在人工确认前多一道。
+    Future<VideoSourceScrapeCoordinator> buildCoordinator(
+      _CatalogConfirmationAniDbProvider provider, {
+      AiVideoIdentityDecider? decider,
+      _FakeAiAdvisor? advisor,
+    }) async =>
+        VideoSourceScrapeCoordinator(
+          primaryProvider: VideoMetadataProviderKind.anidb,
+          database: db,
+          config: const VideoSourceScrapeGlobalConfig(),
+          registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+            provider,
+          ]),
+          aiIdentityAdvisor: advisor ??
+              (decider == null
+                  ? null
+                  : _FakeAiAdvisor(
+                      decide: decider,
+                    )),
+        );
+
+    List<VideoScrapeAiIdentityNote> aiNotes(SourceScrapeReport report) =>
+        <VideoScrapeAiIdentityNote>[
+          for (final SourceScrapeIssue issue in report.warnings)
+            if (parseVideoScrapeAiIdentityNote(issue.message)
+                case final VideoScrapeAiIdentityNote note)
+              note,
+        ];
+
+    test('高置信判定：不弹人工确认，绑定该候选并在运行记录留 ai:matched 标记',
+        () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      final List<AiVideoIdentityQuery> queries = <AiVideoIdentityQuery>[];
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        decider: (AiVideoIdentityQuery query) async {
+          queries.add(query);
+          return const AiVideoIdentityDecision(
+            key: 'anidb:7',
+            confidence: 0.93,
+            reason: '标题与年份一致',
+          );
+        },
+      );
+      bool confirmationAsked = false;
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+        onConfirmation: (VideoSourceScrapeConfirmation confirmation) async {
+          confirmationAsked = true;
+          return confirmation.candidates.first;
+        },
+      );
+
+      expect(confirmationAsked, isFalse, reason: '高置信判定不该再问用户');
+      expect(report.succeededWorks, 1, reason: '${report.errors}');
+      expect(report.pendingConfirmations, 0);
+      // 与人工确认走同一条后续路径：目录候选选中后抓取选中项详情并落库。
+      expect(provider.fetchedIds, <String>['7']);
+      expect(
+        (await db.getVideoMetadataWorkByBook('movie-book'))?.title,
+        'Confirmed Anime',
+      );
+      // 提问只带已取回的候选，不新增网络请求（搜索次数不因 AI 增加）。
+      final AiVideoIdentityQuery query = queries.single;
+      expect(query.candidateKeys, hasLength(15));
+      expect(query.candidateKeys, contains('anidb:7'));
+      expect(query.localTitles, isNotEmpty);
+      expect(query.sampleFileNames, <String>['Movie (2024).mkv']);
+      // 运行记录：warnings 里有一条 ai:matched 标记，且随 summaryJson 落库。
+      final SourceScrapeIssue note = report.warnings.singleWhere(
+        (SourceScrapeIssue issue) =>
+            parseVideoScrapeAiIdentityNote(issue.message) != null,
+      );
+      expect(note.workTitle, 'Movie');
+      expect(
+        parseVideoScrapeAiIdentityNote(note.message)!.confidencePercent,
+        93,
+      );
+      expect(parseVideoScrapeAiIdentityNote(note.message)!.reason, '标题与年份一致');
+      final List<VideoSourceScrapeRunRow> runs =
+          await db.getVideoSourceScrapeRuns(sourceId: source.id);
+      expect(runs.single.summaryJson, contains('ai:matched'));
+    });
+
+    test('低置信判定：仍弹人工确认并标出 AI 建议，运行记录记 ai:declined', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        decider: (AiVideoIdentityQuery query) async =>
+            const AiVideoIdentityDecision(key: 'anidb:7', confidence: 0.6),
+      );
+      bool confirmationAsked = false;
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+        onConfirmation: (VideoSourceScrapeConfirmation confirmation) async {
+          confirmationAsked = true;
+          expect(confirmation.candidates, hasLength(15));
+          final VideoSourceScrapeAiSuggestion suggestion =
+              confirmation.aiSuggestion!;
+          expect(
+            confirmation
+                .candidates[suggestion.candidateIndex].lookup.externalId,
+            '7',
+          );
+          expect(suggestion.confidencePercent, 60);
+          return confirmation.candidates.last;
+        },
+      );
+
+      expect(confirmationAsked, isTrue);
+      expect(report.succeededWorks, 1, reason: '${report.errors}');
+      expect(provider.fetchedIds, <String>['15']);
+      expect(
+        aiNotes(report).map((VideoScrapeAiIdentityNote n) => n.kind),
+        <VideoScrapeAiNoteKind>[VideoScrapeAiNoteKind.declined],
+      );
+    });
+
+    Future<SourceScrapeIssue> aiFailureFor(Object error) async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        _CatalogConfirmationAniDbProvider(),
+        decider: (AiVideoIdentityQuery query) =>
+            Future<AiVideoIdentityDecision?>.error(error),
+      );
+      bool confirmationAsked = false;
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+        onConfirmation: (VideoSourceScrapeConfirmation confirmation) async {
+          confirmationAsked = true;
+          return confirmation.candidates.last;
+        },
+      );
+
+      // AI 失败不连累刮削：照常弹人工确认、照常完成。
+      expect(confirmationAsked, isTrue);
+      expect(report.succeededWorks, 1, reason: '${report.errors}');
+      expect(report.failedWorks, 0);
+      expect(report.errors, isEmpty);
+      final List<VideoSourceScrapeRunRow> runs =
+          await db.getVideoSourceScrapeRuns(sourceId: source.id);
+      expect(runs.single.status, 'completed');
+      // 失败不再无痕：运行记录有 ai:failed。
+      return report.warnings.singleWhere(
+        (SourceScrapeIssue issue) =>
+            parseVideoScrapeAiIdentityNote(issue.message)?.kind ==
+            VideoScrapeAiNoteKind.failed,
+      );
+    }
+
+    test('AI 临时失败（断网 / 超时）：标成临时失败，补刮撤账下轮再试', () async {
+      final SourceScrapeIssue failure =
+          await aiFailureFor(const AiChatFailure('network_error'));
+      expect(failure.providerUnavailable, isTrue);
+      expect(failure.workKey, isNotNull);
+      expect(
+        parseVideoScrapeAiIdentityNote(failure.message)!.reason,
+        'network_error',
+      );
+    });
+
+    test('AI 鉴权失败：照常记账——重试也一样，不能每轮补刮对整库重问', () async {
+      final SourceScrapeIssue failure =
+          await aiFailureFor(const AiChatFailure('unauthorized'));
+      expect(failure.providerUnavailable, isFalse);
+      expect(
+        parseVideoScrapeAiIdentityNote(failure.message)!.reason,
+        'unauthorized',
+      );
+    });
+
+    test('非 AiChatFailure 异常：不算临时，理由只留类型名不透出原文', () async {
+      final SourceScrapeIssue failure = await aiFailureFor(
+        StateError('https://example.test/v1?key=sk-secret'),
+      );
+      expect(failure.providerUnavailable, isFalse);
+      expect(
+        parseVideoScrapeAiIdentityNote(failure.message)!.reason,
+        'StateError',
+      );
+      expect(failure.message, isNot(contains('sk-secret')));
+    });
+
+    test('后台批次（无确认回调）：高置信判定直接收敛，不再落待确认', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        decider: (AiVideoIdentityQuery query) async =>
+            const AiVideoIdentityDecision(key: 'anidb:3', confidence: 0.9),
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(report.succeededWorks, 1, reason: '${report.errors}');
+      expect(report.pendingConfirmations, 0);
+      expect(provider.fetchedIds, <String>['3']);
+    });
+
+    test('未注入 decider：歧义照旧落待确认（行为不变）', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      final VideoSourceScrapeCoordinator coordinator =
+          await buildCoordinator(provider, decider: null);
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(report.pendingConfirmations, 1);
+      expect(report.succeededWorks, 0);
+      expect(provider.fetchCount, 0);
+    });
+
+    // BUG-2828：挂起原因结构化落库，事后能分出是哪条分支、AI 问没问、问了什么。
+    Future<VideoScrapePendingNote> pendingNoteAfter(
+      AiVideoIdentityDecider? decider, {
+      VideoSourceScrapeConfirmationCallback? onConfirmation,
+      bool assigned = true,
+    }) async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        _CatalogConfirmationAniDbProvider(),
+        advisor: decider == null
+            ? null
+            : (_FakeAiAdvisor(decide: decider)
+              ..capability = assigned ? 'provider-a|model-1' : null),
+      );
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+        onConfirmation: onConfirmation,
+      );
+      expect(report.pendingConfirmations, 1);
+      final VideoScrapePendingNote note = report.warnings
+          .map((SourceScrapeIssue issue) =>
+              parseVideoScrapePendingNote(issue.message))
+          .whereType<VideoScrapePendingNote>()
+          .single;
+      // 作品键与计划器同源，待确认清单靠它对号；落库后解出来的是同一条。
+      expect(note.workKeys, <String>[
+        (await VideoSourceWorkPlanner(db).plan(source)).single.stableKey,
+      ]);
+      final List<VideoSourceScrapeRunRow> runs =
+          await db.getVideoSourceScrapeRuns(sourceId: source.id);
+      final SourceScrapeReport stored =
+          decodeSourceScrapeReport(runs.single.summaryJson)!;
+      expect(
+        stored.warnings
+            .map((SourceScrapeIssue issue) =>
+                parseVideoScrapePendingNote(issue.message)?.cause)
+            .whereType<VideoScrapePendingCause>(),
+        <VideoScrapePendingCause>[note.cause],
+      );
+      // 原有的人类可读文案整段保留。
+      expect(note.reason, contains('需要人工确认'));
+      return note;
+    }
+
+    test('挂起原因：后台批次 AI 低置信 → 等确认 · AI 不够确定', () async {
+      final VideoScrapePendingNote note = await pendingNoteAfter(
+        (AiVideoIdentityQuery query) async =>
+            const AiVideoIdentityDecision(key: 'anidb:7', confidence: 0.6),
+      );
+      expect(note.cause, VideoScrapePendingCause.awaitingConfirmation);
+      expect(note.aiOutcome, VideoScrapeAiOutcome.declined);
+      expect(note.candidateCount, 15);
+    });
+
+    test('挂起原因：未指派 AI 提供商 → unassigned', () async {
+      bool asked = false;
+      final VideoScrapePendingNote note = await pendingNoteAfter(
+        (AiVideoIdentityQuery query) async {
+          asked = true;
+          return null;
+        },
+        assigned: false,
+      );
+      // 未指派时完全不发 AI 请求（AI 硬边界）。
+      expect(asked, isFalse);
+      expect(note.cause, VideoScrapePendingCause.awaitingConfirmation);
+      expect(note.aiOutcome, VideoScrapeAiOutcome.unassigned);
+    });
+
+    test('挂起原因：没装配 AI → unavailable', () async {
+      final VideoScrapePendingNote note = await pendingNoteAfter(null);
+      expect(note.aiOutcome, VideoScrapeAiOutcome.unavailable);
+    });
+
+    test('挂起原因：AI 调用失败 → failed', () async {
+      final VideoScrapePendingNote note = await pendingNoteAfter(
+        (AiVideoIdentityQuery query) async => throw StateError('ai down'),
+      );
+      expect(note.aiOutcome, VideoScrapeAiOutcome.failed);
+    });
+
+    test('挂起原因：用户取消确认 → dismissed', () async {
+      final VideoScrapePendingNote note = await pendingNoteAfter(
+        (AiVideoIdentityQuery query) async =>
+            const AiVideoIdentityDecision(key: 'anidb:7', confidence: 0.6),
+        onConfirmation: (VideoSourceScrapeConfirmation confirmation) async =>
+            null,
+      );
+      expect(note.cause, VideoScrapePendingCause.dismissed);
+      expect(note.aiOutcome, VideoScrapeAiOutcome.declined);
+      expect(note.candidateCount, 15);
+    });
+
+    // 刮过却没留标记的路径会让待确认清单对用户说「没有记录」，所以异常与来源级
+    // 结账也必须带作品键。
+    test('挂起原因：单作品异常记成 error 并带作品键', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final VideoSourceScrapeCoordinator coordinator =
+          await buildCoordinator(_CatalogConfirmationAniDbProvider(),
+              decider: null);
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+        onConfirmation: (VideoSourceScrapeConfirmation confirmation) async =>
+            throw StateError('boom'),
+      );
+      expect(report.failedWorks, 1);
+      final VideoScrapePendingNote note =
+          parseVideoScrapePendingNote(report.errors.single.message)!;
+      expect(note.cause, VideoScrapePendingCause.error);
+      expect(note.reason, contains('boom'));
+      expect(note.workKeys, <String>[
+        (await VideoSourceWorkPlanner(db).plan(source)).single.stableKey,
+      ]);
+    });
+
+    test('挂起原因：整批没有可用资料源时来源级结账带全部作品键', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final VideoSourceScrapeCoordinator coordinator =
+          VideoSourceScrapeCoordinator(
+        primaryProvider: VideoMetadataProviderKind.anidb,
+        database: db,
+        config: const VideoSourceScrapeGlobalConfig(),
+        registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[]),
+      );
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+      final VideoScrapePendingNote note =
+          parseVideoScrapePendingNote(report.errors.single.message)!;
+      expect(note.cause, VideoScrapePendingCause.providerUnavailable);
+      expect(note.workKeys, <String>[
+        for (final VideoSourceScrapeWork work
+            in await VideoSourceWorkPlanner(db).plan(source))
+          work.stableKey,
+      ]);
+    });
+
+    test('同一目录同一批候选只问一次 AI（用户取消后重扫不重问）', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      int deciderCalls = 0;
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        decider: (AiVideoIdentityQuery query) async {
+          deciderCalls++;
+          return const AiVideoIdentityDecision(key: null, confidence: 0.2);
+        },
+      );
+
+      for (int round = 0; round < 2; round++) {
+        final SourceScrapeReport report = await coordinator.scrapeSource(
+          source,
+          cancellationToken: VideoSourceScrapeCancellationToken(),
+          onProgress: (_) {},
+          onConfirmation: (VideoSourceScrapeConfirmation confirmation) async =>
+              null,
+        );
+        expect(report.pendingConfirmations, 1, reason: 'round $round');
+      }
+
+      expect(deciderCalls, 1);
+    });
+
+    test('换了 AI 提供商 / 模型：缓存的「不选」作废，同一批候选重问', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      int calls = 0;
+      final _FakeAiAdvisor advisor = _FakeAiAdvisor(
+        decide: (AiVideoIdentityQuery query) async {
+          calls++;
+          return calls == 1
+              ? const AiVideoIdentityDecision(key: null, confidence: 0)
+              : const AiVideoIdentityDecision(key: 'anidb:4', confidence: 0.95);
+        },
+      );
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        advisor: advisor,
+      );
+
+      final SourceScrapeReport first = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+      expect(first.pendingConfirmations, 1);
+
+      advisor.capability = 'provider-b|model-2';
+      final SourceScrapeReport second = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(calls, 2, reason: '能力键变了必须重问，不能沿用旧提供商的「不选」');
+      expect(second.succeededWorks, 1, reason: '${second.errors}');
+      expect(provider.fetchedIds, <String>['4']);
+    });
+
+    test('未指派 AI（能力键为 null）：一次都不问，也不记 AI 标记', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      int calls = 0;
+      final _FakeAiAdvisor advisor = _FakeAiAdvisor(
+        decide: (AiVideoIdentityQuery query) async {
+          calls++;
+          return const AiVideoIdentityDecision(key: 'anidb:1', confidence: 1);
+        },
+      )..capability = null;
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        _CatalogConfirmationAniDbProvider(),
+        advisor: advisor,
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(calls, 0);
+      expect(report.pendingConfirmations, 1);
+      expect(aiNotes(report), isEmpty);
+      expect(coordinator.aiIdentityAvailable, isFalse);
+    });
+
+    test('「AI 识别」单作品：绕过缓存强制重问，高置信即采用', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider();
+      int calls = 0;
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        decider: (AiVideoIdentityQuery query) async {
+          calls++;
+          return calls == 1
+              ? const AiVideoIdentityDecision(key: null, confidence: 0)
+              : const AiVideoIdentityDecision(key: 'anidb:9', confidence: 0.9);
+        },
+      );
+      final SourceScrapeReport background = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+      expect(background.pendingConfirmations, 1);
+
+      final VideoSourceScrapeWork work = (await VideoSourceWorkPlanner(
+        db,
+      ).plan(source))
+          .single;
+      final SourceScrapeReport identified =
+          await coordinator.identifyWorkWithAi(
+        source: source,
+        workTitle: work.title,
+        workStableKey: work.stableKey,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(calls, 2, reason: '用户点「AI 识别」就是要重问，不能回缓存');
+      expect(identified.succeededWorks, 1, reason: '${identified.errors}');
+      expect(provider.fetchedIds, <String>['9']);
+      expect(
+        aiNotes(identified).map((VideoScrapeAiIdentityNote n) => n.kind),
+        <VideoScrapeAiNoteKind>[VideoScrapeAiNoteKind.matched],
+      );
+    });
+
+    test('资料源查无：按 AI 给的标题重搜，重搜候选仍要过 AI 判定才采用', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider(
+        answersTitle: (String title) => title == 'Official Title',
+      );
+      final List<AiVideoIdentityQuery> decided = <AiVideoIdentityQuery>[];
+      final _FakeAiAdvisor advisor = _FakeAiAdvisor(
+        decide: (AiVideoIdentityQuery query) async {
+          decided.add(query);
+          return const AiVideoIdentityDecision(key: 'anidb:2', confidence: 0.9);
+        },
+        suggest: (AiVideoIdentityQuery query) async {
+          expect(query.candidates, isEmpty);
+          return <String>['Official Title'];
+        },
+      );
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        advisor: advisor,
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(provider.searchedTitles, contains('Official Title'));
+      expect(decided.single.candidateKeys, hasLength(15));
+      expect(report.succeededWorks, 1, reason: '${report.errors}');
+      expect(provider.fetchedIds, <String>['2']);
+      expect(
+        aiNotes(report).map((VideoScrapeAiIdentityNote n) => n.kind),
+        <VideoScrapeAiNoteKind>[
+          VideoScrapeAiNoteKind.searched,
+          VideoScrapeAiNoteKind.matched,
+        ],
+      );
+    });
+
+    test('资料源查无且 AI 没给新标题：保留查无结论，不问判定', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      int decideCalls = 0;
+      final _FakeAiAdvisor advisor = _FakeAiAdvisor(
+        decide: (AiVideoIdentityQuery query) async {
+          decideCalls++;
+          return const AiVideoIdentityDecision(key: null, confidence: 0);
+        },
+        suggest: (AiVideoIdentityQuery query) async => const <String>[],
+      );
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        _CatalogConfirmationAniDbProvider(answersTitle: (String _) => false),
+        advisor: advisor,
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(decideCalls, 0);
+      expect(report.succeededWorks, 0);
+      expect(report.pendingConfirmations, 0);
+      expect(report.failedWorks, 1);
+    });
+
+    test('AI 给的「标题」是站点 URL / 显式 id：丢掉，不当身份直取', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider(answersTitle: (String _) => false);
+      int decideCalls = 0;
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        advisor: _FakeAiAdvisor(
+          decide: (AiVideoIdentityQuery query) async {
+            decideCalls++;
+            return const AiVideoIdentityDecision(
+                key: 'anidb:12', confidence: 1);
+          },
+          suggest: (AiVideoIdentityQuery query) async =>
+              <String>['https://anidb.net/anime/12'],
+        ),
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(provider.fetchedIds, isEmpty, reason: 'AI 只出搜索词，不能指定身份');
+      expect(decideCalls, 0);
+      expect(report.succeededWorks, 0);
+    });
+
+    test('资料源搜索失败（鉴权 401）：没搜成，不找 AI 要搜索词', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      int suggestCalls = 0;
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        _CatalogConfirmationAniDbProvider(
+          searchError: const VideoMetadataProviderUnavailable(
+            VideoMetadataProviderKind.anidb,
+            'HTTP 401',
+          ),
+        ),
+        advisor: _FakeAiAdvisor(
+          decide: (AiVideoIdentityQuery query) async => null,
+          suggest: (AiVideoIdentityQuery query) async {
+            suggestCalls++;
+            return <String>['Official Title'];
+          },
+        ),
+      );
+
+      await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(suggestCalls, 0, reason: '换标题重搜只会撞同一个故障');
+    });
+
+    test('AI 标题重搜到唯一精确命中：仍要过 AI 判定，低置信落待确认', () async {
+      final SourceLibraryRow source = await _createMovieSource(
+        db,
+        root,
+        provider: VideoMetadataProviderKind.anidb,
+      );
+      final _CatalogConfirmationAniDbProvider provider =
+          _CatalogConfirmationAniDbProvider(
+        answersTitle: (String _) => false,
+        uniqueExactTitle: 'Official Title',
+      );
+      // 前提：同一请求直接交给 resolver 会被判为唯一精确命中。
+      final VideoMetadataResolution direct = await VideoMetadataResolver(
+        registry: VideoMetadataProviderRegistry(<VideoMetadataProvider>[
+          provider,
+        ]),
+      ).resolve(
+        VideoMetadataResolveRequest(
+          selectedProvider: VideoMetadataProviderKind.anidb,
+          mediaKind: VideoMetadataMediaKind.movie,
+          titleCandidates: const <String>['Official Title'],
+          year: 2024,
+        ),
+      );
+      expect(direct.status, VideoMetadataResolutionStatus.matched);
+
+      final List<AiVideoIdentityQuery> decided = <AiVideoIdentityQuery>[];
+      final VideoSourceScrapeCoordinator coordinator = await buildCoordinator(
+        provider,
+        advisor: _FakeAiAdvisor(
+          decide: (AiVideoIdentityQuery query) async {
+            decided.add(query);
+            return const AiVideoIdentityDecision(
+              key: 'anidb:42',
+              confidence: 0.5,
+            );
+          },
+          suggest: (AiVideoIdentityQuery query) async =>
+              <String>['Official Title'],
+        ),
+      );
+
+      final SourceScrapeReport report = await coordinator.scrapeSource(
+        source,
+        cancellationToken: VideoSourceScrapeCancellationToken(),
+        onProgress: (_) {},
+      );
+
+      expect(decided.single.candidateKeys, <String>['anidb:42']);
+      expect(report.succeededWorks, 0, reason: 'AI 给的词恰好精确命中也不绕过门槛');
+      expect(report.pendingConfirmations, 1);
+    });
+  });
+}
+
+class _FakeAiAdvisor implements AiVideoIdentityAdvisor {
+  _FakeAiAdvisor({
+    required AiVideoIdentityDecider decide,
+    Future<List<String>> Function(AiVideoIdentityQuery query)? suggest,
+  })  : _decide = decide,
+        _suggest =
+            suggest ?? ((AiVideoIdentityQuery query) async => const <String>[]);
+
+  String? capability = 'provider-a|model-1';
+  final AiVideoIdentityDecider _decide;
+  final Future<List<String>> Function(AiVideoIdentityQuery query) _suggest;
+
+  @override
+  String? get capabilityKey => capability;
+
+  @override
+  Future<AiVideoIdentityDecision> decide(AiVideoIdentityQuery query) async =>
+      await _decide(query) ??
+      const AiVideoIdentityDecision(key: null, confidence: 0);
+
+  @override
+  Future<List<String>> suggestSearchTitles(AiVideoIdentityQuery query) =>
+      _suggest(query);
+}
+
+Future<({int collectionId, SourceLibraryRow source})> _createContinuationSource(
+    FushiDatabase db, Directory root) async {
+  final Directory seasonDir = Directory(p.join(root.path, 'Show', 'Season 02'));
+  await seasonDir.create(recursive: true);
+  for (final String name in <String>[
+    'Show S02E01.mkv',
+    'Show S02E02.mkv',
+  ]) {
+    await File(p.join(seasonDir.path, name)).writeAsBytes(const <int>[0]);
+  }
+  final int sourceId = await db.insertMediaSource(
+    MediaSourcesCompanion.insert(
+      label: 'Continuation source',
+      mediaKind: 'video',
+      rootPath: root.path,
+      createdAt: 1,
+    ),
+  );
+  await db.upsertVideoBook(VideoBooksCompanion(
+    bookUid: const Value<String>('s2e1'),
+    title: const Value<String>('Show S02E01'),
+    videoPath: Value<String>(p.join(seasonDir.path, 'Show S02E01.mkv')),
+    sourceId: Value<int?>(sourceId),
+  ));
+  await db.upsertVideoBook(VideoBooksCompanion(
+    bookUid: const Value<String>('s2e2'),
+    title: const Value<String>('Show S02E02'),
+    videoPath: Value<String>(p.join(seasonDir.path, 'Show S02E02.mkv')),
+    sourceId: Value<int?>(sourceId),
+  ));
+  final int collectionId =
+      await db.createMediaCollection('Show', collectionType: 'playlist');
+  await db.addToCollection(collectionId, MediaKind.video, 's2e1');
+  await db.addToCollection(collectionId, MediaKind.video, 's2e2');
+  await db.upsertVideoSourceScrapeSettings(
+    VideoSourceScrapeSettingsCompanion.insert(
+      sourceId: Value<int>(sourceId),
+      providerOverride: const Value<String?>('anidb'),
+      writeNfo: const Value<bool>(false),
+      writeImages: const Value<bool>(false),
+      fanartEnabled: const Value<bool>(false),
+      updatedAt: 1,
+    ),
+  );
+  return (
+    collectionId: collectionId,
+    source: (await db.getMediaSourceById(sourceId))!,
+  );
+}
+
+Future<SourceLibraryRow> _createMovieSource(
+  FushiDatabase db,
+  Directory root, {
+  required VideoMetadataProviderKind provider,
+}) async {
+  final File video = File(p.join(root.path, 'Movie (2024).mkv'));
+  await video.writeAsBytes(const <int>[0]);
+  final int sourceId = await db.insertMediaSource(
+    MediaSourcesCompanion.insert(
+      label: 'Movie source',
+      mediaKind: 'video',
+      rootPath: root.path,
+      createdAt: 1,
+    ),
+  );
+  await db.upsertVideoBook(VideoBooksCompanion(
+    bookUid: const Value<String>('movie-book'),
+    title: const Value<String>('Movie'),
+    videoPath: Value<String>(video.path),
+    sourceId: Value<int?>(sourceId),
+  ));
+  await db.upsertVideoSourceScrapeSettings(
+    VideoSourceScrapeSettingsCompanion.insert(
+      sourceId: Value<int>(sourceId),
+      providerOverride: Value<String?>(provider.name),
+      writeNfo: const Value<bool>(false),
+      writeImages: const Value<bool>(false),
+      fanartEnabled: const Value<bool>(false),
+      updatedAt: 1,
+    ),
+  );
+  return (await db.getMediaSourceById(sourceId))!;
+}
+
+class _FakeAniDbProvider implements VideoMetadataProvider {
+  int searchCount = 0;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Show',
+        year: 2025,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '42', isDefault: true),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(
+            seasonNumber: 1,
+            title: 'Season 1',
+            episodeCount: 2,
+          ),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    return <VideoMetadataWork>[work];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      <VideoMetadataEpisode>[
+        VideoMetadataEpisode(
+          seasonNumber: 1,
+          episodeNumber: 1,
+          title: 'Episode One',
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'anidb', value: '4201'),
+          ],
+          credits: <VideoMetadataCredit>[
+            VideoMetadataCredit(
+              kind: VideoMetadataCreditKind.voiceActor,
+              person: VideoMetadataPerson(
+                id: '7',
+                name: 'Voice Actor',
+                ids: const <VideoMetadataId>[
+                  VideoMetadataId(type: 'anidb', value: '7'),
+                ],
+              ),
+              character: VideoMetadataCharacter(name: 'Hero'),
+            ),
+          ],
+        ),
+        VideoMetadataEpisode(
+          seasonNumber: 1,
+          episodeNumber: 2,
+          title: 'Episode Two',
+          ids: const <VideoMetadataId>[
+            VideoMetadataId(type: 'anidb', value: '4202'),
+          ],
+        ),
+      ];
+
+  @override
+  void close() {}
+}
+
+class _CatalogConfirmationAniDbProvider implements VideoMetadataProvider {
+  _CatalogConfirmationAniDbProvider({
+    this.answersTitle,
+    this.searchError,
+    this.uniqueExactTitle,
+  });
+
+  /// null = 任何标题都给 15 条模糊候选；否则只有它放行的标题才有结果。
+  final bool Function(String title)? answersTitle;
+
+  /// 非 null 时每次搜索都抛它（模拟资料源鉴权失败等）。
+  final Exception? searchError;
+
+  /// 搜这个标题时只回一条标题、类型、年份都精确的作品（anidb:42）。
+  final String? uniqueExactTitle;
+  int fetchCount = 0;
+  final List<String> fetchedIds = <String>[];
+  final List<String> searchedTitles = <String>[];
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    final Exception? error = searchError;
+    if (error != null) throw error;
+    if (request.title == uniqueExactTitle) {
+      searchedTitles.add(request.title);
+      return <VideoMetadataWork>[
+        VideoMetadataWork(
+          provider: providerKind,
+          kind: VideoMetadataMediaKind.movie,
+          title: request.title,
+          year: 2024,
+          ids: <VideoMetadataId>[
+            VideoMetadataId(type: 'anidb', value: '42', isDefault: true),
+          ],
+        ),
+      ];
+    }
+    return _catalog(request);
+  }
+
+  List<VideoMetadataWork> _catalog(VideoMetadataSearchRequest request) =>
+      <VideoMetadataWork>[
+        if (_record(request.title))
+          for (int id = 1; id <= 15; id++)
+            VideoMetadataWork(
+              provider: providerKind,
+              kind: VideoMetadataMediaKind.movie,
+              title: 'Fuzzy catalog result $id',
+              ids: <VideoMetadataId>[
+                VideoMetadataId(
+                  type: 'anidb',
+                  value: '$id',
+                  isDefault: true,
+                ),
+              ],
+              rawPayload: const <String, Object?>{
+                AniDbVideoMetadataProvider.catalogOnlyPayloadKey: true,
+              },
+            ),
+      ];
+
+  bool _record(String title) {
+    searchedTitles.add(title);
+    return answersTitle?.call(title) ?? true;
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    fetchedIds.add(lookup.externalId);
+    return VideoMetadataWork(
+      provider: providerKind,
+      kind: VideoMetadataMediaKind.movie,
+      title: 'Confirmed Anime',
+      ids: <VideoMetadataId>[
+        VideoMetadataId(
+          type: 'anidb',
+          value: lookup.externalId,
+          isDefault: true,
+        ),
+      ],
+    );
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _ExactMovieProvider implements VideoMetadataProvider {
+  int searchCount = 0;
+  int fetchCount = 0;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    return const <VideoMetadataWork>[];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    return VideoMetadataWork(
+      provider: providerKind,
+      kind: VideoMetadataMediaKind.movie,
+      title: 'Exact Movie',
+      year: 2024,
+      ids: const <VideoMetadataId>[
+        VideoMetadataId(type: 'anidb', value: '4242', isDefault: true),
+      ],
+    );
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _PrimaryContinuationProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Show Season 2',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '200'),
+          VideoMetadataId(type: 'tmdb', value: '100'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(seasonNumber: 1, title: '主源当前季'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[work];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      <VideoMetadataEpisode>[
+        VideoMetadataEpisode(
+          seasonNumber: 1,
+          episodeNumber: 1,
+          title: '主源续季第一集',
+        ),
+      ];
+
+  @override
+  void close() {}
+}
+
+class _AuthorityAniDbProvider implements VideoMetadataProvider {
+  _AuthorityAniDbProvider({
+    required this.episodeNumbers,
+    this.throwEpisodeFetch = false,
+  });
+
+  final List<int> episodeNumbers;
+  final bool throwEpisodeFetch;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Show Season 2',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '300', isDefault: true),
+          VideoMetadataId(type: 'tmdb', value: '100'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(
+            seasonNumber: 1,
+            title: 'AniDB current season',
+            episodeCount: episodeNumbers.length,
+            episodes: <VideoMetadataEpisode>[
+              for (final int number in episodeNumbers)
+                VideoMetadataEpisode(
+                  seasonNumber: 1,
+                  episodeNumber: number,
+                  title: 'AniDB episode $number',
+                ),
+            ],
+          ),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[work];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async {
+    if (throwEpisodeFetch) {
+      throw StateError('AniDB episode response incomplete');
+    }
+    return work.seasons.single.episodes;
+  }
+
+  @override
+  void close() {}
+}
+
+class _ContinuationTmdbProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.tmdb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Show',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'tmdb', value: '100'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(seasonNumber: 1, title: 'TMDB Season 1'),
+          VideoMetadataSeason(seasonNumber: 2, title: 'TMDB Season 2'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[work];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      seasonNumber == 1
+          ? <VideoMetadataEpisode>[
+              VideoMetadataEpisode(
+                seasonNumber: 1,
+                episodeNumber: 1,
+                title: 'TMDB S01E01',
+              ),
+            ]
+          : <VideoMetadataEpisode>[
+              VideoMetadataEpisode(
+                seasonNumber: 2,
+                episodeNumber: 1,
+                title: 'TMDB S02E01',
+              ),
+              VideoMetadataEpisode(
+                seasonNumber: 2,
+                episodeNumber: 2,
+                title: 'TMDB S02E02',
+              ),
+            ];
+
+  @override
+  void close() {}
+}
+
+class _YearCapturingAniDbProvider implements VideoMetadataProvider {
+  final List<int?> searchYears = <int?>[];
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Movie',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '500'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchYears.add(request.year);
+    return <VideoMetadataWork>[work];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _HimoutoAniDbProvider implements VideoMetadataProvider {
+  final List<int?> searchYears = <int?>[];
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Himouto! Umaru-chan',
+        originalTitle: '干物妹！うまるちゃん',
+        year: 2015,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '67126'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(seasonNumber: 1, title: 'Season 1'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchYears.add(request.year);
+    return <VideoMetadataWork>[work];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      <VideoMetadataEpisode>[
+        for (final int number in <int>[8, 9])
+          VideoMetadataEpisode(
+            seasonNumber: 1,
+            episodeNumber: number,
+            title: 'Episode $number',
+          ),
+      ];
+
+  @override
+  void close() {}
+}
+
+class _ReZeroAniDbProvider implements VideoMetadataProvider {
+  final List<String> searchTitles = <String>[];
+  final List<int?> searchSeasons = <int?>[];
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Re：从零开始的异世界生活',
+        originalTitle: 'Re:ゼロから始める異世界生活',
+        aliases: const <String>['Re Zero Season 3'],
+        year: 2016,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '65942'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(seasonNumber: 3, title: 'Season 3'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchTitles.add(request.title);
+    searchSeasons.add(request.seasonNumber);
+    return request.title == 'Re：从零开始的异世界生活'
+        ? <VideoMetadataWork>[work]
+        : const <VideoMetadataWork>[];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      <VideoMetadataEpisode>[
+        for (final int number in <int>[1, 2])
+          VideoMetadataEpisode(
+            seasonNumber: 3,
+            episodeNumber: number,
+            title: 'Episode $number',
+          ),
+      ];
+
+  @override
+  void close() {}
+}
+
+class _NoEpisodeAniDbProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.tv,
+        title: 'Unknown Show',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '600'),
+        ],
+        seasons: <VideoMetadataSeason>[
+          VideoMetadataSeason(seasonNumber: 1, title: 'Season 1'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[work];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      work.seasons;
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _PrimaryMovieProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get _searchWork => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Movie',
+        year: 2024,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '1', isDefault: true),
+        ],
+      );
+
+  VideoMetadataWork get _details => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: '主源电影',
+        year: 2024,
+        plot: '主源简介',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '1', isDefault: true),
+          VideoMetadataId(type: 'tmdb', value: '99'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[_searchWork];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      _details;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _ThrowingTmdbProvider implements VideoMetadataProvider {
+  int searchCount = 0;
+  int fetchCount = 0;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.tmdb;
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    throw StateError('TMDB search should not run when id is already bound');
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    throw StateError('TMDB unavailable');
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _PersistedCrossrefAniDbProvider implements VideoMetadataProvider {
+  _PersistedCrossrefAniDbProvider({required this.includeTmdbCrossref});
+
+  final bool includeTmdbCrossref;
+  int searchCount = 0;
+  int fetchCount = 0;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get _searchWork => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Movie',
+        year: 2024,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '17617', isDefault: true),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    return <VideoMetadataWork>[_searchWork];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    return VideoMetadataWork(
+      provider: providerKind,
+      kind: VideoMetadataMediaKind.movie,
+      title: 'AniDB Movie',
+      year: 2024,
+      episodeGroupId: includeTmdbCrossref ? 'persisted-group' : null,
+      ids: <VideoMetadataId>[
+        VideoMetadataId(
+          type: 'anidb',
+          value: lookup.externalId,
+          isDefault: true,
+        ),
+        if (includeTmdbCrossref)
+          const VideoMetadataId(type: 'tmdb', value: '99'),
+      ],
+    );
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _RecordingCrossrefTmdbProvider implements VideoMetadataProvider {
+  int searchCount = 0;
+  final List<String> searchTitles = <String>[];
+  int fetchCount = 0;
+  final List<VideoMetadataLookup> fetchedLookups = <VideoMetadataLookup>[];
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.tmdb;
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    searchTitles.add(request.title);
+    return <VideoMetadataWork>[
+      VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'TMDB search result',
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'tmdb', value: 'unexpected-search'),
+        ],
+      ),
+    ];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    fetchedLookups.add(lookup);
+    return VideoMetadataWork(
+      provider: providerKind,
+      kind: VideoMetadataMediaKind.movie,
+      title: 'TMDB supplement',
+      episodeGroupId: lookup.episodeGroupId,
+      ids: <VideoMetadataId>[
+        VideoMetadataId(type: 'tmdb', value: lookup.externalId),
+      ],
+    );
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _RefreshingAniDbProvider implements VideoMetadataProvider {
+  int fetchCount = 0;
+
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork _work(String title) => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: title,
+        year: 2024,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '42', isDefault: true),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[_work('Movie')];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    return _work('Movie metadata $fetchCount');
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _ImageAniDbProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Movie',
+        year: 2024,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'anidb', value: '70', isDefault: true),
+          VideoMetadataId(type: 'tmdb', value: '700'),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      <VideoMetadataWork>[work];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      work;
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _TwoBackdropTmdbProvider implements VideoMetadataProvider {
+  int searchCount = 0;
+  int fetchCount = 0;
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.tmdb;
+
+  @override
+  bool get isAvailable => true;
+
+  VideoMetadataWork get work => VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Movie',
+        year: 2024,
+        ids: const <VideoMetadataId>[
+          VideoMetadataId(type: 'tmdb', value: '700', isDefault: true),
+        ],
+        images: const <VideoMetadataImage>[
+          VideoMetadataImage(
+            kind: VideoMetadataImageKind.backdrop,
+            url: 'https://images.test/best.jpg',
+            provider: VideoMetadataProviderKind.tmdb,
+            voteAverage: 9,
+            voteCount: 100,
+          ),
+          VideoMetadataImage(
+            kind: VideoMetadataImageKind.backdrop,
+            url: 'https://images.test/secondary.jpg',
+            provider: VideoMetadataProviderKind.tmdb,
+            voteAverage: 8,
+            voteCount: 200,
+          ),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async {
+    searchCount++;
+    return <VideoMetadataWork>[work];
+  }
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async {
+    fetchCount++;
+    return work;
+  }
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+class _RecordingAssetDownloader extends VideoMetadataAssetDownloader {
+  final List<String> urls = <String>[];
+  final Uint8List bytesForBest = Uint8List.fromList(<int>[0xff, 0xd8, 0xff, 1]);
+
+  @override
+  Future<VideoMetadataDownloadedAsset> download(String url) async {
+    urls.add(url);
+    return VideoMetadataDownloadedAsset(
+      bytes: bytesForBest,
+      extension: '.jpg',
+      contentType: 'image/jpeg',
+    );
+  }
+
+  @override
+  void close() {}
+}
+
+/// 按 lookup 的 AniDB id 给出不同封面 URL 的电影 provider（换身份 = 换封面）。
+class _CoverPerIdentityAniDbProvider implements VideoMetadataProvider {
+  @override
+  VideoMetadataProviderKind get providerKind => VideoMetadataProviderKind.anidb;
+
+  @override
+  bool get isAvailable => true;
+
+  @override
+  Future<List<VideoMetadataWork>> search(
+    VideoMetadataSearchRequest request,
+  ) async =>
+      const <VideoMetadataWork>[];
+
+  @override
+  Future<VideoMetadataWork?> fetchWork(VideoMetadataLookup lookup) async =>
+      VideoMetadataWork(
+        provider: providerKind,
+        kind: VideoMetadataMediaKind.movie,
+        title: 'Work ${lookup.externalId}',
+        year: 2018,
+        ids: <VideoMetadataId>[
+          VideoMetadataId(
+            type: 'anidb',
+            value: lookup.externalId,
+            isDefault: true,
+          ),
+        ],
+        images: <VideoMetadataImage>[
+          VideoMetadataImage(
+            kind: VideoMetadataImageKind.cover,
+            url: 'https://images.test/${lookup.externalId}.jpg',
+            provider: providerKind,
+          ),
+        ],
+      );
+
+  @override
+  Future<List<VideoMetadataSeason>> fetchSeasons(
+    VideoMetadataLookup lookup,
+  ) async =>
+      const <VideoMetadataSeason>[];
+
+  @override
+  Future<List<VideoMetadataEpisode>> fetchEpisodes(
+    VideoMetadataLookup lookup, {
+    required int seasonNumber,
+  }) async =>
+      const <VideoMetadataEpisode>[];
+
+  @override
+  void close() {}
+}
+
+/// 把 URL 本身当图片字节回显，便于断言落盘的是哪一张。
+class _UrlEchoAssetDownloader extends VideoMetadataAssetDownloader {
+  @override
+  Future<VideoMetadataDownloadedAsset> download(String url) async =>
+      VideoMetadataDownloadedAsset(
+        bytes: Uint8List.fromList(utf8.encode('IMG $url')),
+        extension: '.jpg',
+        contentType: 'image/jpeg',
+      );
+
+  @override
+  void close() {}
+}

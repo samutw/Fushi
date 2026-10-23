@@ -1,0 +1,460 @@
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
+
+import 'package:fushi/src/lookup/gal_attached_text_controller.dart';
+import 'package:fushi/src/mining/gal_audio_tracks_panel.dart';
+import 'package:fushi/src/mining/gal_hook_session_controller.dart';
+import 'package:fushi/src/mining/galgame_audio_source.dart';
+import 'package:fushi/src/pages/implementations/game_shared.dart';
+import 'package:fushi/src/sync/texthooker_service.dart';
+import 'package:fushi/src/utils/components/fushi_staggered_entrance.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi/src/utils/misc/desktop_audio_playback.dart';
+import 'package:fushi/utils.dart';
+
+typedef GalTextThreadSelector = Future<bool> Function(
+  TexthookerTextThread thread,
+);
+
+/// 本弹窗**被系统自动关闭**时的原因，作为路由返回值交给调用方。
+///
+/// 只有一种值：给「点击风险确认」让位。它必须与「用户自己关掉」区分开——
+/// 调用方用 `_captureSetupShownForSession` 记「本会话已提示过」，那个标记的唯一
+/// 用途就是让用户主动关掉后不再被每来一行台词就弹一次（选中线程有自己的判据，
+/// 不靠这个标记）。让位不是用户的意思，标记必须回滚，否则风险确认完之后
+/// 捕获设置本会话再也不会出现。
+enum GalCaptureSetupOutcome { yieldedToRiskConsent }
+
+/// 游戏启动/附着后首次出现候选线程时的捕获设置大弹窗。
+///
+/// 左侧先选台词线程，右侧明确区分「音频采集源已就绪」与「本句已有音频」；引擎 PCM
+/// 模式还可在同一处试听、选语音轨和排除 BGM。选中线程后自动关闭，也保留显式关闭。
+class GalCaptureSetupDialog extends StatefulWidget {
+  const GalCaptureSetupDialog({
+    required this.session,
+    required this.onSelectThread,
+    required this.attachedText,
+    super.key,
+  });
+
+  final GalHookSessionController session;
+  final GalTextThreadSelector onSelectThread;
+  final GalAttachedTextController attachedText;
+
+  @override
+  State<GalCaptureSetupDialog> createState() => _GalCaptureSetupDialogState();
+}
+
+class _GalCaptureSetupDialogState extends State<GalCaptureSetupDialog> {
+  String? _selectingThreadKey;
+  int? _previewingSourcePtr;
+  Timer? _previewResetTimer;
+  Future<void> _previewQueue = Future<void>.value();
+  int _previewGeneration = 0;
+  bool _autoCloseScheduled = false;
+  bool _dismissRequested = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(widget.session.refreshAudioTracks());
+  }
+
+  @override
+  void dispose() {
+    _previewGeneration++;
+    _previewResetTimer?.cancel();
+    unawaited(DesktopAudioPlayback.stop());
+    super.dispose();
+  }
+
+  Future<void> _selectThread(TexthookerTextThread thread) async {
+    if (_selectingThreadKey != null) return;
+    setState(() => _selectingThreadKey = thread.key);
+    final bool selected = await widget.onSelectThread(thread);
+    if (!mounted) return;
+    if (selected) {
+      _dismissOnce(yieldingToRiskConsent: false);
+      return;
+    }
+    setState(() => _selectingThreadKey = null);
+  }
+
+  void _requestPreview(GalAudioTrack track) {
+    final int generation = ++_previewGeneration;
+    _previewQueue = _previewQueue.then(
+      (_) => _togglePreview(track, generation),
+    );
+    unawaited(_previewQueue);
+  }
+
+  Future<void> _togglePreview(GalAudioTrack track, int generation) async {
+    if (!mounted || generation != _previewGeneration) return;
+    if (_previewingSourcePtr == track.sourcePtr) {
+      _previewResetTimer?.cancel();
+      setState(() => _previewingSourcePtr = null);
+      await DesktopAudioPlayback.stop();
+      return;
+    }
+    final GalTrackPreview? preview =
+        await widget.session.exportTrackPreview(track.sourcePtr);
+    if (!mounted || generation != _previewGeneration) return;
+    if (preview == null) {
+      FushiToast.show(msg: t.game_track_preview_failed);
+      return;
+    }
+    final bool started = await DesktopAudioPlayback.playFile(preview.filePath);
+    if (!mounted) return;
+    if (generation != _previewGeneration) {
+      await DesktopAudioPlayback.stop();
+      return;
+    }
+    if (!started) {
+      FushiToast.show(msg: t.game_track_preview_failed);
+      return;
+    }
+    _previewResetTimer?.cancel();
+    setState(() => _previewingSourcePtr = track.sourcePtr);
+    _previewResetTimer = Timer(
+      Duration(milliseconds: preview.durationMs + 300),
+      () {
+        if (mounted) setState(() => _previewingSourcePtr = null);
+      },
+    );
+  }
+
+  void _scheduleAutoClose({required bool yieldingToRiskConsent}) {
+    if (_autoCloseScheduled || _dismissRequested) return;
+    _autoCloseScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _autoCloseScheduled = false;
+      if (mounted) _dismissOnce(yieldingToRiskConsent: yieldingToRiskConsent);
+    });
+  }
+
+  void _dismissOnce({required bool yieldingToRiskConsent}) {
+    if (_dismissRequested) return;
+    final ModalRoute<dynamic>? route = ModalRoute.of(context);
+    // Barrier/Escape may already have started popping this DialogRoute while
+    // the State is still mounted. Never let the queued auto-close pop the
+    // workbench route that has become current underneath it.
+    if (route == null || !route.isCurrent) return;
+    _dismissRequested = true;
+    Navigator.of(context).maybePop(
+      yieldingToRiskConsent
+          ? GalCaptureSetupOutcome.yieldedToRiskConsent
+          : null,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final Size screen = MediaQuery.sizeOf(context);
+    final double dialogHeight = (screen.height * 0.72).clamp(420.0, 680.0);
+    // BUG-1474：宽度原先是硬编码 900。AlertDialog 默认 insetPadding 左右各 40，
+    // 窗口宽 < 980 时那个 900 会被父约束挤压，两栏跟着变窄、线程标题被吃掉。
+    // 按可用宽度收口：想要 900，但绝不超过实际能给的宽度。
+    final double dialogWidth = (screen.width - 80).clamp(320.0, 900.0);
+    return FushiAlertDialog(
+      title: Text(t.game_capture_setup_title),
+      content: SizedBox(
+        width: dialogWidth,
+        height: dialogHeight,
+        child: ListenableBuilder(
+          listenable: Listenable.merge(<Listenable>[
+            widget.session,
+            widget.attachedText,
+          ]),
+          builder: (BuildContext context, Widget? child) {
+            // 选中线程是用户自己的动作，弹窗该让位并且**不**回滚「本会话已提示
+            // 过」的标记。
+            //
+            // 这里原本还有第二条腿：`needsUnsafeRiskAcceptance` 为真时也自动关，
+            // 好让游戏窗盖住本弹窗时用户仍能够到工具条上的「确认点击风险」。
+            // BUG-2154 把那道门整个去掉之后（风险恒定接受），它恒为假、这条腿
+            // 恒不可达 —— 留着只会让「弹窗会不会自己关」多一个永远不成立的答案。
+            // `yieldingToRiskConsent` 参数本身保留：它是 _scheduleAutoClose 的
+            // 回滚语义，门若哪天按引擎重开，接回来只是一个 else-if。
+            if (widget.session.selectedTextThreadKey != null) {
+              _scheduleAutoClose(yieldingToRiskConsent: false);
+            }
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Text(
+                  t.game_capture_setup_hint,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
+                const SizedBox(height: 16),
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (BuildContext context, BoxConstraints box) {
+                      final Widget threads = _buildThreadPane(context);
+                      final Widget audio = _buildAudioPane(context);
+                      if (box.maxWidth >= 760) {
+                        return Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: <Widget>[
+                            Expanded(flex: 6, child: threads),
+                            const SizedBox(width: 12),
+                            Expanded(flex: 5, child: audio),
+                          ],
+                        );
+                      }
+                      return Column(
+                        children: <Widget>[
+                          Expanded(flex: 6, child: threads),
+                          const SizedBox(height: 12),
+                          Expanded(flex: 5, child: audio),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+      actions: <Widget>[
+        FushiTextButton(
+          onPressed: () => _dismissOnce(yieldingToRiskConsent: false),
+          child: Text(t.dialog_close),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildThreadPane(BuildContext context) {
+    final List<TexthookerTextThread> threads = widget.session.textThreads;
+    final Map<String, String> labels = assignThreadDisplayLabels(threads);
+    final bool glass = isGlassDesign(context);
+    // M3E：外框是 surface 底的描边卡，候选线程是一组分段行（组首尾大圆角、
+    // 内侧小圆角、悬停 / 按下形变）；外框若是填充卡，分段与外框同色看不出缝。
+    return FushiCard(
+      padding: EdgeInsets.zero,
+      variant: glass ? FushiCardVariant.filled : FushiCardVariant.outlined,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _PaneHeader(
+            icon: FushiIcons.textFields,
+            title: t.game_text_thread,
+            trailing: threads.isEmpty
+                ? null
+                : Text(
+                    '${threads.length}',
+                    style: context.fushiType.labelLarge.tabular,
+                  ),
+          ),
+          Expanded(
+            child: threads.isEmpty
+                // 还没有候选线程：M3E 空态（色块图标弹入），不是一行孤零零的灰字。
+                // BUG-3026：线程栏在常见桌面窗口（1400×900）里只剩百来像素高，
+                // 72px 色块 + 标题的空态放不下会溢出；放得下时照常居中，放不下
+                // 时改为可滚动，不裁、不溢出。
+                ? LayoutBuilder(
+                    builder:
+                        (BuildContext context, BoxConstraints constraints) =>
+                            SingleChildScrollView(
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  minHeight: constraints.maxHeight,
+                                ),
+                                child: FushiPlaceholderMessage(
+                                  icon: FushiIcons.pending,
+                                  message: t.game_waiting_for_text,
+                                ),
+                              ),
+                            ),
+                  )
+                : FushiEntranceScope(
+                    child: ListView.builder(
+                    padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                    itemCount: threads.length,
+                    itemBuilder: fushiStaggeredItemBuilder((
+                      BuildContext context,
+                      int index,
+                    ) {
+                      final TexthookerTextThread thread = threads[index];
+                      final bool selecting = _selectingThreadKey == thread.key;
+                      return FushiGroupedListItem(
+                        index: index,
+                        count: threads.length,
+                        selected: selecting,
+                        child: FushiListItem(
+                        leading: const FushiListLeadingIcon(
+                          Icons.forum_outlined,
+                        ),
+                        // BUG-1474：线程 label 形如 `TextRender · 0x459f50 · #1a2b`，
+                        // 默认单行必被切。这里父容器（ListView 行）高度自由，
+                        // 按 BUG-1184 的规矩逐调用点放宽是安全的。
+                        titleMaxLines: 2,
+                        title: Text(
+                          '${labels[thread.key] ?? thread.label} · '
+                          '${thread.observedLineCount}',
+                        ),
+                        subtitle: Text(
+                          texthookerThreadSubtitle(
+                                audioLineCount: thread.audioLineCount,
+                                latestText: thread.displayPreviewText,
+                                // BUG-1474：一句话（常是「……」或人名）分辨不出
+                                // 这条是不是正文流；给最近 3 句。
+                                recentTexts: thread.recentPreviewTexts,
+                                audioLabel: t.game_text_thread_audio_count(
+                                  count: thread.audioLineCount,
+                                ),
+                                // BUG-2112：伪影线程折叠后像干净整句，必须明示。
+                                artifactLabel: thread.isArtifactDominated
+                                    ? t.game_text_thread_artifact_hint
+                                    : null,
+                              ) ??
+                              t.game_waiting_for_text,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        trailing: selecting
+                            ? const SizedBox.square(
+                                dimension: 24,
+                                child: FushiCircularProgressIndicator(),
+                              )
+                            : const FushiIcon(Icons.chevron_right),
+                        onTap: selecting
+                            ? null
+                            : () => unawaited(_selectThread(thread)),
+                        ),
+                      );
+                    }),
+                  ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAudioPane(BuildContext context) {
+    final GalHookSessionState state = widget.session.state;
+    final String source = galHookAudioBackendLabel(state.audioBackend);
+    final String? format = state.audioFormat == null
+        ? null
+        : '${state.audioFormat!.sampleRate} Hz · '
+            '${state.audioFormat!.channels} ch · '
+            '${state.audioFormat!.bitsPerSample} bit';
+    return FushiCard(
+      padding: EdgeInsets.zero,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          _PaneHeader(icon: FushiIcons.audio, title: t.game_audio_tracks),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  _AudioSourceSummary(source: source, format: format),
+                  const SizedBox(height: 12),
+                  Text(
+                    t.game_audio_requires_thread,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
+                  ),
+                  const SizedBox(height: 8),
+                  GalAudioTracksPanel(
+                    state: state,
+                    onSelectVoice: widget.session.selectVoiceTrack,
+                    onToggleExcluded: widget.session.setTrackExcluded,
+                    onPreviewTrack: _requestPreview,
+                    previewingSourcePtr: _previewingSourcePtr,
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _AudioSourceSummary extends StatelessWidget {
+  const _AudioSourceSummary({required this.source, required this.format});
+
+  final String source;
+  final String? format;
+
+  @override
+  Widget build(BuildContext context) {
+    // M3E 饱和色块：音频采集源是这一栏的「结论」，与下面的逐轨列表分开。
+    final Color? foreground = fushiCardToneColors(
+      context,
+      FushiCardTone.secondary,
+    )?.onContainer;
+    final FushiTypography type = context.fushiType;
+    return FushiCard(
+      tone: FushiCardTone.secondary,
+      padding: const EdgeInsets.fromLTRB(12, 12, 14, 12),
+      child: Row(
+        children: <Widget>[
+          const FushiListLeadingIcon(
+            Icons.graphic_eq_outlined,
+            tone: FushiCardTone.primary,
+            size: 40,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  source,
+                  style: type.titleSmallEmphasized.copyWith(color: foreground),
+                ),
+                if (format != null)
+                  Text(
+                    format!,
+                    style: type.bodySmall.tabular.copyWith(color: foreground),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 两栏各自的栏头：M3E 方圆角色块图标 + emphasized 标题（+ 可选尾部计数）。
+class _PaneHeader extends StatelessWidget {
+  const _PaneHeader({required this.icon, required this.title, this.trailing});
+
+  final IconData icon;
+  final String title;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 12, 16, 10),
+      child: Row(
+        children: <Widget>[
+          FushiListLeadingIcon(
+            icon,
+            shape: FushiLeadingShape.square,
+            size: 36,
+            iconSize: 20,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(title, style: context.fushiType.titleMediumEmphasized),
+          ),
+          if (trailing != null) trailing!,
+        ],
+      ),
+    );
+  }
+}

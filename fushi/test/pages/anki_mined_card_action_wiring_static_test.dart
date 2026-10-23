@@ -1,0 +1,244 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+import '../helpers/source_guard.dart';
+
+/// TODO-1007/1008：「点 ✓ 弹操作选择（覆写/新增重复卡/查看·在 Anki 中打开）」可达性
+/// 链路的源码守卫。锁住 minedCardAction 在 popup.js → webview → layer → 两条宿主车道
+/// （mixin / base_source_page）全程接线，避免任一层漏接导致点 ✓ 又回到「静默无反应」。
+void main() {
+  String read(String relativePath) {
+    final file = File(relativePath);
+    expect(file.existsSync(), isTrue, reason: 'missing $relativePath');
+    return file.readAsStringSync();
+  }
+
+  test('popup.js: clicking a mined ✓ invokes the host minedCardAction handler',
+      () {
+    final src = read('assets/popup/popup.js');
+    // The ✓ click (mined, not latest) must hand off to the host, not silently
+    // return.
+    expect(src.contains('async function minedCardAction('), isTrue);
+    expect(src.contains("callHandler('minedCardAction', fields)"), isTrue);
+    // BUG-1064：宿主自带原生对话框时（app 内）仍然必须把点击交给 minedCardAction。
+    // 这一支现在写在三元里（另一支是 app 外的页内面板），所以钉调用本身而不是旧的
+    // `const reply = await ...` 行形。
+    expect(src.contains('parseMineResult(await minedCardAction('), isTrue,
+        reason: 'the dataset.mined branch must still call minedCardAction '
+            'when the host has a native dialog');
+    expect(src.contains('hasNativeMinedCardAction()'), isTrue,
+        reason: 'the two lanes must be selected by the host capability flag');
+  });
+
+  /// BUG-1064：app 外表面（Windows 裸 WebView2 剪贴板面板 / 瞬态查词窗、浏览器扩展）
+  /// 没有 Flutter 层可以呈现这个对话框，它们的 minedCardAction 只会被立刻解析成 null。
+  /// 旧代码把 null 当「宿主已处理」→ 点已制卡的 ✓ 完全没反应。这一组钉死替代车道：
+  /// popup.js 自己画页内面板，数据走两根新 deferred 桥，动作复用 updateEntry/mineEntry。
+  group('BUG-1064 app 外点 ✓ 走页内面板（不得再静默）', () {
+    test('popup.js 有页内面板与它的两根数据桥', () {
+      final src = read('assets/popup/popup.js');
+      expect(src.contains('function showMinedCardActionPanel('), isTrue);
+      expect(src.contains('async function runInPageMinedCardAction('), isTrue);
+      expect(src.contains("'findMinedMatches'"), isTrue,
+          reason: '命中列表必须来自宿主真值（repo.findMatchingNotes）');
+      expect(src.contains("'openMinedNote'"), isTrue);
+      // 覆写/新增必须复用既有两根桥，不得新开写路径。
+      expect(src.contains("if (choice.action === 'overwrite')"), isTrue);
+      expect(src.contains('await updateEntry('), isTrue);
+      expect(src.contains("if (choice.action === 'duplicate')"), isTrue);
+      expect(src.contains('await mineEntry('), isTrue);
+      // 面板里产生原生选区会被 selection.js 当成查词，必须禁选。
+      final css = read('assets/popup/popup.css');
+      expect(css.contains('.mined-action-panel'), isTrue);
+      expect(css.contains('.mined-action-backdrop'), isTrue);
+      expect(css.contains('user-select: none'), isTrue);
+      expect(css.contains('html.mined-action-open'), isTrue,
+          reason: '瞬态窗高度按内容收缩，面板打开期间必须撑最小高度否则被裁');
+    });
+
+    test('BUG-2051 ↗「在 Anki 中打开」只有一条车道，且判据与 ✓ 同源', () {
+      final src = read('assets/popup/popup.js');
+      // 不再按宿主能力分流：app 内外都走同一根 openInAnki 桥。旧实现的页内车道
+      // （先 findMinedMatches 按字段名反查、再 openMinedNote 按 id 打开）与画 ✓ 的
+      // 判据不同源，跨笔记类型的重复卡永远查不到 → ✓ 说已制卡、↗ 说没有卡。
+      expect(src.contains('async function openWordInAnki('), isTrue);
+      expect(
+          src.contains(
+              'await openWordInAnki(openAnkiButton, expression, reading)'),
+          isTrue,
+          reason: '↗ 点击必须无条件走宿主桥');
+      expect(src.contains('runInPageOpenInAnki'), isFalse,
+          reason: '页内反查车道必须整条删除，否则第二条判据又活了');
+      expect(src.contains('openOnly'), isFalse,
+          reason: '面板的「只列卡片+打开」形态随页内车道一起删除');
+      // 三态：宿主回 'opened' 静默，'noMatch'/其它各说各的（app 外没有 toast）。
+      expect(src.contains("if (outcome === 'opened') return;"), isTrue);
+      expect(src.contains("outcome === 'noMatch'"), isTrue);
+      expect(src.contains('function showInlineHint('), isTrue,
+          reason: 'app 外没有 toast，结果必须就地提示而不是静默');
+      final css = read('assets/popup/popup.css');
+      expect(css.contains('.inline-hint'), isTrue);
+    });
+
+    test('BUG-2051 Dart 两条车道都调同一个仓库方法', () {
+      final overlay = read('lib/src/lookup/overlay_bridge_handlers.dart');
+      expect(overlay.contains("case 'openInAnki':"), isTrue);
+      expect(
+          overlay.contains('repo.openWordInAnki(expression, reading)'), isTrue);
+      // app 内车道（webview handler → 两个页面 mixin）走同一个方法。
+      final webview =
+          read('lib/src/pages/implementations/dictionary_popup_webview.dart');
+      expect(webview.contains("handlerName: 'openInAnki'"), isTrue);
+      expect(webview.contains('return outcome.name;'), isTrue,
+          reason: '结局必须回传给 popup.js，否则弹窗无从提示');
+      for (final String path in <String>[
+        'lib/src/pages/implementations/dictionary_page_mixin.dart',
+        'lib/src/pages/base_source_page.dart',
+      ]) {
+        expect(read(path).contains('repo.openWordInAnki(expression, reading)'),
+            isTrue,
+            reason: '$path 必须走同一个仓库方法');
+      }
+    });
+    test('C++ 把两根新桥列入 DEFERRED（minedCardAction 仍保持即时 null）', () {
+      final cpp = read('windows/runner/global_lookup_window.cpp');
+      expect(cpp.contains('body.find("\\"findMinedMatches\\"")'), isTrue);
+      expect(cpp.contains('body.find("\\"openMinedNote\\"")'), isTrue);
+      // BUG-2051：↗ 现在也要真答复。漏了它，app 外的 ↗ 会被原生立刻解析成 null，
+      // popup.js 读成「宿主没接这根桥」→ 只剩一句「无法在 Anki 中打开」。
+      expect(cpp.contains('body.find("\\"openInAnki\\"")'), isTrue);
+      expect(cpp.contains('body.find("\\"minedCardAction\\"")'), isFalse,
+          reason: 'minedCardAction 是 Flutter 对话框，app 外无法呈现，'
+              '仍然不得纳入 deferred——替代方案是 popup.js 的页内面板');
+    });
+
+    test('Dart 侧解析两根新桥（复用 repo 的既有查找/打开）', () {
+      final src = read('lib/src/lookup/overlay_bridge_handlers.dart');
+      expect(src.contains("case 'findMinedMatches':"), isTrue);
+      expect(src.contains("case 'openMinedNote':"), isTrue);
+      expect(
+          src.contains('repo.findMatchingNotes(expression, reading)'), isTrue);
+      expect(src.contains('repo.openNoteInAnki(noteId)'), isTrue);
+    });
+
+    test('注入把「宿主有没有原生对话框」告诉 popup.js', () {
+      final src =
+          read('lib/src/pages/implementations/popup_settings_injection.dart');
+      expect(
+          src.contains(
+              'window.__fushiMinedCardActionNative = \${!options.globalLookup};'),
+          isTrue,
+          reason: 'app 外（globalLookup）恒 false → 页内面板；'
+              'app 内恒 true → Flutter 对话框');
+    });
+  });
+
+  test('dictionary_popup_webview.dart registers the minedCardAction JS handler',
+      () {
+    final src =
+        read('lib/src/pages/implementations/dictionary_popup_webview.dart');
+    expect(src.contains("handlerName: 'minedCardAction'"), isTrue);
+    expect(src.contains('widget.onMinedCardAction!'), isTrue);
+    expect(
+        src.contains(
+            'Future<MinePopupResult> Function(Map<String, String> fields)?\n      onMinedCardAction'),
+        isTrue,
+        reason: 'onMinedCardAction field must be declared on the webview');
+  });
+
+  test('dictionary_popup_layer.dart threads onMinedCardAction to the webview',
+      () {
+    final src =
+        read('lib/src/pages/implementations/dictionary_popup_layer.dart');
+    expect(src.contains('this.onMinedCardAction'), isTrue);
+    expect(src.contains('onMinedCardAction: onMinedCardAction'), isTrue);
+  });
+
+  test('both host lanes provide onMinedCardAction and wire it into the layer',
+      () {
+    final mixin =
+        read('lib/src/pages/implementations/dictionary_page_mixin.dart');
+    expect(
+        mixin.contains(
+            'Future<MinePopupResult> onMinedCardAction(Map<String, String> fields)'),
+        isTrue);
+    expect(mixin.contains('onMinedCardAction: onMinedCardAction'), isTrue);
+    expect(mixin.contains('runAnkiMinedCardAction('), isTrue);
+
+    final base = read('lib/src/pages/base_source_page.dart');
+    expect(base.contains('Future<MinePopupResult> onMinedCardActionFromPopup('),
+        isTrue);
+    // 钉不变式而不是某一种写法：制卡模块关掉时这条接线变成
+    // `onMinedCardAction: cardCreationEnabled ? onMinedCardActionFromPopup : null`
+    // 并换了行，接线本身没断。写死整串实参会让这类合法改动无辜变红。
+    expect(
+      RegExp(r'onMinedCardAction:[\s\S]{0,120}?onMinedCardActionFromPopup')
+          .hasMatch(base),
+      isTrue,
+      reason: 'host lane 必须把 onMinedCardActionFromPopup 接进弹窗层（允许模块闸）',
+    );
+    expect(base.contains('runAnkiMinedCardAction('), isTrue);
+  });
+
+  // BUG-2605：mineNew 只在用户已被告知「卡已有」并选择继续后才会被调（「新增为重复卡」
+  // / AnkiMobile「再加一张」/ 反查为空后重制）。两条车道构造它时必须给请求拍上
+  // AnkiMiningPayload.withAllowDuplicate，否则三个后端的 addNote 仍按全局 allowDupes
+  // （默认关）把这一次判成重复拒掉——用户报「手动选了新增，Fushi 还是说重复不导出」。
+  test('both host lanes mark the mineNew request as an explicit duplicate add',
+      () {
+    final RegExp marked = RegExp(
+      r'mineNew: \(\) async \{[\s\S]{0,200}?AnkiMiningPayload\.withAllowDuplicate\(fields\)',
+    );
+    expect(
+      marked.hasMatch(
+        read('lib/src/pages/implementations/dictionary_page_mixin.dart'),
+      ),
+      isTrue,
+      reason: 'dictionary_page_mixin 的 mineNew 必须带 withAllowDuplicate',
+    );
+    expect(
+      marked.hasMatch(read('lib/src/pages/base_source_page.dart')),
+      isTrue,
+      reason: 'base_source_page 的 mineNew 必须带 withAllowDuplicate',
+    );
+  });
+
+  test('action sheet orchestrator falls back to mineNew when nothing matches',
+      () {
+    final src = read('lib/src/anki/anki_mined_card_action_sheet.dart');
+    expect(
+        src.contains('Future<AnkiCardMutationResult> runAnkiMinedCardAction('),
+        isTrue);
+    // No matches (card deleted since detection) -> mine fresh, never silent.
+    expect(src.contains('if (matches.isEmpty)'), isTrue);
+    expect(src.contains('return mineNew();'), isTrue);
+    // The viewer offers overwrite + open-in-Anki.
+    expect(src.contains('showAnkiNoteViewer'), isTrue);
+    expect(src.contains('openNoteInAnki'), isTrue);
+  });
+
+  // TODO-1007 健壮性守卫：每一处 await 宿主回调都必须被 try/catch 包裹，catch 内复位
+  // _busy 并给用户反馈，否则宿主网络/平台通道抛错时 action sheet 卡在进度条无反应。
+  test('mineNew/overwrite await 每处都被 try/catch 包裹且 catch 内复位 _busy + 反馈', () {
+    final src = read('lib/src/anki/anki_mined_card_action_sheet.dart');
+    // 五处 await 宿主回调：_runMineNew / _runOverwrite /
+    // _AnkiNoteViewerDialogState._overwrite，加上「回读不了 Anki 的后端」裁决框的
+    // _UnverifiedMinedCardDialogState._runMineNew / ._runForget（AnkiMobile 车道）。
+    expect(
+      'try {'.allMatches(src).length,
+      greaterThanOrEqualTo(5),
+      reason: '每处宿主回调 await 必须各有 try',
+    );
+    // catch 块固定形态：复位 _busy（避免卡死）+ 弹失败反馈。每处都必须出现这条收口。
+    final String catchReset = compactCode('setState(() => _busy = false); '
+        'FushiToast.show(msg: t.anki_card_action_failed,');
+    expect(
+      catchReset.allMatches(compactCode(src)).length,
+      5,
+      reason: '五处 catch 必须复位 _busy 并弹 anki_card_action_failed 反馈',
+    );
+    // 失败分支早返回，不得继续走成功的 Navigator.pop。
+    expect(src.contains('} catch (e) {'), isTrue);
+  });
+}

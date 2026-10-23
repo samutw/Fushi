@@ -1,0 +1,49 @@
+import 'package:fushi/src/stats/stat_window.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+// 统计来源标识 kStatSourceBook / kStatSourceVideo（命名统一 Phase 3.4）已挪进
+// fushi_core 的 stat_source_kind.dart（同枚举 StatSourceKind）——它们是 schema
+// 值域的一部分且写入点跨层。本文件只保留分桶/日期键等纯函数。
+
+/// 把按日期分布的活动计数分桶到「今日 / 本周 / 本月 / 全部」。
+///
+/// 阅读统计与视频统计共用：收藏词条（每条 count=1）和制卡计数（每行已聚合的
+/// count）都经此分桶，与 [computeVideoStats] 里完成数的区间判定保持同一套阈值。
+class StatActivityBuckets {
+  int today = 0;
+  int week = 0;
+  int month = 0;
+  int all = 0;
+}
+
+/// 统计行 dateKey 的权威格式器：形如 `2026-06-07`（零填充月/日，可字典序比较），
+/// 与 DB 里 reading_statistics / mining_statistics / favorite_words 的 dateKey 同格式。
+/// P4 写侧收敛：委托 [FushiDatabase.statDateKeyOf]（复合入口在 DB 层派生 dateKey
+/// 的同一实现），收藏/查词记账、活动分桶共用，避免各调用点各写一遍。
+String statDateKey(DateTime d) => FushiDatabase.statDateKeyOf(d);
+
+/// 「今天」的统计 dateKey（按本地时区当天）。记账写入（[addMiningCount] 等）取此值。
+String statTodayKey() => statDateKey(DateTime.now());
+
+/// [now] 所属统计日的日历日（本地 0 点）：先按可配重置时刻取 dateKey 再还原成日期。
+/// 热力图等按「日历日」摆格子的地方用它当今日，不得用 `DateTime(y, m, d)` 合成午夜
+/// （重置时刻 = 4 点时凌晨 2 点仍属昨日）。
+DateTime statTodayDay(DateTime now) =>
+    FushiDatabase.statDateKeyToDay(statDateKey(now));
+
+/// 纯函数：把 (dateKey, count) 事件按 [now] 的今日/本周/本月/全部窗口累加。
+/// 窗口阈值只来自 [StatWindow]（v92：近 7 天恰 7 天、近 30 天恰 30 天）。
+StatActivityBuckets bucketActivityByDateKey(
+  Iterable<(String dateKey, int count)> events,
+  DateTime now,
+) {
+  final StatActivityBuckets b = StatActivityBuckets();
+  final StatWindow w = StatWindow(now);
+  for (final (String dateKey, int count) in events) {
+    b.all += count;
+    if (w.isToday(dateKey)) b.today += count;
+    if (w.inWeek(dateKey)) b.week += count;
+    if (w.inMonth(dateKey)) b.month += count;
+  }
+  return b;
+}

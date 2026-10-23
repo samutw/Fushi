@@ -1,0 +1,230 @@
+import 'dart:io';
+
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:fushi/models.dart';
+import 'package:fushi/src/focus/fushi_focus_controller.dart';
+import 'package:fushi/src/mining/galgame_library.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/games_library_page.dart';
+import 'package:fushi/src/pages/implementations/media_item_dialog_page.dart'
+    show MediaItemDialogFrame;
+import 'package:fushi/src/utils/misc/reveal_in_file_manager.dart'
+    show currentRevealHost;
+import 'package:fushi/utils.dart';
+
+import '../helpers/test_platform_services.dart';
+
+/// 游戏卡封面入口守卫：视频/合集早就能自定义封面，游戏库过去只有「重命名 / 移除」，
+/// `GalgameEntry.coverPath` 字段无人写 → 每张卡永远是默认手柄图标。
+///
+/// 本测试钉住两条：
+/// 1. 卡片溢出菜单与长按/右键菜单**都**含「设置封面」「自动获取封面」（两处菜单
+///    共用同一份 `_menuItems`，任一处漏项都会红）；
+/// 2. 有 coverPath 且文件真实存在时，卡片渲染的是 [Image]（封面），而不是占位图标。
+void main() {
+  setUp(() {
+    LocaleSettings.setLocale(AppLocale.en);
+    SharedPreferences.setMockInitialValues(<String, Object>{});
+  });
+
+  Future<AppModel> buildModel(List<GalgameEntry> games) async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(db.close);
+    final PreferencesRepository prefsRepo = PreferencesRepository(db);
+    await prefsRepo.loadFromDb();
+    final Directory tmpDir =
+        Directory.systemTemp.createTempSync('fushi_game_cover_menu_');
+    addTearDown(() {
+      try {
+        tmpDir.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+    final AppModel appModel = AppModel(testPlatformServices())
+      ..wireLocalAudioForTesting(
+          prefsRepo: prefsRepo, databaseDirectory: tmpDir)
+      // v54：游戏库真相源是 Drift 表，仓储绑 AppModel.database，测试必须注入。
+      ..wireDatabaseForTesting(db);
+    await appModel.setGalgames(games);
+    return appModel;
+  }
+
+  Future<void> pumpPage(WidgetTester tester, AppModel appModel) async {
+    final GlobalKey<NavigatorState> navKey = GlobalKey<NavigatorState>();
+    FushiToast.navigatorKey = navKey;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: <Override>[appProvider.overrideWith((_) => appModel)],
+        child: TranslationProvider(
+          child: MaterialApp(
+            navigatorKey: navKey,
+            home: const FushiFocusRoot(child: GamesLibraryPage()),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+  }
+
+  /// 卡片菜单应含的全部项，**按三库页统一次序**（重命名 → 封面类 → 刮削 →
+  /// 加入合集 → 标签 → 删除；游戏特有的详情/状态保持最前）。与
+  /// `_GameCard._menuItems` 单一真相源对账：漏项或乱序本表即断言失败。
+  /// 'remove' 在长按对话框落危险区，但文案仍必须在场。
+  ///
+  /// 「窗口超分 · <当前档>」是 Windows-only（galgame hook 与 Magpie 都只做 Windows），
+  /// 所以两个分支都要断言：Windows 上必须在场，非 Windows 上必须不在场——后者正是
+  /// Linux CI 会跑到的分支，它守的是「平台门没被顺手删掉」。
+  List<String> menuLabels() => <String>[
+        t.game_view_detail,
+        t.game_play_status,
+        t.media_stats_action,
+        t.game_rename,
+        t.game_set_cover,
+        t.game_auto_cover,
+        t.game_scrape,
+        t.add_to_collection,
+        t.tag_label,
+        // 内容语言（内容字体链）：决定这个游戏的 hook 文本 / 查词卡词头用哪条字体
+        // 链。hook 文本没有任何语言声明可读，用户指定是它唯一的真值来源，所以与
+        // 标签同属「每游戏配置」，紧随其后。
+        t.book_language_action,
+        if (Platform.isWindows) '${t.game_upscaling} · ${t.game_upscaling_off}',
+        // BUG-1477：每游戏「日语区域（转区）」档，与超分同为「启动期配置」，
+        // 故紧邻它排在删除之前。未设过的游戏显示默认档——BUG-2253 起默认档是
+        // `off` 而不再是 `auto`（判错的代价不对称：该转没转只是乱码、用户看得见
+        // 且能来这个菜单改；不该转却转了会让汉化版直接闪退），于是这一行与紧邻的
+        // 超分行同形，两个「启动期配置」默认都不替用户动游戏的启动方式。
+        if (Platform.isWindows)
+          '${t.game_japanese_locale} · ${t.game_japanese_locale_off}',
+        // 「打开文件位置」：与书架书卡 / 视频卡同一条动作、同一份文案。门控是
+        // 「有没有文件管理器契约」（桌面恒有，移动端恒无），不是 galgame 的 Windows
+        // 边界——flutter_test 宿主恒为桌面，故这里恒在场。
+        if (currentRevealHost() != null) t.media_file_location_open,
+        t.game_remove,
+      ];
+
+  testWidgets('溢出菜单项齐全（含设置封面 / 自动获取封面 / 加入合集）', (WidgetTester tester) async {
+    final AppModel appModel = await buildModel(<GalgameEntry>[
+      GalgameEntry(
+        id: 'g1',
+        name: 'テスト',
+        exePath: r'Z:\missing\game.exe',
+        workdir: r'Z:\missing',
+        addedAt: DateTime(2026),
+      ),
+    ]);
+    await pumpPage(tester, appModel);
+
+    // 设计系统包装 FushiPopupMenuButton 是 PopupMenuButton 的子类，byType 按
+    // 精确运行时类型匹配会漏掉它。
+    await tester.tap(
+        find.byWidgetPredicate((Widget w) => w is PopupMenuButton<String>));
+    await tester.pumpAndSettle();
+
+    // 限定在溢出菜单项内找：工具栏的「游玩状态」下拉 chip 与菜单项同文案，
+    // 全局 find.text 会把它也数进来。
+    for (final String label in menuLabels()) {
+      expect(
+        find.descendant(
+          of: find.byType(PopupMenuItem<String>),
+          matching: find.text(label),
+        ),
+        findsOneWidget,
+        reason: '溢出菜单缺「$label」',
+      );
+    }
+
+    // 次序也要钉住（统一约定：重命名 → 封面类 → 刮削 → 加入合集 → 标签 → 删除）。
+    final List<String> shown = tester
+        .widgetList<PopupMenuItem<String>>(find.byType(PopupMenuItem<String>))
+        .map((PopupMenuItem<String> item) => (item.child! as Text).data!)
+        .toList();
+    expect(shown, menuLabels(), reason: '溢出菜单次序偏离三库页统一约定');
+  });
+
+  testWidgets('长按菜单走 MediaItemDialogFrame 且与溢出菜单项一致',
+      (WidgetTester tester) async {
+    final AppModel appModel = await buildModel(<GalgameEntry>[
+      GalgameEntry(
+        id: 'g1',
+        name: 'テスト',
+        exePath: r'Z:\missing\game.exe',
+        workdir: r'Z:\missing',
+        addedAt: DateTime(2026),
+      ),
+    ]);
+    await pumpPage(tester, appModel);
+
+    await tester.longPress(find.text('テスト', skipOffstage: false).first);
+    await tester.pumpAndSettle();
+
+    // 与书/视频卡同款对话框骨架（不再是手搓 SimpleDialog）。
+    expect(find.byType(MediaItemDialogFrame), findsOneWidget);
+    for (final String label in menuLabels()) {
+      expect(
+        find.descendant(
+          of: find.byType(MediaItemDialogFrame),
+          matching: find.text(label),
+        ),
+        findsOneWidget,
+        reason: '长按菜单缺「$label」（须与溢出菜单同源同项）',
+      );
+    }
+  });
+
+  testWidgets('有封面文件时卡片渲染封面图而非占位图标', (WidgetTester tester) async {
+    final Directory dir =
+        Directory.systemTemp.createTempSync('fushi_game_cover_render_');
+    addTearDown(() {
+      try {
+        dir.deleteSync(recursive: true);
+      } catch (_) {}
+    });
+    // 1×1 PNG：只需要文件真实存在且能被 Image.file 拿到。
+    final File cover = File('${dir.path}${Platform.pathSeparator}g1.png')
+      ..writeAsBytesSync(_onePixelPng);
+
+    final AppModel appModel = await buildModel(<GalgameEntry>[
+      GalgameEntry(
+        id: 'g1',
+        name: 'テスト',
+        exePath: r'Z:\missing\game.exe',
+        workdir: r'Z:\missing',
+        coverPath: cover.path,
+        addedAt: DateTime(2026),
+      ),
+    ]);
+    await pumpPage(tester, appModel);
+
+    // 封面统一走 ShelfFileCover（BUG-959：resizedFileImage 降采样 + FadeInImage），
+    // 底层 provider 是 ResizeImage 包 FileImage——两层都断言，防退回裸 Image.file。
+    expect(
+      find.byWidgetPredicate(
+        (Widget w) =>
+            w is FadeInImage &&
+            w.image is ResizeImage &&
+            (w.image as ResizeImage).imageProvider is FileImage,
+      ),
+      findsOneWidget,
+      reason: 'coverPath 指向的文件存在时必须经降采样封面加载器渲染封面图',
+    );
+  });
+}
+
+/// 最小合法 PNG（1×1，透明）。
+final List<int> _onePixelPng = <int>[
+  0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
+  0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+  0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+  0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+  0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+  0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+  0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+  0x42, 0x60, 0x82,
+];

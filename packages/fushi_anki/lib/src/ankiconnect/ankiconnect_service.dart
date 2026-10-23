@@ -1,0 +1,1438 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
+import '../anki_models.dart';
+import '../card_source_link.dart';
+import '../anki_note_type_definition.dart';
+import '../lapis_note_type.dart';
+
+/// 一张 note 的现有字段（`name → value`）与所属笔记类型名（AnkiConnect 没给时为 null）。
+typedef AnkiConnectNoteInfo = ({String? modelName, Map<String, String> fields});
+
+class AnkiConnectService {
+  final String host;
+  final int port;
+  final bool useHttps;
+
+  /// Whether this endpoint runs on the same machine and can read a local path
+  /// passed to AnkiConnect's `storeMediaFile`.
+  bool get canReadLocalMediaPaths => ankiConnectHostIsLoopback(host);
+
+  /// AnkiConnect API key. When the AnkiConnect add-on has `apiKey` configured,
+  /// every request must carry a matching `key`; otherwise it replies with
+  /// "valid api key must be provided". Empty means no key (the default).
+  final String apiKey;
+
+  /// Injected transport, or null to build [_defaultClient] lazily on first use.
+  final http.Client? _injectedClient;
+
+  /// Overall per-request budget (connect + send + receive). A reachable
+  /// AnkiConnect answers findNotes/addNote well under a second; 10s tolerates a
+  /// busy collection or a mid-sync Anki without hanging a mine indefinitely.
+  final Duration _timeout;
+
+  /// Per-request budget for collection-scale maintenance (media dedup): bulk
+  /// `notesInfo` over the whole collection, batched field rewrites and media
+  /// deletes. Such requests legitimately run for seconds to minutes on a big
+  /// collection, so the interactive 10s default would kill them mid-flight
+  /// while Anki keeps executing them in the background (BUG-2824). Interactive
+  /// paths (mining, duplicate checks) keep the short default.
+  static const Duration kLongTaskTimeout = Duration(minutes: 5);
+
+  /// Connection-establishment budget for the lazily-built default client
+  /// (BUG-665). A live AnkiConnect (localhost/LAN) connects near-instantly, so
+  /// 5s is generous while still failing an unreachable host fast.
+  final Duration _connectionTimeout;
+
+  http.Client? _builtDefaultClient;
+
+  /// The transport. The default client is built on the **first request**, not
+  /// in the constructor, so subclasses that override the network methods — and
+  /// tests that install an HttpOverrides fake for the separate remote-audio
+  /// `HttpClient()` — never trigger a real [HttpClient] at construction time.
+  http.Client get _client =>
+      _injectedClient ??
+      (_builtDefaultClient ??= _defaultClient(_connectionTimeout));
+
+  AnkiConnectService({
+    this.host = 'localhost',
+    this.port = 8765,
+    this.useHttps = false,
+    this.apiKey = '',
+    http.Client? client,
+    Duration timeout = const Duration(seconds: 10),
+    Duration connectionTimeout = const Duration(seconds: 5),
+  })  : _injectedClient = client,
+        _timeout = timeout,
+        _connectionTimeout = connectionTimeout;
+
+  /// Default HTTP client with a phase-tagged connection-establishment timeout.
+  ///
+  /// BUG-665: the bare `http.Client()` had no connection timeout, so when the
+  /// configured AnkiConnect host is unreachable/black-holed (wrong host, VPN
+  /// down, firewall dropping SYNs, a remote host that never answers) the connect
+  /// phase dangled up to the full [_timeout] response budget before the combined
+  /// `.timeout` killed it as an opaque `TimeoutException: Future not completed`.
+  /// package:http wraps connect, request-delivery, and response-header socket
+  /// failures in the same public exception shape. Its message and errno cannot
+  /// prove delivery phase. The connection factory is the only layer that knows
+  /// no HTTP request exists yet, so only failures raised there receive the
+  /// explicit [AnkiConnectPreDeliveryException] marker.
+  static http.Client _defaultClient(Duration connectionTimeout) {
+    final HttpClient ioClient = HttpClient()
+      ..connectionTimeout = null
+      ..connectionFactory = (
+        Uri url,
+        String? proxyHost,
+        int? proxyPort,
+      ) async {
+        final String targetHost = proxyHost ?? url.host;
+        final int targetPort = proxyPort ?? url.port;
+        try {
+          final Socket socket = await Socket.connect(
+            targetHost,
+            targetPort,
+            timeout: connectionTimeout,
+          );
+          return ConnectionTask.fromSocket(
+            Future<Socket>.value(socket),
+            socket.destroy,
+          );
+        } catch (error, stackTrace) {
+          Error.throwWithStackTrace(
+            AnkiConnectPreDeliveryException(
+              'AnkiConnect connection failed before the HTTP request started',
+              url,
+              error,
+            ),
+            stackTrace,
+          );
+        }
+      };
+    return IOClient(ioClient);
+  }
+
+  /// [idempotent] 覆盖按 [action] 名推导的默认值。只有 `multi` 需要它：批次
+  /// 的可重试性由**里面装了什么**决定，而不是外层动作名。
+  Future<dynamic> _request(String action,
+      [Map<String, dynamic>? params, bool? idempotent]) async {
+    await _guardSelfLoop();
+    final body = jsonEncode({
+      'action': action,
+      'version': 6,
+      if (params != null) 'params': params,
+      // Only send `key` when configured: AnkiConnect with no apiKey set does
+      // not expect the field, and sending an empty one is needless.
+      if (apiKey.isNotEmpty) 'key': apiKey,
+    });
+    final response = await _postWithStaleConnectionRetry(
+      body,
+      action: action,
+      idempotent: idempotent ?? !_nonIdempotentActions.contains(action),
+    );
+    // A process other than AnkiConnect (proxy, captive portal, wrong port)
+    // can answer with a non-200 or non-JSON body; surface a clear error
+    // instead of an opaque FormatException.
+    if (response.statusCode != 200) {
+      throw AnkiConnectException(
+        'AnkiConnect returned HTTP ${response.statusCode} from $host:$port '
+        '(is AnkiConnect listening on this port?)',
+      );
+    }
+    final dynamic result;
+    try {
+      result = jsonDecode(response.body);
+    } on FormatException {
+      throw AnkiConnectException(
+        'Invalid (non-JSON) response from $host:$port — not AnkiConnect?',
+      );
+    }
+    // The v6 contract guarantees an object with both 'result' and 'error'.
+    if (result is! Map ||
+        !result.containsKey('result') ||
+        !result.containsKey('error')) {
+      throw AnkiConnectException(
+        'Unexpected response shape from AnkiConnect (action: $action)',
+      );
+    }
+    if (result['error'] != null) {
+      final String message = result['error'].toString();
+      if (action == 'addNote' && message == kAnkiConnectDuplicateError) {
+        throw AnkiConnectDuplicateException(message);
+      }
+      throw AnkiConnectException(message);
+    }
+    return result['result'];
+  }
+
+  /// 防自环判定缓存：`实例 id|scheme://host:port` → 是否指向本进程的兼容端点。
+  static final Map<String, bool> _selfLoopVerdicts = <String, bool>{};
+
+  /// 本进程挂着 Fushi 的 AnkiConnect 兼容端点时，先问一次目标地址 `fushiIdentify`：
+  /// 回的实例 id 是本进程的 → 拒绝（否则「推 Anki」会写回 Fushi 自己的 SRS，查重也查的是自己）。
+  /// 真 AnkiConnect 回 `unsupported action`，判定为「不是自己」并缓存；连接层失败不下结论，
+  /// 交给真正的请求去报错。没挂兼容端点（[fushiAnkiConnectCompatInstanceId] 为 null）时零开销。
+  Future<void> _guardSelfLoop() async {
+    final String? id = fushiAnkiConnectCompatInstanceId;
+    if (id == null || id.isEmpty) return;
+    final String key = '$id|${useHttps ? 'https' : 'http'}://$host:$port';
+    final bool? cached = _selfLoopVerdicts[key];
+    if (cached == false) return;
+    if (cached == true) throw AnkiConnectSelfLoopException();
+    final bool isSelf;
+    try {
+      final http.Response response = await _post(
+        jsonEncode(<String, Object>{'action': 'fushiIdentify', 'version': 6}),
+      );
+      if (response.statusCode != 200) return;
+      final Object? decoded = jsonDecode(response.body);
+      final Object? result = decoded is Map ? decoded['result'] : null;
+      isSelf = result is Map &&
+          result['fushi'] == true &&
+          result['instance'] == id;
+    } catch (_) {
+      return;
+    }
+    _selfLoopVerdicts[key] = isSelf;
+    if (isSelf) throw AnkiConnectSelfLoopException();
+  }
+
+  /// Actions that mutate Anki state and are NOT safe to *blindly* re-send.
+  /// package:http wraps the write *and* the response-header read in one try, so
+  /// a connection drop can surface *after* the request reached AnkiConnect —
+  /// re-sending `addNote`/`createModel` would then create a duplicate card or
+  /// hit "model already exists". So we retry these only when the transport
+  /// supplies an [AnkiConnectPreDeliveryException], never from a public socket
+  /// type, errno, message, or response-phase drop.
+  /// Every other action (version/deckNames/modelNames/modelFieldNames/
+  /// findNotes/storeMediaFile/createDeck) is idempotent, so re-sending on any
+  /// connection drop has no side effect.
+  static const Set<String> _nonIdempotentActions = {'addNote', 'createModel'};
+
+  /// Posts [body] to AnkiConnect, retrying exactly once for idempotent
+  /// connection drops or an explicitly marked pre-delivery failure.
+  ///
+  /// BUG-065: AnkiConnect's minimal HTTP server closes idle keep-alive
+  /// connections. The persistent [http.Client] pools connections and can hand a
+  /// request one the server has already closed; the first use fails with a
+  /// connection-drop error (Windows errno=10053 WSAECONNABORTED / 10054
+  /// WSAECONNRESET, POSIX EPIPE/ECONNRESET — surfaced as "Write failed",
+  /// "Connection reset", "Broken pipe"), so the user sees an instant failure
+  /// rather than the 10s timeout. Re-issuing on a fresh connection (the dead one
+  /// is dropped from the pool) fixes it. This is the standard "retry an
+  /// idempotent request on a stale pooled connection" strategy (cf. Go net/http,
+  /// java.net.http). Genuine refusals/timeouts are not connection-drops and fall
+  /// through to the caller (a retry would not help).
+  ///
+  /// BUG-091: idempotent actions retry on recognised connection drops.
+  /// Non-idempotent actions retry only on a transport-issued pre-delivery
+  /// marker. All public ClientException/SocketException shapes are ambiguous:
+  /// package:http can emit the same type after the request was fully delivered.
+  Future<http.Response> _postWithStaleConnectionRetry(
+    String body, {
+    required String action,
+    required bool idempotent,
+  }) async {
+    try {
+      return await _post(body);
+    } on http.ClientException catch (e) {
+      final bool retryable =
+          idempotent ? _isConnectionDrop(e) : _isPreDeliveryFailure(e);
+      if (retryable) {
+        try {
+          return await _post(body);
+        } on http.ClientException catch (retryError) {
+          if (!idempotent && !_isPreDeliveryFailure(retryError)) {
+            throw AnkiConnectCommitUnknownException(action, retryError);
+          }
+          rethrow;
+        } on SocketException catch (retryError) {
+          if (!idempotent) {
+            throw AnkiConnectCommitUnknownException(action, retryError);
+          }
+          rethrow;
+        } on TimeoutException catch (retryError) {
+          if (!idempotent) {
+            throw AnkiConnectCommitUnknownException(action, retryError);
+          }
+          rethrow;
+        }
+      }
+      if (!idempotent && !_isPreDeliveryFailure(e)) {
+        throw AnkiConnectCommitUnknownException(action, e);
+      }
+      rethrow;
+    } on SocketException catch (e) {
+      if (!idempotent) {
+        throw AnkiConnectCommitUnknownException(action, e);
+      }
+      rethrow;
+    } on TimeoutException catch (e) {
+      // `_post` starts its overall timeout only after handing the request to
+      // package:http. Without a connect/write-phase exception there is no proof
+      // that addNote stayed local: Anki may have consumed it and created the
+      // note while the response hung. Treat that delivery-ambiguous timeout as
+      // commit-unknown and never blindly retry the non-idempotent action.
+      if (!idempotent) {
+        throw AnkiConnectCommitUnknownException(action, e);
+      }
+      rethrow;
+    }
+  }
+
+  static bool _isPreDeliveryFailure(http.ClientException e) =>
+      e is AnkiConnectPreDeliveryException;
+
+  Future<http.Response> _post(String body) {
+    return _client.post(
+      Uri.parse('${useHttps ? 'https' : 'http'}://$host:$port'),
+      body: body,
+      headers: {
+        'Content-Type': 'application/json',
+        'Connection': 'close',
+      },
+    ).timeout(_timeout);
+  }
+
+  /// True when [e] is a transient connection-drop (stale pooled socket) worth
+  /// one retry on a fresh connection. Prefers the OS error code — an ABI
+  /// constant, stable across platforms and package:http versions — over the
+  /// human-readable message, falling back to text only when no [OSError] is
+  /// available. package:http wraps a dart:io [SocketException] in a type that
+  /// implements both [http.ClientException] and [SocketException], so [osError]
+  /// is usually reachable here.
+  static bool _isConnectionDrop(http.ClientException e) {
+    if (e is AnkiConnectPreDeliveryException) return true;
+    if (e is SocketException) {
+      final int? code = (e as SocketException).osError?.errorCode;
+      if (code != null) {
+        // Win: 10053 WSAECONNABORTED, 10054 WSAECONNRESET.
+        // POSIX: 32 EPIPE, 104 ECONNRESET (Linux), 54 ECONNRESET (macOS).
+        return code == 10053 ||
+            code == 10054 ||
+            code == 32 ||
+            code == 104 ||
+            code == 54;
+      }
+    }
+    final String message = e.message.toLowerCase();
+    return message.contains('write failed') ||
+        message.contains('connection reset') ||
+        message.contains('broken pipe') ||
+        message.contains('connection aborted');
+  }
+
+  List<String> _asStringList(dynamic result, String action) {
+    if (result is! List) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for $action (expected a list)',
+      );
+    }
+    return result.cast<String>();
+  }
+
+  // ── 批量请求（AnkiConnect `multi`）──────────────────────────────────────
+
+  /// 一次 `multi` 往返最多打包多少条子 action。
+  ///
+  /// 为什么批量是数量级的收益：AnkiConnect 的 HTTP 服务是**协作式轮询**——
+  /// `QTimer` 按 `apiPollInterval`（默认 **25 ms**）触发一次 `advance()`，每次
+  /// tick 只 `accept()` **一条**连接，全程跑在 Anki 的 Qt 主线程上，而且响应写
+  /// 完即 `close()`（无 keep-alive）。于是**每个请求的地板成本 = 一次 TCP 建连
+  /// + 至少一个 25 ms tick**，与请求本身多小完全无关。N 个操作串行发就是 N 个
+  /// tick；打成一批就是 1 个。
+  ///
+  /// 100 是「往返数够少」与「单条 JSON 别涨到几十 MB」之间的取舍——
+  /// `updateNoteFields` 要把整条笔记的字段正文发回去，批太大 payload 会失控。
+  static const int kMultiBatchSize = 100;
+
+  /// 把 [actions] 打包成**恰好一次** AnkiConnect `multi` 往返。
+  ///
+  /// 返回值与 [actions] 一一对应、同序。**子 action 失败不抛**，而是在对应位置
+  /// 带上 [AnkiConnectBatchResult.error]：`multi` 的语义就是逐条报告，一条失败
+  /// 不该把整批吞掉——调用方按自己的策略决定跳过还是中止。
+  ///
+  /// 每条子 action 都显式带 `version: 6`。不带时 AnkiConnect 的成功路径返回
+  /// **裸值**、失败路径才返回 `{result, error}` 信封（`format_success_reply`
+  /// 看版本、`format_exception_reply` 不看），同一个结果数组里两种形状混着无法
+  /// 可靠区分——裸值自己就可能是带 `error` 键的 map。带上 version 后形状统一。
+  ///
+  /// 不做「老版本 AnkiConnect 没有 multi」的回退：`multi` 自 2017 年就在且从无
+  /// 版本门槛，而本仓库的去重链路依赖的 `getMediaDirPath` 是 2023 年才加的——
+  /// 能走到这里的 AnkiConnect 必然支持 `multi`。
+  Future<List<AnkiConnectBatchResult>> requestMulti(
+    List<AnkiConnectAction> actions,
+  ) async {
+    if (actions.isEmpty) return const <AnkiConnectBatchResult>[];
+    // 批次的可重试性由内容决定：只要有一条不可盲重发，整批就按不可盲重发处理。
+    final bool idempotent = actions.every(
+      (AnkiConnectAction a) => !_nonIdempotentActions.contains(a.action),
+    );
+    final dynamic result = await _request(
+      'multi',
+      <String, dynamic>{
+        'actions': <Map<String, dynamic>>[
+          for (final AnkiConnectAction a in actions)
+            <String, dynamic>{
+              'action': a.action,
+              'version': 6,
+              if (a.params != null) 'params': a.params,
+              // 子 action 也要带 key：插件的 `multi` 就是对每条子请求再跑一遍
+              // `handler`，而 `handler` 逐条比对 key。外层带了、里层不带，配置了
+              // apiKey 的 Anki 会把每一条都判 'valid api key must be provided'，
+              // 整批批量写（去重改写 / 批量改字段 / 重排位置）静默全失败。
+              if (apiKey.isNotEmpty) 'key': apiKey,
+            },
+        ],
+      },
+      idempotent,
+    );
+    if (result is! List || result.length != actions.length) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for multi (expected '
+        '${actions.length} results, got '
+        '${result is List ? '${result.length}' : result.runtimeType})',
+      );
+    }
+    return <AnkiConnectBatchResult>[
+      for (final dynamic item in result) _decodeMultiItem(item),
+    ];
+  }
+
+  static AnkiConnectBatchResult _decodeMultiItem(dynamic item) {
+    if (item is Map &&
+        item.containsKey('result') &&
+        item.containsKey('error')) {
+      final Object? error = item['error'];
+      return AnkiConnectBatchResult(
+        result: item['result'],
+        error: error?.toString(),
+      );
+    }
+    // 我们永远发 version: 6，理论上到不了这里；真到了就当裸成功值，别把一个
+    // 形状意外拖成整批失败。
+    return AnkiConnectBatchResult(result: item);
+  }
+
+  /// 按 [kMultiBatchSize] 切块跑 [actions]，结果按原序拼回。
+  ///
+  /// 往返数 = `ceil(actions.length / kMultiBatchSize)`（空表 0 次）。
+  Future<List<AnkiConnectBatchResult>> _requestMultiChunked(
+    List<AnkiConnectAction> actions,
+  ) async {
+    // 空批一次都不发：这些批量入口经常被喂空表（整批副本全被跳过），发一个
+    // 空 multi 就是白白多一次往返。
+    if (actions.isEmpty) return const <AnkiConnectBatchResult>[];
+    if (actions.length <= kMultiBatchSize) return requestMulti(actions);
+    final List<AnkiConnectBatchResult> out = <AnkiConnectBatchResult>[];
+    for (int i = 0; i < actions.length; i += kMultiBatchSize) {
+      final int end = (i + kMultiBatchSize).clamp(0, actions.length);
+      out.addAll(await requestMulti(actions.sublist(i, end)));
+    }
+    return out;
+  }
+
+  Future<bool> isAvailable() async {
+    try {
+      await _request('version');
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String?> checkConnection() async {
+    try {
+      await _request('version');
+      return null;
+    } on AnkiConnectException catch (e) {
+      // AnkiConnect 自己的 error 字段 / HTTP / 非 JSON 形状错误：这是**真 AnkiConnect**
+      // 的英文语义文本（如 'unauthorized'、'valid api key must be provided'），安全可
+      // 直接展示在设置页，便于排障；不属于 TODO-752a 的 socket/proxy 乱码源。
+      return e.message;
+    } catch (e) {
+      // socket / timeout / http 等连接层异常：按稳定码（TODO-752a）返回设置页用的
+      // 英文提示——绝不把异常 toString() 透传（其中可能含 latin1 误解码的乱码）。
+      final String code = classifyAnkiConnectError(e);
+      return ankiConnectErrorHint(code, host: host, port: port);
+    }
+  }
+
+  Future<List<String>> getDeckNames() async {
+    return _asStringList(await _request('deckNames'), 'deckNames');
+  }
+
+  /// BUG-2051：卡组名 → id。查询串里**不放卡组名**的前提（见
+  /// [ankiDuplicateDeckIds]）：Anki 搜索里的 `deck:` 是**通配匹配**（`_` 单字、
+  /// `*` 任意），而查重那侧（AnkiConnect `duplicateScopeOptions.deckName`）是
+  /// **精确名**。本机实测同一个真卡组名：`deck:"…zh-C_"` 命中 1501 条，而查重侧
+  /// 同样把最后一个字换成 `_` 就判「不重复」。带 `_` 的卡组名（本机确有
+  /// `galgame_card_test`）会让两侧对「哪些卡在范围内」给出不同答案。
+  Future<Map<String, int>> getDeckNamesAndIds() async {
+    return _asNameIdMap(await _request('deckNamesAndIds'), 'deckNamesAndIds');
+  }
+
+  Future<List<String>> getModelNames() async {
+    return _asStringList(await _request('modelNames'), 'modelNames');
+  }
+
+  /// BUG-2051：笔记类型名 → id。Anki 的第一字段判重（`dupe:` 搜索）以**笔记类型 id**
+  /// 为参数，所以要跨全部笔记类型复现 `canAddNotesWithErrorDetail` 的判据就必须先拿
+  /// 到全部 id。识别不出 id 的表项直接跳过（宁可少查一个笔记类型，也不要让整次打开
+  /// 因为一条脏数据失败）。
+  Future<Map<String, int>> getModelNamesAndIds() async {
+    return _asNameIdMap(await _request('modelNamesAndIds'), 'modelNamesAndIds');
+  }
+
+  /// `{名字: id}` 应答的共用解析。识别不出 id 的表项直接跳过（宁可少一个条目，
+  /// 也不要让整次调用因为一条脏数据失败）。
+  Map<String, int> _asNameIdMap(dynamic result, String action) {
+    if (result is! Map) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for $action (expected an object)',
+      );
+    }
+    final out = <String, int>{};
+    result.forEach((dynamic key, dynamic value) {
+      final int? id =
+          value is int ? value : int.tryParse(value?.toString() ?? '');
+      if (id != null) out[key.toString()] = id;
+    });
+    return out;
+  }
+
+  Future<List<String>> getModelFields(String modelName) async {
+    return _asStringList(
+      await _request('modelFieldNames', {'modelName': modelName}),
+      'modelFieldNames',
+    );
+  }
+
+  Future<int?> addNote({
+    required String deckName,
+    required String modelName,
+    required Map<String, String> fields,
+    List<String>? tags,
+    Map<String, String>? mediaFiles,
+    bool allowDuplicate = false,
+    AnkiDuplicateScope duplicateScope = AnkiDuplicateScope.deck,
+  }) async {
+    // Let addNote perform the duplicate check atomically. AnkiConnect implements
+    // this path as a first-field checksum lookup, whereas a separate findNotes
+    // field query runs synchronously on Anki's GUI thread and can make Anki
+    // appear frozen on a large/busy collection.
+    final result = await _request('addNote', {
+      'note': {
+        'deckName': deckName,
+        'modelName': modelName,
+        'fields': fields,
+        'options': _addNoteDuplicateOptions(
+          deckName: deckName,
+          allowDuplicate: allowDuplicate,
+          scope: duplicateScope,
+        ),
+        if (tags != null) 'tags': tags,
+      },
+    });
+    // A successful addNote returns the new note id. A null id with no error
+    // means the add did not actually happen — treat it as a failure.
+    if (result == null) {
+      throw AnkiConnectException('AnkiConnect returned no note id for addNote');
+    }
+    return result is int ? result : int.tryParse(result.toString());
+  }
+
+  /// 查重：把「这张卡加不加得进去」原样问 Anki 自己，与 [addNote] **物理同源**。
+  ///
+  /// BUG-1915 根因。此前这里走 `findNotes "<第一字段名>:<词>"`，而 [addNote] 的判重是
+  /// Anki 内建的**第一字段 checksum**（`duplicateScopeOptions`，含 `checkAllModels`）。
+  /// 两者判的根本不是一件事：
+  ///
+  ///   * `findNotes` 按**字段名**匹配 → 只能命中「恰好也有同名字段」的笔记类型；
+  ///   * Anki 按**第一字段位置**匹配 → 跨全部笔记类型，不管那个字段叫什么。
+  ///
+  /// 于是一个卡组里混装两种笔记类型（实测：1501 张第一字段名为 `Word` 的旧卡 +
+  /// 12 张第一字段名为 `Expression` 的新卡）时，旧卡里已有的词查重恒判「不重复」→
+  /// 弹窗画可制卡 `+`，用户一点却被 [addNote] 以重复拒绝。两条判据必须是同一条。
+  ///
+  /// 做法不是「让两边的条件长得一样」（那还会再漂移一次），而是**删掉第二条判据**：
+  /// 直接调 AnkiConnect 的 `canAddNotesWithErrorDetail`，它内部走的就是 [addNote]
+  /// 用的同一个 `isNoteDuplicateOrEmptyInScope`。options 也复用同一个
+  /// [_addNoteDuplicateOptions]，不再手写一份。
+  ///
+  /// 只传第一字段：Anki 的判重只看第一字段，其余字段留空不影响判定，也省掉在查词
+  /// 渲染路径上构造整张卡的开销。
+  ///
+  /// 已知边界（无法在查词时消除）：探测传的第一字段值是词条本身（[firstFieldValue]），
+  /// 而制卡时那一格是 `fieldMappings` 渲染的结果。第一字段映射成 `{expression}`
+  /// （Lapis 出厂默认）时两者逐字节相同；映射成依赖句子/媒体的模板时，查词阶段根本
+  /// 拿不到那些数据，任何实现都无法预知制卡时的第一字段。此时探测退化为「按词查」，
+  /// 与旧行为一致，不比现状差。
+  Future<bool> isDuplicateForAdd({
+    required String deckName,
+    required String modelName,
+    required String firstFieldName,
+    required String firstFieldValue,
+    AnkiDuplicateScope scope = AnkiDuplicateScope.deck,
+  }) async {
+    final Map<String, Object?> note = <String, Object?>{
+      'deckName': deckName,
+      'modelName': modelName,
+      'fields': <String, String>{firstFieldName: firstFieldValue},
+      // 探测问的是「Anki 认不认为这是重复」，与用户的「允许重复」偏好无关：
+      // 恒传 allowDuplicate:false。若跟随 settings.allowDupes，开了允许重复的
+      // 用户就永远等不到 canAdd:false，✓ 再也画不出来。
+      'options': _addNoteDuplicateOptions(
+        deckName: deckName,
+        allowDuplicate: false,
+        scope: scope,
+      ),
+    };
+    final dynamic result = await _request(
+      'canAddNotesWithErrorDetail',
+      <String, dynamic>{
+        'notes': <Object?>[note],
+      },
+    );
+    if (result is! List || result.isEmpty) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for canAddNotesWithErrorDetail '
+        '(expected a non-empty list)',
+      );
+    }
+    final dynamic first = result.first;
+    if (first is! Map) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for canAddNotesWithErrorDetail '
+        '(expected an object per note)',
+      );
+    }
+    if (first['canAdd'] == true) return false;
+    // canAdd:false 有多种原因（卡组/笔记类型不存在、第一字段为空……）。只有 Anki
+    // 明说是重复才算重复——把「配置过期」当成「已制卡」会让每个词都画上 ✓。
+    return first['error']?.toString() == kAnkiConnectDuplicateError;
+  }
+
+  Future<List<int>> findNotesByField({
+    required String deckName,
+    required String fieldName,
+    required String fieldValue,
+    AnkiDuplicateScope scope = AnkiDuplicateScope.deck,
+  }) async {
+    final result = await _request('findNotes', {
+      'query': _fieldValueQuery(
+        deckName: deckName,
+        fieldName: fieldName,
+        fieldValue: fieldValue,
+        scope: scope,
+      ),
+    });
+    if (result is! List) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for findNotes (expected a list)',
+      );
+    }
+    return result.map((dynamic id) {
+      if (id is int) return id;
+      return int.parse(id.toString());
+    }).toList();
+  }
+
+  Future<void> storeMediaFile({
+    required String filename,
+    String? data,
+    String? path,
+  }) async {
+    await _request('storeMediaFile', {
+      'filename': filename,
+      if (data != null) 'data': data,
+      if (path != null) 'path': path,
+    });
+  }
+
+  /// Whether [filename] already exists in the active profile's media folder.
+  ///
+  /// `getMediaFilesNames` avoids downloading the file just to distinguish a
+  /// content-addressed shared file from one created by the current mining
+  /// attempt. The exact-name check also prevents glob results from being
+  /// mistaken for the requested file.
+  Future<bool> mediaFileExists(String filename) async {
+    final result = await _request('getMediaFilesNames', {
+      'pattern': filename,
+    });
+    if (result is! List) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for getMediaFilesNames '
+        '(expected a list)',
+      );
+    }
+    return result.any((dynamic value) => value.toString() == filename);
+  }
+
+  // ── 媒体维护（字节级去重）────────────────────────────────────────────
+  // getMediaDirPath / findNotes 读取类幂等；deleteMediaFile 同名重删是 no-op，
+  // 也幂等——均不列入 [_nonIdempotentActions]。
+
+  /// Anki 当前 profile 的 collection.media 绝对路径（本机扫描用，避免把
+  /// 整个媒体库经 base64 拉过 HTTP）。
+  Future<String> getMediaDirPath() async {
+    final result = await _request('getMediaDirPath');
+    if (result is! String || result.isEmpty) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for getMediaDirPath',
+      );
+    }
+    return result;
+  }
+
+  /// 删除媒体文件（按文件名）。只在引用已全部改写干净后调用。
+  Future<void> deleteMediaFile(String filename) async {
+    await _request('deleteMediaFile', {'filename': filename});
+  }
+
+  /// 批量删除媒体文件。往返数 = `ceil(filenames.length / kMultiBatchSize)`，
+  /// **不是** `filenames.length`——这正是媒体去重从「一个一个删」变快的地方。
+  ///
+  /// 逐条报告结果（同序），失败条不抛：一个文件删不掉不该让剩下几百个都不删。
+  Future<List<AnkiConnectBatchResult>> deleteMediaFiles(
+    List<String> filenames,
+  ) {
+    return _requestMultiChunked(<AnkiConnectAction>[
+      for (final String f in filenames)
+        AnkiConnectAction('deleteMediaFile', <String, dynamic>{'filename': f}),
+    ]);
+  }
+
+  /// 按任意 Anki 搜索式查 note id（去重用 `"<文件名>"` 全字段文本检索）。
+  Future<List<int>> findNotesByQuery(String query) async {
+    final result = await _request('findNotes', {'query': query});
+    if (result is! List) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for findNotes (expected a list)',
+      );
+    }
+    return result.map((dynamic id) {
+      if (id is int) return id;
+      return int.parse(id.toString());
+    }).toList();
+  }
+
+  /// 批量查 note id。往返数 = `ceil(queries.length / kMultiBatchSize)`。
+  ///
+  /// 返回与 [queries] 同序；**某条查询失败（或结果形状不对）时该位置是
+  /// `null`**，绝不降级成空列表。去重靠这个结果判断「还有没有人引用这个文件」，
+  /// 把失败静默当成「没人引用」就会删掉仍在用的媒体——null 强制调用方显式处理。
+  Future<List<List<int>?>> findNotesByQueries(List<String> queries) async {
+    final List<AnkiConnectBatchResult> results =
+        await _requestMultiChunked(<AnkiConnectAction>[
+      for (final String q in queries)
+        AnkiConnectAction('findNotes', <String, dynamic>{'query': q}),
+    ]);
+    return <List<int>?>[
+      for (final AnkiConnectBatchResult r in results) _asNoteIds(r),
+    ];
+  }
+
+  /// 把一条批量结果解成 note id 列表；失败或形状不对返回 null（保守）。
+  static List<int>? _asNoteIds(AnkiConnectBatchResult r) {
+    if (r.isError) return null;
+    final Object? value = r.result;
+    if (value is! List) return null;
+    final List<int> ids = <int>[];
+    for (final dynamic raw in value) {
+      final int? id = raw is int ? raw : int.tryParse(raw.toString());
+      if (id == null) return null;
+      ids.add(id);
+    }
+    return ids;
+  }
+
+  Future<void> createModel(AnkiNoteTypeTemplate template) async {
+    await _request('createModel', {
+      'modelName': template.name,
+      'inOrderFields': template.fields,
+      'css': template.css,
+      'isCloze': false,
+      'cardTemplates': [
+        {
+          'Name': template.cardName,
+          'Front': template.front,
+          'Back': template.back,
+        },
+      ],
+    });
+  }
+
+  Future<void> createDeck(String name) async {
+    await _request('createDeck', {'deck': name});
+  }
+
+  // ── note type 模板读写（Lapis 客制化/备份/自动迁移）────────────────────
+  // 读取类天然幂等；updateModelStyling / updateModelTemplates 同载荷重发结果
+  // 一致，也幂等——都不列入 [_nonIdempotentActions]，掉线可安全重试。
+
+  /// 读取 [modelName] 的全部卡模板正/反面。AnkiConnect `modelTemplates`
+  /// 返回 `{模板名: {Front, Back}}`。
+  Future<List<AnkiCardTemplate>> modelTemplates(String modelName) async {
+    final result = await _request('modelTemplates', {'modelName': modelName});
+    if (result is! Map) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for modelTemplates (expected a map)',
+      );
+    }
+    return result.entries.map((MapEntry<dynamic, dynamic> e) {
+      final dynamic sides = e.value;
+      return AnkiCardTemplate(
+        name: e.key.toString(),
+        front: sides is Map ? sides['Front']?.toString() ?? '' : '',
+        back: sides is Map ? sides['Back']?.toString() ?? '' : '',
+      );
+    }).toList();
+  }
+
+  /// 读取 [modelName] 的 styling（CSS）。AnkiConnect `modelStyling` 返回
+  /// `{css: ...}`。
+  Future<String> modelStyling(String modelName) async {
+    final result = await _request('modelStyling', {'modelName': modelName});
+    if (result is! Map || result['css'] is! String) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for modelStyling (expected {css})',
+      );
+    }
+    return result['css'] as String;
+  }
+
+  /// 覆写 [modelName] 的 styling（CSS）。
+  Future<void> updateModelStyling(String modelName, String css) async {
+    await _request('updateModelStyling', {
+      'model': {'name': modelName, 'css': css},
+    });
+  }
+
+  /// 覆写 [modelName] 的卡模板正/反面（按模板名匹配）。
+  Future<void> updateModelTemplates(
+      String modelName, List<AnkiCardTemplate> templates) async {
+    await _request('updateModelTemplates', {
+      'model': {
+        'name': modelName,
+        'templates': <String, dynamic>{
+          for (final AnkiCardTemplate t in templates)
+            t.name: <String, String>{'Front': t.front, 'Back': t.back},
+        },
+      },
+    });
+  }
+
+  // TODO-270 C1：更新已存在 note 的字段。AnkiConnect `updateNoteFields` 接收
+  // `{note: {id, fields}}`，只覆盖给出的字段，其余保留。带固定 [noteId]，重发
+  // 幂等（同 id + 同 fields 结果一致），故不列入 [_nonIdempotentActions]——可像
+  // storeMediaFile 一样在连接掉线时安全重试。
+  Future<void> updateNoteFields(int noteId, Map<String, String> fields) async {
+    await _request('updateNoteFields', {
+      'note': {
+        'id': noteId,
+        'fields': fields,
+      },
+    });
+  }
+
+  /// BUG-2606：给已存在的 note 追加标签。AnkiConnect `addTags` 接收
+  /// `{notes: [id], tags: "a b c"}`，与现有标签取并集、已有的不重复；重发幂等，
+  /// 故同 [updateNoteFields] 不列入 [_nonIdempotentActions]。[tags] 为空时不发请求。
+  Future<void> addTags(int noteId, List<String> tags) async {
+    if (tags.isEmpty) return;
+    await _request('addTags', {
+      'notes': [noteId],
+      'tags': tags.join(' '),
+    });
+  }
+
+  /// 批量覆写笔记字段。往返数 = `ceil(updates.length / kMultiBatchSize)`。
+  ///
+  /// 逐条报告结果（与 [updates] 同序），失败条不抛：调用方要能分清哪几条没写
+  /// 进去。单条 `updateNoteFields` 幂等，整批同样幂等。
+  Future<List<AnkiConnectBatchResult>> updateNoteFieldsMany(
+    List<AnkiNoteFieldsUpdate> updates,
+  ) {
+    return _requestMultiChunked(<AnkiConnectAction>[
+      for (final AnkiNoteFieldsUpdate u in updates)
+        AnkiConnectAction('updateNoteFields', <String, dynamic>{
+          'note': <String, dynamic>{'id': u.noteId, 'fields': u.fields},
+        }),
+    ]);
+  }
+
+  // TODO-270 C1：读取一个 note 的现有字段。AnkiConnect `notesInfo` 接收
+  // `{notes: [id]}`，返回每个 note 一项 `{noteId, modelName, tags,
+  // fields: {<name>: {value, order}}}`。我们只取 `fields` 拍平成 `name → value`。
+  // note 不存在时 AnkiConnect 返回一个空对象项（无 noteId/fields）；这里统一以
+  // 「无 fields」当作不存在返回 `null`。
+  Future<Map<String, String>?> notesInfo(int noteId) async =>
+      (await noteInfo(noteId))?.fields;
+
+  /// [notesInfo] 的原语：同一次往返顺带把 `modelName` 带回来。覆盖既有卡（BUG-2606）
+  /// 要先确认目标 note 就是当前选定的笔记类型——`findMatchingNotes` 按**首字段名**
+  /// 搜同卡组，任何带同名首字段的别的 note type 都会命中，而整卡覆盖会把它没映射的
+  /// 字段全部清空。
+  Future<AnkiConnectNoteInfo?> noteInfo(int noteId) async {
+    final result = await _request('notesInfo', {
+      'notes': [noteId],
+    });
+    if (result is! List || result.isEmpty) return null;
+    final first = result.first;
+    if (first is! Map) return null;
+    final rawFields = first['fields'];
+    if (rawFields is! Map) return null;
+    final fields = <String, String>{};
+    rawFields.forEach((dynamic key, dynamic value) {
+      // 每个字段是 `{value: <html>, order: <int>}`；取 value。
+      if (value is Map && value['value'] is String) {
+        fields[key.toString()] = value['value'] as String;
+      } else if (value is String) {
+        // 容错：某些代理/版本可能直接给字符串值。
+        fields[key.toString()] = value;
+      }
+    });
+    final dynamic modelName = first['modelName'];
+    return (
+      modelName: modelName is String && modelName.isNotEmpty ? modelName : null,
+      fields: fields,
+    );
+  }
+
+  /// Candidate notes whose fields contain the source ID substring. Substring
+  /// hits are not identities: the repository confirms each candidate by parsing
+  /// its `fushi://source` href (BUG-2527 removed the redundant marker tag).
+  Future<List<int>> findNotesBySourceId(String sourceId) =>
+      findNotesByQuery(CardSourceLink.searchQueryForSourceId(sourceId));
+
+  // TODO-1007/1008：批量读取多张 note 的字段（字段名 -> 值），供命中多张时一次往返
+  // 拉全部预览。AnkiConnect `notesInfo` 接收 `{notes: [id...]}`，按 id 顺序返回每项
+  // `{noteId, fields:{<name>:{value,order}}}`。返回 `noteId -> (name -> value)`；
+  // 形状异常项跳过（fail-soft）。
+  Future<Map<int, Map<String, String>>> notesInfoMany(List<int> noteIds) async {
+    if (noteIds.isEmpty) return <int, Map<String, String>>{};
+    final result = await _request('notesInfo', {'notes': noteIds});
+    final out = <int, Map<String, String>>{};
+    if (result is! List) return out;
+    for (final item in result) {
+      if (item is! Map) continue;
+      final rawId = item['noteId'];
+      final int? id =
+          rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
+      if (id == null) continue;
+      final rawFields = item['fields'];
+      if (rawFields is! Map) continue;
+      final fields = <String, String>{};
+      rawFields.forEach((dynamic key, dynamic value) {
+        if (value is Map && value['value'] is String) {
+          fields[key.toString()] = value['value'] as String;
+        } else if (value is String) {
+          fields[key.toString()] = value;
+        }
+      });
+      out[id] = fields;
+    }
+    return out;
+  }
+
+  // ── 卡片级 API：卡组新卡按词频重排 ──────────────────────────────────────
+
+  /// AnkiConnect `findCards`：按 Anki 搜索语法返回 card id。
+  Future<List<int>> findCards(String query) async {
+    final dynamic result =
+        await _request('findCards', <String, dynamic>{'query': query});
+    if (result is! List) {
+      throw AnkiConnectException(
+        'Unexpected AnkiConnect response for findCards (expected a list)',
+      );
+    }
+    return <int>[
+      for (final dynamic item in result)
+        if (item is int) item else if (item is num) item.toInt(),
+    ];
+  }
+
+  /// 一次 `cardsInfo` 最多带多少张卡：每项都附带渲染好的问答 HTML 与全部
+  /// 字段正文，几千张一次拉回来 payload 会到几十 MB。
+  static const int kCardsInfoBatchSize = 200;
+
+  /// AnkiConnect `cardsInfo`：按 [cardIds] 顺序返回每张卡的信息，分批往返。
+  /// 不存在的卡（AnkiConnect 给空对象）被跳过。
+  Future<List<AnkiCardInfo>> cardsInfo(List<int> cardIds) async {
+    final List<AnkiCardInfo> out = <AnkiCardInfo>[];
+    for (int i = 0; i < cardIds.length; i += kCardsInfoBatchSize) {
+      final int end = (i + kCardsInfoBatchSize).clamp(0, cardIds.length);
+      final dynamic result = await _request('cardsInfo', <String, dynamic>{
+        'cards': cardIds.sublist(i, end),
+      });
+      if (result is! List) {
+        throw AnkiConnectException(
+          'Unexpected AnkiConnect response for cardsInfo (expected a list)',
+        );
+      }
+      for (final dynamic item in result) {
+        final AnkiCardInfo? info = AnkiCardInfo.fromJson(item);
+        if (info != null) out.add(info);
+      }
+    }
+    return out;
+  }
+
+  /// 批量改写新卡的队列位置：每张卡一条 `setSpecificValueOfCard`
+  /// `{card, keys: ['due'], newValues: [due], warning_check: true}`，打成
+  /// `multi` 分批发。`warning_check` 是 AnkiConnect 对 did/queue/type 这类
+  /// 危险键的显式确认开关（本机 AnkiConnect 源码里 `due` 不在那张清单上，
+  /// 带上只是前向兼容，无副作用）。
+  ///
+  /// **结果形状不走 error 信封**（读的是插件源码）：成功是 `[true]`，
+  /// 卡不存在等异常是 `[[false, "<msg>"]]`，参数形状不对直接 `false`——
+  /// 三种都在 `result` 里、`error` 为 null。调用方用
+  /// [ankiSetSpecificValueFailure] 解读，别拿 `isError` 当成功判据。
+  ///
+  /// 同 id + 同值重发结果一致，幂等，可安全走连接掉线重试。逐条报告结果
+  /// （与 [updates] 同序），失败条不抛。
+  Future<List<AnkiConnectBatchResult>> setCardsDueMany(
+    List<AnkiCardDueUpdate> updates,
+  ) {
+    return _requestMultiChunked(<AnkiConnectAction>[
+      for (final AnkiCardDueUpdate u in updates)
+        AnkiConnectAction('setSpecificValueOfCard', <String, dynamic>{
+          'card': u.cardId,
+          'keys': <String>['due'],
+          'newValues': <int>[u.due],
+          'warning_check': true,
+        }),
+    ]);
+  }
+
+  // TODO-1007/1008：在 Anki 桌面端打开浏览器并选中 [noteId]（`guiBrowse` 接收
+  // `{query: 'nid:<id>'}`，把 Anki 主窗口的 Browse 视图过滤到该 note）。需要 Anki GUI
+  // 在前台才有视觉效果；纯远程/无 GUI 时 AnkiConnect 仍返回成功（不抛）。
+  Future<void> guiBrowse(int noteId) async {
+    await guiBrowseQuery('nid:$noteId');
+  }
+
+  /// BUG-2051：把 Anki 浏览器过滤到任意 [query]，并回传**被选中的 card id**。
+  ///
+  /// ↗ 的调用方只喂 [ankiNoteIdBrowseQuery] 产出的 `nid:a,b,c`：命中与否已经由
+  /// 上一步（同源的 `dupe:` 查询）定死，这里只负责「打开」，**返回值不参与任何
+  /// 判定**。这是「返回值是附加信息、不是成败标志」的最强形式：调用方连读都不读，
+  /// 也就没有第二条判据可以漂移。下面的 `null` / `[]` 区分保留给其它调用方。
+  ///
+  /// 应答**不是列表**时返回 `null`，而不是空列表——这两件事不是一回事：
+  ///
+  /// - `[]` = 这台 Anki 明确答「一张都没选中」→ 可以说「没有找到已制的卡片」；
+  /// - `null` = 这台 AnkiConnect 的 `guiBrowse` 压根不回传命中列表（旧版本只回
+  ///   `null`）。`guiBrowse` 的语义是「**打开浏览器并搜索**」，返回值是附加信息
+  ///   而不是成败标志：请求既然没抛，浏览器就已经开着并过滤到了这条查询。把这个
+  ///   「未知」降维成「零命中」，那台机器上就会出现浏览器明明开着、我们却弹
+  ///   「没有找到已制的卡片」——正是 BUG-2051 要修掉的那句错话换个成因再来一次。
+  ///
+  /// 不做版本判断：那要多一次 `version` 往返，还得硬编码一张「哪个版本起回列表」
+  /// 的表，而任何代理 / fork 都能让这张表失效。按语义处理没有版本假设。
+  Future<List<int>?> guiBrowseQuery(String query) async {
+    final dynamic result = await _request('guiBrowse', {'query': query});
+    if (result is! List) return null;
+    return <int>[
+      for (final dynamic id in result)
+        if (id is int)
+          id
+        else if (int.tryParse(id.toString()) case final int parsed)
+          parsed,
+    ];
+  }
+}
+
+/// AnkiConnect 在 `createNote` 里对重复卡抛出的固定文案。`addNote` 与
+/// `canAddNotesWithErrorDetail` 走的是同一段代码、同一句文案，所以两处判定复用
+/// 这一个字面量（BUG-1915：判据同源的前提是连错误文本都别各写一份）。
+const String kAnkiConnectDuplicateError =
+    'cannot create note because it is a duplicate';
+
+String _escapeAnkiQuery(String value) => value.replaceAll('"', '\\"');
+
+/// TODO-752a：把一个 AnkiConnect 网络异常分类成**与 locale 无关、永不乱码**的稳定码
+/// （见 [AnkiErrorCode]）。优先用 OS 错误码（ABI 常量，跨平台/跨 package:http 版本稳定）
+/// 区分超时与连接失败，再按异常类型兜底。这是 checkConnection / mineEntry 共用的单一来源，
+/// 取代各处对 SocketException / http.ClientException 的 toString() 透传。
+String classifyAnkiConnectError(Object error) {
+  if (error is AnkiConnectPreDeliveryException) {
+    // 建连阶段就失败：一个 HTTP 请求都还没发出去。底层抛的是 SocketException
+    // 还是 `Socket.connect` 的超时，对用户是同一件事——那个地址上没人接。一律归
+    // refused，好让 connectionTimeout 保持**单一含义**（见下）。此前这里递归看
+    // cause，两个阶段的超时会撞进同一个码，提示也就只能含糊说「检查防火墙」。
+    return AnkiErrorCode.connectionRefused;
+  }
+  if (error is TimeoutException) {
+    // 走到这里的超时**一定是应答阶段**的：连接工厂已经把建连失败标成
+    // [AnkiConnectPreDeliveryException] 拦在上面，所以 TCP 是连上了、请求也发出去
+    // 了，只是没人按 AnkiConnect 的规矩回话。在 localhost 上这几乎只有两种可能：
+    // 这个端口上蹲着的根本不是 AnkiConnect（端口被别的程序占了），或者 Anki 卡住。
+    // 文案据此给出可操作的下一步（换端口），而不是泛泛的「网络超时」。
+    return AnkiErrorCode.connectionTimeout;
+  }
+  if (error is SocketException) {
+    // 连接被拒（POSIX ECONNREFUSED=111/61，Win WSAECONNREFUSED=10061）或任何建连失败：
+    // AnkiConnect 没在监听 / Anki 没开。osError 缺失时仍按 socket 归为「拒绝/不可达」，
+    // 比透传英文原文好。
+    return AnkiErrorCode.connectionRefused;
+  }
+  if (error is http.ClientException) {
+    return AnkiErrorCode.httpError;
+  }
+  return AnkiErrorCode.connectionUnknown;
+}
+
+/// 是否是**传输层**失败（socket / 超时 / http），而不是 AnkiConnect 应答的业务错误、
+/// 也不是本地编程错误（payload 解析、空列表 firstWhere 之类）。
+///
+/// 这三选一原本在制卡失败映射、查重冷却、Lapis 一键配置三处各写了一份；判据同源才
+/// 不会漂成「一处认它是网络错、另一处不认」。
+bool isAnkiConnectTransportError(Object error) =>
+    error is SocketException ||
+    error is TimeoutException ||
+    error is http.ClientException;
+
+/// 给**设置页**（非 toast）用的英文可读提示：toast 走主 app 的本地化映射，这里仅服务
+/// checkConnection；来源统一到稳定码（不再透传异常原文）。
+/// [host]/[port] 仅用于丰富英文回退文案；缺省时省略（用户看到的 toast 由主 app 按
+/// [code] 本地化，本回退串不含地址也无碍）。
+String ankiConnectErrorHint(String code, {String? host, int? port}) {
+  final String where =
+      (host != null && host.isNotEmpty && port != null) ? ' ($host:$port)' : '';
+  switch (code) {
+    case AnkiErrorCode.connectionRefused:
+      return 'Connection refused$where (is Anki Desktop running?).\n'
+          'Check that AnkiConnect add-on (2055492159) is installed.';
+    case AnkiErrorCode.connectionTimeout:
+      return 'Connected to$where but got no answer.\n'
+          'Something is listening on that port and it is not answering as '
+          'AnkiConnect - the port is probably taken by another program '
+          '(or Anki is frozen). Switch AnkiConnect to a free port.';
+    case AnkiErrorCode.httpError:
+      return 'HTTP error connecting to AnkiConnect$where.';
+    default:
+      return 'Cannot connect to AnkiConnect$where.';
+  }
+}
+
+bool ankiConnectHostIsLoopback(String host) {
+  final String normalized = host.trim().toLowerCase();
+  if (normalized == 'localhost') return true;
+  final String unbracketed =
+      normalized.startsWith('[') && normalized.endsWith(']')
+          ? normalized.substring(1, normalized.length - 1)
+          : normalized;
+  return InternetAddress.tryParse(unbracketed)?.isLoopback ?? false;
+}
+
+/// 由查重范围 [scope] 解析出的 Anki 搜索卡组子句；空串 = 不限卡组（整个收藏集）。
+///
+/// Anki 的 `deck:X` **本来就包含** X 的子卡组，但不含父卡组与兄弟子卡组——这正是
+/// 「目标选了 `Lapis::Vocab` 就查不到 `Lapis` 其它子卡组里的同词卡」的原因。
+/// [AnkiDuplicateScope.deckRoot] 把卡组名截到第一段（`Lapis::Vocab::N5` → `Lapis`），
+/// 于是整棵 Lapis 树都在范围内。
+///
+/// 纯函数（不碰网络/设置），供单测直接钉查询语义。
+String ankiDuplicateDeckFilter(String deckName, AnkiDuplicateScope scope) {
+  switch (scope) {
+    case AnkiDuplicateScope.collection:
+      return '';
+    case AnkiDuplicateScope.deckRoot:
+      // `::` 是 Anki 的层级分隔符；没有分隔符时根卡组就是它自己。
+      final String root = deckName.split('::').first;
+      // 卡组名本身为空（配置异常）时不要发出 `deck:""` 这种恒不命中的子句，
+      // 退化成不限卡组，宁可多查也不要静默查不到（fail-open 与本设置的意图一致）。
+      if (root.isEmpty) return '';
+      return 'deck:"${_escapeAnkiQuery(root)}"';
+    case AnkiDuplicateScope.deck:
+      if (deckName.isEmpty) return '';
+      return 'deck:"${_escapeAnkiQuery(deckName)}"';
+  }
+}
+
+/// 解读一条 `setSpecificValueOfCard` 的结果：null = 成功，否则是失败原因。
+///
+/// AnkiConnect 该 action 把失败写在 `result` 里而不是 `error`：成功 `[true]`，
+/// 异常 `[[false, "<msg>"]]`，参数形状不对返回裸 `false`。
+String? ankiSetSpecificValueFailure(AnkiConnectBatchResult r) {
+  if (r.isError) return r.error;
+  final Object? v = r.result;
+  if (v is List && v.isNotEmpty) {
+    final Object? first = v.first;
+    if (first == true) return null;
+    if (first is List && first.isNotEmpty && first.first == false) {
+      return first.length > 1 ? first[1].toString() : 'rejected';
+    }
+    return 'unexpected setSpecificValueOfCard result: $first';
+  }
+  if (v == false) return 'setSpecificValueOfCard rejected the request';
+  return 'unexpected setSpecificValueOfCard result: $v';
+}
+
+/// 卡组新卡重排的 Anki 搜索串：按**卡组 id** 选中 [deckName] 及其全部子卡组，
+/// 再限定 `is:new` 并排除筛选牌组（`-deck:filtered`：那里的 `due` 是暂存值，
+/// 改了会在退出筛选时被覆盖或把原值弄丢）。
+///
+/// 不用 `deck:"名字"`：它是通配匹配（BUG-2051，`_` 单字、`*` 任意），带 `_`
+/// 的卡组名会把兄弟卡组一起圈进来，而重排写的是队列位置，圈错一张就是改错
+/// 一张。`did:` 只匹配该 id 本身、不含子卡组，所以子树要自己按 `父::子` 名字
+/// 前缀展开。找不到卡组返回空串（调用方按「没有新卡」处理）。
+String ankiDeckNewCardsQuery(
+  Map<String, int> deckNamesAndIds,
+  String deckName,
+) {
+  if (deckName.isEmpty) return '';
+  final String prefix = '$deckName::';
+  final List<int> ids = <int>[
+    for (final MapEntry<String, int> e in deckNamesAndIds.entries)
+      if (e.key == deckName || e.key.startsWith(prefix)) e.value,
+  ];
+  if (ids.isEmpty) return '';
+  final String scope = ids.length == 1
+      ? 'did:${ids.single}'
+      : '(${ids.map((int id) => 'did:$id').join(' OR ')})';
+  return '$scope is:new -deck:filtered';
+}
+
+Map<String, Object> _addNoteDuplicateOptions({
+  required String deckName,
+  required bool allowDuplicate,
+  required AnkiDuplicateScope scope,
+}) {
+  final bool collectionWide = scope == AnkiDuplicateScope.collection;
+  final String scopedDeckName = switch (scope) {
+    AnkiDuplicateScope.deck => deckName,
+    AnkiDuplicateScope.deckRoot => deckName.split('::').first,
+    AnkiDuplicateScope.collection => '',
+  };
+  return <String, Object>{
+    'allowDuplicate': allowDuplicate,
+    'duplicateScope': collectionWide ? 'collection' : 'deck',
+    'duplicateScopeOptions': <String, Object>{
+      if (!collectionWide && scopedDeckName.isNotEmpty)
+        'deckName': scopedDeckName,
+      'checkChildren': !collectionWide,
+      // The old field query was not restricted to the selected note type.
+      // Preserve that cross-model scope while switching to AnkiConnect's
+      // indexed primary-field checksum lookup.
+      'checkAllModels': true,
+    },
+  };
+}
+
+/// BUG-2051：与 [AnkiConnectService.isDuplicateForAdd]（= `addNote` 内建判重）
+/// **同源**的搜索串——「Anki 认为这个词已经有卡」的那批卡，用搜索语法表达一遍。
+///
+/// 根因回顾：画 ✓ 的判据是 Anki 内建的**第一字段 checksum**（跨全部笔记类型，不看
+/// 字段叫什么名字），而 ↗「在 Anki 中打开」此前是另发一条 `"<第一字段名>:<词>"`
+/// 按**字段名**查。本机实测（卡组 `正在背::Kaishi 1.5k  zh-CH` 里混装两种笔记类型）：
+/// `canAddNotesWithErrorDetail` 判 `たっぷり` 重复 → 画 ✓，而
+/// `"Expression:たっぷり"` 恒 0 命中（那张卡是 Kaishi，第一字段叫 `Word`）→ ↗ 弹
+/// 「没有找到已制的卡片」。同一个词，两句互相打架的说法。
+///
+/// `canAddNotes` 只回布尔、给不出 note id，所以「同源」不能靠复用它。Anki 搜索语法
+/// 里的 `dupe:<笔记类型id>,<文本>` **就是**那条 checksum 判据的搜索版本（Anki 浏览器
+/// 侧栏的「重复」用的也是它），于是跨全部笔记类型 = 每个 id 一个 `dupe:` 子句 OR 起来，
+/// 再按 [deckIds] 前置一个**按 id** 的卡组过滤器（`did:`，见 [ankiDuplicateDeckIds]）。
+///
+/// 实测（本机真 Anki，AnkiConnect 25.x）：
+/// - `(did:1771332842760) ("dupe:1758278161949,たっぷり" OR …)` → `[1758347126448]`，
+///   正是 ✓ 认的那张；换成 `deck:"<同一卡组名>"` 结果相同，但见下面的通配符陷阱；
+/// - `dupe:` 按**第一个逗号**切（`"dupe:mid,x,たっぷり"` 不命中，排除了按最后一个逗号切），
+///   所以词里含逗号不会截断文本；
+/// - 未知的笔记类型 id 只是不命中、不报错，故全量 OR 安全；
+/// - 值里的引号/反斜杠/空格/冒号/括号/星号在整体加引号后都能解析，且 `*` 不当通配符
+///   （`dupe:` 是精确文本比较，不是模糊匹配）——**这是查询串里唯一还留着的名字，
+///   而它恰好是精确比较的那一个**。
+///
+/// [value] 为空或 [modelIds] 为空时返回空串——调用方据此不发这次请求（空搜索串会把
+/// 整个收藏集摊开，绝不能当成「这个词的卡」）。[deckIds] 为空 = 不限卡组。
+String ankiDuplicateSearchQuery({
+  required String value,
+  required Iterable<int> modelIds,
+  required Iterable<int> deckIds,
+}) {
+  if (value.isEmpty) return '';
+  final List<int> ids = modelIds.toList(growable: false);
+  if (ids.isEmpty) return '';
+  final String escaped = _escapeAnkiQuery(value);
+  // 每个子句整体加引号：值里的空格/冒号/括号否则会被 Anki 的查询解析器切开。
+  final String dupeTerms =
+      ids.map((int mid) => '"dupe:$mid,$escaped"').join(' OR ');
+  // 单个笔记类型也照样套括号：与卡组过滤器并置时 `A B OR C` 的结合律会把
+  // 卡组条件只绑到第一个子句上，那是一句悄悄查错范围的查询。
+  final String dupeGroup = '($dupeTerms)';
+  final String deckFilter = ankiDeckIdFilter(deckIds);
+  return deckFilter.isEmpty ? dupeGroup : '$deckFilter $dupeGroup';
+}
+
+/// BUG-2051：把卡组**范围**解析成一组卡组 id，替代往搜索串里塞卡组名。
+///
+/// 为什么不能按名字查：Anki 搜索里的 `deck:` 是**通配匹配**，`_` 匹配任一字符、
+/// `*` 匹配任意串；而画 ✓ 的那侧（AnkiConnect `duplicateScopeOptions.deckName`）
+/// 是**精确名**。本机实测（同一个真卡组）：
+/// `deck:"…zh-CH"` → 1501 条、`deck:"…zh-C_"` → 同样 1501 条、`deck:"e*"` → 整棵
+/// eggrolls 树；而查重侧把最后一个字换成 `_` 或用 `正在背::*` 都判「不重复」。
+/// 也就是说：只要卡组名里有 `_` 或 `*`（本机就有 `galgame_card_test`），两侧对
+/// 「哪些卡在范围内」的答案就不一样——那正是判据漂移的下一个入口。id 没有这个问题。
+///
+/// `did:` **只匹配该卡组自己、不含子卡组**（实测：父卡组 `did:` n=1，
+/// `deck:` n=10164），所以子卡组要在这里按名字前缀**精确**展开（`名 == 目标` 或
+/// `名.startsWith('目标::')`）——这与查重侧 `checkChildren: true` 的口径一致。
+/// 字符串比较在 Dart 里做，不经过 Anki 的查询解析器，也就没有通配符语义。
+///
+/// 返回空列表 = 不加卡组过滤（整个收藏集）：[AnkiDuplicateScope.collection] 本来
+/// 就不看卡组；卡组名为空或**已不存在**（配置过期）时同样退化成不限卡组——fail-open，
+/// 宁可多列几张也好过对着一张确实存在的卡说「没有找到」。
+///
+/// ⚠️ **这一格与 ✓ 侧的方向是相反的，而且是有意的**：画 ✓ 的查重走 AnkiConnect
+/// `duplicateScopeOptions.deckName`，卡组名解析不出时它直接判「不重复」（fail-**closed**）。
+/// 本侧 fail-open 只在「↗ 被 ✓ 门控」的前提下安全——↗ 按钮只在已画 ✓ 时可见，所以
+/// 多圈进来的卡用户看不到。**谁要是把本函数复用到不受 ✓ 门控的入口，先想清楚这条**：
+/// 那里 fail-open 会让「卡组配置过期」静默变成「整库范围」，而不是一个可见的失败。
+List<int> ankiDuplicateDeckIds({
+  required String deckName,
+  required AnkiDuplicateScope scope,
+  required Map<String, int> deckNamesAndIds,
+}) {
+  final String target = switch (scope) {
+    AnkiDuplicateScope.collection => '',
+    // `::` 是 Anki 的层级分隔符；没有分隔符时根卡组就是它自己。
+    AnkiDuplicateScope.deckRoot => deckName.split('::').first,
+    AnkiDuplicateScope.deck => deckName,
+  };
+  if (target.isEmpty) return const <int>[];
+  final String childPrefix = '$target::';
+  final List<int> ids = <int>[
+    for (final MapEntry<String, int> e in deckNamesAndIds.entries)
+      if (e.key == target || e.key.startsWith(childPrefix)) e.value,
+  ];
+  ids.sort();
+  return ids;
+}
+
+/// `(did:a OR did:b)`；空列表 → 空串（不限卡组）。
+String ankiDeckIdFilter(Iterable<int> deckIds) {
+  final List<int> ids = deckIds.toList(growable: false);
+  if (ids.isEmpty) return '';
+  // 与 dupe 组同样的理由套括号：`did:a OR did:b (X)` 的结合律会查错范围。
+  return '(${ids.map((int did) => 'did:$did').join(' OR ')})';
+}
+
+/// BUG-2051：把一批 note id 变成 Anki 浏览器的查询串 `nid:a,b,c`。
+///
+/// ↗ 最终喂给 `guiBrowse` 的**只有这一句**：浏览器地址栏里不出现词、不出现卡组名，
+/// 于是「浏览器里列出来的」与「我们判定命中的」在物理上是同一批笔记，中间没有第二次
+/// 匹配可以漂移。实测 `nid:a,b,c` 多 id 逗号形式被 Anki 接受（n=3）。
+///
+/// 空列表返回空串——调用方据此不发这次 `guiBrowse`（空搜索串会把整库摊开）。
+String ankiNoteIdBrowseQuery(Iterable<int> noteIds) {
+  final List<int> ids = noteIds.toList(growable: false);
+  if (ids.isEmpty) return '';
+  return 'nid:${ids.join(',')}';
+}
+
+String _fieldValueQuery({
+  required String deckName,
+  required String fieldName,
+  required String fieldValue,
+  required AnkiDuplicateScope scope,
+}) {
+  // Quote the whole "field:value" term so field names containing spaces
+  // (e.g. "Sentence Audio") are not split by Anki's query parser.
+  final String fieldTerm =
+      '"${_escapeAnkiQuery(fieldName)}:${_escapeAnkiQuery(fieldValue)}"';
+  final String deckFilter = ankiDuplicateDeckFilter(deckName, scope);
+  return deckFilter.isEmpty ? fieldTerm : '$deckFilter $fieldTerm';
+}
+
+/// Transport proof that no HTTP request was started.
+///
+/// Generic [http.ClientException], [SocketException], errno, and message text
+/// are intentionally insufficient: package:http exposes the same shape for
+/// response-phase failures after a request may have committed.
+class AnkiConnectPreDeliveryException extends http.ClientException {
+  AnkiConnectPreDeliveryException(
+    super.message,
+    super.uri,
+    this.cause,
+  );
+
+  final Object cause;
+}
+
+/// 一条待打进 `multi` 的 AnkiConnect action。
+class AnkiConnectAction {
+  const AnkiConnectAction(this.action, [this.params]);
+
+  /// AnkiConnect action 名（`deleteMediaFile` / `findNotes` / …）。
+  final String action;
+
+  /// 该 action 的 `params`；无参时为 null（字段整体省略）。
+  final Map<String, dynamic>? params;
+}
+
+/// `multi` 里一条子 action 的结果。
+///
+/// [error] 非空 = 这一条失败了（其余条不受影响）。AnkiConnect 对失败的子
+/// action 永远返回 `{result: null, error: "..."}`，所以失败信息不会丢。
+class AnkiConnectBatchResult {
+  const AnkiConnectBatchResult({this.result, this.error});
+
+  final Object? result;
+  final String? error;
+
+  bool get isError => error != null;
+}
+
+/// [AnkiConnectService.updateNoteFieldsMany] 的一条：给 [noteId] 覆盖 [fields]
+/// 里列出的字段（未列出的字段保持不变）。
+class AnkiNoteFieldsUpdate {
+  const AnkiNoteFieldsUpdate({required this.noteId, required this.fields});
+
+  final int noteId;
+  final Map<String, String> fields;
+}
+
+class AnkiConnectException implements Exception {
+  final String message;
+  AnkiConnectException(this.message);
+  @override
+  String toString() => 'AnkiConnectException: $message';
+}
+
+/// 本进程挂着的 Fushi AnkiConnect 兼容端点的随机实例 id（宿主挂载兼容层时设置，卸下时置 null）。
+///
+/// fushi_anki 不依赖 fushi_engine，所以由宿主经这个全局装配点注入；[AnkiConnectService]
+/// 推 Anki 前用它识别「目标地址其实是 Fushi 自己的兼容端点」。
+String? fushiAnkiConnectCompatInstanceId;
+
+/// 推 Anki 的地址指向了 Fushi 自己的 AnkiConnect 兼容端点。
+class AnkiConnectSelfLoopException extends AnkiConnectException {
+  AnkiConnectSelfLoopException()
+      : super(
+          '推 Anki 的地址指向了 Fushi 自己的兼容端点'
+          ' (the AnkiConnect address points at the Fushi '
+          'AnkiConnect-compatible endpoint, not Anki)',
+        );
+}
+
+class AnkiConnectDuplicateException extends AnkiConnectException {
+  AnkiConnectDuplicateException(super.message);
+}
+
+class AnkiConnectCommitUnknownException extends AnkiConnectException {
+  AnkiConnectCommitUnknownException(this.action, this.cause)
+      : super(
+          'AnkiConnect lost the $action response after the request may have '
+          'reached Anki. The operation may have completed; verify Anki before '
+          'retrying.',
+        );
+
+  final String action;
+  final Object cause;
+}

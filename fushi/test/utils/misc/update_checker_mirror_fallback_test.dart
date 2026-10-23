@@ -1,0 +1,417 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/utils/misc/update_checker.dart';
+
+void main() {
+  group('updateCheckUrls (候选 URL 列表，纯函数)', () {
+    test('首项是用户/直连 URL 本身（有 VPN/系统代理时直连优先）', () {
+      const String direct = 'https://api.github.com/repos/x/y/releases/latest';
+      final List<String> urls = updateCheckUrls(direct);
+      expect(urls.first, direct);
+    });
+
+    test('其余项把每个 gh 代理前缀套在直连 URL 前（GFW 兜底）', () {
+      const String direct = 'https://api.github.com/repos/x/y/releases/latest';
+      final List<String> urls = updateCheckUrls(direct);
+      // 至少应包含多个镜像（不止一个），保证单点不可达仍有后备。
+      expect(urls.length, greaterThan(2));
+      for (final String prefix in updateCheckProxyPrefixes) {
+        expect(urls, contains('$prefix$direct'));
+      }
+    });
+
+    test('候选列表里直连只出现一次且无重复', () {
+      const String direct = 'https://api.github.com/repos/x/y/releases/latest';
+      final List<String> urls = updateCheckUrls(direct);
+      expect(urls.toSet().length, urls.length, reason: '不应有重复候选');
+      expect(urls.where((String u) => u == direct).length, 1);
+    });
+
+    test('镜像前缀清单是可维护常量且包含已知可用候选', () {
+      // 用户日志里连不上的 ghproxy.cc 仍作为多候选之一保留（轮换名单，多备几个）。
+      expect(updateCheckProxyPrefixes, isNotEmpty);
+      expect(
+        updateCheckProxyPrefixes.every((String p) => p.endsWith('/')),
+        isTrue,
+        reason: '前缀必须以 / 结尾才能直接拼接 URL',
+      );
+    });
+
+    test('已 DNS 失效的死域名 ghproxy.homeboyc.cn 不得再出现在镜像清单里'
+        '（TODO-666：用户真机 Failed host lookup errno=7）', () {
+      // 守卫：该公共 gh 代理域名已不再解析（用户日志 errno=7），留着只会在
+      // 下载全失败时贡献误导性 host-lookup 报错。任何复活它的改动都应红。
+      expect(
+        updateCheckProxyPrefixes.any(
+          (String p) => p.contains('ghproxy.homeboyc.cn'),
+        ),
+        isFalse,
+        reason: 'ghproxy.homeboyc.cn DNS 已失效，必须保持移除',
+      );
+    });
+
+    test('直连 URL 恒为首候选（BUG-292：检查命中 api.github.com，'
+        '公共 gh 代理一律 403/限流，唯一可成功路径是直连）', () {
+      const String api = 'https://api.github.com/repos/x/y/releases/latest';
+      final List<String> urls = updateCheckUrls(api);
+      expect(
+        urls.first,
+        api,
+        reason:
+            'api.github.com 经任何镜像都被 GitHub 限流 403，'
+            '检查阶段只有直连能成功，故直连必须排第一',
+      );
+      // 镜像候选仍保留多个（对「下载」阶段有用：实测 ghfast.top/ghproxy.net 返回 206）。
+      expect(
+        urls.length,
+        greaterThan(updateCheckProxyPrefixes.length),
+        reason: '直连 + 全部镜像前缀，候选数应 = 1 + 镜像数',
+      );
+    });
+  });
+
+  group('updateDownloadUrls (官网 R2 + GitHub 回退)', () {
+    test('Fushi release 资产优先走官网不可变 R2 路径，再回退原 GitHub 链', () {
+      const String direct =
+          'https://github.com/hajisensai/Fushi/releases/download/v2.1.1/'
+          'fushi-2.1.1-windows-setup.exe';
+      final List<String> urls = updateDownloadUrls(direct);
+
+      expect(
+        urls.first,
+        'https://fushi.moe/releases/v/v2.1.1/'
+        'fushi-2.1.1-windows-setup.exe?src=r2',
+        reason: '官网 R2 应作为 App 内更新下载首选源',
+      );
+      expect(urls[1], direct, reason: 'R2 未命中后立即回退 GitHub 直连');
+      for (final String prefix in updateCheckProxyPrefixes) {
+        expect(urls, contains('$prefix$direct'));
+      }
+      expect(urls.toSet().length, urls.length, reason: '候选不得重复');
+    });
+
+    test('版本和文件名经 Uri 安全解码再编码，保留空格', () {
+      const String direct =
+          'https://github.com/hajisensai/fushi/releases/download/'
+          'v2.2.0/fushi%20setup.exe';
+      expect(
+        officialR2UrlForUpdateAsset(direct),
+        'https://fushi.moe/releases/v/v2.2.0/fushi%20setup.exe?src=r2',
+      );
+    });
+
+    test('预发布 tag 不生成官网 R2 候选：R2 只镜像正式版（BUG-2855）', () {
+      // mirror-releases.yml 跳过所有 isPrerelease 的 release；debug 还挂在滚动 tag 上。
+      // 以前这些资产照样排出 fushi.moe 首选候选，线上实测必然 404 再回退 GitHub，
+      // 用户每次自动更新都看到下载源从 fushi.moe 换成 github。
+      const List<String> prerelease = <String>[
+        'https://github.com/hajisensai/Fushi/releases/download/'
+            'fushi-debug-rolling/fushi-2.9.0-debug.16720-windows-setup.exe',
+        'https://github.com/hajisensai/fushi/releases/download/'
+            'v2.2.0-debug.7%2Babc1234/fushi%20debug.apk',
+        'https://github.com/hajisensai/Fushi/releases/download/'
+            'v2.7.0-beta.14929/fushi-2.7.0-beta.14929-windows-setup.exe',
+      ];
+      for (final String url in prerelease) {
+        expect(officialR2UrlForUpdateAsset(url), isNull, reason: url);
+        expect(
+          updateDownloadUrls(url),
+          updateCheckUrls(url),
+          reason: '预发布直接从 GitHub 直连开始，回退链不变：$url',
+        );
+      }
+    });
+
+    test('手动首选 GitHub / 代理站只重排首项，完整回退链不丢', () {
+      const String direct =
+          'https://github.com/hajisensai/Fushi/releases/download/v2.1.1/a.apk';
+      final List<String> automatic = updateDownloadUrls(direct);
+      final List<String> github = updateDownloadUrls(
+        direct,
+        preference: updateDownloadSourceGitHub,
+      );
+      expect(github.first, direct);
+      expect(github.toSet(), automatic.toSet());
+
+      final String prefix = updateCheckProxyPrefixes[2];
+      final List<String> proxy = updateDownloadUrls(
+        direct,
+        preference: updateDownloadSourceForProxy(prefix),
+      );
+      expect(proxy.first, '$prefix$direct');
+      expect(proxy.toSet(), automatic.toSet());
+      expect(proxy.length, automatic.length, reason: '选源不能删除灾备候选');
+    });
+
+    test('无效的存量首选值安全回退自动顺序', () {
+      const String direct =
+          'https://github.com/hajisensai/Fushi/releases/download/v2.1.1/a.apk';
+      expect(
+        updateDownloadUrls(direct, preference: 'proxy:https://dead.invalid/'),
+        updateDownloadUrls(direct),
+      );
+    });
+
+    test('旧仓库、第三方 host、API 和非 HTTPS URL 不得映射到官网 R2', () {
+      const List<String> unsupported = <String>[
+        'https://github.com/hajisensai/hibiki/releases/download/v1/a.apk',
+        'https://example.com/hajisensai/fushi/releases/download/v1/a.apk',
+        'https://api.github.com/repos/hajisensai/fushi/releases/latest',
+        'http://github.com/hajisensai/fushi/releases/download/v1/a.apk',
+      ];
+      for (final String url in unsupported) {
+        expect(officialR2UrlForUpdateAsset(url), isNull, reason: url);
+        expect(updateDownloadUrls(url), updateCheckUrls(url), reason: url);
+      }
+    });
+  });
+
+  group('resolveUpdateDownloadPlan (所选来源钉在哪个候选上 + 用没用上)', () {
+    const String official =
+        'https://github.com/hajisensai/Fushi/releases/download/v2.1.1/a.apk';
+    const String legacyRepo =
+        'https://github.com/hajisensai/hibiki/releases/download/v1/a.apk';
+
+    test('自动：不钉候选，也不算「没用上所选来源」', () {
+      final UpdateDownloadPlan plan = resolveUpdateDownloadPlan(
+        official,
+        preference: updateDownloadSourceAutomatic,
+      );
+      expect(plan.pinnedUrl, isNull);
+      expect(plan.hasExplicitSource, isFalse);
+      expect(plan.preferenceUnavailable, isFalse);
+      expect(plan.candidates, updateDownloadUrls(official));
+    });
+
+    test('显式选源：钉住首项候选，完整回退链不变', () {
+      for (final MapEntry<String, String> pair in <String, String>{
+        updateDownloadSourceCloudflare: officialR2UrlForUpdateAsset(official)!,
+        updateDownloadSourceGitHub: official,
+        updateDownloadSourceForProxy(updateCheckProxyPrefixes[1]):
+            '${updateCheckProxyPrefixes[1]}$official',
+      }.entries) {
+        final UpdateDownloadPlan plan = resolveUpdateDownloadPlan(
+          official,
+          preference: pair.key,
+        );
+        expect(plan.pinnedUrl, pair.value, reason: pair.key);
+        expect(plan.candidates.first, pair.value, reason: pair.key);
+        expect(plan.preferenceUnavailable, isFalse, reason: pair.key);
+        expect(
+          plan.candidates.toSet(),
+          resolveUpdateDownloadPlan(official).candidates.toSet(),
+          reason: '选源只重排、不删候选',
+        );
+      }
+    });
+
+    test('所选来源对本资产不适用 → 回退行为不变，但降级可观测', () {
+      // 旧仓库直链映射不出官网 R2（officialR2UrlForUpdateAsset 返 null）。以前这里
+      // 只是静默退回自动顺序：UI 零提示，用户以为自己锁定了 Cloudflare。
+      final UpdateDownloadPlan plan = resolveUpdateDownloadPlan(
+        legacyRepo,
+        preference: updateDownloadSourceCloudflare,
+      );
+      expect(plan.pinnedUrl, isNull);
+      expect(plan.hasExplicitSource, isTrue);
+      expect(plan.preferenceUnavailable, isTrue);
+      expect(
+        plan.candidates,
+        updateCheckUrls(legacyRepo),
+        reason: '不适用时候选序与自动完全一致（回退行为零变化）',
+      );
+      expect(
+        plan.requestedSource,
+        updateDownloadSourceCloudflare,
+        reason: '要告诉用户「没用上的是哪一个」，请求值必须留住',
+      );
+    });
+
+    test('预发布资产选了 Cloudflare → 降级可观测，而不是钉住必然 404 的 R2', () {
+      const String debugAsset =
+          'https://github.com/hajisensai/Fushi/releases/download/'
+          'fushi-debug-rolling/fushi-2.9.0-debug.16720-windows-setup.exe';
+      final UpdateDownloadPlan plan = resolveUpdateDownloadPlan(
+        debugAsset,
+        preference: updateDownloadSourceCloudflare,
+      );
+      expect(plan.pinnedUrl, isNull);
+      expect(plan.preferenceUnavailable, isTrue);
+      expect(plan.candidates.first, debugAsset);
+    });
+
+    test('已下线的镜像前缀同样算「没用上所选来源」', () {
+      final UpdateDownloadPlan plan = resolveUpdateDownloadPlan(
+        official,
+        preference: 'proxy:https://dead.invalid/',
+      );
+      expect(plan.pinnedUrl, isNull);
+      expect(plan.preferenceUnavailable, isTrue);
+    });
+  });
+
+  group('fetchFirstSuccessfulBody (并发竞速选最快活源，注入 fetcher)', () {
+    test('直连合法成功 → 直连胜出（候选并发发起，不再串行逐个等）', () async {
+      final List<String> attempted = <String>[];
+      final String? body = await fetchFirstSuccessfulBody(
+        <String>['a', 'b', 'c'],
+        fetch: (String url) async {
+          attempted.add(url);
+          return 'BODY($url)';
+        },
+      );
+      // TODO-821：胜出条件=合法响应；直连('a',首项)成功 → 直连优先 tie-break 胜出。
+      expect(body, 'BODY(a)', reason: '直连合法成功 → 直连优先胜出');
+      // 并发语义：全部候选都被并发发起（不再串行「首个成功后跳过 b/c」）。
+      expect(
+        attempted,
+        unorderedEquals(<String>['a', 'b', 'c']),
+        reason: '并发竞速：所有候选都并发发起',
+      );
+    });
+
+    test('直连+部分镜像失败时，唯一合法成功的候选胜出（并发全发起）', () async {
+      final List<String> attempted = <String>[];
+      final String? body = await fetchFirstSuccessfulBody(
+        <String>['a', 'b', 'c'],
+        fetch: (String url) async {
+          attempted.add(url);
+          if (url == 'a' || url == 'b') return null; // a/b 不可达
+          return 'BODY($url)';
+        },
+      );
+      // 'c' 是唯一合法成功者 → 它胜出（直连 'a' 失败，不触发 tie-break）。
+      expect(body, 'BODY(c)');
+      expect(
+        attempted,
+        unorderedEquals(<String>['a', 'b', 'c']),
+        reason: '全失败/落败前每个候选都并发发起过',
+      );
+    });
+
+    test('直连抛异常不终止竞速：唯一合法成功的镜像胜出（异常不冒泡）', () async {
+      final List<String> attempted = <String>[];
+      final String? body = await fetchFirstSuccessfulBody(
+        <String>['a', 'b'],
+        fetch: (String url) async {
+          attempted.add(url);
+          if (url == 'a') throw const FormatException('boom');
+          return 'BODY(b)';
+        },
+      );
+      // 直连 'a' 抛异常（失败）→ 不参与裁决；'b' 合法成功胜出。
+      expect(body, 'BODY(b)');
+      expect(attempted, unorderedEquals(<String>['a', 'b']));
+    });
+
+    test('全部候选失败才返回 null（整体失败）', () async {
+      final List<String> attempted = <String>[];
+      final String? body = await fetchFirstSuccessfulBody(
+        <String>['a', 'b', 'c'],
+        fetch: (String url) async {
+          attempted.add(url);
+          return null;
+        },
+      );
+      expect(body, isNull);
+      expect(
+        attempted,
+        unorderedEquals(<String>['a', 'b', 'c']),
+        reason: '全失败前每个候选都并发发起过',
+      );
+    });
+
+    test('每个失败的候选都通过 onFailure 回调记录其主机标签', () async {
+      final List<String> failedHosts = <String>[];
+      await fetchFirstSuccessfulBody(
+        <String>[
+          'https://api.github.com/x',
+          'https://ghfast.top/https://api.github.com/x',
+        ],
+        fetch: (String url) async => null, // 全失败
+        onFailure: (String host, Object? error) => failedHosts.add(host),
+      );
+      expect(
+        failedHosts,
+        unorderedEquals(<String>['api.github.com', 'ghfast.top']),
+        reason:
+            '日志要能看出连不上哪个源（hostLabelForUpdateUrl）；'
+            '并发竞速下记录顺序不定，但每个失败源都要记一条',
+      );
+    });
+
+    test('成功的候选不会触发 onFailure', () async {
+      final List<String> failedHosts = <String>[];
+      final String? body = await fetchFirstSuccessfulBody(
+        <String>['a', 'b'],
+        fetch: (String url) async => url == 'a' ? null : 'ok',
+        onFailure: (String host, Object? error) => failedHosts.add(host),
+      );
+      expect(body, 'ok');
+      expect(failedHosts, <String>[hostLabelForUpdateUrl('a')]);
+    });
+  });
+
+  group('selectRepresentativeDownloadFailure (全失败时抛哪个错，纯函数 TODO-666)', () {
+    UpdateDownloadAttemptFailure failure(String url, Object error) =>
+        UpdateDownloadAttemptFailure(
+          url: url,
+          error: error,
+          stack: StackTrace.current,
+        );
+
+    test('全失败时优先返回直连(首候选)的错误，而非列表末尾的死镜像错误', () {
+      const String direct =
+          'https://github.com/x/y/releases/download/v1/app.apk';
+      final Object directError = Exception('direct github unreachable');
+      const Object deadMirrorError = SocketException(
+        "Failed host lookup: 'ghproxy.homeboyc.cn'",
+      );
+      final List<UpdateDownloadAttemptFailure> failures =
+          <UpdateDownloadAttemptFailure>[
+            failure(direct, directError),
+            failure('https://ghfast.top/$direct', Exception('mirror timeout')),
+            // 列表末尾恰是已失效死镜像：原实现会把它当整轮失败原因展示（误导）。
+            failure('https://ghproxy.homeboyc.cn/$direct', deadMirrorError),
+          ];
+      final UpdateDownloadAttemptFailure? chosen =
+          selectRepresentativeDownloadFailure(failures, directUrl: direct);
+      expect(chosen, isNotNull);
+      expect(
+        chosen!.error,
+        same(directError),
+        reason: '应锚定直连失败（真问题=需代理），不取末尾死镜像 host-lookup 失败',
+      );
+    });
+
+    test('没有直连候选失败记录时，回退到首个失败（仍不取末尾死镜像）', () {
+      const String direct =
+          'https://github.com/x/y/releases/download/v1/app.apk';
+      final Object firstMirrorError = Exception('first mirror failed');
+      final List<UpdateDownloadAttemptFailure> failures =
+          <UpdateDownloadAttemptFailure>[
+            failure('https://ghfast.top/$direct', firstMirrorError),
+            failure(
+              'https://ghproxy.homeboyc.cn/$direct',
+              const SocketException(
+                "Failed host lookup: 'ghproxy.homeboyc.cn'",
+              ),
+            ),
+          ];
+      final UpdateDownloadAttemptFailure? chosen =
+          selectRepresentativeDownloadFailure(failures, directUrl: direct);
+      expect(chosen, isNotNull);
+      expect(chosen!.error, same(firstMirrorError));
+    });
+
+    test('无任何失败记录返回 null（调用方用通用兜底文案）', () {
+      final UpdateDownloadAttemptFailure? chosen =
+          selectRepresentativeDownloadFailure(
+            const <UpdateDownloadAttemptFailure>[],
+            directUrl: 'https://github.com/x/y/z',
+          );
+      expect(chosen, isNull);
+    });
+  });
+}

@@ -1,0 +1,1497 @@
+name: Build Release APK
+
+on:
+  # TODO-1208: docs-only / repo-chore pushes (docs/**, *.md, board files) should
+  # not fire the full ~49m release build. Scope the PUSH trigger to build-relevant
+  # paths. The `release` and `workflow_dispatch` triggers below are intentionally
+  # left UNfiltered so manual beta/formal publishes always run regardless of what
+  # changed. A version bump lives in fushi/pubspec.yaml (under fushi/**) so it
+  # still triggers; the rolling debug seq = commit count, so skipping a seq on a
+  # docs-only push is harmless.
+  # Fushi 改名过渡期曾暂停 push 自动发布（2026-08-07 用户指示），
+  # 2026-08-13 用户指示恢复。
+  #
+  # 2026-09-30 精简 CI：push 路径 = 本 workflow 真正读到的文件，逐个列出。以前挂整个
+  # `tool/**` 与 `.github/workflows/**`，改 tool/bug.dart 或任何一条别的 workflow 都会在
+  # develop 上跑一整轮发布构建。workflow / 发布脚本自身的守卫由 ci-config-gate.yml 在
+  # PR 与 push 上跑；无头服务端由 server-gate.yml 负责（APK 不含它）。
+  # 两条发布 workflow 互相列对方：check_release_policy.ps1 在发布第一步同时校验两份，
+  # 改一份就可能让另一条的第一步红，必须当场暴露。
+  # 守卫：fushi/test/build/release_workflow_path_filter_guard_test.dart（清单与实际
+  # 调用的 tool/ 脚本逐个对账）。
+  push:
+    branches: ['main', 'develop']
+    paths:
+      - 'fushi/**'
+      - 'packages/**'
+      # Android 构建真正用到的原生源码：fushidicts 走 build.gradle 的 CMake，
+      # torrent / p2p / fsrs 在本 workflow 里编成 .so 进 jniLibs。
+      - 'native/fushidicts/**'
+      - 'native/fushi_torrent/**'
+      - 'native/fushi_p2p/**'
+      - 'native/fushi_fsrs/**'
+      - 'ci/**'
+      - 'third_party/**'
+      - 'tool/check_release_policy.ps1'
+      - 'tool/release_sequence.sh'
+      - 'tool/publish_update_manifest.sh'
+      - 'tool/merge_update_manifest.py'
+      - 'tool/feedback_mark_released.sh'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-desktop.yml'
+      - '.github/actions/provide-baked-secrets/**'
+      - '.github/actions/native-artifact-store/**'
+      - '.github/actions/native-store-names/**'
+      - '.github/actions/pdfium-hook-cache/**'
+      - '.github/scripts/verify_torrent_abi.sh'
+      - 'pubspec.yaml'
+      - 'pubspec.lock'
+      - '!packages/fushi_server/**'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel: debug, beta, or formal'
+        required: true
+        default: beta
+        type: choice
+        options:
+          - debug
+          - beta
+          - formal
+      tag_name:
+        description: 'Optional release tag. Defaults to v<version>-debug.<seq>+<sha>, v<version>-beta.<seq>, or v<version>.'
+        required: false
+      release_name:
+        description: 'Optional GitHub Release title.'
+        required: false
+      skip_tests:
+        description: 'Fast build: skip the analyze/unit/package test suites and go straight to compile+publish. Only honored on workflow_dispatch (push-triggered debug builds always run the tests).'
+        required: false
+        default: true
+        type: boolean
+      build_only:
+        description: 'Build the channel artifacts but publish nothing: no GitHub Release, no update manifest. Artifacts stay downloadable from the run page. Use to hand a release candidate out for testing before committing to the publish.'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # 组名带 workflow 名（2026-09-08，用户要求正式版并行发包）：Android（release.yml）与
+  # 桌面/Apple（release-desktop.yml）是两条产出不相交的 workflow，而 GitHub 的 concurrency
+  # 组是**仓库级**的——两条 workflow 只要组名算出来一样就串行，且同组「1 个 in-progress +
+  # 1 个 pending」的语义会让第二个 pending 把第一个 pending **取消**（2026-09-03 实测：同
+  # sha 先后 dispatch Android beta 与桌面 beta，Android 那条 5 秒内 cancelled、0 个 job）。
+  # 正式版靠 `release: published` 同时点燃两条、同 tag 同组必串行：桌面/Apple 包要等
+  # Android 整条跑完才开始（v2.2.4：Android 13:44 上传，Windows/macOS/iOS 14:52）。
+  # 两条并行上传同一个 GitHub Release 是安全的，上传侧本就按此设计：rolling debug 的
+  # prune 只删本平台资产（TODO-1131）；softprops 建 release 撞车会重取（同一条 workflow
+  # 里 windows/macos/ios 早就并行上传同一个 release）；update-manifest 推送有「重取远端
+  # tip 再合并」循环（TODO-781）。同一条 workflow 内仍按 tag/sha 串行，同 tag 两次 dispatch
+  # 不会互相踩。守卫：fushi/test/build/release_workflow_concurrency_guard_test.dart。
+  #
+  # push 事件按**分支**分组（2026-09-30）：此前 push 也按 sha 分组，develop 上每推一次就
+  # 各自跑满一整轮 debug 发布，连推 5 次 = 5 轮全跑完、中间 4 轮的产物马上被最新那轮覆盖。
+  # 改成同分支一组后：正在跑的那轮照样跑完（仍是 cancel-in-progress: false——半路取消会让
+  # rolling debug 资产与 update-manifest 只写一半），只有**排队中**的旧 pending 被后来者顶掉。
+  # 被跳过的 commit 无害：debug 序号 = commit 数（tool/release_sequence.sh），跳号本就发生在
+  # 每次 docs-only push 上（见上面 TODO-1208）；最新那轮包含它们的全部改动，tests job 也跑在
+  # 最新那轮的树上。代价：最新 commit 的 debug 包最多要等正在跑的那一轮结束才开跑。
+  # release / workflow_dispatch 仍按 tag/sha，正式版与手动发布不受影响。
+  # 组名前缀仍带 workflow 名：Android 与桌面在同一分支上也各自一组、互不取消（09-03 教训）。
+  group: fushi-release-${{ github.workflow }}-${{ github.event_name == 'push' && github.ref || github.event.release.tag_name || github.event.inputs.tag_name || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # BUG-2817：`release` 事件只给应用 release（tag = v<数字>…）构建；模型 / 依赖资产
+    # release（manga-panel-detector-onnx-v1、vendor-libmpv、voice-hook-helper…）被手动
+    # 发布时不许整套构建、把安装包挂到它们身上。表达式没有正则，只能逐个列 v0..v9；
+    # 守卫 fushi/test/build/release_event_app_tag_guard_test.dart 钉住每个 job 都带它。
+    if: ${{ (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v0') || startsWith(github.event.release.tag_name, 'v1') || startsWith(github.event.release.tag_name, 'v2') || startsWith(github.event.release.tag_name, 'v3') || startsWith(github.event.release.tag_name, 'v4') || startsWith(github.event.release.tag_name, 'v5') || startsWith(github.event.release.tag_name, 'v6') || startsWith(github.event.release.tag_name, 'v7') || startsWith(github.event.release.tag_name, 'v8') || startsWith(github.event.release.tag_name, 'v9')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      # publish_update_manifest.sh 推完正式版清单要 `gh workflow run` 唤醒 R2 镜像；
+      # job 级 permissions 会把没列出的 scope 置 none，缺 actions: write 则 dispatch 403。
+      actions: write
+    # 发布步骤已搬到下面的 `publish-android` job（2026-10-17，正式版云端预构建 + 审批门）：
+    # 这里只构建、签名、上传 run artifact，绝不对外发布任何东西。
+    #
+    # job outputs 只留 publish-android 的 job 级 if 要用的三个开关。通道解析结果（tag、
+    # 发布 tag、文件清单、公告正文……）经 `fushi-release-channel-<sha>` artifact 交过去：
+    # GitHub 会把「可能含 secret 值」的 job output 整条丢掉（只打一行 Skip output 警告）。
+    # 2026-10-17 实测 publish_tag=fushi-debug-rolling 与 files 被丢，publish 拿空 tag 去
+    # prune rolling release，`gh release view ''` 落到 Latest（v2.9.1）上差点删掉它的资产。
+    # artifact 内容不做这种过滤。守卫 fushi/test/build/release_publish_gate_guard_test.dart。
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      publish_managed_release: ${{ steps.channel.outputs.publish_managed_release }}
+      publish_manifest: ${{ steps.channel.outputs.publish_manifest }}
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    - name: Validate unified release policy
+      shell: pwsh
+      run: ./tool/check_release_policy.ps1
+
+    - uses: actions/setup-java@v5
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.47.6'
+        cache: true
+    # pdfium_dart's build hook downloads PDFium from GitHub on every fresh
+    # runner; restore it so a release-asset hiccup cannot fail the build.
+    - uses: ./.github/actions/pdfium-hook-cache
+      with:
+        purpose: android
+
+    # 与 release-desktop.yml 的同名 step 一样在仓库根运行：BUG-1586 的
+    # `bash tool/release_sequence.sh` 是根相对路径，working-directory: fushi
+    # 会把它解析成不存在的 fushi/tool/（exit 127，自动发布恢复当天首跑即红）。
+    - name: Resolve Android release channel
+      id: channel
+      shell: bash
+      env:
+        INPUT_CHANNEL: ${{ github.event.inputs.channel }}
+        INPUT_BUILD_ONLY: ${{ github.event.inputs.build_only }}
+        INPUT_TAG_NAME: ${{ github.event.inputs.tag_name }}
+        INPUT_RELEASE_NAME: ${{ github.event.inputs.release_name }}
+        RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+        RELEASE_IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        RELEASE_BODY: ${{ github.event.release.body }}
+      run: |
+        set -euo pipefail
+        PUBSPEC_VERSION=$(grep '^version:' fushi/pubspec.yaml | sed 's/version: *//')
+        VERSION="${PUBSPEC_VERSION%%+*}"
+        PUBSPEC_BUILD="${PUBSPEC_VERSION#*+}"
+        if [ "$PUBSPEC_BUILD" = "$PUBSPEC_VERSION" ]; then
+          PUBSPEC_BUILD=1
+        fi
+        if ! [[ "$PUBSPEC_BUILD" =~ ^[0-9]+$ ]]; then
+          echo "::error title=Invalid pubspec build number::Expected numeric +build in $PUBSPEC_VERSION"
+          exit 1
+        fi
+        RELEASE_SEQUENCE=$(bash tool/release_sequence.sh)
+        if ! [[ "$RELEASE_SEQUENCE" =~ ^[0-9]+$ ]] || [ "$RELEASE_SEQUENCE" -le 0 ]; then
+          echo "::error title=Invalid release sequence::Expected positive git rev-list count, got $RELEASE_SEQUENCE"
+          exit 1
+        fi
+        # TODO-414: Android versionCode = build.gradle's versionCodeBase (1e9, a
+        # one-time migration floor above every historically-shipped versionCode)
+        # + 100 * RELEASE_SEQUENCE + ABI offset. The build number passed here is
+        # JUST the monotonic commit count, NOT PUBSPEC_BUILD * 1e6 + seq: the
+        # old *1e6 formula produced versionCode ~6.6e9, which overflows int32 and
+        # exceeds Android's 2.1e9 ceiling, so beta/release Android packages could
+        # not be built at all. PUBSPEC_BUILD stays parsed for logging only.
+        echo "PUBSPEC_BUILD (log only, not in versionCode): $PUBSPEC_BUILD"
+        ANDROID_BUILD_NUMBER=$RELEASE_SEQUENCE
+        SHORT_SHA="${GITHUB_SHA::7}"
+        EVENT="${GITHUB_EVENT_NAME}"
+        CHANNEL="${INPUT_CHANNEL:-}"
+        TAG="${INPUT_TAG_NAME:-}"
+        NAME="${INPUT_RELEASE_NAME:-}"
+        # BUG-2088：正式版/测试版**真实更新公告**的来源。此前 BODY 只有一行模板，
+        # 而 NOTES 就是它——实测 v2.1.1 的 latest-stable.json 里 notes 是
+        # 「Manual formal release from bridge/auto-migrate-download @ 4d1c8f4.」，
+        # 而 GitHub 上那份正文有 3613 字：**应用内更新弹窗给用户看的一直是占位符**。
+        # 约定：公告写在 docs/release-notes/<语义版本>.md，正式/测试通道自动取用；
+        # 手动发 GitHub Release 时优先用 Release 正文（那才是当场写的那份）。
+        # debug 通道不取——滚动开发构建挂完整 changelog 会误导。
+        NOTES_FILE="docs/release-notes/${VERSION}.md"
+        BODY=""
+        PRERELEASE=true
+        MAKE_LATEST=false
+        FILES="fushi/build/release-artifacts/*-debug.apk"
+        BUILD_DEBUG_APK=true
+        BUILD_DEBUG_CHANNEL_APK=false
+        BUILD_SPLIT_RELEASE_APK=false
+        NEEDS_RELEASE_KEYSTORE=false
+        PUBLISH_MANAGED_RELEASE=false
+        # BUG-869: manifest-only publish flag, decoupled from
+        # PUBLISH_MANAGED_RELEASE so the `release` event can emit
+        # latest-stable.json WITHOUT re-running the softprops managed-release
+        # create/upsert (which would touch the user's manually-created Release).
+        # MANIFEST_CHANNEL is the channel handed to publish_update_manifest.sh
+        # (debug|beta|formal) that decides the latest-<channel>.json filename.
+        PUBLISH_MANIFEST=false
+        MANIFEST_CHANNEL=""
+
+        case "$EVENT" in
+          push)
+            CHANNEL=debug
+            TAG="${TAG:-v${VERSION}-debug.${RELEASE_SEQUENCE}+${SHORT_SHA}}"
+            NAME="${NAME:-Fushi debug ${VERSION} (${SHORT_SHA})}"
+            BODY="Automated release-signed debug-channel build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Push releases are always prerelease and never Latest."
+            BUILD_DEBUG_APK=false
+            BUILD_DEBUG_CHANNEL_APK=true
+            NEEDS_RELEASE_KEYSTORE=true
+            PUBLISH_MANAGED_RELEASE=true
+            ;;
+          workflow_dispatch)
+            case "$CHANNEL" in
+              debug)
+                TAG="${TAG:-v${VERSION}-debug.${RELEASE_SEQUENCE}+${SHORT_SHA}}"
+                NAME="${NAME:-Fushi debug ${VERSION} (${SHORT_SHA})}"
+                BODY="Manual release-signed debug-channel build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Debug releases are prerelease and never Latest."
+                BUILD_DEBUG_APK=false
+                BUILD_DEBUG_CHANNEL_APK=true
+                NEEDS_RELEASE_KEYSTORE=true
+                ;;
+              beta)
+                TAG="${TAG:-v${VERSION}-beta.${RELEASE_SEQUENCE}}"
+                NAME="${NAME:-Fushi ${VERSION} beta ${RELEASE_SEQUENCE}}"
+                BODY="Manual beta/test build from ${GITHUB_REF_NAME} @ ${SHORT_SHA}. Beta/test releases are prerelease and never Latest."
+                if [ -f "$NOTES_FILE" ]; then BODY="$(cat "$NOTES_FILE")"; fi
+                FILES="fushi/build/release-artifacts/fushi-*.apk"
+                BUILD_DEBUG_APK=false
+                BUILD_SPLIT_RELEASE_APK=true
+                NEEDS_RELEASE_KEYSTORE=true
+                ;;
+              formal)
+                TAG="${TAG:-v${VERSION}}"
+                NAME="${NAME:-Fushi ${VERSION}}"
+                BODY="Manual formal release from ${GITHUB_REF_NAME} @ ${SHORT_SHA}."
+                if [ -f "$NOTES_FILE" ]; then BODY="$(cat "$NOTES_FILE")"; fi
+                PRERELEASE=false
+                MAKE_LATEST=true
+                FILES="fushi/build/release-artifacts/fushi-*.apk"
+                BUILD_DEBUG_APK=false
+                BUILD_SPLIT_RELEASE_APK=true
+                NEEDS_RELEASE_KEYSTORE=true
+                ;;
+              *)
+                echo "::error title=Invalid release channel::Use debug, beta, or formal."
+                exit 1
+                ;;
+            esac
+            PUBLISH_MANAGED_RELEASE=true
+            ;;
+          release)
+            CHANNEL=github-release
+            # BUG-2104：本分支曾是**唯一**没显式关掉 debug APK 的分支。
+            # `BUILD_DEBUG_APK` 的初值是 true（见本步骤开头），push / dispatch 的
+            # debug|beta|formal 四条分支各自设了 false，只有这里漏了 ⇒ 留在默认 true；
+            # 而下面的上传 glob 是 `fushi-*.apk`，顺手把 `fushi-<ver>-<sha>-debug.apk`
+            # 扫进正式 release 的资产表和已发布的 latest-stable-fushi.json。
+            # 后果不致命（两批已出货客户端都按名字把 `-debug.apk` 排除在 stable/beta 之外，
+            # 见 fushi/test/utils/misc/formal_asset_naming_legacy_contract_test.dart 与
+            # platform_updater.dart 的 _isDebugApkAsset），但正式版页面上多一个 debug 构建
+            # 可供手动下载、白烧一次构建、清单里多一条无用条目。
+            # **手动发 GitHub Release 正是本仓文档里正式版的一等路径**，所以这条必然复发。
+            BUILD_DEBUG_APK=false
+            # 手动发 GitHub Release：正文就是当场写的公告，优先用它；留空（先建空
+            # Release 再补正文）时回落到仓库里的公告文件。
+            BODY="${RELEASE_BODY:-}"
+            if [ -z "$BODY" ] && [ -f "$NOTES_FILE" ]; then BODY="$(cat "$NOTES_FILE")"; fi
+            TAG="${RELEASE_TAG_NAME:-${GITHUB_REF_NAME}}"
+            FILES="fushi/build/release-artifacts/fushi-*.apk"
+            BUILD_SPLIT_RELEASE_APK=true
+            NEEDS_RELEASE_KEYSTORE=true
+            # BUG-869: a manually-published, NON-prerelease GitHub Release IS the
+            # formal stable release. Emit latest-stable.json (with releaseSequence)
+            # so in-China stable clients can read the seq for "谁后用谁" comparison.
+            # This writes ONLY the data-file manifest; it never creates/modifies
+            # the Release (PUBLISH_MANAGED_RELEASE stays false). A manual PRERELEASE
+            # (beta via the UI) is left alone so it can never pollute stable.
+            if [ "${RELEASE_IS_PRERELEASE}" = "false" ]; then
+              MANIFEST_CHANNEL=formal
+              PUBLISH_MANIFEST=true
+              PRERELEASE=false
+            fi
+            ;;
+          *)
+            echo "::error title=Unsupported event::$EVENT is not a release channel event."
+            exit 1
+            ;;
+        esac
+
+        # BUG-869: push / workflow_dispatch keep existing behavior — MANIFEST_CHANNEL
+        # follows CHANNEL (debug|beta|formal) and the manifest publishes whenever the
+        # managed release does. Only the `release` event opts in above independently.
+        if [ -z "$MANIFEST_CHANNEL" ]; then MANIFEST_CHANNEL="$CHANNEL"; fi
+        if [ "$PUBLISH_MANAGED_RELEASE" = true ]; then PUBLISH_MANIFEST=true; fi
+
+        # build_only：出候选包给人测，但**什么都不发布**。
+        #
+        # 刻意放在所有 channel 分支解析完之后：版本串、资产名、签名、构建开关全部
+        # 照该 channel 的真实规则算（所以 formal 的 build_only 产物就是正式版产物，
+        # 不是「像正式版的东西」），只把最后两个发布开关摁掉。
+        #
+        # 只认 workflow_dispatch：`release` 事件（手动发 GitHub Release）本身就是
+        # 发布意图，push 的滚动 debug 也必须照常出包，两者都不该被这个开关影响——
+        # 它们的 github.event.inputs.build_only 恒为空，下面的等值判断自然不成立。
+        if [ "$INPUT_BUILD_ONLY" = "true" ]; then
+          PUBLISH_MANAGED_RELEASE=false
+          PUBLISH_MANIFEST=false
+          echo "::notice title=Build-only run::Channel '$CHANNEL' artifacts will be built and uploaded to this workflow run, but no GitHub Release and no update manifest will be published."
+        fi
+
+        BUILD_VERSION_NAME="${TAG#v}"
+        BUILD_VERSION_NAME="${BUILD_VERSION_NAME%%+*}"
+        case "$CHANNEL" in
+          debug)
+            if ! [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*-debug\.[0-9]+\+[0-9A-Fa-f]{7,40}$ ]]; then
+              echo "::error title=Invalid debug tag::Use v<version>-debug.<sequence>+<short-sha>, not debug-<sha>."
+              exit 1
+            fi
+            ;;
+          beta)
+            if ! [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*-beta\.[0-9]+$ ]]; then
+              echo "::error title=Invalid beta tag::Use v<version>-beta.<sequence>."
+              exit 1
+            fi
+            ;;
+          formal)
+            if ! [[ "$TAG" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+              echo "::error title=Invalid formal tag::Use v<version>."
+              exit 1
+            fi
+            ;;
+        esac
+
+        # TODO-1049: the debug channel publishes to ONE fixed rolling GitHub
+        # Release tag (`debug-rolling`) instead of a new v<version>-debug.<seq>
+        # tag per push, so debug builds stop piling up prereleases that bury the
+        # formal/beta entries in the Releases list. PUBLISH_TAG is the git tag
+        # the GitHub Release actually uses; TAG stays the versioned/seq tag that
+        # the client compares (manifest `tag` field) and that names the APK.
+        # beta/formal are unchanged: their release IS the version tag.
+        #
+        # BUG-1481: the rolling tag is per PRODUCT FAMILY. The bridge product
+        # (`app.hibiki.reader`) keeps the historical `debug-rolling`; Fushi takes
+        # its own tag. Sharing one rolling tag put both families' assets in one
+        # release, and the prune step below groups candidates by PLATFORM only
+        # (`case "$name" in *.apk)`) before keeping the top KEEP_SEQS sequences --
+        # so the family with the higher commit count deleted the other family's
+        # assets on every build. Per-family tags make that grouping single-product
+        # again; do NOT re-merge them.
+        ROLLING_DEBUG_TAG=fushi-debug-rolling
+        if [ "$CHANNEL" = debug ]; then
+          PUBLISH_TAG="$ROLLING_DEBUG_TAG"
+          ROLLING_DEBUG=true
+        else
+          PUBLISH_TAG="$TAG"
+          ROLLING_DEBUG=false
+        fi
+
+        {
+          echo "channel=$CHANNEL"
+          echo "tag=$TAG"
+          echo "publish_tag=$PUBLISH_TAG"
+          echo "rolling_debug=$ROLLING_DEBUG"
+          echo "name=$NAME"
+          echo "prerelease=$PRERELEASE"
+          echo "make_latest=$MAKE_LATEST"
+          echo "build_debug_apk=$BUILD_DEBUG_APK"
+          echo "build_debug_channel_apk=$BUILD_DEBUG_CHANNEL_APK"
+          echo "build_split_release_apk=$BUILD_SPLIT_RELEASE_APK"
+          echo "needs_release_keystore=$NEEDS_RELEASE_KEYSTORE"
+          echo "build_version_name=$BUILD_VERSION_NAME"
+          echo "android_build_number=$ANDROID_BUILD_NUMBER"
+          echo "release_sequence=$RELEASE_SEQUENCE"
+          echo "publish_managed_release=$PUBLISH_MANAGED_RELEASE"
+          echo "publish_manifest=$PUBLISH_MANIFEST"
+          echo "manifest_channel=$MANIFEST_CHANNEL"
+          echo "files=$FILES"
+          echo "body<<EOF"
+          echo "$BODY"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Decode keystore
+      if: steps.channel.outputs.needs_release_keystore == 'true'
+      run: |
+        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > fushi/android/fushi-release.jks
+
+    - name: Create key.properties
+      if: steps.channel.outputs.needs_release_keystore == 'true'
+      working-directory: fushi/android
+      run: |
+        cat > key.properties <<EOF
+        storePassword=${{ secrets.KEYSTORE_PASSWORD }}
+        keyPassword=${{ secrets.KEY_PASSWORD }}
+        keyAlias=${{ secrets.KEY_ALIAS }}
+        storeFile=fushi-release.jks
+        EOF
+
+    - name: Remove local proxy from gradle.properties
+      working-directory: fushi/android
+      run: |
+        sed -i '/systemProp\.http\.proxyHost/d' gradle.properties
+        sed -i '/systemProp\.http\.proxyPort/d' gradle.properties
+        sed -i '/systemProp\.https\.proxyHost/d' gradle.properties
+        sed -i '/systemProp\.https\.proxyPort/d' gradle.properties
+        sed -i '/systemProp\.http\.nonProxyHosts/d' gradle.properties
+
+    # 烘进包里的密钥统一由 composite action 注入 —— 这批注入曾被逐字抄进 11 个
+    # job，抄到最后 TMDB 有 3 个变体、两条发布 workflow 一处都没有，导致发出去
+    # 的包里 TMDB 恒「未配置」而 CI 全绿（BUG-1588）。真相源只留一份。
+    - name: Provide baked-in secret stubs
+      uses: ./.github/actions/provide-baked-secrets
+      with:
+        google-oauth-client-secret: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        log-upload-endpoint: ${{ secrets.LOG_UPLOAD_ENDPOINT }}
+        log-upload-token: ${{ secrets.LOG_UPLOAD_TOKEN }}
+        dandanplay-app-id: ${{ secrets.DANDANPLAY_APP_ID }}
+        dandanplay-app-secret: ${{ secrets.DANDANPLAY_APP_SECRET }}
+        tmdb-api-key: ${{ secrets.TMDB_API_KEY }}
+        opensubtitles-api-key: ${{ secrets.OPENSUBTITLES_API_KEY }}
+    # TODO-2721: 只缓存 Gradle 的下载物（modules-2 / wrapper dists），不缓存
+    # <ver>/transforms 这类可从 modules-2 重算的派生产物。三个 workflow
+    # （main / release / build-multiplatform）的 path + key 必须逐字相同，且此步
+    # 之前不得 sed 改 build.gradle / settings.gradle —— 否则同一份内容会被存成
+    # 两条各 2.7 GB 的缓存。理由见 docs/agent/build.md 的「CI 缓存配额」，守卫见
+    # fushi/test/build/workflow_cache_quota_guard_test.dart。
+    - name: Cache Gradle caches
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.gradle/caches/modules-2
+          ~/.gradle/caches/journal-1
+          ~/.gradle/wrapper/dists
+        key: ${{ runner.os }}-gradle-v2-${{ hashFiles('fushi/android/**/*.gradle*', 'fushi/android/gradle/wrapper/gradle-wrapper.properties') }}
+        restore-keys: |
+          ${{ runner.os }}-gradle-v2-
+
+    - name: Remove aliyun mirrors from gradle files
+      working-directory: fushi/android
+      run: |
+        sed -i "/maven.*aliyun/d" build.gradle
+        sed -i "/maven.*aliyun/d" settings.gradle
+
+    - name: Flutter pub get
+      working-directory: fushi
+      run: flutter pub get
+
+    - name: Apply pub cache patches
+      run: |
+        chmod +x ci/apply-patches.sh
+        bash ci/apply-patches.sh
+
+    # 内置 libtorrent 引擎的 Android .so：vcpkg 交叉编 libtorrent + bridge，产物落
+    # native/fushi_torrent/prebuilt/android/arm64-v8a/，由 fushi/android/app/
+    # build.gradle 的 jniLibs copy-if-present 随包。
+    #
+    # 范围决策：**只编 arm64-v8a**（2026 年真机几乎全是 arm64）。armeabi-v7a /
+    # x86_64 的 split APK 与 fat debug APK 在这些 ABI 上没有 .so，运行期
+    # EmbeddedTorrentHost.open 返回 null → 自动回退外接 qb（与 Windows 缺 DLL
+    # 同一条路径），不是静默破坏。要补其它 ABI 时给脚本追加 ABI 参数即可。
+    #
+    # 缓存姿势照抄 build-multiplatform.yml 的 Windows vcpkg 步骤（TODO-2668）：
+    # key 带 runner ImageVersion（镜像决定 vcpkg 修订与工具链 = 决定 ABI hash，
+    # 常量 key 会让另一镜像永远冷编且命中即不回存）；distfile 目录第二层兜
+    # 「新镜像上线那一次必然冷编」的高危外网取件。
+    - name: Resolve vcpkg cache identity
+      id: vcpkg_cache_id
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      shell: bash
+      run: |
+        image="${ImageVersion:-unknown-image}"
+        image="$(echo "$image" | tr -c '0-9A-Za-z._-' '-')"
+        echo "vcpkg cache identity (runner ImageVersion): $image"
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+    # 原生产物持久库（.github/actions/native-artifact-store，与 build-multiplatform.yml /
+    # release-desktop.yml 的 windows job 同一套）：输入没变就直接取上次 develop/main 编好的
+    # .so，省掉 libtorrent vcpkg 交叉编（~7 min）+ fushi_p2p cargo-ndk（~6 min）。
+    # 2026-09-30 实测 run 36659762478：build job 28.0 min，这两步合计 13.0 min。
+    # 仓库 10 GB 缓存配额约 1 小时换一轮，所以不用 actions/cache 存成品（理由见该 action
+    # 头注释与 docs/agent/build.md「CI 缓存配额」）。
+    #
+    # 名字 = 全部构建输入：源码树哈希（native/fushi_torrent/** 含 CMakeLists / vcpkg.json
+    # 钉版 / overlay ports+triplets / 构建脚本；native/fushi_p2p/** 含 Cargo.lock / 构建脚本）
+    # + 实际使用的 NDK 版本 + 镜像内 vcpkg 修订 + Rust / cargo-ndk 钉版 + runner 镜像版本
+    # + ABI 列表。在**任何东西被构建之前**算：此时 gitignore 的 prebuilt/ build-android-*/
+    # target/ 都还不存在，之后再算就不是同一个值。
+    # 取到的件和现编的件走**同一组**产物校验步骤（下面两个 Verify），不因为是恢复来的就少验。
+    # 任何 miss（没有、过期、非可信来源、SHA256SUMS 不符、下载失败）都回落到现编。
+    - name: Resolve native artifact store names (Android)
+      id: native_store
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      # 名字配方只在 .github/actions/native-store-names/names.sh 写一次（与桌面 / PR 各端
+      # 同源；Rust / cargo-ndk 钉版也从这里读），守卫 native_store_names_single_source_guard。
+      uses: ./.github/actions/native-store-names
+      with:
+        platform: android
+    - name: Restore libtorrent Android .so from native artifact store
+      id: torrent_store
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      uses: ./.github/actions/native-artifact-store
+      with:
+        mode: restore
+        name: ${{ steps.native_store.outputs.torrent }}
+        path: native/fushi_torrent/prebuilt/android
+    - name: Cache vcpkg source distfiles (libtorrent android)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.torrent_store.outputs.hit != 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ runner.temp }}/vcpkg-downloads
+          !${{ runner.temp }}/vcpkg-downloads/tools
+        key: ${{ runner.os }}-vcpkg-downloads-libtorrent-android-v1-${{ steps.vcpkg_cache_id.outputs.image }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-downloads-libtorrent-android-v1-
+    - name: Cache vcpkg binary archives (libtorrent android)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.torrent_store.outputs.hit != 'true' }}
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/vcpkg/archives
+        # v1 -> v2：同 Windows，manifest 钉版换了 ABI hash（BUG-1772）。
+        # 末段 = vcpkg.json / overlay ports / triplets 的哈希：改钉版自动换 key，不再靠手动
+        # bump vN（命中即不回存，忘了 bump 就每次重编改过的包）。restore-keys 只在同一
+        # 镜像内前缀回退，没变的包照样从归档恢复；跨镜像不回退的约束不变。
+        key: ${{ runner.os }}-vcpkg-libtorrent-arm64-android-v2-${{ steps.vcpkg_cache_id.outputs.image }}-${{ hashFiles('native/fushi_torrent/vcpkg.json', 'native/fushi_torrent/vcpkg-ports/**', 'native/fushi_torrent/vcpkg-triplets/**') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-libtorrent-arm64-android-v2-${{ steps.vcpkg_cache_id.outputs.image }}
+    - name: Build embedded libtorrent Android .so (vcpkg)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.torrent_store.outputs.hit != 'true' }}
+      timeout-minutes: 90
+      shell: bash
+      env:
+        VCPKG_DOWNLOADS: ${{ runner.temp }}/vcpkg-downloads
+      run: |
+        set -euo pipefail
+        chmod +x native/fushi_torrent/build_android_so.sh
+        bash native/fushi_torrent/build_android_so.sh \
+          "$VCPKG_INSTALLATION_ROOT" "$ANDROID_NDK_LATEST_HOME" arm64-v8a
+    # 现编与恢复共用的产物校验（与 native-torrent-gate.yml 的 android-arm64 同一组断言）：
+    # 恢复来的件只核过 SHA256SUMS（= 与存入时逐字节一致），这里再验它确实是我们要的
+    # 东西——在、导出头文件声明的每个 ht_* 符号、AArch64、LOAD 段 16KB 对齐。
+    - name: Verify libtorrent Android .so
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        so="native/fushi_torrent/prebuilt/android/arm64-v8a/libfushi_torrent_ffi.so"
+        test -f "$so" || { echo "::error::missing artifact $so"; exit 1; }
+        file "$so"
+        nm_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+        if [ ! -x "$nm_bin" ]; then nm_bin=nm; fi
+        bash .github/scripts/verify_torrent_abi.sh "$so" "$nm_bin"
+        # BUG-3284：C++ 运行时必须静态链入（c++_static）。依赖 APK 里那份由 pickFirst
+        # 挑中的老 libc++_shared.so 时，新 NDK 编出的本库在设备上 dlopen 失败。
+        # 恢复来的旧件（c++_shared 时代存入的）同样会在这里被拦下，回落不到发布。
+        readelf_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+        if [ ! -x "$readelf_bin" ]; then readelf_bin=readelf; fi
+        bash .github/scripts/verify_android_cxx_self_contained.sh "$so" "$readelf_bin" "$nm_bin"
+        machine="$(readelf -h "$so" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+        echo "ELF machine: $machine"
+        case "$machine" in
+          *AArch64*) : ;;
+          *) echo "::error title=wrong target arch::期望 AArch64，实际 $machine"; exit 1 ;;
+        esac
+        load_aligns="$(readelf -lW "$so" | awk '$1 == "LOAD" { print $NF }')"
+        if ! grep -qx '0x4000' <<< "$load_aligns"; then
+          echo "::error title=16KB alignment lost::LOAD segment 不是 0x4000 对齐（检查 CMakeLists 的 max-page-size）"
+          exit 1
+        fi
+        ls -lh "$so"
+    - name: Save libtorrent Android .so to native artifact store
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.torrent_store.outputs.hit != 'true' }}
+      continue-on-error: true
+      uses: ./.github/actions/native-artifact-store
+      with:
+        mode: save
+        name: ${{ steps.native_store.outputs.torrent }}
+        path: native/fushi_torrent/prebuilt/android
+
+    # 互联 P2P 隧道（iroh）的 Android .so：cargo-ndk 交叉编，产物落
+    # native/fushi_p2p/prebuilt/android/<abi>/，由 build.gradle 的 jniLibs
+    # copy-if-present 随包。失败口径与上面的 libtorrent 一致：**构建失败即 job 失败**，
+    # 不降级出一个悄悄少了 P2P 的包（缺库只是运行期能力隐藏，出包时没人会发现）。
+    #
+    # ABI 范围与 APK 对齐：debug APK 只出 arm64，split release APK 出 arm64-v8a /
+    # armeabi-v7a / x86_64 三个。Rust 交叉编译便宜（缓存命中约 1 min），不像
+    # libtorrent 那样只编 arm64。工具链/缓存与 native-p2p-gate.yml 逐字一致。
+    # 持久库命中时 Rust 工具链 / rust-cache / cargo-ndk 一概不装（名字里已钉它们的版本）。
+    - name: Restore fushi_p2p Android .so from native artifact store
+      id: p2p_store
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      uses: ./.github/actions/native-artifact-store
+      with:
+        mode: restore
+        name: ${{ steps.native_store.outputs.p2p }}
+        path: native/fushi_p2p/prebuilt/android
+    - name: Set up Rust (fushi_p2p, Android targets)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.p2p_store.outputs.hit != 'true' }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.native_store.outputs.p2p_rust }}
+        targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+    - name: Cache Rust build (fushi_p2p)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.p2p_store.outputs.hit != 'true' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: native/fushi_p2p -> target
+        key: fushi-p2p-android
+    - name: Install cargo-ndk
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.p2p_store.outputs.hit != 'true' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk@${{ steps.native_store.outputs.cargo_ndk }}
+    - name: Build fushi_p2p Android .so (cargo-ndk)
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.p2p_store.outputs.hit != 'true' }}
+      timeout-minutes: 45
+      shell: bash
+      run: |
+        set -euo pipefail
+        bash native/fushi_p2p/build_android_so.sh "$ANDROID_NDK_LATEST_HOME" arm64-v8a armeabi-v7a x86_64
+    # 现编与恢复共用：每个 ABI 的 .so 都要导出 Dart 绑定 lookup 的全部 fp2p_* 符号。
+    - name: Verify fushi_p2p Android .so
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        nm_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+        if [ ! -x "$nm_bin" ]; then nm_bin=nm; fi
+        for abi in arm64-v8a armeabi-v7a x86_64; do
+          bash native/fushi_p2p/verify_abi.sh "native/fushi_p2p/prebuilt/android/$abi/libfushi_p2p.so" "$nm_bin"
+        done
+    - name: Save fushi_p2p Android .so to native artifact store
+      if: ${{ (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') && steps.p2p_store.outputs.hit != 'true' }}
+      continue-on-error: true
+      uses: ./.github/actions/native-artifact-store
+      with:
+        mode: save
+        name: ${{ steps.native_store.outputs.p2p }}
+        path: native/fushi_p2p/prebuilt/android
+
+    # SRS 排程内核（fsrs-rs）的 Android .so：cargo-ndk 交叉编，产物落
+    # native/fushi_fsrs/prebuilt/android/<abi>/，由 build.gradle 的 jniLibs copy-if-present
+    # 随包。失败口径同 fushi_p2p：**构建失败即 job 失败**，不降级出一个悄悄少了 SRS 原生
+    # 内核的包；出包后下面还会逐 ABI 核对 APK 里确有 libfushi_fsrs.so。
+    # 工具链钉法与 fushi_p2p 同源（Rust / cargo-ndk 版本都从 native_store 读，与
+    # native-fsrs-gate.yml 的 1.95.0 / 4.1.2 一致）；ABI 同样三个。fushi_fsrs 不进原生产物
+    # 持久库（与 build-multiplatform.yml 各端的 fushi_fsrs 步骤同一口径：冷编便宜），只靠
+    # rust-cache。fushi_p2p 持久库命中时它那组 Rust / cargo-ndk 安装步骤被跳过，所以这里
+    # 无条件再装一次（同版本，幂等）。
+    - name: Set up Rust (fushi_fsrs, Android targets)
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.native_store.outputs.p2p_rust }}
+        targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+    - name: Cache Rust build (fushi_fsrs)
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: native/fushi_fsrs -> target
+        key: fushi-fsrs-android
+    - name: Install cargo-ndk (fushi_fsrs)
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-ndk@${{ steps.native_store.outputs.cargo_ndk }}
+    - name: Build fushi_fsrs Android .so (cargo-ndk)
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      timeout-minutes: 45
+      shell: bash
+      run: |
+        set -euo pipefail
+        bash native/fushi_fsrs/build_android_so.sh "$ANDROID_NDK_LATEST_HOME" arm64-v8a armeabi-v7a x86_64
+    # 每个 ABI 的 .so：ELF 架构对得上，且导出 Dart 绑定 lookup 的全部 ffsrs_* 符号。
+    - name: Verify fushi_fsrs Android .so
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        nm_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+        if [ ! -x "$nm_bin" ]; then nm_bin=nm; fi
+        for pair in arm64-v8a:AArch64 armeabi-v7a:ARM x86_64:X86-64; do
+          abi="${pair%%:*}"; want="${pair#*:}"
+          so="native/fushi_fsrs/prebuilt/android/$abi/libfushi_fsrs.so"
+          test -f "$so" || { echo "::error::missing artifact $so"; exit 1; }
+          machine="$(readelf -h "$so" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+          echo "$abi: ELF machine = $machine"
+          case "$machine" in
+            *"$want"*) : ;;
+            *) echo "::error title=wrong target arch::$abi 期望 $want，实际 $machine"; exit 1 ;;
+          esac
+          bash native/fushi_fsrs/verify_abi.sh "$so" "$nm_bin"
+        done
+
+    # TODO-fast-release: analyze/unit/package tests no longer gate this build job.
+    # They ran here as sequential steps BEFORE `flutter build apk`, so a slow or
+    # red suite delayed (and could block) the debug-channel APK the user is
+    # waiting on. They now live in the sibling `tests` job below, which runs in
+    # PARALLEL off the same trigger and does NOT gate build/publish: the APK
+    # compiles + publishes immediately, and a test failure still surfaces as a red
+    # X on the `tests` job (continuous signal preserved on every push, including
+    # direct develop pushes that skip the PR gate in main.yml). The desktop/EXE
+    # workflow (release-desktop.yml) never ran tests, so nothing there changes.
+    # The workflow_dispatch skip_tests input now governs whether the `tests` job
+    # runs (see its job-level `if`), keeping the manual fast-release path intact.
+    - name: Collect Android release build diagnostics
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Tool versions"
+        pwd
+        git rev-parse --short HEAD
+        flutter --version
+        dart --version
+        java -version
+        (cd android && timeout 120s ./gradlew --version --no-daemon) || true
+        echo "::endgroup::"
+        echo "::group::Pre-build output paths"
+        ls -la build || true
+        ls -la build/app || true
+        ls -la build/app/outputs || true
+        ls -la build/app/outputs/flutter-apk || true
+        find build/app/outputs/flutter-apk -maxdepth 1 -type f -name '*.apk' -print -exec ls -lh {} \; || true
+        echo "::endgroup::"
+
+    - name: Build debug APK
+      if: steps.channel.outputs.build_debug_apk == 'true'
+      working-directory: fushi
+      timeout-minutes: 20
+      shell: bash
+      run: |
+        set -euo pipefail
+        flutter --verbose build apk --debug \
+          --build-name "${{ steps.channel.outputs.build_version_name }}" \
+          --build-number "${{ steps.channel.outputs.android_build_number }}" \
+          --dart-define="FUSHI_BUILD_VERSION=${{ steps.channel.outputs.build_version_name }}"
+
+    - name: Prepare debug APK release asset
+      if: steps.channel.outputs.build_debug_apk == 'true'
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        BUILD_VERSION_NAME="${{ steps.channel.outputs.build_version_name }}"
+        SHORT_SHA="${GITHUB_SHA::7}"
+        APK_DIR=build/app/outputs/flutter-apk
+        OUT_DIR=build/release-artifacts
+        DEBUG_APK=$(find "$APK_DIR" -maxdepth 1 -type f -name '*-debug.apk' | sort | head -n 1)
+        if [ -z "$DEBUG_APK" ]; then
+          echo "::error title=Debug APK missing::No *-debug.apk found in $APK_DIR"
+          exit 1
+        fi
+        mkdir -p "$OUT_DIR"
+        rm -f "$OUT_DIR"/fushi-*.apk
+        cp "$DEBUG_APK" "$OUT_DIR/fushi-${BUILD_VERSION_NAME}-${SHORT_SHA}-debug.apk"
+
+    - name: Build release-signed debug-channel APK
+      if: steps.channel.outputs.build_debug_channel_apk == 'true'
+      working-directory: fushi
+      timeout-minutes: 30
+      shell: bash
+      run: |
+        set -euo pipefail
+        flutter --verbose build apk --release --target-platform android-arm64 \
+          --build-name "${{ steps.channel.outputs.build_version_name }}" \
+          --build-number "${{ steps.channel.outputs.android_build_number }}" \
+          --dart-define="FUSHI_BUILD_VERSION=${{ steps.channel.outputs.build_version_name }}"
+
+    - name: Prepare release-signed debug-channel APK asset
+      if: steps.channel.outputs.build_debug_channel_apk == 'true'
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        BUILD_VERSION_NAME="${{ steps.channel.outputs.build_version_name }}"
+        SHORT_SHA="${GITHUB_SHA::7}"
+        APK_DIR=build/app/outputs/flutter-apk
+        OUT_DIR=build/release-artifacts
+        DEBUG_CHANNEL_APK=$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*-debug.apk' | sort | head -n 1)
+        if [ -z "$DEBUG_CHANNEL_APK" ]; then
+          echo "::error title=Debug channel APK missing::No release-signed APK found in $APK_DIR"
+          exit 1
+        fi
+        mkdir -p "$OUT_DIR"
+        rm -f "$OUT_DIR"/fushi-*.apk
+        cp "$DEBUG_CHANNEL_APK" "$OUT_DIR/fushi-${BUILD_VERSION_NAME}-${SHORT_SHA}-debug.apk"
+
+    - name: Build release APK (split per ABI)
+      if: steps.channel.outputs.build_split_release_apk == 'true'
+      working-directory: fushi
+      timeout-minutes: 60
+      shell: bash
+      run: |
+        set -euo pipefail
+        flutter --verbose build apk --split-per-abi --release \
+          --build-name "${{ steps.channel.outputs.build_version_name }}" \
+          --build-number "${{ steps.channel.outputs.android_build_number }}" \
+          --dart-define="FUSHI_BUILD_VERSION=${{ steps.channel.outputs.build_version_name }}"
+
+    - name: Collect Android post-build diagnostics
+      if: ${{ always() && (steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true') }}
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Post-build APK diagnostics"
+        pwd
+        find build/app/outputs/flutter-apk -maxdepth 1 -type f -name '*.apk' -print -exec ls -lh {} \; || true
+        find build/app/outputs -maxdepth 5 -type f \( -name '*.apk' -o -name '*.aab' \) -print || true
+        echo "::endgroup::"
+
+    - name: Prepare release APK assets
+      if: steps.channel.outputs.build_split_release_apk == 'true'
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        BUILD_VERSION_NAME="${{ steps.channel.outputs.build_version_name }}"
+        APK_DIR=build/app/outputs/flutter-apk
+        OUT_DIR=build/release-artifacts
+        mkdir -p "$OUT_DIR"
+        for f in "$APK_DIR"/app-*-release.apk; do
+          ABI=$(basename "$f" | sed 's/^app-//;s/-release\.apk$//')
+          cp "$f" "$OUT_DIR/fushi-${BUILD_VERSION_NAME}-${ABI}.apk"
+        done
+
+    # jniLibs 是 copy-if-present：.so 没落到 prebuilt/ 时 Gradle 静默跳过，APK 照出、
+    # P2P 能力在用户那里整块消失。这里按「APK 里 app 能跑的每个 ABI（有 libflutter.so
+    # 的 lib/<abi>/），都必须有那个 ABI 的 libfushi_p2p.so」逐包核对，把「编了但没进包」
+    # 挡在发布前。判据用 libflutter.so 而不是「任何 lib/ 目录」：第三方插件可能自带
+    # Flutter 根本不支持的 ABI 目录（如 x86），那上面 app 本身就起不来。
+    - name: Verify fushi_p2p is packaged in every APK ABI
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        apks=(build/release-artifacts/fushi-*.apk)
+        if [ "${#apks[@]}" -eq 0 ]; then
+          echo "::error title=No APK to verify::build/release-artifacts has no fushi-*.apk"
+          exit 1
+        fi
+        for apk in "${apks[@]}"; do
+          listing="$(unzip -Z1 "$apk")"
+          abis="$(printf '%s\n' "$listing" | sed -n 's#^lib/\([^/]*\)/libflutter\.so$#\1#p' | sort -u)"
+          if [ -z "$abis" ]; then
+            echo "::error title=APK has no Flutter engine::$apk has no lib/<abi>/libflutter.so"
+            exit 1
+          fi
+          for abi in $abis; do
+            # here-string，不用 `printf | grep -q`：清单是整个 APK 的条目（远超 64KB 管道缓冲），
+            # grep -q 一命中就退出，printf 随即 SIGPIPE，在 pipefail 下整条管道判失败，`if !`
+            # 就把「找到了」读成「没有」（BUG-2804，2f08d46 / 248238cf7 两次假红，日志里是
+            # `printf: write error: Broken pipe`）。
+            if ! grep -qx "lib/$abi/libfushi_p2p.so" <<< "$listing"; then
+              echo "::error title=fushi_p2p missing from APK::$apk lib/$abi/ has no libfushi_p2p.so"
+              exit 1
+            fi
+            echo "ok: $apk lib/$abi/libfushi_p2p.so"
+          done
+        done
+
+    # 同上，fushi_fsrs（SRS 排程内核）也是 jniLibs copy-if-present：逐包、逐 ABI 核对
+    # APK 里确有 libfushi_fsrs.so，把「编了但没进包」挡在发布前。判据与 here-string
+    # 理由（BUG-2804）同上一步。
+    - name: Verify fushi_fsrs is packaged in every APK ABI
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        apks=(build/release-artifacts/fushi-*.apk)
+        if [ "${#apks[@]}" -eq 0 ]; then
+          echo "::error title=No APK to verify::build/release-artifacts has no fushi-*.apk"
+          exit 1
+        fi
+        for apk in "${apks[@]}"; do
+          listing="$(unzip -Z1 "$apk")"
+          abis="$(printf '%s\n' "$listing" | sed -n 's#^lib/\([^/]*\)/libflutter\.so$#\1#p' | sort -u)"
+          if [ -z "$abis" ]; then
+            echo "::error title=APK has no Flutter engine::$apk has no lib/<abi>/libflutter.so"
+            exit 1
+          fi
+          for abi in $abis; do
+            if ! grep -qx "lib/$abi/libfushi_fsrs.so" <<< "$listing"; then
+              echo "::error title=fushi_fsrs missing from APK::$apk lib/$abi/ has no libfushi_fsrs.so"
+              exit 1
+            fi
+            echo "ok: $apk lib/$abi/libfushi_fsrs.so"
+          done
+        done
+
+    # libbluray opens the Blu-ray libaacs module as soname libaacs.so.0; the app
+    # preloads libfushi_aacs.so (native/fushi_aacs) from every ABI it runs on.
+    - name: Verify fushi_aacs is packaged in every APK ABI
+      if: ${{ steps.channel.outputs.build_debug_apk == 'true' || steps.channel.outputs.build_debug_channel_apk == 'true' || steps.channel.outputs.build_split_release_apk == 'true' }}
+      working-directory: fushi
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        apks=(build/release-artifacts/fushi-*.apk)
+        if [ "${#apks[@]}" -eq 0 ]; then
+          echo "::error title=No APK to verify::build/release-artifacts has no fushi-*.apk"
+          exit 1
+        fi
+        for apk in "${apks[@]}"; do
+          listing="$(unzip -Z1 "$apk")"
+          abis="$(printf '%s\n' "$listing" | sed -n 's#^lib/\([^/]*\)/libflutter\.so$#\1#p' | sort -u)"
+          for abi in $abis; do
+            # here-string, not printf | grep -q (BUG-2804 SIGPIPE false red).
+            if ! grep -qx "lib/$abi/libfushi_aacs.so" <<< "$listing"; then
+              echo "::error title=fushi_aacs missing from APK::$apk lib/$abi/ has no libfushi_aacs.so"
+              exit 1
+            fi
+            echo "ok: $apk lib/$abi/libfushi_aacs.so"
+          done
+        done
+
+    # TODO-866: the prepared APKs in build/release-artifacts/ are otherwise only
+    # ever uploaded as GitHub Release assets (the softprops steps below). When
+    # that release publish intermittently 403s ("Resource not accessible by
+    # integration"), the APK is built successfully but has NO download path and
+    # is destroyed with the runner. Capture it as a workflow-run artifact so the
+    # build is always downloadable from the run page, decoupled from Release
+    # publish. Pure additive capture: touches no tag/publish/Latest/formal
+    # logic. always() + no channel gate so a successful build is downloadable
+    # even if a later publish step 403s; if-no-files-found: ignore tolerates
+    # channels/events that produced no APK.
+    # 通道解析结果交给 publish-android 的唯一通道（不走 job outputs，原因见本 job 的
+    # outputs 注释）。一键一文件，原样写值：不经 shell 展开、不怕多行公告。
+    - name: Save Android release channel for publish job
+      if: always() && steps.channel.outcome == 'success'
+      shell: bash
+      env:
+        CH_CHANNEL: ${{ steps.channel.outputs.channel }}
+        CH_TAG: ${{ steps.channel.outputs.tag }}
+        CH_PUBLISH_TAG: ${{ steps.channel.outputs.publish_tag }}
+        CH_ROLLING_DEBUG: ${{ steps.channel.outputs.rolling_debug }}
+        CH_NAME: ${{ steps.channel.outputs.name }}
+        CH_PRERELEASE: ${{ steps.channel.outputs.prerelease }}
+        CH_MAKE_LATEST: ${{ steps.channel.outputs.make_latest }}
+        CH_BUILD_VERSION_NAME: ${{ steps.channel.outputs.build_version_name }}
+        CH_RELEASE_SEQUENCE: ${{ steps.channel.outputs.release_sequence }}
+        CH_PUBLISH_MANAGED_RELEASE: ${{ steps.channel.outputs.publish_managed_release }}
+        CH_PUBLISH_MANIFEST: ${{ steps.channel.outputs.publish_manifest }}
+        CH_MANIFEST_CHANNEL: ${{ steps.channel.outputs.manifest_channel }}
+        CH_FILES: ${{ steps.channel.outputs.files }}
+        CH_BODY: ${{ steps.channel.outputs.body }}
+      run: |
+        set -euo pipefail
+        dir=fushi/build/release-channel
+        mkdir -p "$dir"
+        for key in channel tag publish_tag rolling_debug name prerelease make_latest build_version_name release_sequence publish_managed_release publish_manifest manifest_channel files body; do
+          var="CH_${key^^}"
+          printf '%s' "${!var}" > "$dir/$key"
+        done
+
+    - name: Upload Android release channel to workflow run
+      if: always() && steps.channel.outcome == 'success'
+      uses: actions/upload-artifact@v7
+      with:
+        name: fushi-release-channel-${{ github.sha }}
+        path: fushi/build/release-channel/
+        if-no-files-found: error
+        retention-days: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.channel == 'formal' || github.event.inputs.channel == 'beta')) && 30 || 14 }}
+
+    - name: Upload APK artifacts to workflow run
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: fushi-${{ steps.channel.outputs.channel }}-apk-${{ github.sha }}
+        path: fushi/build/release-artifacts/*.apk
+        if-no-files-found: ignore
+        # 正式 / 测试版 dispatch 的 publish job 要等人工审批（环境 release-publish，
+        # 待审批 job 最长挂 30 天），publish job 从这份 artifact 取 APK：保留期必须
+        # 盖住整个审批窗口，否则过了 14 天再批就发不出去。
+        retention-days: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.channel == 'formal' || github.event.inputs.channel == 'beta')) && 30 || 14 }}
+
+  # 对外发布全部收在这个 job（2026-10-17 用户要求：正式版必须云端预构建好，说「发版」
+  # 时秒发、不重新构建）。build job 只构建 + 签名 + 上传 run artifact；这里下载 artifact
+  # 后才做 GitHub Release 创建 / 上传、滚动 debug 清理、更新清单、反馈回填、main 同步。
+  #
+  # 审批门：workflow_dispatch 的 formal / beta 走环境 `release-publish`（必需审批人
+  # hajisensai、允许自审），job 停在「Waiting」直到批准；push 的滚动 debug 与手动发
+  # GitHub Release（`release` 事件，本身就是发布动作）走无保护规则的 `release-auto`，
+  # 不等人。不用「表达式算出空串 = 不挂环境」：官方文档没写这条语义，push 发布每天
+  # 跑十几次，赌错就是全停；两个具名环境的行为都有文档保证。
+  # build_only 时两个发布开关都是 false，job 级 if 直接跳过，不会弹审批。
+  # release-desktop.yml 的 publish / testflight 两个 job 挂同一个门（本 job 叫 publish-android：
+  # 两条 workflow 的 job 名按产出不相交，守卫 release_workflow_push_branches_guard_test），同 tag 两条
+  # dispatch 都停在门口，两条都批准才是完整的一次发版。流程见 docs/agent/build.md
+  # 「正式版预构建与审批发布」；守卫 fushi/test/build/release_publish_gate_guard_test.dart。
+  publish-android:
+    needs: build
+    if: ${{ (github.event_name == 'release' || needs.build.outputs.publish_managed_release == 'true' || needs.build.outputs.publish_manifest == 'true') && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v0') || startsWith(github.event.release.tag_name, 'v1') || startsWith(github.event.release.tag_name, 'v2') || startsWith(github.event.release.tag_name, 'v3') || startsWith(github.event.release.tag_name, 'v4') || startsWith(github.event.release.tag_name, 'v5') || startsWith(github.event.release.tag_name, 'v6') || startsWith(github.event.release.tag_name, 'v7') || startsWith(github.event.release.tag_name, 'v8') || startsWith(github.event.release.tag_name, 'v9')) }}
+    environment: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.channel == 'formal' || github.event.inputs.channel == 'beta')) && 'release-publish' || 'release-auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      # publish_update_manifest.sh 推完正式版清单要 `gh workflow run` 唤醒 R2 镜像；
+      # job 级 permissions 会把没列出的 scope 置 none，缺 actions: write 则 dispatch 403。
+      actions: write
+
+    steps:
+    # 完整历史：反馈回填要 `git merge-base --is-ancestor`，main 同步拿工作区当
+    # `--reference` 借对象，清单脚本在 tool/ 下。
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 0
+
+    # 把 build job 的通道解析结果还原成 steps.channel.outputs.*（不在这里重新解析：
+    # 同一份结果只算一次，publish 与 build 不可能对版本串 / tag / 开关各执一词）。
+    # 来源是 build job 上传的 artifact，不是 job outputs（会被 secret 过滤静默丢值）。
+    - name: Download Android release channel from build job
+      uses: actions/download-artifact@v7
+      with:
+        name: fushi-release-channel-${{ github.sha }}
+        path: ${{ runner.temp }}/release-channel
+
+    - name: Load Android release channel from build job
+      id: channel
+      shell: bash
+      env:
+        CH_DIR: ${{ runner.temp }}/release-channel
+      run: |
+        set -euo pipefail
+        for key in channel tag publish_tag rolling_debug name prerelease make_latest build_version_name release_sequence publish_managed_release publish_manifest manifest_channel files body; do
+          if [ ! -f "$CH_DIR/$key" ]; then
+            echo "::error title=Release channel incomplete::build job did not hand over '$key'"
+            exit 1
+          fi
+        done
+        # 空 tag 绝不能往下走：prune / 上传拿空 tag 会落到 Latest release 上。
+        for key in channel tag publish_tag; do
+          if [ -z "$(cat "$CH_DIR/$key")" ]; then
+            echo "::error title=Empty release channel value::'$key' is empty; refusing to publish"
+            exit 1
+          fi
+        done
+        {
+          for key in channel tag publish_tag rolling_debug name prerelease make_latest build_version_name release_sequence publish_managed_release publish_manifest manifest_channel files; do
+            printf '%s=%s\n' "$key" "$(cat "$CH_DIR/$key")"
+          done
+          echo "body<<FUSHI_RELEASE_BODY_EOF"
+          cat "$CH_DIR/body"
+          printf '\n'
+          echo "FUSHI_RELEASE_BODY_EOF"
+        } >> "$GITHUB_OUTPUT"
+        echo "channel=$(cat "$CH_DIR/channel") tag=$(cat "$CH_DIR/tag") publish_tag=$(cat "$CH_DIR/publish_tag") managed=$(cat "$CH_DIR/publish_managed_release") manifest=$(cat "$CH_DIR/publish_manifest")/$(cat "$CH_DIR/manifest_channel")"
+
+    - name: Download APK artifacts from build job
+      uses: actions/download-artifact@v7
+      with:
+        name: fushi-${{ steps.channel.outputs.channel }}-apk-${{ github.sha }}
+        path: fushi/build/release-artifacts
+
+    - name: Upload APKs to GitHub Release event
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: ${{ steps.channel.outputs.tag }}
+        files: |
+          fushi/build/release-artifacts/fushi-*.apk
+
+    # TODO-1049 / TODO-1123: the debug channel reuses ONE rolling GitHub Release
+    # (tag `debug-rolling`). softprops upserts same-named assets but never
+    # removes an asset from a PRIOR commit (different seq/sha in the name), so
+    # without pruning the rolling release would accumulate one APK+EXE per commit.
+    #
+    # TODO-1123 root-cause narrowing of the pruned-asset 404 race: the OLD prune
+    # kept ONLY the current build's seq, so a device that had just fetched the
+    # PREVIOUS manifest (older seq) and then started downloading would 404 the
+    # instant a newer push pruned that seq's APK. We now keep the most recent
+    # KEEP_SEQS (=3: current + prior two) sequences, giving in-flight downloads a
+    # grace window across a couple of pushes. The client also re-resolves the
+    # manifest on a 404 and retries the fresh URL once (update_checker), so this
+    # CI change is the "widen the window" half of a two-sided fix. Same-commit
+    # Android+desktop share the seq, so they never prune each other. Skipped
+    # unless this run is the rolling debug channel. Missing release / nothing to
+    # prune is a no-op.
+    - name: Prune stale assets from rolling debug release
+      if: steps.channel.outputs.publish_managed_release == 'true' && steps.channel.outputs.rolling_debug == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        PUBLISH_TAG: ${{ steps.channel.outputs.publish_tag }}
+        BUILD_VERSION_NAME: ${{ steps.channel.outputs.build_version_name }}
+      run: |
+        set -euo pipefail
+        # Keep the most recent KEEP_SEQS debug sequences (current + prior 2) so a
+        # client mid-download against a just-superseded seq is not 404'd.
+        KEEP_SEQS=3
+        if ! gh release view "$PUBLISH_TAG" --repo "$REPO" >/dev/null 2>&1; then
+          echo "Rolling release $PUBLISH_TAG does not exist yet; nothing to prune."
+          exit 0
+        fi
+        mapfile -t ASSET_NAMES < <(
+          gh release view "$PUBLISH_TAG" --repo "$REPO" --json assets \
+            --jq '.assets[].name' || true
+        )
+        if [ "${#ASSET_NAMES[@]}" -eq 0 ]; then
+          echo "No assets on $PUBLISH_TAG; nothing to prune."
+          exit 0
+        fi
+        # TODO-1131: only ever prune THIS platform's own assets. The rolling
+        # debug release is shared by Android/Windows/Apple, each publishing from
+        # an independent workflow run. Computing the kept-seq set across ALL
+        # platforms' assets means a lagging platform (slower or transiently
+        # failed build) has its last-good asset's seq pushed out of the top
+        # KEEP_SEQS by the OTHER platforms' newer seqs -- so another platform's
+        # prune deletes it and the rolling release "loses" that device. Scope the
+        # candidate set to this platform's filename shape (Android: *.apk) so each
+        # platform keeps its own top KEEP_SEQS and never touches another's assets.
+        PLATFORM_ASSETS=()
+        for name in "${ASSET_NAMES[@]}"; do
+          case "$name" in
+            *.apk) PLATFORM_ASSETS+=("$name") ;;
+          esac
+        done
+        # Check length BEFORE re-expanding the (possibly empty) array: on macOS
+        # bash 3.2 `("${empty[@]}")` under `set -u` is an unbound-variable error,
+        # and no-asset-for-this-platform is exactly the lagging / first-publish
+        # case this fix must handle gracefully. `${#arr[@]}` is safe on 3.2.
+        if [ "${#PLATFORM_ASSETS[@]}" -eq 0 ]; then
+          echo "No Android assets on $PUBLISH_TAG; nothing to prune."
+          exit 0
+        fi
+        ASSET_NAMES=("${PLATFORM_ASSETS[@]}")
+        # Asset names embed the versionName token `-<base>-debug.<seq>-` (e.g.
+        # fushi-0.11.1-debug.5633-3cf5905-debug.apk). Parse the current build's
+        # seq from BUILD_VERSION_NAME (0.11.1-debug.5633), extract every asset's
+        # seq the same way, keep the top KEEP_SEQS distinct seqs (numeric desc),
+        # and delete only assets whose seq is NOT in that set. Assets with no
+        # parseable debug seq are treated as stale (superseded/legacy naming).
+        seq_of() { printf '%s' "$1" | sed -n 's/.*-debug\.\([0-9]\+\).*/\1/p'; }
+        CURRENT_SEQ="$(seq_of "$BUILD_VERSION_NAME")"
+        {
+          # TODO-1129: terminal-position `[ -n "$X" ] && echo` inside a pipefail
+          # brace-group returns 1 when the test is false (empty seq), which
+          # pipefail propagates and set -e kills the step silently. Use no-else
+          # `if` so a false test yields exit 0.
+          if [ -n "$CURRENT_SEQ" ]; then echo "$CURRENT_SEQ"; fi
+          for name in "${ASSET_NAMES[@]}"; do
+            s="$(seq_of "$name")"
+            if [ -n "$s" ]; then echo "$s"; fi
+          done
+        } | sort -rn -u > /tmp/all_seqs.txt
+        mapfile -t KEEP_SEQ_LIST < <(head -n "$KEEP_SEQS" /tmp/all_seqs.txt)
+        echo "Keeping debug seqs: ${KEEP_SEQ_LIST[*]:-<none>}"
+        in_keep() {
+          local target="$1"
+          for k in "${KEEP_SEQ_LIST[@]}"; do
+            [ "$k" = "$target" ] && return 0
+          done
+          return 1
+        }
+        STALE=()
+        for name in "${ASSET_NAMES[@]}"; do
+          [ -n "$name" ] || continue
+          s="$(seq_of "$name")"
+          if [ -z "$s" ] || ! in_keep "$s"; then
+            STALE+=("$name")
+          fi
+        done
+        if [ "${#STALE[@]}" -eq 0 ]; then
+          echo "No stale assets on $PUBLISH_TAG (all within kept seqs)."
+          exit 0
+        fi
+        for asset in "${STALE[@]}"; do
+          [ -n "$asset" ] || continue
+          echo "  deleting stale asset $asset from $PUBLISH_TAG"
+          gh release delete-asset "$PUBLISH_TAG" "$asset" --repo "$REPO" --yes
+        done
+
+    - name: Publish Android channel release
+      if: steps.channel.outputs.publish_managed_release == 'true'
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: ${{ steps.channel.outputs.publish_tag }}
+        # Rolling debug: target the DEFAULT branch, not github.sha. GitHub rejects a
+        # GITHUB_TOKEN update of a release whose resolved target commit changes
+        # .github/workflows/ relative to the default branch (REST docs, "Update a release";
+        # the token cannot hold `workflows`). develop diverged from main in workflows from
+        # 2026-09-29 21:13 on and the rolling publish failed intermittently with
+        # "Resource not accessible by integration" (10 of 27 attempts; Android stuck ~3 h).
+        # The rolling tag already exists, so target_commitish never moves it; the develop
+        # sha stays in the release name/body. Beta/formal keep github.sha.
+        target_commitish: ${{ steps.channel.outputs.rolling_debug == 'true' && github.event.repository.default_branch || github.sha }}
+        name: ${{ steps.channel.outputs.name }}
+        body: ${{ steps.channel.outputs.body }}
+        prerelease: ${{ steps.channel.outputs.prerelease }}
+        make_latest: ${{ steps.channel.outputs.make_latest }}
+        files: ${{ steps.channel.outputs.files }}
+
+    # TODO-1049 (supersedes TODO-967): the debug channel now publishes to ONE
+    # fixed rolling release (`debug-rolling`), so no new per-push
+    # v<version>-debug.<seq>+<sha> prereleases are ever created. This step
+    # garbage-collects the LEGACY versioned debug prereleases the old scheme
+    # accumulated (and any that a stale/manual run might create), leaving the
+    # Releases list with a single rolling debug entry alongside the formal/beta
+    # ones. Runs ONLY on the automated push debug path -- never on
+    # workflow_dispatch nor on release events -- and ONLY in this one workflow so
+    # it cannot race release-desktop.yml (which publishes the SAME rolling tag).
+    # HARD SAFETY, two independent filters before any delete: (1) isPrerelease
+    # must be true AND isLatest must be false (never touch a formal or Latest
+    # release), and (2) the tag must match ^v.*-debug\.[0-9]+\+ (the legacy
+    # versioned debug tag shape) -- which the rolling tag `debug-rolling` does
+    # NOT match, so the rolling release is never deleted. A release failing
+    # either filter is left untouched.
+    - name: Prune legacy versioned debug prereleases
+      if: github.event_name == 'push' && steps.channel.outputs.channel == 'debug'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        # List every release with the fields needed for the double filter.
+        # --json keeps this robust against output format changes; jq does the
+        # prerelease + regex filtering, never a loose grep.
+        mapfile -t STALE < <(
+          gh release list --repo "$REPO" --limit 1000 \
+            --json tagName,isPrerelease,isLatest \
+            --jq '
+              .[]
+              | select(.isPrerelease == true and .isLatest == false)
+              | select(.tagName | test("^v.*-debug\\.[0-9]+\\+"))
+              | .tagName
+            '
+        )
+        if [ "${#STALE[@]}" -eq 0 ]; then
+          echo "No legacy versioned debug prereleases to delete."
+          exit 0
+        fi
+        echo "Deleting ${#STALE[@]} legacy versioned debug prerelease(s):"
+        for tag in "${STALE[@]}"; do
+          [ -n "$tag" ] || continue
+          # Defence in depth: re-assert the legacy debug tag shape per tag so a
+          # malformed jq result can never delete a non-debug or the rolling tag.
+          if [[ ! "$tag" =~ ^v.*-debug\.[0-9]+\+ ]]; then
+            echo "::warning title=Skipping non-legacy-debug tag::Refusing to delete '$tag' (does not match legacy versioned debug tag pattern)"
+            continue
+          fi
+          echo "  deleting $tag"
+          gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag
+        done
+
+    # TODO-705: publish a mirror update manifest so beta/debug in-China update
+    # checks succeed (raw.githubusercontent.com is proxiable; api.github.com
+    # /releases is mirror-403'd, BUG-292). This pushes a DATA FILE to the
+    # update-manifest branch -- it is NOT a GitHub Release: it never sets
+    # make_latest / prerelease:false, reuses the channel outputs verbatim, uses
+    # the shared release_sequence (never run_number), and update-manifest is
+    # absent from this workflow's push trigger (main/develop only) so it does
+    # not cascade a run.
+    - name: Publish mirror update manifest (Android assets)
+      # BUG-869: gate on publish_manifest (decoupled from publish_managed_release)
+      # and use manifest_channel so the `release` event emits latest-stable.json
+      # without re-touching the manually-created Release.
+      if: steps.channel.outputs.publish_manifest == 'true'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        CHANNEL: ${{ steps.channel.outputs.manifest_channel }}
+        TAG: ${{ steps.channel.outputs.tag }}
+        # TODO-1049: manifest `tag` keeps the versioned/seq TAG for client
+        # version comparison; asset URLs resolve under DOWNLOAD_TAG (the actual
+        # release tag -- `debug-rolling` for debug, else identical to TAG).
+        DOWNLOAD_TAG: ${{ steps.channel.outputs.publish_tag }}
+        PRERELEASE: ${{ steps.channel.outputs.prerelease }}
+        NOTES: ${{ steps.channel.outputs.body }}
+        VERSION: ${{ steps.channel.outputs.build_version_name }}
+        RELEASE_SEQUENCE: ${{ steps.channel.outputs.release_sequence }}
+        ARTIFACTS_DIR: fushi/build/release-artifacts
+        ASSET_GLOB: fushi-*.apk
+        PLATFORM_LABEL: android
+      run: bash tool/publish_update_manifest.sh
+
+    # 反馈发布回填：清单落地 = 这一版 Android 包已对用户可见，把「本构建包含其修复」的
+    # 反馈记上 <channel>.android = 本版本（按 git 祖先关系判定，见脚本头注释）。
+    # 绝不能让发布变红：步骤 continue-on-error，脚本内部失败也只打 ::warning。
+    # 守卫：fushi/test/build/feedback_workflow_guard_test.dart。
+    - name: Backfill feedback fix releases (Android)
+      if: steps.channel.outputs.publish_manifest == 'true'
+      continue-on-error: true
+      shell: bash
+      env:
+        FEEDBACK_CI_TOKEN: ${{ secrets.FEEDBACK_CI_TOKEN }}
+        FEEDBACK_API_BASE: ${{ vars.FEEDBACK_API_BASE }}
+        CHANNEL: ${{ steps.channel.outputs.manifest_channel }}
+        PLATFORM: android
+        VERSION: ${{ steps.channel.outputs.build_version_name }}
+        HEAD_SHA: ${{ github.sha }}
+      run: bash tool/feedback_mark_released.sh
+
+    # 正式版发布成功后自动把 main 同步成 develop（2026-09-08 用户要求）。
+    #
+    # main 只有两种来源的提交：从 develop 合过来的（历史上是人工 `Merge develop into main
+    # for X.Y.Z`），以及两条图表 workflow 的机器人提交（dev-activity.yml / star-history.yml
+    # 是 scheduled，只能跑在默认分支 main 上，SVG 因此只落在 main）。所以 main 永远不是
+    # develop 的祖先、纯快进永远失败，这里沿用人工时代的合并：`git merge --no-ff -X theirs`——
+    # 图表 SVG 两边都改过就取 develop 的（第二天定时任务会重新生成），除此之外 main 不该有
+    # develop 没有的东西。-X theirs 解不了的冲突（modify/delete）直接红，让人来看，绝不
+    # force-push。GITHUB_TOKEN 的 push 不级联触发 main 的 push 构建，也不会因此多发一版。
+    #
+    # 只在本 workflow 做（release-desktop.yml 不做）：两条正式版 workflow 现在并行，各推一次
+    # 就是两条合并提交。排在清单发布之后：清单落地 = 这一版的 Android 资产已上传完，此时
+    # 同步 main 才是「发布成功后」。用 GITHUB_WORKSPACE 当 --reference 借对象，不重新拉全库；
+    # 不在工作树里直接 checkout main：烘密钥那步改过已入库的占位文件，切分支会被挡。
+    # 守卫：fushi/test/build/release_workflow_main_sync_guard_test.dart。
+    #
+    # 从 main 发的正式版不同步（用户 2026-10-22：「正式版的代码应该是 main 的」）：
+    # 此时 main 本身就是正式版代码，再把 develop 合进来会让测试版代码整批落进 main。
+    - name: Sync main to develop after formal release
+      if: steps.channel.outputs.manifest_channel == 'formal' && github.ref_name != 'main'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+        RELEASE_TAG: ${{ steps.channel.outputs.tag }}
+      run: |
+        set -euo pipefail
+        WORK="$(mktemp -d)"
+        REMOTE="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+        git clone -q --no-tags --reference "$GITHUB_WORKSPACE" --branch main "$REMOTE" "$WORK"
+        git -C "$WORK" config user.name 'github-actions[bot]'
+        git -C "$WORK" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+        for attempt in 1 2 3; do
+          git -C "$WORK" fetch -q --no-tags origin +refs/heads/develop:refs/remotes/origin/develop +refs/heads/main:refs/remotes/origin/main
+          git -C "$WORK" checkout -q -B main origin/main
+          DEVELOP="$(git -C "$WORK" rev-parse --short origin/develop)"
+          if git -C "$WORK" merge-base --is-ancestor origin/develop HEAD; then
+            echo "main already contains develop ($DEVELOP); nothing to sync."
+            exit 0
+          fi
+          if ! git -C "$WORK" merge --no-ff -X theirs -m "Merge develop into main for ${RELEASE_TAG} (formal release)" origin/develop; then
+            git -C "$WORK" merge --abort || true
+            echo "::error title=main sync failed::develop 合不进 main（-X theirs 解不了的冲突）。main 上不该有 develop 没有的实质改动，请人工合并。"
+            exit 1
+          fi
+          if git -C "$WORK" push -q origin HEAD:refs/heads/main; then
+            echo "main -> $(git -C "$WORK" rev-parse --short HEAD) (develop $DEVELOP, attempt $attempt)"
+            exit 0
+          fi
+          echo "push rejected (attempt $attempt); main moved underneath us, re-fetching and re-merging..."
+          git -C "$WORK" reset -q --hard
+          sleep "$attempt"
+        done
+        echo "::error title=main sync failed::推 main 三次都被拒（有人同时在推 main）。请人工把 develop 合进 main。"
+        exit 1
+
+  # TODO-fast-release: the analyze/unit/package suites that used to run as
+  # sequential steps at the top of the `build` job (gating `flutter build apk`)
+  # now live here as an INDEPENDENT job. It shares the same trigger as `build`
+  # but has NO `needs:` relationship, so it runs in parallel and never delays or
+  # blocks the debug-channel APK. A failure still marks the whole workflow run
+  # red (signal preserved on every push, including direct develop pushes that
+  # bypass main.yml's PR gate). The job-level `if` keeps the workflow_dispatch
+  # skip_tests fast-release path: a manual dispatch with skip_tests:true skips
+  # this entire job. Setup mirrors `build` minus the Android/Gradle/keystore bits
+  # tests don't need (analyze + Dart-VM unit tests link no native/Android
+  # toolchain). Only google_oauth_secret.dart is gitignored and must be stubbed
+  # or `flutter analyze` fails to compile google_drive_auth.dart; the
+  # log_upload/dandanplay placeholders are committed, so their stubs are needed
+  # only to bake real secrets when present (kept here for parity with `build`).
+  tests:
+    # BUG-2817：`release` 事件只给应用 release（tag = v<数字>…）构建；模型 / 依赖资产
+    # release（manga-panel-detector-onnx-v1、vendor-libmpv、voice-hook-helper…）被手动
+    # 发布时不许整套构建、把安装包挂到它们身上。表达式没有正则，只能逐个列 v0..v9；
+    # 守卫 fushi/test/build/release_event_app_tag_guard_test.dart 钉住每个 job 都带它。
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_tests == 'true') && (github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v0') || startsWith(github.event.release.tag_name, 'v1') || startsWith(github.event.release.tag_name, 'v2') || startsWith(github.event.release.tag_name, 'v3') || startsWith(github.event.release.tag_name, 'v4') || startsWith(github.event.release.tag_name, 'v5') || startsWith(github.event.release.tag_name, 'v6') || startsWith(github.event.release.tag_name, 'v7') || startsWith(github.event.release.tag_name, 'v8') || startsWith(github.event.release.tag_name, 'v9')) }}
+    runs-on: ubuntu-latest
+    # 2026-09-12：60 → 90。全量套件（25k+ 条）实测 57~58 分钟跑完，60 分钟上限只剩
+    # 2 分钟余量，合入 #1438/#1430② 多几条测试后连续四次 60 分钟整点被 cancel——
+    # 表现与「某条测试挂死」一模一样，但同 run 的 build job（上限 90）14 分钟就绿。
+    # 这里跟 build 对齐；真正的出路是给 tool/flutter_test_failures.dart 加
+    # --shard-index/--shard-total 再上 matrix 并行（TODO），不是继续抬上限。
+    # 2026-09-30：已按文件分片（--file-shard，原理见 main.yml 的 unit-tests 注释）。
+    # 矩阵 5 份：4 片主应用单测 + checks（analyze + 包测试），各自独立 runner 并行；
+    # 分片数改 matrix 和 --file-shard 分母两处。
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ['0', '1', '2', '3', checks]
+    name: tests (${{ matrix.part }})
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: subosito/flutter-action@v2
+      with:
+        flutter-version: '3.47.6'
+        cache: true
+    # pdfium_dart's build hook downloads PDFium from GitHub on every fresh
+    # runner; restore it so a release-asset hiccup cannot fail the build.
+    - uses: ./.github/actions/pdfium-hook-cache
+      with:
+        purpose: test
+
+    # 烘进包里的密钥统一由 composite action 注入 —— 这批注入曾被逐字抄进 11 个
+    # job，抄到最后 TMDB 有 3 个变体、两条发布 workflow 一处都没有，导致发出去
+    # 的包里 TMDB 恒「未配置」而 CI 全绿（BUG-1588）。真相源只留一份。
+    - name: Provide baked-in secret stubs
+      uses: ./.github/actions/provide-baked-secrets
+      with:
+        google-oauth-client-secret: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+        log-upload-endpoint: ${{ secrets.LOG_UPLOAD_ENDPOINT }}
+        log-upload-token: ${{ secrets.LOG_UPLOAD_TOKEN }}
+        dandanplay-app-id: ${{ secrets.DANDANPLAY_APP_ID }}
+        dandanplay-app-secret: ${{ secrets.DANDANPLAY_APP_SECRET }}
+        tmdb-api-key: ${{ secrets.TMDB_API_KEY }}
+        opensubtitles-api-key: ${{ secrets.OPENSUBTITLES_API_KEY }}
+    - name: Flutter pub get
+      working-directory: fushi
+      run: flutter pub get
+
+    - name: Apply pub cache patches
+      run: |
+        chmod +x ci/apply-patches.sh
+        bash ci/apply-patches.sh
+
+    - name: Run dart analyze
+      if: matrix.part == 'checks'
+      working-directory: fushi
+      run: flutter analyze
+
+    - name: Run unit tests (main app, file shard ${{ matrix.part }}/4)
+      if: matrix.part != 'checks'
+      working-directory: fushi
+      run: dart run tool/flutter_test_failures.dart --file-shard=${{ matrix.part }}/4 --exclude-tags golden
+
+    - name: Run package tests
+      if: matrix.part == 'checks'
+      run: |
+        # 扫描面按磁盘枚举，不写死包清单：这里是 packages/*/test 的**唯一** runner，
+        # 上一版把五个包名写成字面量，于是任何新加的自有包连同它的测试在 CI 里
+        # 一次都不会跑，而且表现为绿。排除项只有两类，都有明确归属：
+        #   * vendored / fork / stub —— 上游产物，不归本仓测；
+        #   * fushi_torrent —— 测试要 dlopen 真 DLL，Linux 上整组 skip，由
+        #     build-multiplatform.yml 里那个带 FUSHI_TORRENT_LIB 的 job 专门跑。
+        skip="flutter_inappwebview_windows gamepads_windows gamepads_android_stub fushi_torrent"
+        ran=0
+        for pkg in packages/*/; do
+          name=$(basename "$pkg")
+          case " $skip " in
+            *" $name "*) echo "::notice title=Skipped package::$name（vendored 或有专用 job）"; continue;;
+          esac
+          if [ -d "$pkg/test" ]; then
+            echo "::group::Testing $name"
+            (cd "$pkg" && dart ../../fushi/tool/flutter_test_failures.dart --output-dir=../../.codex-test/flutter-test/$name)
+            echo "::endgroup::"
+            ran=$((ran + 1))
+          else
+            echo "::warning title=No package tests::$name has no test/ dir — its code is only covered transitively by the main-app suite"
+          fi
+        done
+        # 规模哨兵：枚举写错或 packages/ 布局变动会让循环一个包都不跑，而「零个包跑过」
+        # 与「所有包都绿」在退出码上完全一样。实测 4 个（core/anki/audio/platform）。
+        if [ "$ran" -lt 3 ]; then
+          echo "::error title=Package test enumeration collapsed::只跑了 $ran 个包的测试，实测应有 4 个。去修枚举逻辑，不要调低这个下界。"
+          exit 1
+        fi

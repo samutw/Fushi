@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# TODO-705: Publish a mirror update manifest (latest-<channel>.json) to the
+# `update-manifest` orphan branch so beta/debug update checks succeed inside
+# China (raw.githubusercontent.com is reachable through public gh proxies; the
+# api.github.com /releases list is 403'd through every mirror, see BUG-292).
+#
+# This is a DATA FILE pushed to a git branch, NOT a GitHub Release. It must
+# never promote a Latest release / prerelease:false and never call the release
+# the release-channel hard rules (CLAUDE.md) say push events only produce
+# debug/prerelease/non-Latest artifacts, and `update-manifest` is intentionally
+# absent from both release workflows' push trigger branch lists (main/develop
+# only), so writing it never cascades a new workflow run.
+#
+# Required env:
+#   CHANNEL           release channel (debug|beta|formal|github-release)
+#   TAG               VERSION tag written into the manifest's `tag` field, e.g.
+#                     v0.10.1-beta.162 / v0.10.1-debug.5633+3cf5905. The client
+#                     compares THIS to decide "is there a newer build?", so it
+#                     must keep the versioned/seq shape even when the debug
+#                     channel reuses a single rolling GitHub Release (TODO-1049).
+#   DOWNLOAD_TAG      git tag the assets actually live under on GitHub, used ONLY
+#                     to form browser_download_url = releases/download/<tag>/...
+#                     Defaults to TAG (beta/formal: the release IS the version
+#                     tag). The debug channel sets it to the fixed rolling tag
+#                     `debug-rolling`, so one GitHub Release entry is reused
+#                     forever (no per-push prerelease pile-up) while the
+#                     manifest's `tag` still advances by seq (TODO-1049).
+#   PRERELEASE        true|false  (echoed verbatim from steps.channel outputs)
+#   NOTES             release notes / body
+#   RELEASE_SEQUENCE  monotonic git rev-list count (NOT a workflow run-number)
+#   VERSION           normalized version (build_version_name)
+#   REPO              owner/repo, e.g. hajisensai/Fushi
+#   GITHUB_TOKEN      token with contents:write on REPO
+#   ARTIFACTS_DIR     dir holding the built release assets for THIS platform
+#   ASSET_GLOB        glob (relative to ARTIFACTS_DIR) of this platform's assets
+#   PLATFORM_LABEL    short label for the commit message (android|desktop)
+set -euo pipefail
+
+: "${CHANNEL:?CHANNEL required}"
+: "${TAG:?TAG required}"
+: "${RELEASE_SEQUENCE:?RELEASE_SEQUENCE required}"
+: "${VERSION:?VERSION required}"
+: "${REPO:?REPO required}"
+: "${GITHUB_TOKEN:?GITHUB_TOKEN required}"
+: "${ARTIFACTS_DIR:?ARTIFACTS_DIR required}"
+: "${ASSET_GLOB:?ASSET_GLOB required}"
+PRERELEASE="${PRERELEASE:-true}"
+NOTES="${NOTES:-}"
+PLATFORM_LABEL="${PLATFORM_LABEL:-platform}"
+# Download-URL tag defaults to the version TAG (beta/formal: the release IS the
+# version tag); the debug channel passes the rolling `debug-rolling` tag so
+# asset URLs resolve on the single reused release even though `tag` keeps the
+# per-push seq for version comparison (TODO-1049).
+DOWNLOAD_TAG="${DOWNLOAD_TAG:-$TAG}"
+# Linear backoff base between publish retries, in milliseconds. 3000ms is the
+# right politeness interval for a real GitHub remote. The offline race test
+# drives a local bare repo where there is nothing to be polite to, so it lowers
+# this -- the retry SEMANTICS (re-fetch live tip, re-merge, never clobber) are
+# what the test asserts; the wait length is orthogonal to them.
+RETRY_BACKOFF_MS="${MANIFEST_RETRY_BACKOFF_MS:-3000}"
+
+# Linear backoff: attempt * base. bash has no float math, so format the
+# millisecond total as `<s>.<mmm>` for sleep(1) (fractions are fine in the
+# coreutils / BSD sleep this script runs under).
+backoff_sleep() {
+  local total=$(( $1 * RETRY_BACKOFF_MS ))
+  sleep "$(( total / 1000 )).$(printf '%03d' $(( total % 1000 )))"
+}
+
+# Map (product family, channel) -> manifest filename. Only managed channels get
+# a manifest; github-release events publish through the Release UI directly and
+# are skipped.
+#
+# BUG-1481: the filename MUST carry the product family, not just the channel.
+# Two products ship out of this ONE repo during the Hibiki->Fushi rename --
+# `app.hibiki.reader` (the migration bridge, built from the bridge branch) and
+# `app.fushi.reader` (here). One repo means one `update-manifest` branch, so
+# keying the file on channel alone made both families write the SAME file.
+# merge_update_manifest.py's monotonic seq guard (TODO-1173) then handed the
+# advertised top-level release to whichever family had the higher commit count,
+# permanently: the other family's clients read a version/tag/assets that are not
+# theirs and can never self-update. Splitting the filename is what makes the two
+# release streams independent -- it also degrades the guard and the rolling-tag
+# prune back to the single-product case they were designed for.
+#
+# The historical names (`latest-<channel>.json`) belong to the HIBIKI family and
+# are FROZEN: Hibiki clients already in the wild (v1.2.0 and older) have that
+# exact URL compiled in and cannot be patched. Fushi has never shipped a
+# stable/beta release, so it is Fushi that moves to the suffixed names.
+# `fushi/test/tools/update_manifest_product_split_test.dart` pins this suffix
+# against the client-side constants in update_checker_release.dart.
+MANIFEST_PRODUCT_SUFFIX="-fushi"
+case "$CHANNEL" in
+  debug)  MANIFEST_FILE="latest-debug${MANIFEST_PRODUCT_SUFFIX}.json"
+          LEGACY_MANIFEST_FILE="latest-debug.json" ;;
+  beta)   MANIFEST_FILE="latest-beta${MANIFEST_PRODUCT_SUFFIX}.json"
+          LEGACY_MANIFEST_FILE="latest-beta.json" ;;
+  formal) MANIFEST_FILE="latest-stable${MANIFEST_PRODUCT_SUFFIX}.json"
+          LEGACY_MANIFEST_FILE="latest-stable.json" ;;
+  *)
+    echo "::notice title=Manifest skipped::channel '$CHANNEL' is not a managed update channel; not writing a manifest."
+    exit 0
+    ;;
+esac
+
+# Collect this platform's assets (name + GitHub release download URL). Build
+# numbers / run-numbers are NEVER used to form the URL: the download URL is
+# purely releases/download/<DOWNLOAD_TAG>/<asset-name>, the path the client
+# expects. DOWNLOAD_TAG is the git tag the release actually lives under
+# (== TAG for beta/formal; the fixed `debug-rolling` tag for the debug channel,
+# TODO-1049), which is why it, not the versioned `tag` field, forms the URL.
+# Expand the glob inside the artifacts dir and take basenames. Using a glob
+# loop (not `ls`) keeps names clean: an `ls -F` alias cannot append a classify
+# suffix (*, /). CI asset names are controlled (no spaces/newlines), so a
+# newline-delimited loop is safe and avoids embedding a NUL in this script.
+ASSET_FILES=()
+while IFS= read -r f; do
+  [ -n "$f" ] && ASSET_FILES+=("$f")
+done < <(cd "$ARTIFACTS_DIR" && for g in $ASSET_GLOB; do [ -e "$g" ] && basename "$g"; done)
+if [ "${#ASSET_FILES[@]}" -eq 0 ]; then
+  echo "::error title=No manifest assets::No files matched $ASSET_GLOB in $ARTIFACTS_DIR"
+  exit 1
+fi
+
+# size + sha256 come from the artifact on disk (the same bytes that were just
+# uploaded), not from the GitHub API: the website's chunked downloader verifies
+# the reassembled file against sha256, and the R2 mirror can cross-check it.
+PLATFORM_ASSETS_JSON="$(
+  REPO="$REPO" DOWNLOAD_TAG="$DOWNLOAD_TAG" ARTIFACTS_DIR="$ARTIFACTS_DIR" python3 - "${ASSET_FILES[@]}" <<'PY'
+import hashlib, json, os, sys
+repo = os.environ["REPO"]
+tag = os.environ["DOWNLOAD_TAG"]
+artifacts = os.environ["ARTIFACTS_DIR"]
+base = f"https://github.com/{repo}/releases/download/{tag}"
+
+
+def digest(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+out = []
+for name in sys.argv[1:]:
+    path = os.path.join(artifacts, name)
+    out.append({
+        "name": name,
+        "browser_download_url": f"{base}/{name}",
+        "size": os.path.getsize(path),
+        "sha256": digest(path),
+    })
+print(json.dumps(out))
+PY
+)"
+
+# BUG-1516: the merge step keeps a lagging platform's asset entry forever, but
+# the rolling release PRUNES old assets per platform. A platform that stops
+# publishing therefore ends up advertised at a URL whose file is gone, and the
+# client's only in-app action downloads a hard 404 (real report: an old Hibiki
+# debug client pinned to hibiki-1.3.2-debug.10182-windows-setup.exe long after
+# it was pruned). Hand the merge step the release's CURRENT asset names so it
+# can drop entries that no longer resolve.
+#
+# Fail-open: any gh failure (rate limit, transient 5xx, tag not created yet)
+# leaves this empty, which the merge step reads as "cannot tell" and skips the
+# filter. Deleting every retained asset because a query flaked would be a far
+# worse outage than the stale entry we are removing.
+# MANIFEST_LIVE_ASSETS_OVERRIDE is the offline test seam (same role as
+# MANIFEST_REMOTE_OVERRIDE below); it is never set in CI. Detection is
+# "is it DEFINED" (`+x`), not "is it non-empty": the offline suite must be able
+# to pin the empty/fail-open case too, and `:-` would send that case off to the
+# network instead.
+if [ -n "${MANIFEST_LIVE_ASSETS_OVERRIDE+x}" ]; then
+  LIVE_ASSET_NAMES_JSON="$MANIFEST_LIVE_ASSETS_OVERRIDE"
+else
+  LIVE_ASSET_NAMES_JSON="$(
+    gh release view "$DOWNLOAD_TAG" --repo "$REPO" \
+      --json assets --jq '[.assets[].name]' 2>/dev/null || true
+  )"
+fi
+if [ -z "$LIVE_ASSET_NAMES_JSON" ]; then
+  echo "Live asset list unavailable for $DOWNLOAD_TAG; skipping the stale-asset filter."
+fi
+
+# BUG-1516 ①b: the DESKTOP half of this run also has to reach the retired
+# hibiki-family manifest.
+#
+# BUG-1481 split the manifest per product family so Android never gets handed a
+# cross-package APK -- it literally cannot install one
+# (INSTALL_FAILED_UPDATE_INCOMPATIBLE). Correct for Android. Desktop needs the
+# exact opposite: `platform_updater.dart` keeps ReleaseProduct.any on
+# Windows/macOS on purpose ("桌面不做这层提升……Phase 5 有意如此") because there
+# the package rename is carried by the installer overwriting in place. A Hibiki
+# Windows client selecting `fushi-*-windows-setup.exe` and installing it IS the
+# desktop migration -- there is no desktop bridge (MigrationPage is Android-only).
+#
+# Splitting per FILE therefore cut the desktop migration path: latest-debug.json
+# stopped receiving Fushi assets, its Windows slot froze on the pre-split build,
+# and the rolling prune later deleted that file (the reported 404). Mirror the
+# desktop assets back in -- assets only, never the top level, which stays the
+# bridge's (see ADVERTISE_TOP_LEVEL in merge_update_manifest.py).
+MIRROR_ASSETS_JSON="$(
+  PLATFORM_ASSETS_JSON="$PLATFORM_ASSETS_JSON" python3 <<'PY'
+import json, os
+assets = json.loads(os.environ["PLATFORM_ASSETS_JSON"])
+# Desktop only. APKs stay out (Android cannot install across package names) and
+# .ipa stays out (Apple forbids in-app download/execute, so the entry is inert).
+suffixes = ("-windows-setup.exe", "-macos-arm64.zip")
+print(json.dumps([a for a in assets if a["name"].endswith(suffixes)]))
+PY
+)"
+
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Default to the real GitHub remote. MANIFEST_REMOTE_OVERRIDE lets the
+# offline race test (fushi/test/tools/update_manifest_publish_race_test.dart)
+# point at a local bare repo; it is never set in CI.
+REMOTE="${MANIFEST_REMOTE_OVERRIDE:-https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git}"
+git -C "$WORK_DIR" init -q
+git -C "$WORK_DIR" remote add origin "$REMOTE"
+git -C "$WORK_DIR" config user.name "github-actions[bot]"
+git -C "$WORK_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
+
+
+# Locate the extracted, unit-testable merge step next to this script.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MERGE_PY="$SCRIPT_DIR/merge_update_manifest.py"
+if [ ! -f "$MERGE_PY" ]; then
+  echo "::error title=Missing merge step::$MERGE_PY not found"
+  exit 1
+fi
+
+# Publish loop: ALWAYS merge this platform's assets onto the LIVE remote tip and
+# push. On any non-fast-forward rejection (a sibling platform job pushed first)
+# re-fetch the new tip and re-merge so the loser preserves the winner's assets.
+#
+# Race fix (TODO-781): the prior version swallowed `git fetch` errors and fell
+# into orphan-branch mode, which would WIPE the other platform's already-pushed
+# assets on a transient network blip. Branch existence is now decided
+# deterministically with `git ls-remote`: a present branch MUST fetch cleanly
+# (network failure -> retry, never orphan); only a genuinely absent branch
+# starts an orphan tree.
+attempt=0
+max_attempts=8
+while :; do
+  attempt=$((attempt + 1))
+
+  # Does the manifest branch exist on the remote right now? Decide orphan-vs-fetch
+  # from this, not from whether a fetch happened to fail.
+  branch_exists=0
+  if git -C "$WORK_DIR" ls-remote --exit-code --heads origin update-manifest >/dev/null 2>&1; then
+    branch_exists=1
+  fi
+
+  if [ "$branch_exists" -eq 1 ]; then
+    # Branch exists -> we MUST sync onto its live tip. A fetch failure here is a
+    # transient error, NOT a signal to orphan; retry without destroying assets.
+    if ! git -C "$WORK_DIR" fetch -q origin update-manifest; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        echo "::error title=Manifest fetch failed::Could not fetch existing update-manifest after $max_attempts attempts."
+        exit 1
+      fi
+      echo "Fetch of existing update-manifest failed (attempt $attempt); retrying..."
+      backoff_sleep "$attempt"
+      continue
+    fi
+    git -C "$WORK_DIR" checkout -q -B update-manifest FETCH_HEAD
+    git -C "$WORK_DIR" reset -q --hard FETCH_HEAD
+  else
+    # Branch genuinely absent -> start a fresh orphan tree.
+    git -C "$WORK_DIR" checkout -q --orphan update-manifest
+    git -C "$WORK_DIR" rm -rfq --cached . 2>/dev/null || true
+    find "$WORK_DIR" -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} +
+  fi
+
+  # Merge THIS platform's assets into any existing same-tag manifest (preserve
+  # the other platform's assets, dedupe by name). A different (older) tag is
+  # fully superseded. Runs inside the branch checkout so the manifest path
+  # resolves against the branch tree.
+  (
+    cd "$WORK_DIR"
+    MANIFEST_FILE="$MANIFEST_FILE" \
+    CHANNEL="$CHANNEL" TAG="$TAG" VERSION="$VERSION" \
+    PRERELEASE="$PRERELEASE" NOTES="$NOTES" \
+    RELEASE_SEQUENCE="$RELEASE_SEQUENCE" \
+    PLATFORM_ASSETS_JSON="$PLATFORM_ASSETS_JSON" \
+    LIVE_ASSET_NAMES_JSON="$LIVE_ASSET_NAMES_JSON" \
+    python3 "$MERGE_PY"
+  )
+
+  # Desktop mirror into the hibiki-family manifest (BUG-1516 ①b). Only when this
+  # run actually produced desktop assets AND that manifest already exists -- the
+  # mirror augments a live bridge channel, it never creates one.
+  #
+  # NO liveness filter here on purpose: those entries were published under a
+  # DIFFERENT rolling tag than the one we queried, so a name-based comparison
+  # would read the bridge's own APK as "pruned" and delete it -- taking out
+  # Android's migration path while fixing desktop's. The stale desktop entries
+  # do not need the filter anyway: this run's assets carry a higher sequence and
+  # supersede those slots outright.
+  if [ "$MIRROR_ASSETS_JSON" != "[]" ] && [ -f "$WORK_DIR/$LEGACY_MANIFEST_FILE" ]; then
+    (
+      cd "$WORK_DIR"
+      MANIFEST_FILE="$LEGACY_MANIFEST_FILE" \
+      CHANNEL="$CHANNEL" TAG="$TAG" VERSION="$VERSION" \
+      PRERELEASE="$PRERELEASE" NOTES="$NOTES" \
+      RELEASE_SEQUENCE="$RELEASE_SEQUENCE" \
+      PLATFORM_ASSETS_JSON="$MIRROR_ASSETS_JSON" \
+      LIVE_ASSET_NAMES_JSON="" \
+      ADVERTISE_TOP_LEVEL="false" \
+      python3 "$MERGE_PY"
+    )
+    git -C "$WORK_DIR" add "$LEGACY_MANIFEST_FILE"
+  fi
+
+  git -C "$WORK_DIR" add "$MANIFEST_FILE"
+  if git -C "$WORK_DIR" diff --cached --quiet; then
+    echo "Manifest $MANIFEST_FILE already up to date; nothing to push."
+    break
+  fi
+
+  git -C "$WORK_DIR" commit -q -m "chore(update-manifest): $PLATFORM_LABEL $CHANNEL $TAG (seq $RELEASE_SEQUENCE)"
+  if git -C "$WORK_DIR" push -q origin update-manifest; then
+    echo "Pushed $MANIFEST_FILE to update-manifest (attempt $attempt)."
+    # 清单落地 = 这一批资产已经上传完，正是唤醒 R2 镜像的时刻（BUG-2168）。
+    #
+    # 不能靠一个指向 update-manifest 分支的 push 触发器让镜像自己醒过来，两条独立原因任一
+    # 成立就够：① GitHub 对 push 事件是从被推送的那个 ref 读 .github/workflows/ 决定
+    # 跑什么，而 update-manifest 是只放 JSON 的孤儿分支，上面没有 workflow 文件；
+    # ② 这里用的是 GITHUB_TOKEN，它的 push 不级联新 run。实测该分支每天被推几十次而
+    # actions/runs?branch=update-manifest 的 total_count 至今为 0。
+    # workflow_dispatch 是 ② 的明文例外，所以只能显式 dispatch。
+    #
+    # 只在正式版通道唤醒：debug/beta 每次 push 都写这个分支（一天几十次），镜像它们
+    # 会迅速吃光 R2 免费额度。assert_complete=true 让镜像侧走就位门 + 完整性断言。
+    if [ "$CHANNEL" = "formal" ]; then
+      # 用本次发布跑在哪个 ref 就 dispatch 哪个 ref：镜像 workflow 与它引用的 tool/ 脚本天然同版。
+      # 钉 default_branch 会在 main 落后时 422（main 上的 workflow 还没有 assert_complete 输入）。
+      MIRROR_REF="${GITHUB_REF_NAME:-$(GH_TOKEN="$GITHUB_TOKEN" gh api "repos/$REPO" -q .default_branch 2>/dev/null || echo main)}"
+      if ! GH_TOKEN="$GITHUB_TOKEN" gh workflow run mirror-releases.yml \
+          --repo "$REPO" --ref "$MIRROR_REF" \
+          -f tag="$DOWNLOAD_TAG" -f assert_complete=true; then
+        # 不阻塞发布，但必须响：唤醒断了 = 这一版永远不会被镜像，而镜像 job 自己那条
+        # 「published 6h 仍未就位就报错」的兜底也醒不过来。
+        echo "::error title=Mirror wake-up failed::无法 dispatch mirror-releases.yml（$DOWNLOAD_TAG）。这一版不会被自动镜像，需人工跑一次。"
+      fi
+    fi
+    break
+  fi
+
+  if [ "$attempt" -ge "$max_attempts" ]; then
+    echo "::error title=Manifest push failed::Could not push update-manifest after $max_attempts attempts."
+    exit 1
+  fi
+  # Non-fast-forward: a sibling job pushed first. Drop our commit, loop back to
+  # re-fetch the new live tip and re-merge onto it (preserving their assets).
+  echo "Push raced/failed (attempt $attempt); re-fetching live tip and re-merging..."
+  git -C "$WORK_DIR" reset -q --hard
+  backoff_sleep "$attempt"
+done

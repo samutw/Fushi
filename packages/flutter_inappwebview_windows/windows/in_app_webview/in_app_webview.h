@@ -1,0 +1,277 @@
+#ifndef FLUTTER_INAPPWEBVIEW_PLUGIN_IN_APP_WEBVIEW_H_
+#define FLUTTER_INAPPWEBVIEW_PLUGIN_IN_APP_WEBVIEW_H_
+
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <WebView2.h>
+#include <wil/com.h>
+#include <windows.ui.composition.desktop.h>
+#include <windows.ui.composition.h>
+#include <winrt/base.h>
+
+#include "../flutter_inappwebview_windows_plugin.h"
+#include "../plugin_scripts_js/plugin_scripts_util.h"
+#include "../types/content_world.h"
+#include "../types/navigation_action.h"
+#include "../types/screenshot_configuration.h"
+#include "../types/ssl_certificate.h"
+#include "../types/url_request.h"
+#include "../types/web_history.h"
+#include "../webview_environment/webview_environment.h"
+#include "in_app_webview_settings.h"
+#include "user_content_controller.h"
+#include "webview_channel_delegate.h"
+
+#include <WebView2EnvironmentOptions.h>
+
+namespace flutter_inappwebview_plugin
+{
+  class InAppBrowser;
+
+  using namespace Microsoft::WRL;
+
+  // custom_platform_view
+  enum class InAppWebViewPointerButton { None, Primary, Secondary, Tertiary };
+  enum class InAppWebViewPointerEventKind { Activate, Down, Enter, Leave, Up, Update };
+  typedef std::function<void(size_t width, size_t height)>
+    SurfaceSizeChangedCallback;
+  typedef std::function<void(const HCURSOR)> CursorChangedCallback;
+  struct VirtualKeyState {
+  public:
+    inline void setIsLeftButtonDown(bool is_down)
+    {
+      set(COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS::
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON,
+        is_down);
+    }
+
+    inline void setIsRightButtonDown(bool is_down)
+    {
+      set(COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS::
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON,
+        is_down);
+    }
+
+    inline void setIsMiddleButtonDown(bool is_down)
+    {
+      set(COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS::
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON,
+        is_down);
+    }
+
+    inline COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS state() const { return state_; }
+
+  private:
+    COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS state_ =
+      COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS::
+      COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+
+    inline void set(COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS key, bool flag)
+    {
+      if (flag) {
+        state_ |= key;
+      }
+      else {
+        state_ &= ~key;
+      }
+    }
+  };
+
+  const std::string CALL_ASYNC_JAVASCRIPT_WRAPPER_JS = "(async function(" + VAR_FUNCTION_ARGUMENT_NAMES + ") { \
+        " + VAR_FUNCTION_BODY + " \
+    })(" + VAR_FUNCTION_ARGUMENT_VALUES + ");";
+
+  struct InAppWebViewCreationParams {
+    const std::variant<std::string, int64_t> id;
+    const std::shared_ptr<InAppWebViewSettings> initialSettings;
+    const std::optional<std::vector<std::shared_ptr<UserScript>>> initialUserScripts;
+  };
+
+  class InAppWebView
+  {
+  public:
+    static inline const std::string METHOD_CHANNEL_NAME_PREFIX = "com.pichillilorenzo/flutter_inappwebview_";
+
+    const FlutterInappwebviewWindowsPlugin* plugin;
+    std::variant<std::string, int64_t> id;
+    wil::com_ptr<ICoreWebView2Environment> webViewEnv;
+    wil::com_ptr<ICoreWebView2Controller> webViewController;
+    wil::com_ptr<ICoreWebView2CompositionController> webViewCompositionController;
+    wil::com_ptr<ICoreWebView2> webView;
+    std::unique_ptr<WebViewChannelDelegate> channelDelegate;
+    std::shared_ptr<InAppWebViewSettings> settings;
+    InAppBrowser* inAppBrowser = nullptr;
+    /// 由 InAppWebViewManager 置 true：宿主 hwnd 是它为本实例建的，析构时 DestroyWindow。
+    /// 窗口宿主模式没有 compositionController 可当判据，故显式标记。
+    bool destroyParentWindowOnClose = false;
+    std::unique_ptr<UserContentController> userContentController;
+
+    InAppWebView(const FlutterInappwebviewWindowsPlugin* plugin, const InAppWebViewCreationParams& params, const HWND parentWindow,
+      wil::com_ptr<ICoreWebView2Environment> webViewEnv,
+      wil::com_ptr<ICoreWebView2Controller> webViewController,
+      wil::com_ptr<ICoreWebView2CompositionController> webViewCompositionController);
+    InAppWebView(InAppBrowser* inAppBrowser, const FlutterInappwebviewWindowsPlugin* plugin, const InAppWebViewCreationParams& params, const HWND parentWindow,
+      wil::com_ptr<ICoreWebView2Environment> webViewEnv,
+      wil::com_ptr<ICoreWebView2Controller> webViewController,
+      wil::com_ptr<ICoreWebView2CompositionController> webViewCompositionController);
+    ~InAppWebView();
+
+    static void createInAppWebViewEnv(const HWND parentWindow, const bool& willBeSurface, WebViewEnvironment* webViewEnvironment, const std::shared_ptr<InAppWebViewSettings> initialSettings, std::function<void(wil::com_ptr<ICoreWebView2Environment> webViewEnv,
+      wil::com_ptr<ICoreWebView2Controller> webViewController,
+      wil::com_ptr<ICoreWebView2CompositionController> webViewCompositionController)> completionHandler);
+
+    // custom_platform_view
+    ABI::Windows::UI::Composition::IVisual* const surface()
+    {
+      return surface_.get();
+    }
+    void setSurfaceSize(size_t width, size_t height, float capture_scale_factor,
+      float device_scale_factor);
+    void setPosition(size_t x, size_t y, float scale_factor);
+    void setCursorPos(double x, double y);
+    void setPointerUpdate(int32_t pointer, InAppWebViewPointerEventKind eventKind,
+      double x, double y, double size, double pressure);
+    void setPointerButtonState(InAppWebViewPointerButton button, bool isDown);
+    void sendScroll(double offset, bool horizontal,
+      COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS extraKeys =
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE);
+    void setScrollDelta(double delta_x, double delta_y);
+    void setPinchDelta(double delta);
+    void onSurfaceSizeChanged(SurfaceSizeChangedCallback callback)
+    {
+      surfaceSizeChangedCallback_ = std::move(callback);
+    }
+    void onCursorChanged(CursorChangedCallback callback)
+    {
+      cursorChangedCallback_ = std::move(callback);
+    }
+    bool createSurface(const HWND parentWindow,
+      winrt::com_ptr<ABI::Windows::UI::Composition::ICompositor> compositor);
+
+    void initChannel(const std::optional<std::variant<std::string, int64_t>> viewId, const std::optional<std::string> channelName);
+    void prepare(const InAppWebViewCreationParams& params);
+    std::optional<std::string> getUrl() const;
+    std::optional<std::string> getTitle() const;
+    void loadUrl(const std::shared_ptr<URLRequest> urlRequest) const;
+    void loadFile(const std::string& assetFilePath) const;
+    void loadData(const std::string& data) const;
+    void reload() const;
+    void goBack();
+    bool canGoBack() const;
+    void goForward();
+    bool canGoForward() const;
+    void goBackOrForward(const int64_t& steps);
+    void canGoBackOrForward(const int64_t& steps, std::function<void(bool)> completionHandler) const;
+    bool isLoading() const
+    {
+      return isLoading_;
+    }
+    void stopLoading() const;
+    void evaluateJavascript(const std::string& source, const std::shared_ptr<ContentWorld> contentWorld, const std::function<void(std::string)> completionHandler) const;
+    void callAsyncJavaScript(const std::string& functionBody, const std::string& argumentsAsJson, const std::shared_ptr<ContentWorld> contentWorld, const std::function<void(std::string)> completionHandler) const;
+    void getCopyBackForwardList(const std::function<void(std::unique_ptr<WebHistory>)> completionHandler) const;
+    void addUserScript(const std::shared_ptr<UserScript> userScript) const;
+    void removeUserScript(const int64_t index, const std::shared_ptr<UserScript> userScript) const;
+    void removeUserScriptsByGroupName(const std::string& groupName) const;
+    void removeAllUserScripts() const;
+    void takeScreenshot(const std::optional<std::shared_ptr<ScreenshotConfiguration>> screenshotConfiguration, const std::function<void(const std::optional<std::string>)> completionHandler) const;
+    void setSettings(const std::shared_ptr<InAppWebViewSettings> newSettings, const flutter::EncodableMap& newSettingsMap);
+    flutter::EncodableValue getSettings() const;
+    void openDevTools() const;
+    void callDevToolsProtocolMethod(const std::string& methodName, const std::optional<std::string>& parametersAsJson, const std::function<void(const HRESULT& errorCode, const std::optional<std::string>&)> completionHandler) const;
+    void addDevToolsProtocolEventListener(const std::string& eventName);
+    void removeDevToolsProtocolEventListener(const std::string& eventName);
+    void pause() const;
+    void resume() const;
+    void getCertificate(const std::function<void(const std::optional<std::unique_ptr<SslCertificate>>)> completionHandler) const;
+
+    std::string pageFrameId() const
+    {
+      return pageFrameId_;
+    }
+
+    static bool isSslError(const COREWEBVIEW2_WEB_ERROR_STATUS& webErrorStatus);
+    void rememberMainFrameInjectedOk(const std::string& rawUrl);
+    bool consumeMainFrameInjectedOk(const std::string& rawUrl);
+  private:
+    // custom_platform_view
+    winrt::com_ptr<ABI::Windows::UI::Composition::IVisual> surface_;
+    SurfaceSizeChangedCallback surfaceSizeChangedCallback_;
+    CursorChangedCallback cursorChangedCallback_;
+    // Composition mode can deliberately capture below device DPR for a shader
+    // upscale pass. Raw WebView pointer coordinates follow capture; Flutter
+    // wheel deltas, CDP screenshot scale, and visual placement follow device DPR.
+    float captureScaleFactor_ = 1.0f;
+    float deviceScaleFactor_ = 1.0f;
+    // 窗口宿主模式（surface_ 为空）：子 HWND 在 Flutter 视图客户区里的物理像素矩形，
+    // 由 setPosition / setSurfaceSize 各更新一半、applyWindowedBounds 一起落地。
+    int windowedX_ = 0;
+    int windowedY_ = 0;
+    int windowedWidth_ = 0;
+    int windowedHeight_ = 0;
+    void applyWindowedBounds();
+    POINT lastCursorPos_ = { 0, 0 };
+    VirtualKeyState virtualKeys_;
+
+    // BUG-870: per-axis sub-unit remainder carried across sendScroll() calls. A
+    // precision touchpad delivers small per-frame scroll deltas; without this the
+    // static_cast<short>(delta * 6) in sendScroll truncated any frame whose scaled
+    // magnitude was < 1 to 0 and dropped it, so slow touchpad scrolling sent no
+    // wheel at all ("can't scroll"). Always < 1 whole wheel unit, so no reset is
+    // needed. Single-threaded (platform-thread method-channel), no lock required.
+    double scrollResidualX_ = 0.0;
+    double scrollResidualY_ = 0.0;
+    // 捏合的 Ctrl+滚轮单独攒余量，不与普通滚动互相污染（BUG-2758）。
+    double pinchResidual_ = 0.0;
+
+    // BUG-871: id of the first active touch contact, flagged POINTER_FLAG_PRIMARY
+    // for its whole lifetime. Injected touch (SendPointerInput) carries no
+    // system-assigned primary, and Chromium starts a pan/scroll manipulation only
+    // from the primary contact — without this a finger drag never scrolls the
+    // WebView, only discrete tap/long-press land. -1 = no active primary.
+    int32_t primaryTouchPointerId_ = -1;
+
+    std::map<UINT64, std::shared_ptr<NavigationAction>> navigationActions_ = {};
+    // 已被 shouldInterceptRequest 注入 2xx 响应的主框架 document URL（去 fragment）。
+    // 用于 NavigationCompleted 纠正 fushi.local 这类自定义拦截域的 DNS 假失败。
+    std::set<std::string> mainFrameInjectedOkUrls_ = {};
+    std::shared_ptr<NavigationAction> lastNavigationAction_;
+    bool isLoading_ = false;
+    std::string pageFrameId_;
+    // 对象存活标志：所有跨 Dart 桥异步回来的 WebResourceRequested deferral 回调都捕获它的
+    // 拷贝，回调入口先解引用判断本对象是否仍存活。析构里翻成 false，使迟到回调不再触碰
+    // this/channelDelegate/args，避免 use-after-free（TODO-931）。
+    std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+    // add_WebResourceRequested 的注册 token，析构时 remove 以阻止析构后再触发新拦截回调。
+    EventRegistrationToken webResourceRequestedToken_ = {};
+    // TODO-964（BUG 同 931 模式的其余 handler）：以下每个 token 配套各自 add_Xxx 的迟到回调
+    // 守卫——析构里翻 *alive_=false 后逐个 remove_Xxx，阻止析构开始后 WebView2 再投递这些事件；
+    // lambda 各自捕获 alive_ 拷贝，入口先判存活，绝不在死分支触碰 this/channelDelegate/成员。
+    EventRegistrationToken navigationStartingToken_ = {};
+    EventRegistrationToken contentLoadingToken_ = {};
+    EventRegistrationToken navigationCompletedToken_ = {};
+    EventRegistrationToken documentTitleChangedToken_ = {};
+    EventRegistrationToken historyChangedToken_ = {};
+    EventRegistrationToken webMessageReceivedToken_ = {};
+    EventRegistrationToken newWindowRequestedToken_ = {};
+    EventRegistrationToken windowCloseRequestedToken_ = {};
+    EventRegistrationToken permissionRequestedToken_ = {};
+    // DOMContentLoaded 注册在 ICoreWebView2_2 接口上，析构时需重新 QueryInterface 该接口才能 remove。
+    EventRegistrationToken domContentLoadedToken_ = {};
+    // CursorChanged 注册在 webViewCompositionController 上。
+    EventRegistrationToken cursorChangedToken_ = {};
+    // Fetch.requestPaused / Runtime.consoleAPICalled 注册在各自的 DevTools 事件 receiver 上；
+    // receiver 与 token 都要留作成员，析构时才能 remove（否则裸 [this] 回调在析构后 UAF）。
+    wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver> fetchRequestPausedEventReceiver_;
+    EventRegistrationToken fetchRequestPausedToken_ = {};
+    wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver> consoleMessageEventReceiver_;
+    EventRegistrationToken consoleMessageToken_ = {};
+    std::map<std::string, std::pair<wil::com_ptr<ICoreWebView2DevToolsProtocolEventReceiver>, EventRegistrationToken>> devToolsProtocolEventListener_ = {};
+
+    void registerEventHandlers();
+    void registerSurfaceEventHandlers();
+  };
+}
+#endif //FLUTTER_INAPPWEBVIEW_PLUGIN_IN_APP_WEBVIEW_H_

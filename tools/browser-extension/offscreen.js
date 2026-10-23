@@ -1,0 +1,153 @@
+// TODO-1000 批量制卡：offscreen 只做「录一小段完整 webm」。startCapture 建 tabCapture 流；
+// 每次 beginClip 新起一个 MediaRecorder（自包含、可解码），endClip 停止并回 base64。
+// 不再滚动分段、不暂停、不算墙钟偏移（旧模型的时钟错配就是「完全不行」根因）。
+let stream = null;
+// BUG-2159 审查：在途的 startCapture Promise。并发调用共用同一次 getUserMedia，绝不起第二条流。
+let startInFlight = null;
+// stopCapture 每次 +1。在途 getUserMedia 落地时代数变了 = 等待期间被 stop → 这条流已无主，自行停轨。
+let captureGen = 0;
+let recorder = null;
+let chunks = [];
+let clipStartWall = 0; // 本段 clip 起始墙钟，用来回给服务端真实时长（否则整段裁默认封顶 6s → 长句被截）
+let mime = 'video/webm;codecs=vp8,opus';
+
+function pickMime() {
+  const prefs = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  for (const m of prefs) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return 'video/webm';
+}
+
+async function startCapture(streamId) {
+  // 同源导航（切下一集）会让上一个 tabCapture 流的轨道 end，但 stream 变量仍是个 truthy 对象。
+  // 只有 stream.active 才算「已在录」直接复用；否则先把这个死流拆掉再重新 getUserMedia，
+  // 不然 nfEnsureCapture 会以为还在录 → 之后每段都从死流录出黑/空片（跨集失败根因）。
+  if (stream && stream.active) return { ok: true, already: true };
+  // BUG-2159 审查：fushiIconClick 先写 storage 再起录，content 收到变化后 800ms 即发 nfEnsureCapture；
+  // 慢机上首个 getUserMedia 未 resolve 时 isRecording 为 false → background 再起一条。旧实现只守
+  // 已落地的 stream：两条流先后 resolve、后者覆盖变量，前者的音轨永远没人 stop → 标签页在批量结束
+  // 后持续哑掉（接回扬声器还在时这条泄漏听不出来）。在途 Promise 共享：第二个调用直接等第一个。
+  if (startInFlight) return startInFlight;
+  startInFlight = openCapture(streamId).finally(() => { startInFlight = null; });
+  return startInFlight;
+}
+
+async function openCapture(streamId) {
+  if (stream) {
+    try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    stream = null;
+    recorder = null;
+    chunks = [];
+  }
+  const gen = captureGen;
+  const opened = await navigator.mediaDevices.getUserMedia({
+    audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } },
+    video: {
+      mandatory: {
+        chromeMediaSource: 'tab', chromeMediaSourceId: streamId,
+        // TODO-1145：捕获分辨率是整条 Netflix 制卡链路的支配性限制器——offscreen 录
+        // 出的 webm 只有这个分辨率，下游 GIF 转码（gifWidth）/单帧再高也无法超采源。
+        // 用户决策：上限对齐 app 内视频制卡（本地源典型 1080p，静帧封顶
+        // downsampleCardScreenshot 长边 2000，1920 原样透传）——提到 1920×1080。
+        // max* 只是上限不放大：低清源仍按源分辨率录。
+        maxWidth: 1920, maxHeight: 1080, maxFrameRate: 12,
+      },
+    },
+  });
+  // BUG-2159：tabCapture 会把标签页音频改道进流 → 录制期间标签页**本来就不对用户放音**。
+  // 旧实现在这里用 AudioContext 把流接回 destination「回放时仍能听到」，但批量回放期间页面已藏
+  // 字幕/控制条/光标（content.fushiRunNetflixBatch），用户不是在看片；那段声音只是把整集台词
+  // 对着房间放。删掉接回：录制照走流里的音轨（与扬声器无关），stopCapture 停轨后 Chrome 自动把
+  // 标签页音频还给扬声器。不要再把流 connect 到 destination。
+  if (gen !== captureGen) {
+    // 等 getUserMedia 期间被 stopCapture（用户点取消 / 跨集停录）：这条流没有主人，立即停轨，
+    // 否则它一直占着 tab 音频捕获、标签页持续无声，而 isRecording 还汇报 false。
+    try { opened.getTracks().forEach((t) => t.stop()); } catch (_) {}
+    return { ok: false, error: 'stopped' };
+  }
+  stream = opened;
+  mime = pickMime();
+  return { ok: true };
+}
+
+function stopCapture() {
+  captureGen += 1;
+  try { if (recorder && recorder.state !== 'inactive') { recorder.onstop = null; recorder.stop(); } } catch (_) {}
+  recorder = null; chunks = [];
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+}
+
+function beginClip() {
+  if (!stream) return { ok: false, error: 'no stream' };
+  // V16#3 防孤儿：上一段 recorder 若因异常未经 endClip 收口仍在录，先强停并解绑再新建，
+  // 否则直接覆盖 recorder 变量会让旧 MediaRecorder 成孤儿、仍在流上跑（内存/流泄漏）。
+  if (recorder && recorder.state !== 'inactive') {
+    try { recorder.onstop = null; recorder.ondataavailable = null; recorder.stop(); } catch (_) {}
+  }
+  recorder = null;
+  chunks = [];
+  clipStartWall = Date.now();
+  recorder = new MediaRecorder(stream, {
+    mimeType: mime, videoBitsPerSecond: 5625000, audioBitsPerSecond: 128000,
+  });
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
+  recorder.start();
+  return { ok: true };
+}
+
+function endClip() {
+  return new Promise((resolve) => {
+    if (!recorder || recorder.state === 'inactive') { resolve({ ok: false, error: 'no clip' }); return; }
+    // 时长用墙钟（beginClip→endClip 经过）：这是**上界**（含 seek 稳定/消息往返），服务端整段裁
+    // [0, 时长] 时 ffmpeg 到 EOF 即止 → 拿到完整整句、绝不因固定 6s 默认把长句截断。
+    const durMs = Math.max(1000, Date.now() - clipStartWall);
+    recorder.onstop = async () => {
+      const blob = new Blob(chunks, { type: mime });
+      chunks = [];
+      const b64 = await blobToBase64(blob);
+      resolve({ ok: true, clipBase64: b64, clipDurationMs: durMs });
+    };
+    try {
+      recorder.stop();
+    } catch (_) {
+      // V16 遗留缺口：stop() 抛异常时若只 resolve，第 85 行刚挂的 onstop、这个坏
+      // recorder、滞留的 chunks 都成孤儿仍挂在流上（下一段靠 beginClip 的孤儿守卫才被动
+      // 收；但 chunks 陈旧数据会污染）。与 beginClip/stopCapture 对称，就地解绑清理。
+      recorder.onstop = null;
+      recorder.ondataavailable = null;
+      recorder = null;
+      chunks = [];
+      resolve({ ok: false, error: 'stop failed' });
+    }
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve) => {
+    const r = new FileReader();
+    r.onloadend = () => {
+      // data URL: data:<mime>;base64,<数据>。webm 的 MIME 含逗号 → 必须从 ';base64,' 后取，
+      // 不能 split(',')[1]（会切在 codecs 逗号上 → 服务端 base64Decode 抛 → HTTP 400）。
+      const s = String(r.result || '');
+      const i = s.indexOf(';base64,');
+      resolve(i >= 0 ? s.slice(i + 8) : (s.split(',').pop() || ''));
+    };
+    r.readAsDataURL(blob);
+  });
+}
+
+chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
+  if (!msg || msg.target !== 'offscreen') return false;
+  (async () => {
+    try {
+      if (msg.type === 'startCapture') sendResponse(await startCapture(msg.streamId));
+      else if (msg.type === 'stopCapture') { stopCapture(); sendResponse({ ok: true }); }
+      else if (msg.type === 'beginClip') sendResponse(beginClip());
+      else if (msg.type === 'endClip') sendResponse(await endClip());
+      else if (msg.type === 'isRecording') sendResponse({ ok: true, recording: !!(stream && stream.active) });
+      else sendResponse({ ok: false, error: 'unknown' });
+    } catch (e) { sendResponse({ ok: false, error: String(e) }); }
+  })();
+  return true;
+});

@@ -1,0 +1,520 @@
+// TODO-1151：本地备份「导入/恢复」无反馈 + 突然退出误以为失败的修复守卫。
+//
+// 旧行为：导入期只有设置行 24px 小圈；成功后延迟 500ms 直接 exit(0)/FlutterExitApp，
+// 用户看到 app「突然消失」误以为失败。
+//
+// 修复（镜像 TODO-959 数据根迁移遮罩）：
+//   ① 导入执行期把根 widget 切到全屏「正在导入备份，请勿关闭」遮罩 + 进度条；
+//   ② 结束后切到「导入完成 → 立即重启」确认视图，由用户点按后再退出。
+//
+// 本文件：widget 测试断言两阶段 UI（导入期遮罩 / 退出前确认按钮）+ 源码守卫锁住接线。
+import 'dart:io';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/models/app_model.dart' show BackupImportPhase;
+import 'package:fushi/src/sync/backup_import_overlay_view.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi/src/utils/components/glass/fushi_glass_feedback.dart'
+    show FushiLinearProgressIndicator;
+
+void main() {
+  group('BackupImportOverlayView（修①/修②：两阶段遮罩）', () {
+    testWidgets('running：明确「正在导入备份/请勿关闭」文案 + 进度条，无重启按钮',
+        (WidgetTester tester) async {
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.running,
+              onRestart: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 导入期明确告知用户在导入——这正是旧版 24px 小圈缺的语义。
+      expect(find.text(t.backup_import_overlay_title), findsOneWidget);
+      expect(find.text(t.backup_import_overlay_warning), findsOneWidget);
+      expect(find.byType(FushiLinearProgressIndicator), findsOneWidget);
+      // 导入尚未结束，不得出现「立即重启」确认按钮。
+      expect(find.text(t.backup_import_restart_button), findsNothing);
+
+      // 背景非纯黑（消除「app 突然黑屏消失」的观感）。
+      final Scaffold scaffold = tester.widget<Scaffold>(find.byType(Scaffold));
+      expect(scaffold.backgroundColor, isNotNull);
+      expect(scaffold.backgroundColor, isNot(equals(Colors.black)));
+    });
+
+    testWidgets('done：显示结果文案 + 「立即重启」确认按钮；点按触发 onRestart（不自动退出）',
+        (WidgetTester tester) async {
+      int restarts = 0;
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.done,
+              message: t.backup_import_success,
+              onRestart: () => restarts++,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 结束态：结果文案 + 明确的「立即重启」确认按钮，而非旧版「延迟后突然退出」。
+      expect(find.text(t.backup_import_success), findsOneWidget);
+      expect(find.text(t.backup_import_restart_button), findsOneWidget);
+      // running 期的进度条已消失。
+      expect(find.byType(FushiLinearProgressIndicator), findsNothing);
+
+      // 退出必须由用户点按驱动：点按前不退出，点按后恰好触发一次。
+      expect(restarts, 0);
+      await tester.tap(find.byType(FilledButton));
+      await tester.pump();
+      expect(restarts, 1);
+    });
+
+    testWidgets('failed：红色 error_outline 错误图标（非绿✓）+ 失败文案 + 重启按钮',
+        (WidgetTester tester) async {
+      // TODO-1183 根治「导入失败却显绿✓成功」：failed 态必须画错误图标而非成功勾。
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.red),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.failed,
+              message: 'Backup import failed: out of memory',
+              onRestart: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.byIcon(FushiIcons.error), findsOneWidget);
+      expect(find.byIcon(FushiIcons.success), findsNothing);
+      expect(find.text('Backup import failed: out of memory'), findsOneWidget);
+      // DB 已关闭，失败也必须给「立即重启」出口。
+      expect(find.text(t.backup_import_restart_button), findsOneWidget);
+      // running 期的进度条已消失。
+      expect(find.byType(FushiLinearProgressIndicator), findsNothing);
+    });
+
+    testWidgets('running：progress 有值 → 确定进度条（value 非空且跟随更新）',
+        (WidgetTester tester) async {
+      // TODO-1183：后台解压 isolate 经 SendPort 回报字节 → 确定进度，不再「卡死」。
+      final ValueNotifier<double> progress = ValueNotifier<double>(0.42);
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.running,
+              progress: progress,
+              onRestart: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final FushiLinearProgressIndicator bar =
+          tester.widget<FushiLinearProgressIndicator>(find.byType(FushiLinearProgressIndicator));
+      expect(bar.value, isNotNull);
+      expect(bar.value, closeTo(0.42, 1e-9));
+
+      // 进度推进只重建进度条（ValueListenableBuilder），值跟随更新。
+      progress.value = 0.87;
+      await tester.pump();
+      final FushiLinearProgressIndicator bar2 =
+          tester.widget<FushiLinearProgressIndicator>(find.byType(FushiLinearProgressIndicator));
+      expect(bar2.value, closeTo(0.87, 1e-9));
+    });
+  });
+
+  group('BackupImportOverlayView（TODO-1151 validating：读取/预览遮罩）', () {
+    testWidgets('进入：validating 显示「正在读取备份…」+ 校验提示 + 不确定进度条 + 取消按钮，无重启',
+        (WidgetTester tester) async {
+      // 根治：选完文件后 validate + 合并预览要数十秒，旧版只有设置行 24px 小圈。
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.validating,
+              onRestart: () {},
+              onCancel: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 明确告知用户在读取/校验备份——这正是缺口窗口期缺的语义反馈。
+      expect(find.text(t.backup_import_validating_title), findsOneWidget);
+      expect(find.text(t.backup_import_validating_hint), findsOneWidget);
+      // 读取/预览无字节进度 → 不确定进度条（value 为 null）。
+      final FushiLinearProgressIndicator bar =
+          tester.widget<FushiLinearProgressIndicator>(find.byType(FushiLinearProgressIndicator));
+      expect(bar.value, isNull);
+      // validating 期给「取消」出口（DB 仍打开，可安全中断回设置页）。
+      expect(find.text(t.dialog_cancel), findsOneWidget);
+      // 尚未结束/未确认，不得出现「立即重启」出口或绿✓。
+      expect(find.text(t.backup_import_restart_button), findsNothing);
+      expect(find.byIcon(FushiIcons.success), findsNothing);
+      // 背景非纯黑。
+      final Scaffold scaffold = tester.widget<Scaffold>(find.byType(Scaffold));
+      expect(scaffold.backgroundColor, isNot(equals(Colors.black)));
+    });
+
+    testWidgets('取消：点「取消」触发 onCancel（作废校验 token + 退出遮罩回设置页）',
+        (WidgetTester tester) async {
+      int cancels = 0;
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.validating,
+              onRestart: () {},
+              onCancel: () => cancels++,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(cancels, 0);
+      await tester.tap(find.byType(OutlinedButton));
+      await tester.pump();
+      expect(cancels, 1);
+    });
+
+    testWidgets('推进到确认：running 相位不再显示取消按钮（validating→确认后进入的下一相位）',
+        (WidgetTester tester) async {
+      // validating 退出遮罩、弹确认框、确认后进入 running；running 期是不可取消的关库解压，
+      // 故取消按钮只属于 validating，running 不得再出现（相位流转的边界守卫）。
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: BackupImportOverlayView(
+              phase: BackupImportPhase.running,
+              onRestart: () {},
+              onCancel: () {},
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text(t.backup_import_overlay_title), findsOneWidget);
+      expect(find.byType(OutlinedButton), findsNothing);
+      expect(find.text(t.dialog_cancel), findsNothing);
+      // validating 的读取文案不得泄漏到 running。
+      expect(find.text(t.backup_import_validating_title), findsNothing);
+    });
+  });
+
+  group('源码守卫 (TODO-1151)', () {
+    File readSource(String rel) {
+      final File f = File(rel);
+      expect(f.existsSync(), isTrue, reason: 'missing source file: $rel');
+      return f;
+    }
+
+    test('main.dart：备份导入遮罩分支在裸 loading 分支之前，且渲染专用视图', () {
+      final String src = readSource('lib/main.dart').readAsStringSync();
+      // BUG-1666 起 main.dart 在 build 之外也有 `if (!appModel.isInitialised)`
+      // （深链未初始化时暂存词的分支），裸 indexOf 会锚错窗口；判据只关心根 widget
+      // build 内的分支顺序，所以从 build 起点往后找。
+      final int buildIdx = src.indexOf('Widget build(BuildContext context)');
+      expect(buildIdx, greaterThan(0), reason: 'main.dart 必须有根 widget 的 build');
+      // BUG-2106：根分支的判据是 backupImportOwnsAppRoot（**排除 validating**）。
+      // validating 段 DB 仍打开、可取消，换根会把调用方路由连 Navigator 一起销毁
+      // （引导向导整段蒸发）；它改由模态遮罩路由承载。
+      final int backupIdx =
+          src.indexOf('appModel.backupImportOwnsAppRoot', buildIdx);
+      final int loadingIdx =
+          src.indexOf('if (!appModel.isInitialised)', buildIdx);
+      expect(backupIdx, greaterThan(0), reason: '根 widget 必须有备份导入遮罩分支');
+      expect(loadingIdx, greaterThan(0));
+      expect(backupIdx, lessThan(loadingIdx),
+          reason: '导入遮罩必须在裸 loading 分支之前命中，否则导入期回退近黑屏');
+      expect(src.contains('BackupImportOverlayView('), isTrue);
+      // 禁止回退到「所有相位都换根」：那正是 BUG-2106 的病根。
+      expect(
+        src.contains('if (appModel.backupImportActive) {'),
+        isFalse,
+        reason: 'BUG-2106：根分支不得再用 backupImportActive（会把 validating 也换根，'
+            '摧毁调用方路由与引导向导）',
+      );
+      expect(src.contains('if (appModel.backupImportOwnsAppRoot) {'), isTrue,
+          reason: '根分支必须只在关库后的相位（running/done/failed）独占 app 根');
+      // 重启由确认视图按钮 + 导入成功后的自动触发共同驱动（onRestart 注入 backupImportRestart，
+      // 需带 appModel 以委托 lifecycle.restartApp 真重启）。
+      expect(src.contains('onRestart: () => backupImportRestart(appModel)'),
+          isTrue);
+    });
+
+    test('backup.part：先 beginBackupImport 再 closeDatabase（遮罩→关库顺序）', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      final int beginIdx = src.indexOf('appModel.beginBackupImport()');
+      final int closeIdx = src.indexOf('await appModel.closeDatabase()');
+      expect(beginIdx, greaterThan(0), reason: '必须先把导入遮罩顶上来');
+      expect(closeIdx, greaterThan(0));
+      expect(beginIdx, lessThan(closeIdx),
+          reason: 'beginBackupImport 必须在 closeDatabase 之前，否则导入期回退裸 loading');
+    });
+
+    test(
+        'backup.part：beginBackupImport 与 closeDatabase 之间必须 await endOfFrame '
+        '（BUG-810：等 running 遮罩真上屏再关库，否则复制期无遮罩/无进度条）', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      final int beginIdx = src.indexOf('appModel.beginBackupImport()');
+      final int closeIdx = src.indexOf('await appModel.closeDatabase()');
+      final int frameIdx =
+          src.indexOf('await WidgetsBinding.instance.endOfFrame', beginIdx);
+      expect(beginIdx, greaterThan(0));
+      expect(closeIdx, greaterThan(beginIdx));
+      // beginBackupImport 只 SCHEDULE 根切换；不等帧就关库 + 同步解压会在遮罩首帧
+      // raster 前占住 UI isolate → 复制期屏幕停在旧页面无「请勿关闭」遮罩、无进度条。
+      expect(frameIdx, greaterThan(beginIdx),
+          reason: 'beginBackupImport 后必须 await endOfFrame 等遮罩上屏');
+      expect(frameIdx, lessThan(closeIdx),
+          reason: 'endOfFrame 必须在 closeDatabase 之前（遮罩→上屏→关库）');
+    });
+
+    test(
+        'backup.part：成功走 completeBackupImport / 失败走 failBackupImport；删除旧的 500ms 自动退出',
+        () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      // 成功与失败两条路径都切到确认视图（TODO-1183：失败走 failed 态而非绿✓）。
+      expect(
+          src.contains('completeBackupImport(t.backup_import_success)'), isTrue,
+          reason: '导入成功必须切到确认视图，而非直接退出');
+      expect(src.contains('failBackupImport('), isTrue,
+          reason: '导入失败必须切 failed 态（根治「失败显绿✓」，TODO-1183）');
+      expect(src.contains('t.backup_import_failed('), isTrue);
+      // _import 里不得再有「延迟 500ms 后自动退出」的旧逻辑。
+      final int importIdx = src.indexOf('Future<void> _import()');
+      final int nextTop =
+          src.indexOf('Future<_BackupImportChoice?>', importIdx);
+      final String importBody = src.substring(importIdx, nextTop);
+      expect(
+        importBody.contains('Duration(milliseconds: 500)'),
+        isFalse,
+        reason: '导入完成不得再「延迟 500ms 后突然 exit」——那会让用户以为失败',
+      );
+      expect(importBody.contains('exit(0)'), isFalse,
+          reason: '_import 里不得直接 exit(0)，退出改由确认视图按钮驱动');
+    });
+
+    test('backup.part：backupImportRestart 优先真重启(restartApp)+保留纯退出兜底', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      final int fnIdx =
+          src.indexOf('Future<void> backupImportRestart(AppModel appModel)');
+      expect(fnIdx, greaterThan(0), reason: '必须有供确认按钮+自动重启调用的重启函数');
+      final int fnEnd = src.indexOf('\n}', fnIdx);
+      final String fnBody = src.substring(fnIdx, fnEnd);
+      // 优先走经过验证的 lifecycle.restartApp()（真拉新进程，带前台标志/ macOS bundle 处理），
+      // 由 supportsRestart 门控；消除本文件里 ad-hoc Process.start 的劣质重复。
+      expect(fnBody.contains('lifecycle.supportsRestart'), isTrue,
+          reason: '重启前必须先判 supportsRestart');
+      expect(fnBody.contains('lifecycle.restartApp()'), isTrue,
+          reason: '应委托经过验证的 restartApp 真重启，而非本文件里 ad-hoc Process.start');
+      // never-break 兜底: restartApp 失败/不支持时仍退回原平台纯退出分支。
+      expect(fnBody.contains('FlutterExitApp.exitApp()'), isTrue);
+      expect(fnBody.contains('exit(0)'), isTrue);
+    });
+
+    test('backup.part：导入成功后延时自动重启，失败态不自动（TODO-1151 自动重启）', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      final int importIdx = src.indexOf('Future<void> _import()');
+      final int nextTop =
+          src.indexOf('Future<_BackupImportChoice?>', importIdx);
+      final String importBody = src.substring(importIdx, nextTop);
+      // 成功路径：completeBackupImport 之后延时(~1s)自动调 backupImportRestart。
+      final int completeIdx =
+          importBody.indexOf('completeBackupImport(t.backup_import_success)');
+      final int autoRestartIdx =
+          importBody.indexOf('await backupImportRestart(appModel)');
+      expect(completeIdx, greaterThan(0));
+      expect(autoRestartIdx, greaterThan(completeIdx),
+          reason: '导入成功后必须自动调 backupImportRestart（用户诉求：不再手动重开）');
+      expect(importBody.contains('Duration(seconds: 1)'), isTrue,
+          reason: '自动重启前应短暂展示成功态(~1s)再拉新进程，避免像纯退出那样凭空消失');
+      // 失败路径：failBackupImport 之后不得再自动重启（保留手动按钮，用户先读失败原因）。
+      final int failIdx = importBody.indexOf('failBackupImport(');
+      expect(failIdx, greaterThan(0));
+      expect(importBody.indexOf('backupImportRestart', failIdx), -1,
+          reason: '失败态不得自动重启——保留手动「立即重启」按钮，用户读完原因再点');
+    });
+
+    test('app_model：BackupImportPhase 含 validating 相位 + token/取消/退出方法', () {
+      final String src =
+          readSource('lib/src/models/app_model.dart').readAsStringSync();
+      expect(
+        src.contains(
+            'enum BackupImportPhase { validating, running, done, failed }'),
+        isTrue,
+        reason: 'validating 必须是 BackupImportPhase 的首个相位',
+      );
+      // 干净 token/flag 机制：进入校验、判定是否最新、取消作废、成功退出。
+      expect(src.contains('int beginBackupValidating()'), isTrue);
+      expect(src.contains('bool isBackupValidatingCurrent(int token)'), isTrue);
+      expect(src.contains('void cancelBackupValidating()'), isTrue);
+      expect(src.contains('void endBackupValidating()'), isTrue);
+      // BUG-2106：换根判据必须显式把 validating 排除在外。
+      expect(
+        src.contains('bool get backupImportOwnsAppRoot =>'),
+        isTrue,
+        reason: '必须有「是否独占 app 根」的派生判据，供 main.dart 消费',
+      );
+      final int ownsIdx = src.indexOf('bool get backupImportOwnsAppRoot =>');
+      final String ownsBody = src.substring(ownsIdx, ownsIdx + 240);
+      expect(
+        ownsBody.contains('_backupImportPhase != BackupImportPhase.validating'),
+        isTrue,
+        reason: 'BUG-2106：validating 相位不得独占 app 根（否则调用方路由被销毁）',
+      );
+    });
+
+    test('backup.part：validate/preview 期用 validating 遮罩，退出后经全局 navigator 弹确认框',
+        () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      // 导入编排主体已提为库级 runBackupImportFlowForFile（设置页与新手引导
+      // 共用）；顺序断言锚到该函数体内，语义不变。
+      final int importIdx =
+          src.indexOf('Future<void> runBackupImportFlowForFile(');
+      final int beginValIdx =
+          src.indexOf('appModel.beginBackupValidating()', importIdx);
+      final int endValIdx =
+          src.indexOf('appModel.endBackupValidating()', importIdx);
+      final int confirmIdx =
+          src.indexOf('_showBackupImportConfirmDialog(', importIdx);
+      final int beginImportIdx =
+          src.indexOf('appModel.beginBackupImport()', importIdx);
+      expect(beginValIdx, greaterThan(0),
+          reason: 'validate/preview 前必须先上屏 validating 遮罩');
+      // 流转：进 validating → 退 validating → 弹确认框 → 进 running。
+      expect(beginValIdx, lessThan(endValIdx),
+          reason: '先进 validating 遮罩，再在 preview 完成后退出');
+      expect(endValIdx, lessThan(confirmIdx),
+          reason: '必须先退出遮罩再弹确认框（确认框不能弹在被替换掉的遮罩树里）');
+      expect(confirmIdx, lessThan(beginImportIdx),
+          reason: '确认后才进 running 导入相位');
+      // 确认框宿主是全局 navigatorKey 的正常 MaterialApp（本设置页此刻已卸载）。
+      expect(src.contains('appModel.navigatorKey.currentContext'), isTrue,
+          reason: '退出遮罩后须经全局 navigatorKey 取 root context 弹确认框');
+      // in-flight 后台 isolate 结果回来若已取消/被取代则丢弃（token 判定，不吞异常硬编码）。
+      expect(
+          src.contains('appModel.isBackupValidatingCurrent(validatingToken)'),
+          isTrue,
+          reason: 'validate/preview 结果消费前必须用 token 判定是否仍是最新');
+      // BUG-2106：validating 遮罩是压在调用方页面之上的模态路由，不换根。
+      final int overlayIdx =
+          src.indexOf('_BackupValidatingOverlay.show(', importIdx);
+      expect(overlayIdx, greaterThan(beginValIdx),
+          reason: 'beginBackupValidating 之后必须压上遮罩路由（而非依赖换根）');
+      expect(overlayIdx, lessThan(endValIdx),
+          reason: '遮罩必须在校验期间就在栈上');
+      // 每条退出路径都得摘掉它：路由 canPop:false，漏一次 app 就被永久挡住。
+      expect(src.contains('overlay.dismiss();'), isTrue,
+          reason: '退出路径必须摘掉遮罩路由');
+      final int finallyIdx = src.indexOf('} finally {', overlayIdx);
+      expect(finallyIdx, greaterThan(overlayIdx),
+          reason: '遮罩摘除必须有 finally 兜底（早退 / 抛出都不能漏）');
+      expect(
+        src.indexOf('overlay.dismiss();', finallyIdx),
+        greaterThan(finallyIdx),
+        reason: 'finally 里必须 dismiss 遮罩路由',
+      );
+    });
+
+    test('backup.part：遮罩路由只能 removeRoute 摘除（pop 会被 PopScope 拦下）', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      final int cls = src.indexOf('class _BackupValidatingOverlay {');
+      expect(cls, greaterThan(0), reason: '必须有遮罩路由句柄类');
+      final String body = src.substring(cls);
+      expect(body.contains('navigator.removeRoute<void>(route)'), isTrue,
+          reason: 'BUG-2106：路由带 PopScope(canPop:false)，pop 摘不掉，必须 removeRoute');
+      expect(body.contains('navigator.pop('), isFalse,
+          reason: '禁止用 pop 摘遮罩路由（会被 PopScope 拦下，遮罩永久留在栈上）');
+    });
+
+    test('遮罩路由：不可 pop + 不透明 + 接线取消 (BUG-2106)', () {
+      final String src = readSource(
+        'lib/src/sync/backup_validating_overlay_route.dart',
+      ).readAsStringSync();
+      expect(src.contains('canPop: false'), isTrue,
+          reason: '系统返回不得穿过遮罩去 pop 底下的调用方页面（引导向导）');
+      expect(src.contains('opaque: true'), isTrue,
+          reason: '遮罩必须不透明：挡住底下页面的绘制与命中测试');
+      expect(src.contains('phase: BackupImportPhase.validating'), isTrue,
+          reason: '本路由只承载 validating 相位');
+      expect(src.contains('onCancel: onCancel'), isTrue,
+          reason: '取消按钮必须接调用方注入的回调');
+    });
+
+    test('validating 取消接线搬到遮罩路由的调用方 (BUG-2106)', () {
+      // 取消只属于 validating 相位，而 validating 已不由 main.dart 的根分支承载
+      // （那里只剩 running/done/failed，本视图在这三个相位不渲染取消按钮）。
+      final String main = readSource('lib/main.dart').readAsStringSync();
+      expect(
+        main.contains('onCancel: appModel.cancelBackupValidating'),
+        isFalse,
+        reason: 'BUG-2106：根分支不再承载 validating，取消接线不该留在这里',
+      );
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/backup.part.dart')
+              .readAsStringSync();
+      expect(src.contains('appModel.cancelBackupValidating();'), isTrue,
+          reason: '遮罩路由的取消回调必须作废 in-flight 校验 token');
+      final int cancelIdx = src.indexOf('appModel.cancelBackupValidating();');
+      final int dismissIdx = src.lastIndexOf('handle.dismiss();', cancelIdx);
+      expect(dismissIdx, greaterThan(0),
+          reason: '取消必须先摘掉遮罩路由再作废 token（否则遮罩留在栈上）');
+    });
+  });
+}

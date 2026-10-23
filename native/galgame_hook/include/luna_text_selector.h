@@ -1,0 +1,542 @@
+#ifndef FUSHI_LUNA_TEXT_SELECTOR_H_
+#define FUSHI_LUNA_TEXT_SELECTOR_H_
+
+#include <cstddef>
+#include <cstring>
+#include <cstdint>
+#include <cwchar>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace fushi_voice_hook {
+
+// 一个完整句的最小字符数。低于它不做前缀折叠，避免把「ああ」这类叠字噪声
+// （交给 LunaTextIsArtifact 判）或短感叹句误截。
+constexpr int kLunaMinFoldedLineChars = 4;
+
+// Some KiriKiri/Luna hook paths concatenate an already complete line with an
+// exact second copy.  Preserve a view of the first complete line instead of
+// discarding the event as an artifact.  A one-character doubled string remains
+// untouched so the artifact filter can continue rejecting single-character
+// repetition noise.
+//
+// BUG-1175：旧实现只认「整串恰好二倍」（前半 == 后半）。带 ruby 的台词会被
+// KiriKiriZ 分别以 base（汉字）和 ruby（假名）两种形式送进同一个 hook 点，再叠上
+// 本 hook 面固有的完整行双写，实际收到的是 `A A B B A A`（A=汉字版、B=注音版）——
+// 前半 `AAB` != 后半 `BAA`，整串判据一条都不命中，整串原样入环，于是浮窗/台词列表/
+// 制卡内容里一句话出现六遍。
+//
+// 判据是**块级**的：整串必须能被无剩余地切成一串「连续成对重复」的块
+// `s1 s1 s2 s2 … sn sn`（每块 >= kLunaMinFoldedLineChars 字），命中才返回 |s1|。
+// `A A B B A A` 正是这个形状 → 折成 A；「整串恰好二倍」是 n == 1 的特例，
+// 旧行为被完整覆盖。
+//
+// 判据**不得**放宽成「开头二倍就截掉后面全部」：那会把 galgame 里极常见的
+// 合法叠句静默腰斩，而且残句短到过不了 LunaTextIsArtifact，会被当干净行写进环：
+//   「わかったわかった、もう行くよ」→「わかった」
+//   「ありがとうありがとう、本当に助かった」→「ありがとう」
+// 块级判据下这两句的尾巴（`、もう行くよ` / `、本当に助かった`）拆不成成对重复块，
+// 整串判定失败 → 原样放行。**宁可漏折，也不能吞用户的字。**
+//
+// 长度上界只是防御性护栏；超界同样走「原样放行」这个安全方向。
+constexpr int kLunaMaxFoldScanChars = 4096;
+
+// Some MAGES scenario strings expose script controls literally. Under Japanese
+// fonts the reverse solidus is rendered as a yen sign, so a line break can
+// arrive as `\\n`, `¥n`, `￥n`, or the MAGES-native `%r`. Inline font colors use
+// `#RRGGBB;` (for example `#ff8A00;コスプレ`). Glyph-spacing controls use `%p;`
+// or `%p<signed integer>;` (for example `%p-1;─%p;─`). Strip only the control
+// prefix and preserve the styled/positioned text. This transformation is gated
+// by engine identity (kLunaMagesControlEngineAdapterId) or an explicit user profile
+// option, never by executable hash/name; keeping it out of the global path
+// avoids changing legitimate prose/code in unrelated games.
+//
+// Engine adapter id whose Luna text carries these MAGES script controls. The
+// adapter's probe() is the structural identity (SGRE: wind3d11 voice archive or
+// the corroborated scenario renderer anchors), so every build/edition of the
+// engine is covered without pinning one executable.
+constexpr const char kLunaMagesControlEngineAdapterId[] = "sgre";
+
+inline std::wstring LunaNormalizeMagesControls(const wchar_t* text, int len,
+                                               bool enabled) {
+  if (text == nullptr || len <= 0) return std::wstring();
+  if (!enabled) return std::wstring(text, text + len);
+  std::wstring normalized;
+  normalized.reserve(static_cast<size_t>(len));
+  for (int i = 0; i < len; ++i) {
+    const wchar_t c = text[i];
+    if (c == L'%' && i + 1 < len && text[i + 1] == L'r') {
+      normalized.push_back(L'\n');
+      ++i;
+      continue;
+    }
+    if (c == L'%' && i + 2 < len && text[i + 1] == L'p') {
+      int end = i + 2;
+      bool has_sign = false;
+      if (text[end] == L'+' || text[end] == L'-') {
+        has_sign = true;
+        ++end;
+      }
+      const int digits_begin = end;
+      while (end < len && text[end] >= L'0' && text[end] <= L'9') ++end;
+      const bool has_digits = end > digits_begin;
+      // `%p;` is the reset form. Signed forms require at least one digit so a
+      // malformed/literal `%p-;` remains visible rather than losing user text.
+      if (end < len && text[end] == L';' &&
+          ((!has_sign && !has_digits) || has_digits)) {
+        i = end;
+        continue;
+      }
+    }
+    if (c == L'#' && i + 7 < len && text[i + 7] == L';') {
+      bool is_color = true;
+      for (int j = 1; j <= 6; ++j) {
+        const wchar_t digit = text[i + j];
+        if (!((digit >= L'0' && digit <= L'9') ||
+              (digit >= L'a' && digit <= L'f') ||
+              (digit >= L'A' && digit <= L'F'))) {
+          is_color = false;
+          break;
+        }
+      }
+      if (is_color) {
+        i += 7;
+        continue;
+      }
+    }
+    const bool escape = c == L'\\' || c == 0x00a5 || c == 0xffe5;
+    if (escape && i + 1 < len && text[i + 1] == L'n') {
+      normalized.push_back(L'\n');
+      ++i;
+      continue;
+    }
+    if (escape && i + 3 < len && text[i + 1] == L'r') {
+      const wchar_t c2 = text[i + 2];
+      const bool second_escape =
+          c2 == L'\\' || c2 == 0x00a5 || c2 == 0xffe5;
+      if (second_escape && text[i + 3] == L'n') {
+        normalized.push_back(L'\n');
+        i += 3;
+        continue;
+      }
+    }
+    normalized.push_back(c);
+  }
+  return normalized;
+}
+
+inline int LunaNormalizedTextLength(const wchar_t* text, int len) {
+  if (text == nullptr || len < kLunaMinFoldedLineChars * 2) return len;
+  if (len > kLunaMaxFoldScanChars) return len;
+  // block[i] > 0：text[i, len) 可完整拆成成对重复块，值是其首块长度；
+  // block[len] = -1 是「尾巴为空、已拆完」的哨兵；0 表示拆不动。
+  std::vector<int> block(static_cast<size_t>(len) + 1, 0);
+  block[static_cast<size_t>(len)] = -1;
+  for (int i = len - kLunaMinFoldedLineChars * 2; i >= 0; --i) {
+    for (int k = kLunaMinFoldedLineChars; i + 2 * k <= len; ++k) {
+      // 先看尾巴能否拆完再比字符：绝大多数位置在这一步就被剪掉。
+      if (block[static_cast<size_t>(i + 2 * k)] == 0) continue;
+      bool doubled = true;
+      for (int j = 0; j < k && doubled; ++j) {
+        if (text[i + j] != text[i + k + j]) doubled = false;
+      }
+      if (doubled) {
+        block[static_cast<size_t>(i)] = k;
+        break;
+      }
+    }
+  }
+  return block[0] > 0 ? block[0] : len;
+}
+
+// TYPEMOON/HUNEX uses the same structural double-write shape for the
+// in-game toolbar: each control description can be emitted as a consecutive
+// pair before the next description is appended.  Reuse the conservative
+// all-blocks-must-pair rule above so both the native thread preview and the
+// selected text lane see the same bounded first block.  The gate is Luna's
+// semantic hook identity; no executable name/RVA or localized toolbar text
+// participates in the decision.
+inline bool LunaHookFoldsPairedBlocks(const char* hook_name) {
+  return hook_name != nullptr &&
+         (std::strcmp(hook_name, "EmbedKrkrZ") == 0 ||
+          std::strcmp(hook_name, "typemoon") == 0);
+}
+
+inline int LunaNormalizedTextLengthForHook(const char* hook_name,
+                                           const wchar_t* text, int len) {
+  if (!LunaHookFoldsPairedBlocks(hook_name)) {
+    return len;
+  }
+  return LunaNormalizedTextLength(text, len);
+}
+
+// 成对折叠 hook 面上的「粘性尾巴」（BUG-2705）。
+//
+// KiriKiri Z 的 EmbedKrkrZ 面在某些构建上会把「当前循环音效的标签」拼在每句成对台词
+// 之后：音效开始时本线程先单独发出一条不成对的 `T`（如 `■自動車（車内／走行）`），此后
+// 每条台词都是 `P P T`（《千恋＊万花》光盘版原版真机）。块级判据要求整串无剩余地成对，
+// `P P T` 一条都折不了，于是用户看到的每句都是「台词台词■音效名」。
+//
+// 判据是结构性的、按线程有状态：只有当尾巴**逐字等于本线程上一条不成对的独立文本**、且
+// 去掉尾巴后剩余部分能被完整成对切分时才剥掉它。合法叠句（「わかったわかった、もう行くよ」）
+// 的尾巴不可能恰好等于前一条独立事件，照旧原样放行——与块级判据「宁可漏折，也不能吞用户
+// 的字」同一方向。不看任何文本内容、游戏名或哈希。
+class LunaPairedTailTracker {
+ public:
+  // 与 LunaNormalizedTextLengthForHook 同一返回约定：可展示前缀的长度。
+  int NormalizedLength(uint64_t thread_id, const char* hook_name,
+                       const wchar_t* text, int len) {
+    const int base = LunaNormalizedTextLengthForHook(hook_name, text, len);
+    if (base != len || text == nullptr || len <= 0 ||
+        !LunaHookFoldsPairedBlocks(hook_name)) {
+      return base;  // 已完整折叠，或本 hook 面不做成对折叠
+    }
+    const auto it = standalone_.find(thread_id);
+    if (it != standalone_.end()) {
+      const std::wstring& tail = it->second;
+      const int tail_len = static_cast<int>(tail.size());
+      const int body_len = len - tail_len;
+      if (tail_len > 0 && body_len >= kLunaMinFoldedLineChars * 2 &&
+          std::wmemcmp(text + body_len, tail.data(), tail.size()) == 0) {
+        const int folded = LunaNormalizedTextLength(text, body_len);
+        if (folded < body_len) return folded;
+      }
+    }
+    // 只有「开头不是成对块」的独立事件才是候选尾巴（标签本身从不双写）；以 `P P` 开头的
+    // 是台词，不论带不带别的尾巴，都不能顶掉已记下的尾巴。有界：超长的不可能是标签。
+    if (len <= kMaxTailChars && !StartsWithPairedBlock(text, len)) {
+      standalone_[thread_id].assign(text, text + len);
+      recurring_.erase(thread_id);
+      return base;
+    }
+    // helper 在循环音效**已经开始之后**才附着时，从没见过独立的 T（BUG-2705 已知限制），
+    // 上面那条路剥不了，这一段每句都是 `P P T`，而且文本道里存的是畸形串，游戏内查词按
+    // 原文反查不到文本代次、整段点不出卡。补一个同样只看结构的判据：同一线程**连续两条**
+    // 事件以同一个非成对后缀结尾，去掉它后正文都能完整折叠、且正文不同，这个后缀就是粘尾。
+    // 合法叠句（「わかったわかった、もう行くよ」）要连续两句带同一段尾巴才会被误判。
+    int body_len = 0;
+    const int tail_len = ShortestFoldableTail(text, len, &body_len);
+    if (tail_len <= 0) {
+      recurring_.erase(thread_id);
+      return base;
+    }
+    const std::wstring tail(text + body_len, text + len);
+    const std::wstring body(text, text + body_len);
+    const auto seen = recurring_.find(thread_id);
+    if (seen != recurring_.end() && seen->second.tail == tail &&
+        seen->second.body != body) {
+      standalone_[thread_id] = tail;
+      recurring_.erase(seen);
+      return LunaNormalizedTextLength(text, body_len);
+    }
+    recurring_[thread_id] = RecurringTail{tail, body};
+    return base;
+  }
+
+  void Reset() {
+    standalone_.clear();
+    recurring_.clear();
+  }
+
+ private:
+  static bool StartsWithPairedBlock(const wchar_t* text, int len) {
+    for (int k = kLunaMinFoldedLineChars; 2 * k <= len; ++k) {
+      if (std::wmemcmp(text, text + k, static_cast<size_t>(k)) == 0) return true;
+    }
+    return false;
+  }
+
+  // 最短的、去掉后剩余正文能完整成对折叠的后缀长度；没有则返回 0。尾巴自身不能以成对块
+  // 开头（那是下一句台词，不是标签），且有界。
+  static int ShortestFoldableTail(const wchar_t* text, int len, int* body_len) {
+    for (int body = len - 1; body >= kLunaMinFoldedLineChars * 2; --body) {
+      const int tail = len - body;
+      if (tail > kMaxTailChars) break;
+      if (StartsWithPairedBlock(text + body, tail)) continue;
+      if (LunaNormalizedTextLength(text, body) < body) {
+        *body_len = body;
+        return tail;
+      }
+    }
+    return 0;
+  }
+
+  struct RecurringTail {
+    std::wstring tail;
+    std::wstring body;
+  };
+
+  static constexpr int kMaxTailChars = 256;
+  std::map<uint64_t, std::wstring> standalone_;
+  std::map<uint64_t, RecurringTail> recurring_;
+};
+
+// Luna's x64 TYPEMOON hook reports the story renderer and the in-game toolbar
+// through the same hook address/name while keeping them in separate
+// ThreadParam contexts. LunaHook's thread picker preserves that boundary.
+// Fushi normally accepts sibling contexts from the same hook face to survive
+// engines whose story callsite legitimately changes (BUG-1159), but doing so
+// for TYPEMOON merges toolbar descriptions into the selected story lane.
+//
+// This is deliberately keyed by Luna's engine hook identity, not by an EXE
+// basename, hash, RVA, or Japanese toolbar strings, so patched/renamed HUNEX
+// games retain the same structural policy.
+inline bool LunaTextRequiresExactThreadContext(const char* hook_name) {
+  return hook_name != nullptr && std::strcmp(hook_name, "typemoon") == 0;
+}
+
+// CatSystem2: LunaHook's EmbedCS2 hook sits on a script string command that
+// the engine runs twice for every message — once when the script line is
+// processed on the click, and again when the message window starts showing
+// it (measured 2026-09-27 on a cs2 2.6.1 build: each dialogue line and each
+// speaker name arrives as the same text on the same thread 0.2–0.4 s apart,
+// the second copy at the moment the window starts rendering).  The text lane
+// must carry one line per message, so the immediate re-emission is dropped.
+//
+// The rule is keyed by Luna's engine hook identity (no executable name, hash
+// or text content), per thread, exact text only, and time-bounded: a line
+// the player legitimately sees twice in a row needs a click in between, which
+// the engine's own double run never waits for.  Other hooks are untouched
+// (cross-engine negative in luna_text_replay_test).
+inline constexpr uint64_t kLunaImmediateRepeatWindowMs = 1000u;
+
+inline bool LunaHookRepeatsEachMessage(const char* hook_name) {
+  return hook_name != nullptr && std::strcmp(hook_name, "EmbedCS2") == 0;
+}
+
+class LunaImmediateRepeatFilter {
+ public:
+  // True when this event only repeats the previous event of the same thread
+  // and must not be written to the text lane.  Every event (repeat or not)
+  // becomes the thread's new reference.
+  bool IsRepeat(uint64_t thread_id, const char* hook_name,
+                const wchar_t* text, int len, uint64_t now_ms) {
+    if (!LunaHookRepeatsEachMessage(hook_name) || text == nullptr ||
+        len <= 0) {
+      return false;
+    }
+    Last& last = last_[thread_id];
+    const bool repeat =
+        last.valid && now_ms >= last.at_ms &&
+        now_ms - last.at_ms <= kLunaImmediateRepeatWindowMs &&
+        last.text.size() == static_cast<size_t>(len) &&
+        std::wmemcmp(last.text.data(), text, static_cast<size_t>(len)) == 0;
+    last.valid = true;
+    last.at_ms = now_ms;
+    last.text.assign(text, text + len);
+    return repeat;
+  }
+
+  void Reset() { last_.clear(); }
+
+ private:
+  struct Last {
+    bool valid = false;
+    uint64_t at_ms = 0u;
+    std::wstring text;
+  };
+  std::map<uint64_t, Last> last_;
+};
+
+// Characters a script writes as runs on purpose: pause / prolongation marks.
+// A voiced 「…………」【少女】 is one line, not a per-character double write, so
+// their repeats are not evidence of the doubled-write artifact (BUG-2897).
+inline bool LunaIsTypographicRunChar(wchar_t c) {
+  switch (c) {
+    case L'\x2026':  // …
+    case L'\x2025':  // ‥
+    case L'\x2015':  // ―
+    case L'\x2014':  // —
+    case L'\x2500':  // ─
+    case L'\x30FC':  // ー
+    case L'\x30FB':  // ・
+    case L'\xFF5E':  // ～
+    case L'\x301C':  // 〜
+    case L'.':
+    case L'-':
+      return true;
+    default:
+      return false;
+  }
+}
+
+inline bool LunaTextIsArtifact(const wchar_t* text, int len) {
+  if (text == nullptr || len <= 1) return false;
+  bool only_typographic = true;
+  for (int i = 0; i < len && only_typographic; ++i) {
+    only_typographic = LunaIsTypographicRunChar(text[i]);
+  }
+  if (only_typographic) return false;
+  if ((len % 2) == 0) {
+    const int half = len / 2;
+    if (std::wstring(text, text + half) == std::wstring(text + half, text + len)) {
+      return true;
+    }
+  }
+  int segments = 0;
+  int first_run = 0;
+  bool uniform = true;
+  for (int i = 0; i < len;) {
+    int j = i + 1;
+    while (j < len && text[j] == text[i]) ++j;
+    const int run = j - i;
+    if (segments == 0) first_run = run;
+    else if (run != first_run) uniform = false;
+    ++segments;
+    i = j;
+  }
+  if (segments >= 3 && uniform && first_run >= 2) return true;
+  int adjacent_equal = 0;
+  int adjacent_pairs = 0;
+  for (int i = 1; i < len; ++i) {
+    if (LunaIsTypographicRunChar(text[i])) continue;
+    ++adjacent_pairs;
+    if (text[i] == text[i - 1]) ++adjacent_equal;
+  }
+  return len > 4 && adjacent_pairs > 0 &&
+         adjacent_equal * 100 >= adjacent_pairs * 30;
+}
+
+// ── hook 身份 id：injector 与测试共用同一实现 ────────────────────────
+// 放在头里而不是 injector 的 .cpp 里，是为了让跨引擎负向测试能拿真实引擎的
+// (addr, hookcode, hookname, ctx, ctx2) 驱动**生产实现**，而不是手捏 face 常量自证。
+inline uint64_t LunaFnv1a64(uint64_t hash, const void* data, size_t size) {
+  const auto* bytes = static_cast<const unsigned char*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+
+inline uint64_t LunaHashHookNames(uint64_t hash, const wchar_t* hookcode,
+                                  const char* hookname) {
+  if (hookcode != nullptr) {
+    hash = LunaFnv1a64(hash, hookcode, std::wcslen(hookcode) * sizeof(wchar_t));
+  }
+  if (hookname != nullptr) {
+    hash = LunaFnv1a64(hash, hookname, std::strlen(hookname));
+  }
+  return hash == 0 ? 1 : hash;
+}
+
+// 展示/诊断用的全维度线程 id：含 ctx（调用点上下文/返回地址）与 ctx2。
+inline uint64_t LunaTextThreadIdFrom(uint32_t process_id, uint64_t addr,
+                                     uint64_t ctx, uint64_t ctx2,
+                                     const wchar_t* hookcode,
+                                     const char* hookname) {
+  // 字段喂入顺序与旧的 injector 实现逐字节一致，保证 thread_id 取值不变。
+  uint64_t hash = 1469598103934665603ull;
+  hash = LunaFnv1a64(hash, &process_id, sizeof(process_id));
+  hash = LunaFnv1a64(hash, &addr, sizeof(addr));
+  hash = LunaFnv1a64(hash, &ctx, sizeof(ctx));
+  hash = LunaFnv1a64(hash, &ctx2, sizeof(ctx2));
+  return LunaHashHookNames(hash, hookcode, hookname);
+}
+
+// hook「面」id：与 LunaTextThreadIdFrom 同源，**只去掉 ctx**（BUG-1159）。
+//
+// 为什么只去 ctx：LunaHook 的 `ThreadParam` 里两个上下文字段语义完全不同——
+// * `ctx`  = 调用点（返回地址）。同一个 hook 面在不同剧情分支下会走不同调用点，
+//   它一变 thread_id 就变，旧的精确匹配把整段台词丢掉——这正是 BUG-1159。
+// * `ctx2` = split H 码的 **split 值**，是引擎适配方显式声明的语义分类
+//   （典型就是「角色名 vs 正文 vs 选项」）。它必须留在 face 里，否则 split H 码
+//   引擎的角色名会被当成「同一 hook 面的兄弟线程」混进正文流。
+// 包含 ctx2 是保守方向：最差也只是对该维度保持旧的精确匹配行为，不会混流。
+inline uint64_t LunaTextFaceIdFrom(uint32_t process_id, uint64_t addr,
+                                   uint64_t ctx2, const wchar_t* hookcode,
+                                   const char* hookname) {
+  uint64_t hash = 1469598103934665603ull;
+  hash = LunaFnv1a64(hash, &process_id, sizeof(process_id));
+  hash = LunaFnv1a64(hash, &addr, sizeof(addr));
+  hash = LunaFnv1a64(hash, &ctx2, sizeof(ctx2));
+  return LunaHashHookNames(hash, hookcode, hookname);
+}
+
+// 手动/记忆选定的线程是否应放行本行（纯函数，便于单测）。
+//
+// BUG-1159：`selected_text_thread_id` 存的是一个具体的 `TextSlot::thread_id`，而
+// thread_id = FNV1a(processId, addr, **ctx**, ctx2, hookcode, hookname) —— 含调用点。
+// 同一个 hook 面（同 addr + 同 ctx2 + 同 hookcode/hookname）在不同调用路径下 ctx 会变，
+// thread_id 随之变，旧的 `manually_selected == thread_id` 精确匹配就把整段台词丢掉：
+// 真机实测中 textseq83 之后连续 16 句语音资源（间隔规整 5~8s）全部没有对应文本，
+// 文本环没有候选 → 资源配对 kExpired → 写成无标记文件 → 消费端只剩 200ms 时间窗
+// 兜底 → 兜不住 → 整段降级成 system_loopback。
+//
+// ctx 参与 thread_id 是**有意的**（诊断/区分同 hook 的并行调用点），所以这里不改
+// thread_id 的算法，只把**过滤粒度**放宽到 hook 面：选定线程的 face 与本行 face 相同
+// 即放行。face 未知（还没见过选定线程的行）时退回精确匹配，语义与旧实现一致。
+//
+// 放宽的只有 ctx 这一维；split H 码的 ctx2（角色名/正文分类）仍在 face 里，见
+// [LunaTextFaceIdFrom]。
+inline bool LunaSelectedThreadAccepts(uint64_t manually_selected,
+                                      uint64_t thread_id,
+                                      uint64_t selected_face,
+                                      uint64_t face_id) {
+  if (manually_selected == thread_id) return true;
+  return selected_face != 0 && selected_face == face_id;
+}
+
+// 文本环（Ring A）的准入判定。
+//
+// BUG-1193 / v12：这里**不再有"自动选干净线程"**。旧实现按 hookcode 统计 clean/dirty，
+// 累计够 3 行干净就锁定赢家，此后只发布赢家的行。它撑住了很长一段时间，但有两个无法
+// 在本层解决的问题：
+//   ① 猜错就没有出路。赢家一旦锁定，其余线程在采集端就被丢弃，用户在 UI 里看到的是
+//     一堆没有内容的空壳线程，"选不动"——这正是用户报的症状；
+//   ② 它把"哪条是台词"这个只有用户能回答的问题，交给了一个字符级启发式。带汉化补丁的
+//     KiriKiri 上这个启发式必然失败：原文和译文经由**同一个 hook**（EmbedKrkrZ 带
+//     NO_CONTEXT，ctx 被强制清零）流出，两种语言的 ThreadParam 逐字节相同，任何统计
+//     都不可能把它们分开。
+// v12 的答案是不猜：没有显式选择就不发布，由 UI 引导用户从**线程预览区**（见
+// voice_hook_ipc.h ThreadPreviewSlot）挑一条。预览区按线程分槽，不受本判定影响，所以
+// "让用户看见所有线程"和"文本环只装选定线程"不再互相排斥——这是删掉赢家逻辑的前提。
+//
+// 唯一准入来源是用户选定的 selected_text_thread_id。profile 的 `prefer=` 只保留为旧配置
+// 元数据，v12 不得据此绕过显式选择。
+class LunaTextSelector {
+ public:
+  // 判定本行是否写入文本环。[face_id] 是不含 ctx 的 hook 面 id（见
+  // LunaSelectedThreadAccepts）；传 0 表示调用方无法提供，此时退化为精确 thread_id 匹配。
+  //
+  // [manually_selected] 为 0 表示用户尚未为本游戏选定线程：**返回 false**，一行都不发布。
+  // 这是有意的——见类注释。伪影行任何情况下都不进文本环（预览区另有 artifact 标记位，
+  // 脏线程在 UI 里仍然看得见，不会被藏掉）。
+  bool AcceptsLine(uint64_t thread_id, bool artifact, uint64_t manually_selected,
+                   uint64_t face_id = 0) {
+    NoteFace(thread_id, face_id);
+    if (artifact) return false;
+    if (manually_selected == 0) return false;
+    return LunaSelectedThreadAccepts(manually_selected, thread_id,
+                                     FaceOf(manually_selected), face_id);
+  }
+
+  // 登记一条 thread_id → face 映射。
+  //
+  // BUG-1159：这一步必须对**每一行**做，且必须早于准入判定。未选择阶段的行只进入
+  // 预览区、不进入文本环；跨会话记忆恢复（Dart `_maybeRestoreTextThread`）会从
+  // 「本会话已出过 >= 3 行」的线程里挑一条写进 `selected_text_thread_id`，所以这些
+  // 预览行也必须提前登记 face。
+  // 登记在全路径完成后，「选定线程已出过 >= 3 行」就硬性蕴含「face 已知」。
+  void NoteFace(uint64_t thread_id, uint64_t face_id) {
+    if (face_id != 0 && thread_id != 0) thread_face_[thread_id] = face_id;
+  }
+
+  // 已登记的 thread_id → hook 面 id；未见过返回 0。
+  uint64_t FaceOf(uint64_t thread_id) const {
+    const auto it = thread_face_.find(thread_id);
+    return it == thread_face_.end() ? 0 : it->second;
+  }
+
+  void Reset() { thread_face_.clear(); }
+
+ private:
+  // thread_id → hook 面 id。只增不删：一次会话内 hook 面数量有界（每个 hook 的每个
+  // 调用上下文一条），且必须跨「用户选定线程」之前/之后都能查到。
+  std::map<uint64_t, uint64_t> thread_face_;
+};
+
+}  // namespace fushi_voice_hook
+
+#endif  // FUSHI_LUNA_TEXT_SELECTOR_H_

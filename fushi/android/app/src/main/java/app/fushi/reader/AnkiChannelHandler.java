@@ -1,0 +1,1217 @@
+package app.fushi.reader;
+
+import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
+import android.provider.Settings;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.core.content.FileProvider;
+
+import com.ichi2.anki.FlashCardsContract;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
+
+import app.fushi.reader.constants.ChannelNames;
+import io.flutter.embedding.engine.FlutterEngine;
+import io.flutter.plugin.common.MethodCall;
+import io.flutter.plugin.common.MethodChannel;
+
+public class AnkiChannelHandler {
+    private static final String CHANNEL = ChannelNames.ANKI;
+    /** Card source IDs are UUID v4 strings (see CardSourceLink). */
+    private static final String SOURCE_ID_PATTERN =
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+    private static final int AD_PERM_REQUEST = 0;
+
+    /**
+     * AnkiDroid ContentProvider 查询专用的单线程后台执行器（见 {@link #dispatch}）。
+     * 进程级共享：主 engine 与悬浮词典副 engine 的调用同样串行，彼此不并发打 provider。
+     */
+    private static final ExecutorService PROVIDER_IO =
+        Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "fushi-anki-provider");
+            t.setDaemon(true);
+            return t;
+        });
+
+    // BUG-2098：`requestAnkidroidPermissions` 的返回值。此前恒 success(true)——发起
+    // 系统权限请求后**不等用户答复**就返回，Dart 侧紧接着查 provider，于是权限对话框
+    // 还在屏幕上时错误已经报完了；而当系统压根不弹框（用户永久拒绝 / AnkiDroid 没装
+    // 导致这个自定义 dangerous 权限在系统里根本没被任何包定义）时，用户在设置页里
+    // 没有任何路径能把权限授出来。现在返回真实终态，Dart 据此短路并给可操作提示。
+    static final String PERM_GRANTED = "granted";
+    /** 用户拒绝了本次请求，但还能再问（下次仍会弹框）。 */
+    static final String PERM_DENIED = "denied";
+    /** 系统不再弹框（「不再询问」/永久拒绝）——只能去应用设置页手动授予。 */
+    static final String PERM_PERMANENTLY_DENIED = "permanently_denied";
+    /** 副 engine（无 Activity）未授权：弹不了框，须回主 app 授予（BUG-865）。 */
+    static final String PERM_NO_ACTIVITY = "no_activity";
+    /** AnkiDroid 没装（或其 API 被禁）——该权限在系统里不存在，授权无从谈起。 */
+    static final String PERM_UNAVAILABLE = "unavailable";
+
+    // BUG-865：AnkiDroid ContentProvider 访问是「进程 + 权限」作用域，只需 Context
+    // （AnkiDroidHelper 内部已 getApplicationContext()、AddContentApi/FileProvider/
+    // grantUriPermission/getContentResolver/startActivity(NEW_TASK) 均 Context 即可）。
+    // 唯一真正需要 Activity 的是运行时权限弹窗 ActivityCompat.requestPermissions；
+    // 副 FlutterEngine（popupMain/PopupEngineHolder）无 Activity，此时 activity=null，
+    // 权限路径优雅降级（返回 PERMISSION_DENIED，不 NPE），制卡权限已在主 app 授予。
+    private final Context context;
+    @Nullable
+    private final Activity activity;
+    private final AnkiDroidHelper ankiDroid;
+
+    /**
+     * BUG-2098：在途的权限请求——{@code requestAnkidroidPermissions} 把 Dart 侧的
+     * {@link MethodChannel.Result} 挂在这里，直到 {@link #onRequestPermissionsResult}
+     * 拿到系统回调才 resolve。只在主线程读写（channel 回调与权限回调同为主线程）。
+     */
+    @Nullable
+    private MethodChannel.Result pendingPermissionResult;
+
+    /** 主 engine（MainActivity）用：Activity 既作 Context 又能弹权限。 */
+    public AnkiChannelHandler(Activity activity) {
+        this(activity, activity);
+    }
+
+    /**
+     * BUG-865：副 engine（popupMain）用 applicationContext 注册，activity 传 null。
+     *
+     * @param context  用于 ContentProvider / FileProvider 的 Context（内部取
+     *                 applicationContext，避免暖 engine 持有 Activity 泄漏）。
+     * @param activity 运行时权限弹窗宿主；无 Activity（副 engine/服务）时传 null。
+     */
+    public AnkiChannelHandler(@NonNull Context context, @Nullable Activity activity) {
+        this.context = context.getApplicationContext();
+        this.activity = activity;
+        this.ankiDroid = new AnkiDroidHelper(this.context);
+    }
+
+    public void register(@NonNull FlutterEngine engine) {
+        new MethodChannel(engine.getDartExecutor().getBinaryMessenger(), CHANNEL)
+            .setMethodCallHandler((call, rawResult) -> dispatch(call, rawResult, result -> {
+                final String model = call.argument("model");
+                final String deck = call.argument("deck");
+                final String key = call.argument("key");
+                final String sourceId = call.argument("sourceId");
+                final String reading = call.argument("reading");
+                final ArrayList<Integer> readingFieldIndices = call.argument("readingFieldIndices");
+                final ArrayList<String> fields = call.argument("fields");
+                final ArrayList<String> tags = call.argument("tags");
+                final ArrayList<String> models = call.argument("models");
+                final String filename = call.argument("filename");
+                final String preferredName = call.argument("preferredName");
+                final String mimeType = call.argument("mimeType");
+                final AnkiProvider api = AnkiProviders.forContext(context);
+                final ArrayList<String> noteTypeFields = call.argument("noteTypeFields");
+                final String noteTypeName = call.argument("noteTypeName");
+                final String cardName = call.argument("cardName");
+                final String front = call.argument("front");
+                final String back = call.argument("back");
+                final String css = call.argument("css");
+                final String deckName = call.argument("deckName");
+                final Number noteIdArg = call.argument("noteId");
+                final Map<String, String> fieldValues = call.argument("fieldValues");
+                // BUG-2606：覆盖=整体替换——没点名的字段也写空、并入新制会打的标签。
+                final Boolean clearUnspecified = call.argument("clearUnspecified");
+                // Lapis 样式客制化：模板列表（每项 name/front/back），见
+                // readNoteType / updateNoteTypeTemplates。
+                final ArrayList<Map<String, String>> noteTypeTemplates =
+                    call.argument("templates");
+
+                switch (call.method) {
+                    case "addNote":
+                        if (model == null || deck == null) {
+                            result.error("MISSING_ARG",
+                                "model and deck are required", null);
+                        } else if (fields == null || fields.isEmpty()) {
+                            result.error("INVALID_FIELDS",
+                                "fields is null or empty", null);
+                        } else if (requirePermission(result)) {
+                            // BUG-824: addNote was the ONLY provider-touching case
+                            // missing the requirePermission guard. Without it an
+                            // ungranted permission let addNote() run straight into
+                            // AddContentApi's internal `/decks` query, which throws a
+                            // raw SecurityException ("Permission not granted for:
+                            // CardContentProvider.query /decks") that escaped the
+                            // IllegalStateException catch below and surfaced as an
+                            // unreadable toast with no way to grant. Guarding here
+                            // returns the clean PERMISSION_DENIED code AND pops the
+                            // system permission dialog, exactly like getDecks et al.
+                            try {
+                                // TODO-270 B：返回新建 note 的真实 id（Long），供
+                                // Dart 端 MineOutcome.success(noteId:) 携带，弹窗据此
+                                // 进入「最新可改」第三态、后续 updateNoteFields 覆盖。
+                                Long newNoteId = addNote(model, deck, fields, tags);
+                                if (newNoteId == null) {
+                                    result.error("ADD_NOTE_FAILED",
+                                        "AnkiDroid returned no note id "
+                                            + "(duplicate or note type not found)",
+                                        null);
+                                } else {
+                                    result.success(newNoteId);
+                                }
+                            } catch (IllegalStateException e) {
+                                // addNote throws this when the note type is missing.
+                                result.error("ADD_NOTE_FAILED", e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "notesInfo":
+                        // TODO-270 C2：读取一个 note 的现有字段（字段名 -> 值）。
+                        if (noteIdArg == null) {
+                            result.error("MISSING_ARG", "noteId is required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(notesInfo(noteIdArg.longValue()));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "updateNoteFields":
+                        // TODO-270 C2：按 noteId 覆盖给定字段（名 -> 值），其余字段保留；
+                        // BUG-2606：clearUnspecified=true 时其余字段写空、tags 并入。
+                        if (noteIdArg == null || fieldValues == null) {
+                            result.error("MISSING_ARG",
+                                "noteId and fieldValues are required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                String updateError = updateNoteFields(
+                                    noteIdArg.longValue(), fieldValues,
+                                    Boolean.TRUE.equals(clearUnspecified), tags);
+                                if (updateError != null) {
+                                    result.error("UPDATE_NOTE_FAILED",
+                                        updateError, null);
+                                } else {
+                                    result.success(null);
+                                }
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "findNotesBySourceId":
+                        if (sourceId == null || !sourceId.matches(SOURCE_ID_PATTERN)) {
+                            result.error("INVALID_ARG", "Invalid card source ID", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(findNotesBySourceId(sourceId));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e), e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "findNotesByContent":
+                        // TODO-1007/1008：按内容（第一字段 = key，可选 reading 过滤）反查
+                        // 所有同词卡的 note id + 一行预览，使 AnkiDroid 与桌面 AnkiConnect
+                        // 一样能发现「别处/上次会话建的卡」。经 ContentProvider
+                        // findDuplicateNotes(mid, key) -> AnkiNote.getId()，不依赖 bool-only
+                        // 的 checkForDuplicates。
+                        if (models == null || key == null) {
+                            result.error("MISSING_ARG",
+                                "models and key are required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(findNotesByContent(
+                                    models, key, reading, readingFieldIndices));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "openNote":
+                        // BUG-891：用 anki://x-callback-url/browser 深链在 AnkiDroid 中打开该 note。
+                        if (noteIdArg == null) {
+                            result.error("MISSING_ARG", "noteId is required", null);
+                        } else {
+                            try {
+                                result.success(openNote(noteIdArg.longValue()));
+                            } catch (Exception e) {
+                                result.error("OPEN_NOTE_FAILED",
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "checkForDuplicates":
+                        if (models == null || key == null) {
+                            result.error("MISSING_ARG",
+                                "models and key are required", null);
+                        } else if (ankiDroid.shouldRequestPermission()) {
+                            result.success(false);
+                        } else {
+                            // HBK-AUDIT-020: the dupe-check queries the AnkiDroid
+                            // ContentProvider, which can throw (provider disabled
+                            // mid-session, SecurityException, null cursor). Without
+                            // this guard the exception escaped the provider task
+                            // and the Dart Future never completed (hang). Always
+                            // complete the result.
+                            try {
+                                result.success(checkForDuplicates(
+                                    models, key, reading, readingFieldIndices));
+                            } catch (Exception e) {
+                                result.error("DUPE_CHECK_FAILED",
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "getDecks":
+                        if (requirePermission(result)) {
+                            try {
+                                result.success(api.getDeckList());
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "getModelList":
+                        if (requirePermission(result)) {
+                            try {
+                                result.success(api.getModelList(0));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "getFieldList":
+                        if (model == null) {
+                            result.error("MISSING_ARG",
+                                "model is required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                Long mid = ankiDroid.findModelIdByName(model, 1);
+                                if (mid == null) {
+                                    result.error("MODEL_NOT_FOUND",
+                                        "Note type not found: " + model, null);
+                                } else {
+                                    result.success(
+                                        Arrays.asList(api.getFieldList(mid)));
+                                }
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "createNoteType":
+                        if (noteTypeName == null || noteTypeFields == null
+                                || noteTypeFields.isEmpty()) {
+                            result.error("MISSING_ARG",
+                                "noteTypeName and noteTypeFields are required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                // BUG-2380: true = created now, false = already
+                                // there. Dart needs the difference for its
+                                // "created" vs "already existed" message and no
+                                // longer runs a second, disagreeing existence
+                                // check of its own.
+                                result.success(createNoteType(noteTypeName,
+                                    noteTypeFields, cardName, front, back, css));
+                            } catch (Exception e) {
+                                result.error("CREATE_MODEL_FAILED",
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    // ── 已存在 note type 的读/改（Lapis 样式客制化）──────────
+                    // 早期版本据「AnkiDroid 改不了已存在 note type」隐藏整个
+                    // Lapis 样式区，那个前提是错的：CardContentProvider.update()
+                    // 的 models/<mid> 分支支持写 Model.CSS，models/<mid>/
+                    // templates/<ord> 分支支持写 QUESTION_FORMAT/ANSWER_FORMAT。
+                    // 真正被 provider 拒绝的只有改字段名（"Field names cannot be
+                    // changed via provider"），而样式客制化一个字段名都不改。
+                    case "readNoteType":
+                        if (noteTypeName == null) {
+                            result.error("MISSING_ARG",
+                                "noteTypeName is required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(readNoteType(noteTypeName));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "updateNoteTypeStyling":
+                        if (noteTypeName == null || css == null) {
+                            result.error("MISSING_ARG",
+                                "noteTypeName and css are required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(
+                                    updateNoteTypeStyling(noteTypeName, css));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "updateNoteTypeTemplates":
+                        if (noteTypeName == null || noteTypeTemplates == null) {
+                            result.error("MISSING_ARG",
+                                "noteTypeName and templates are required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                result.success(updateNoteTypeTemplates(
+                                    noteTypeName, noteTypeTemplates));
+                            } catch (Exception e) {
+                                result.error(providerErrorCode(e),
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "createDeck":
+                        if (deckName == null) {
+                            result.error("MISSING_ARG",
+                                "deckName is required", null);
+                        } else if (requirePermission(result)) {
+                            try {
+                                // BUG-2380: addNewDeck's return value is the
+                                // *only* success signal the provider gives us
+                                // (null = the insert failed, see
+                                // AnkiProvider#addNewDeck). It used to be
+                                // dropped on the floor followed by an
+                                // unconditional success(null), so a failed
+                                // creation reached Dart as a success and
+                                // "create and use Lapis" ended up selecting the
+                                // user's own first deck instead. addNote and
+                                // addFileToMedia in this same file have always
+                                // null-checked; only the two create-structure
+                                // paths were missing it.
+                                //
+                                // The name lookup here is also the single
+                                // idempotency check now (Dart's own one is
+                                // gone): this one is case-insensitive, Dart's
+                                // was exact, and when they disagreed Dart asked
+                                // for a creation that this branch silently
+                                // skipped while still reporting success.
+                                if (ankiDroid.findDeckIdByName(deckName) != null) {
+                                    result.success(false);
+                                } else if (api.addNewDeck(deckName) == null) {
+                                    result.error("CREATE_DECK_FAILED",
+                                        "AnkiDroid refused to create the deck: "
+                                            + deckName, null);
+                                } else {
+                                    result.success(true);
+                                }
+                            } catch (Exception e) {
+                                result.error("CREATE_DECK_FAILED",
+                                    e.getMessage(), null);
+                            }
+                        }
+                        break;
+                    case "requestAnkidroidPermissions":
+                        requestAnkidroidPermissions(result);
+                        break;
+                    case "hasAnkidroidPermission":
+                        // 只查不弹框：制卡前的模板探测不能替后面的加卡再弹一次授权框
+                        // （BUG-2869）。
+                        result.success(!ankiDroid.shouldRequestPermission());
+                        break;
+                    case "openAnkiPermissionSettings":
+                        // BUG-2098：永久拒绝后系统不再弹框，唯一出路是应用详情页里的
+                        // 权限项；把跳转做成显式能力，Dart 侧才能给「去设置」按钮。
+                        result.success(openAppPermissionSettings());
+                        break;
+                    case "addFileToMedia":
+                        if (filename == null || preferredName == null) {
+                            result.error("MISSING_ARG",
+                                "filename and preferredName are required", null);
+                            break;
+                        }
+                        // BUG-824: inserting into AnkiDroid's media provider also
+                        // needs READ_WRITE_DATABASE. Guard it like addNote so an
+                        // ungranted permission returns PERMISSION_DENIED (+ pops the
+                        // system dialog) instead of throwing a raw SecurityException.
+                        if (!requirePermission(result)) {
+                            break;
+                        }
+                        File file = new File(filename);
+                        // TODO-1012 / BUG-474: filename 多来自 Dart 的
+                        // Directory.systemTemp/anki-media（Android = code_cache）。FileProvider
+                        // 的 provider_paths.xml 必须声明覆盖 code_cache 的根（<files-path
+                        // path="../code_cache">），否则 getUriForFile 抛
+                        // IllegalArgumentException「Failed to find configured root」，SVG 外字
+                        // 制卡断裂。
+                        Uri fileUri = FileProvider.getUriForFile(
+                            context, BuildConfig.APPLICATION_ID + ".provider", file);
+                        // BUG-2195：授给实际安装的那个包。写死主包时，并行版拿不到
+                        // 这个 URI 的读权限，媒体插入必失败。
+                        final AnkiDroidTarget mediaTarget =
+                            AnkiDroidTarget.resolve(context);
+                        if (mediaTarget == null) {
+                            result.error("ANKI_NOT_INSTALLED",
+                                "AnkiDroid is not installed", null);
+                            return;
+                        }
+                        context.grantUriPermission(mediaTarget.packageName, fileUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        ContentValues contentValues = new ContentValues();
+                        contentValues.put(FlashCardsContract.AnkiMedia.FILE_URI,
+                            fileUri.toString());
+                        contentValues.put(FlashCardsContract.AnkiMedia.PREFERRED_NAME,
+                            preferredName);
+                        ContentResolver contentResolver = context.getContentResolver();
+                        Uri returnUri = contentResolver.insert(
+                            mediaTarget.rebase(
+                                FlashCardsContract.AnkiMedia.CONTENT_URI),
+                            contentValues);
+                        if (returnUri == null || returnUri.getPath() == null) {
+                            result.error("MEDIA_INSERT_FAILED",
+                                "AnkiDroid media insert returned null", null);
+                        } else {
+                            result.success(
+                                new File(returnUri.getPath()).toString().substring(1));
+                        }
+                        break;
+                    default:
+                        result.notImplemented();
+                }
+            }));
+    }
+
+    /**
+     * 「空闲一阵后第一次查词要等很久」（shishamo 2026-10-05）：查词弹窗渲染后会逐条
+     * 探测「这个词是否已制卡」（{@code checkForDuplicates} / {@code findNotesByContent}），
+     * 每一次都是一趟跨进程 ContentProvider 查询。AnkiDroid 后台进程被系统回收后，
+     * 这趟查询要先把 AnkiDroid **整个冷启动**（HiBreak 实测：主线程被占 210–250 ms、
+     * 丢 37 帧，弹窗渲染信号从 ~50 ms 推迟到 ~490 ms；牌组大、机器慢时更久），而这里
+     * 原先**全部在主线程**上执行——Hybrid Composition 下 Flutter 的
+     * raster 与 WebView 都绑在主线程，于是整个界面（含刚翻出的弹窗）冻住，直到 AnkiDroid
+     * 起来。一直查词时 AnkiDroid 进程是热的，所以只有「空闲后第一次」慢。
+     *
+     * <p>根因修复：所有碰 AnkiDroid ContentProvider 的方法一律在单线程后台执行器上跑
+     * （保持调用间 FIFO 顺序，addNote → updateNoteFields 不会乱序），结果经
+     * {@link MainThreadResult} 回投主线程（MethodChannel.Result 只能在主线程回复）。
+     * 只有需要 Activity / 不做 IPC 的几个方法留在主线程（见 {@link #runsOnMainThread}）。
+     */
+    private void dispatch(@NonNull MethodCall call, @NonNull MethodChannel.Result result,
+            @NonNull Consumer<MethodChannel.Result> handleCall) {
+        if (runsOnMainThread(call.method)) {
+            handleCall.accept(result);
+            return;
+        }
+        final MethodChannel.Result reply = new MainThreadResult(result);
+        PROVIDER_IO.execute(() -> {
+            try {
+                handleCall.accept(reply);
+            } catch (Throwable t) {
+                // 后台线程上未捕获的异常会直接杀进程；且 Dart 侧 Future 必须完成。
+                reply.error("ANKI_PROVIDER_ERROR", String.valueOf(t.getMessage()), null);
+            }
+        });
+    }
+
+    /**
+     * 留在主线程的方法：要 Activity 弹权限框 / 跳设置页 / 起 Activity，或只是本进程
+     * 内的权限判断（不跨进程）。其余方法都会查询 AnkiDroid ContentProvider。
+     */
+    static boolean runsOnMainThread(@NonNull String method) {
+        switch (method) {
+            case "requestAnkidroidPermissions":
+            case "hasAnkidroidPermission":
+            case "openAnkiPermissionSettings":
+            case "openNote":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * TODO-292: classify an exception thrown by AnkiDroid's {@link AnkiProvider}
+     * ContentProvider client. When the collection database cannot be opened
+     * (collection in use / mid-sync / corrupt, AnkiDroid never opened once, API
+     * disabled, background process killed) AnkiDroid throws with the literal
+     * message {@code "collection is not available"}. Surface that as a dedicated
+     * {@code ANKI_COLLECTION_UNAVAILABLE} code so the Dart layer can show a
+     * localized, actionable hint instead of the raw English text. All other
+     * failures keep the generic {@code ANKI_PROVIDER_ERROR} code.
+     */
+    private String providerErrorCode(Exception e) {
+        final String message = e.getMessage();
+        if (message != null
+                && message.toLowerCase().contains("collection is not available")) {
+            return "ANKI_COLLECTION_UNAVAILABLE";
+        }
+        return "ANKI_PROVIDER_ERROR";
+    }
+
+    /**
+     * BUG-2098：发起 AnkiDroid 运行时权限请求，并**等到用户答复**再 resolve。
+     *
+     * <p>此前这里是「发起请求 + 立刻 success(true)」，Dart 侧 await 完马上就去查
+     * provider，系统权限对话框还没被点，错误就已经弹给用户了；对话框根本没弹的两种
+     * 情况（永久拒绝 / AnkiDroid 未安装）更是让用户在这个页面上无路可走。
+     *
+     * <p>五种终态见 {@code PERM_*} 常量。注意先判「是否已授权」再判 activity：副
+     * engine 无 Activity 但权限早在主 app 授予过时，仍须回 {@code granted}（BUG-865）。
+     */
+    private void requestAnkidroidPermissions(MethodChannel.Result result) {
+        if (!ankiDroid.shouldRequestPermission()) {
+            result.success(PERM_GRANTED);
+            return;
+        }
+        if (!AnkiDroidHelper.isApiAvailable(context)) {
+            // AnkiDroid 没装/API 被禁：READ_WRITE_DATABASE 由 AnkiDroid 定义，没有任
+            // 何包定义它时 requestPermissions 会立即静默判拒且不弹框——报「去设置授权」
+            // 是误导，那个权限项在设置里根本不存在。
+            result.success(PERM_UNAVAILABLE);
+            return;
+        }
+        if (activity == null) {
+            result.success(PERM_NO_ACTIVITY);
+            return;
+        }
+        if (pendingPermissionResult != null) {
+            // 已有一次请求在途（系统对话框正开着）。不排队、不覆盖：覆盖会让前一个
+            // Dart Future 永远挂着。当作本次被拒，调用方重试即可。
+            result.success(PERM_DENIED);
+            return;
+        }
+        pendingPermissionResult = result;
+        ankiDroid.requestPermission(activity, AD_PERM_REQUEST);
+    }
+
+    /**
+     * BUG-2098：系统权限回调入口，由 {@code MainActivity.onRequestPermissionsResult}
+     * 转发。返回 {@code true} 表示本次回调属于 AnkiDroid 权限请求。
+     *
+     * <p>拒绝后区分「还能再问」与「不再询问」：请求刚被拒且
+     * {@code shouldShowRequestPermissionRationale} 仍为 false，说明系统已不再弹框，
+     * 只能去应用设置页授予。
+     */
+    public boolean onRequestPermissionsResult(int requestCode, @NonNull int[] grantResults) {
+        if (requestCode != AD_PERM_REQUEST) {
+            return false;
+        }
+        final MethodChannel.Result pending = pendingPermissionResult;
+        pendingPermissionResult = null;
+        if (pending == null) {
+            return true;
+        }
+        final boolean granted = grantResults.length > 0
+            && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+        if (granted) {
+            pending.success(PERM_GRANTED);
+        } else if (activity != null && ankiDroid.canAskPermissionAgain(activity)) {
+            pending.success(PERM_DENIED);
+        } else {
+            pending.success(PERM_PERMANENTLY_DENIED);
+        }
+        return true;
+    }
+
+    /** BUG-2098：打开本应用的系统详情页（权限项所在处）。成功返回 true。 */
+    private boolean openAppPermissionSettings() {
+        try {
+            final Intent intent = new Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", context.getPackageName(), null));
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            context.startActivity(intent);
+            return true;
+        } catch (Exception e) {
+            android.util.Log.w("fushi-anki", "cannot open app settings", e);
+            return false;
+        }
+    }
+
+    /**
+     * provider 访问前的权限守卫。BUG-824 起每个碰 provider 的分支都过它。
+     *
+     * <p>BUG-2098：这里不再自己发起权限请求——发起与等待是
+     * {@link #requestAnkidroidPermissions} 的单一职责（本方法发起的那次请求无人
+     * 等待，会被静默丢弃）。此处只做「没权限就干净失败」的兜底。
+     *
+     * <p>因此 Dart 侧**每个碰 provider 的用户主动入口**都必须先走
+     * {@code _ensurePermission()}（AnkiRepository 里那条），否则该入口再也弹
+     * 不出权限框，只剩 PERMISSION_DENIED。守卫见
+     * {@code packages/fushi_anki/test/ankidroid_permission_flow_test.dart}。
+     */
+    private boolean requirePermission(MethodChannel.Result result) {
+        if (ankiDroid.shouldRequestPermission()) {
+            result.error("PERMISSION_DENIED",
+                "AnkiDroid permission not granted. Please grant and retry.",
+                null);
+            return false;
+        }
+        // BUG-2278: 权限已授 != provider 现在还在。用户可以在 AnkiDroid 里关掉 API
+        // provider——包还在、授权还在，shouldRequestPermission() 仍是 false——而
+        // AnkiDroidHelper.getApi() 这时返回 null。三个消费方（findDuplicateNotesByKeys /
+        // findModelIdByName / findDeckIdByName）都是裸解引用，NPE 会逃出下面那些只捕
+        // IllegalStateException 的 catch，result 一次都不会被调用，Dart 侧的
+        // invokeMethod Future 就永远挂着：用户看到制卡卡死、零提示。
+        //
+        // 这条不变式以前靠「provider 一次解析后永不失效」的静态缓存兜着（那也意味着
+        // 运行期装上 AnkiDroid 要重启才认），本 PR 拆掉缓存后必须在入口显式判。
+        if (!AnkiDroidHelper.isApiAvailable(context)) {
+            result.error("ANKI_NOT_INSTALLED",
+                "AnkiDroid's API provider is unavailable "
+                    + "(not installed, or the API is disabled in AnkiDroid).",
+                null);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Adds a note via {@link AnkiProvider#addNote} and returns the new note id.
+     *
+     * <p>TODO-270 B: AnkiDroid addNote returns the {@code Long} id of the newly
+     * created note (or {@code null} if it refused to create one - e.g. a
+     * duplicate the collection rejected). We surface that id all the way back to
+     * {@code MineOutcome.noteId} so the popup can later overwrite this exact note
+     * by id (symmetric with the AnkiConnect backend).
+     *
+     * @throws IllegalStateException if the note type cannot be found.
+     */
+    private Long addNote(String model, String deck,
+                         ArrayList<String> fields, ArrayList<String> tags) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+
+        long deckId;
+        Long existingDeck = ankiDroid.findDeckIdByName(deck);
+        if (existingDeck != null) {
+            deckId = existingDeck;
+        } else {
+            deckId = api.addNewDeck(deck);
+        }
+
+        Long modelIdObj = ankiDroid.findModelIdByName(model, fields.size());
+        if (modelIdObj == null) {
+            throw new IllegalStateException("Note type not found: " + model);
+        }
+        long modelId = modelIdObj;
+
+        // TODO-115: 旧 Yuuna fork 在此硬编码追加一个名为 Yuuna 的默认 tag（无特殊
+        // 含义，仅旧应用名残留）。已移除——制卡的 `hibiki` 固定标签与 book/anime 分类标签
+        // 现统一由 Dart 端 BaseAnkiRepository.buildNoteTags 计算后经 `tags` 传入，
+        // 与 AnkiConnect 后端对称；这里只透传，不再注入任何后端专属默认 tag。
+        Set<String> allTags = new HashSet<>();
+        if (tags != null) {
+            allTags.addAll(tags);
+        }
+
+        return api.addNote(modelId, deckId, fields.toArray(new String[0]), allTags);
+    }
+
+    /**
+     * TODO-270 C2: reads an existing note's fields as a {@code name -> value}
+     * map (symmetric with the AnkiConnect notesInfo contract).
+     *
+     * <p>AnkiDroid is positional: {@link AnkiNote#getFields()} is an array in the
+     * note's model field order, with no field names attached. We resolve the
+     * note's model id (via the {@code Note.MID} column) and zip its field-name
+     * list ({@link AnkiProvider#getFieldList}) with the positional values.
+     *
+     * @return {@code name -> value} (insertion-ordered by field order), or
+     *         {@code null} if the note no longer exists / its model is gone.
+     */
+    private Map<String, String> notesInfo(long noteId) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+        AnkiNote note = api.getNote(noteId);
+        if (note == null) {
+            return null;
+        }
+        String[] fieldNames = fieldNamesForNote(api, noteId);
+        if (fieldNames == null) {
+            return null;
+        }
+        String[] values = note.getFields();
+        Map<String, String> result = new LinkedHashMap<>();
+        for (int i = 0; i < fieldNames.length && i < values.length; i++) {
+            result.put(fieldNames[i], values[i] == null ? "" : values[i]);
+        }
+        return result;
+    }
+
+    /**
+     * TODO-270 C2: overwrites the given fields of an existing note (symmetric
+     * with the AnkiConnect updateNoteFields contract).
+     *
+     * <p>{@link AnkiProvider#updateNoteFields} takes a positional
+     * {@code String[]} keyed by the model's field order. We start from the note's
+     * current values and overwrite the named ones; with {@code clearUnspecified}
+     * false, unspecified fields are preserved.
+     *
+     * <p>BUG-2606: {@code clearUnspecified} true makes this a whole-card replace
+     * (the card becomes what a freshly mined one would be): every field the
+     * caller did not name is written empty, so a stale value left in an unmapped
+     * field (Lapis {@code SentenceFurigana}, filled by another tool and preferred
+     * by the template) can no longer keep showing the old sentence. {@code tags}
+     * (the set a fresh mine would carry) is unioned into the note's existing
+     * tags — the user's other tags are kept.
+     *
+     * @return {@code null} on success, or a human-readable error string when the
+     *         note / its model cannot be found or AnkiDroid refused the update.
+     */
+    private String updateNoteFields(long noteId, Map<String, String> fieldValues,
+                                    boolean clearUnspecified, List<String> tags) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+        AnkiNote note = api.getNote(noteId);
+        if (note == null) {
+            return "Note not found: " + noteId;
+        }
+        String[] fieldNames = fieldNamesForNote(api, noteId);
+        if (fieldNames == null) {
+            return "Note type not found for note: " + noteId;
+        }
+        String[] existing = note.getFields();
+        String[] merged = new String[fieldNames.length];
+        for (int i = 0; i < fieldNames.length; i++) {
+            String value = fieldValues.get(fieldNames[i]);
+            if (value != null) {
+                merged[i] = value;
+            } else if (!clearUnspecified && i < existing.length && existing[i] != null) {
+                merged[i] = existing[i];
+            } else {
+                merged[i] = "";
+            }
+        }
+        boolean ok = api.updateNoteFields(noteId, merged);
+        if (!ok) {
+            return "AnkiDroid rejected the field update for note " + noteId;
+        }
+        if (tags != null && !tags.isEmpty()) {
+            Set<String> mergedTags = new HashSet<>(note.getTags());
+            if (mergedTags.addAll(tags)) {
+                if (!api.updateNoteTags(noteId, mergedTags)) {
+                    return "AnkiDroid rejected the tag update for note " + noteId;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Resolves the field-name list (in field order) for the model that owns
+     * noteId. {@link AnkiNote} carries no model id, so we read the note's
+     * {@code Note.MID} column from the ContentProvider, then ask
+     * {@link AnkiProvider#getFieldList} for that model's field names.
+     *
+     * @return the field names in order, or {@code null} if the note / model is
+     *         not resolvable.
+     */
+    private String[] fieldNamesForNote(AnkiProvider api, long noteId) {
+        Long modelId = modelIdForNote(noteId);
+        if (modelId == null) {
+            return null;
+        }
+        return api.getFieldList(modelId);
+    }
+
+    /**
+     * Reads the {@code mid} (model id) column of a note from AnkiDroid's
+     * {@link FlashCardsContract.Note} ContentProvider. Returns {@code null} if
+     * the note does not exist or the provider yields no row.
+     */
+    private Long modelIdForNote(long noteId) {
+        ContentResolver resolver = context.getContentResolver();
+        Uri noteUri = Uri.withAppendedPath(
+            FlashCardsContract.Note.CONTENT_URI, Long.toString(noteId));
+        try (Cursor cursor = resolver.query(
+                noteUri,
+                new String[]{FlashCardsContract.Note.MID},
+                null, null, null)) {
+            if (cursor == null || !cursor.moveToFirst()) {
+                return null;
+            }
+            int midIndex = cursor.getColumnIndex(FlashCardsContract.Note.MID);
+            if (midIndex < 0 || cursor.isNull(midIndex)) {
+                return null;
+            }
+            return cursor.getLong(midIndex);
+        }
+    }
+
+    private boolean checkForDuplicates(ArrayList<String> models, String key,
+                                       String reading,
+                                       ArrayList<Integer> readingFieldIndices) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+        for (int i = 0; i < models.size(); i++) {
+            String model = models.get(i);
+            Long mid = ankiDroid.findModelIdByName(model, 1);
+            if (mid == null) continue;
+            List<AnkiNote> notes = api.findDuplicateNotes(mid, key);
+            if (notes.isEmpty()) continue;
+            if (reading == null || reading.isEmpty()) return true;
+            int readingIdx = (readingFieldIndices != null && i < readingFieldIndices.size())
+                    ? readingFieldIndices.get(i) : -1;
+            if (readingIdx < 0) return true;
+            for (AnkiNote note : notes) {
+                String[] noteFields = note.getFields();
+                if (readingIdx < noteFields.length && reading.equals(noteFields[readingIdx])) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * TODO-1007/1008: find every note whose first field equals {@code key}
+     * (optionally also matching {@code reading} at the given field index) and
+     * return a list of {@code {noteId, preview}} maps, ordered newest-first
+     * (AnkiDroid note ids are creation-epoch longs, larger = newer).
+     *
+     * <p>This is the AnkiDroid analogue of the AnkiConnect findNotes + notesInfo
+     * path: it discovers cards created anywhere (other apps, previous sessions),
+     * not just the current popup session. {@link AnkiProvider#findDuplicateNotes}
+     * gives the matching {@link AnkiNote}s; {@link AnkiNote#getId()} is the note
+     * id and {@link AnkiNote#getFields()}[0] (HTML-stripped on the Dart side) is
+     * the preview.
+     *
+     * @return a list of {@code LinkedHashMap{noteId:Long, preview:String}},
+     *         newest-first; empty when nothing matches.
+     */
+    private List<Map<String, Object>> findNotesByContent(
+            ArrayList<String> models, String key, String reading,
+            ArrayList<Integer> readingFieldIndices) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+        // De-dup by note id across models (a card matches at most one model, but
+        // guard anyway), then sort newest-first.
+        final LinkedHashMap<Long, String> byId = new LinkedHashMap<>();
+        for (int i = 0; i < models.size(); i++) {
+            String model = models.get(i);
+            Long mid = ankiDroid.findModelIdByName(model, 1);
+            if (mid == null) continue;
+            List<AnkiNote> notes = api.findDuplicateNotes(mid, key);
+            if (notes == null || notes.isEmpty()) continue;
+            int readingIdx = (readingFieldIndices != null && i < readingFieldIndices.size())
+                    ? readingFieldIndices.get(i) : -1;
+            for (AnkiNote note : notes) {
+                String[] noteFields = note.getFields();
+                // When a reading is supplied and the model has a reading field,
+                // keep only notes whose reading also matches (mirrors the dupe
+                // check). Otherwise accept on the first-field match alone.
+                if (reading != null && !reading.isEmpty() && readingIdx >= 0) {
+                    if (readingIdx >= noteFields.length
+                            || !reading.equals(noteFields[readingIdx])) {
+                        continue;
+                    }
+                }
+                long id = note.getId();
+                String preview = noteFields.length > 0 && noteFields[0] != null
+                        ? noteFields[0] : "";
+                byId.put(id, preview);
+            }
+        }
+        List<Long> ids = new ArrayList<>(byId.keySet());
+        ids.sort((a, b) -> Long.compare(b, a)); // newest (larger id) first
+        List<Map<String, Object>> out = new ArrayList<>(ids.size());
+        for (Long id : ids) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("noteId", id);
+            entry.put("preview", byId.get(id));
+            out.add(entry);
+        }
+        return out;
+    }
+
+    /**
+     * Candidate notes whose fields contain the card source ID substring, without
+     * guessing by word or local note id. The notes URI accepts Anki browser
+     * syntax (notes_v2 accepts SQL instead); an unqualified term is a substring
+     * match over the note fields, mirroring
+     * {@code CardSourceLink.searchQueryForSourceId}. Substring hits are only
+     * candidates: the Dart repository confirms identity by parsing each note's
+     * {@code fushi://source} href (BUG-2527 removed the redundant marker tag).
+     * Rebase to the selected installation so parallel AnkiDroid builds work too.
+     */
+    private List<Long> findNotesBySourceId(String sourceId) {
+        final AnkiDroidTarget target = AnkiDroidTarget.resolve(context);
+        if (target == null) {
+            throw new IllegalStateException("AnkiDroid is unavailable");
+        }
+        final List<Long> ids = new ArrayList<>();
+        try (Cursor cursor = context.getContentResolver().query(
+                target.rebase(FlashCardsContract.Note.CONTENT_URI),
+                new String[] {FlashCardsContract.Note._ID},
+                "sourceId=" + sourceId, null, null)) {
+            // A null cursor means lookup failed, never a trustworthy empty match.
+            if (cursor == null) {
+                throw new IllegalStateException("AnkiDroid source lookup returned no cursor");
+            }
+            final int idIndex = cursor.getColumnIndexOrThrow(FlashCardsContract.Note._ID);
+            while (cursor.moveToNext()) {
+                final long id = cursor.getLong(idIndex);
+                if (id > 0 && !ids.contains(id)) ids.add(id);
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * BUG-891: open the given note in AnkiDroid's Card Browser via the exported
+     * {@code anki://x-callback-url/browser?search=nid:<id>} VIEW deep link.
+     *
+     * The old approach — {@code ACTION_VIEW} on the note ContentProvider URI
+     * ({@code content://com.ichi2.anki.flashcards/notes/<id>}) — never resolved:
+     * that URI is served only by AnkiDroid's ContentProvider (query/insert), and
+     * NO AnkiDroid activity registers an intent-filter for {@code ACTION_VIEW} on
+     * it (nor on its {@code vnd.com.ichi2.anki.note} mimeType). So
+     * {@code resolveActivity} always returned null and the card never opened.
+     *
+     * The supported deep link is the exported {@code CardBrowserDeepLink} alias
+     * (scheme {@code anki}, host {@code x-callback-url}, path {@code /browser});
+     * its {@code search} query param is fed straight into the browser, so
+     * {@code nid:<id>} filters to this note. Returns {@code true} when an activity
+     * was launched, {@code false} when nothing can handle it (e.g. an AnkiDroid
+     * too old to expose the deep link) — the caller then surfaces a toast.
+     */
+    private boolean openNote(long noteId) {
+        Uri browserUri = Uri.parse("anki://x-callback-url/browser?search="
+            + Uri.encode("nid:" + noteId));
+        Intent intent = new Intent(Intent.ACTION_VIEW, browserUri);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        if (intent.resolveActivity(context.getPackageManager()) == null) {
+            return false;
+        }
+        context.startActivity(intent);
+        return true;
+    }
+
+    /**
+     * BUG-2380: returns true when this call actually created the note type,
+     * false when an equivalent one already existed.
+     *
+     * It used to return void and drop {@code addNewCustomModel}'s result. That
+     * result is the *only* success signal the provider gives us (it returns
+     * null on failure, see {@link AnkiProvider#addNewCustomModel}), so dropping
+     * it meant a failed creation reached Dart as a success — and "create and
+     * use Lapis" then picked whatever note type happened to be first in the
+     * user's collection. Throw instead, so the channel maps it to
+     * CREATE_MODEL_FAILED like any other failure on this path.
+     *
+     * The existence check also *is* the idempotency check now: Dart no longer
+     * runs its own (they disagreed — this one matches on name + field count,
+     * Dart compared names for exact equality, so a collection where the two
+     * disagreed made Dart ask for a creation that this method silently skipped
+     * while reporting success).
+     */
+    private boolean createNoteType(String name, ArrayList<String> fields,
+                                   String cardName, String front, String back,
+                                   String css) {
+        final AnkiProvider api = AnkiProviders.forContext(context);
+        // Idempotent: a model with this name + field count already exists.
+        if (ankiDroid.findModelIdByName(name, fields.size()) != null) {
+            return false;
+        }
+        final Long modelId = api.addNewCustomModel(
+            name,
+            fields.toArray(new String[0]),
+            new String[] { cardName },
+            new String[] { front },
+            new String[] { back },
+            css,
+            null,
+            null
+        );
+        if (modelId == null) {
+            throw new IllegalStateException(
+                "AnkiDroid refused to create the note type: " + name);
+        }
+        return true;
+    }
+
+    /** `content://com.ichi2.anki.flashcards/models/<mid>`。 */
+    private static Uri noteTypeUri(long mid) {
+        return Uri.withAppendedPath(
+            FlashCardsContract.Model.CONTENT_URI, Long.toString(mid));
+    }
+
+    /** `content://com.ichi2.anki.flashcards/models/<mid>/templates`。 */
+    private static Uri noteTypeTemplatesUri(long mid) {
+        return Uri.withAppendedPath(noteTypeUri(mid), "templates");
+    }
+
+    /**
+     * 读一个已存在 note type 的完整定义（字段顺序 / 卡模板 / CSS），供 Lapis
+     * 备份与漂移判定。note type 不存在返回 {@code null}（Dart 侧照契约转
+     * 「未找到」，不是错误）。
+     *
+     * <p>字段名列表由 provider 用 {@code Utils.joinFields} 以 0x1f 连接成一个
+     * 字符串返回（{@link FlashCardsContract.Model#FIELD_NAMES}），这里拆回列表。
+     */
+    @Nullable
+    private Map<String, Object> readNoteType(String name) {
+        final Long mid = ankiDroid.findModelIdByName(name, 1);
+        if (mid == null) return null;
+        final ContentResolver resolver = context.getContentResolver();
+        final Map<String, Object> out = new LinkedHashMap<>();
+        try (Cursor cursor = resolver.query(
+                noteTypeUri(mid),
+                new String[] {
+                    FlashCardsContract.Model.NAME,
+                    FlashCardsContract.Model.FIELD_NAMES,
+                    FlashCardsContract.Model.CSS,
+                },
+                null, null, null)) {
+            if (cursor == null || !cursor.moveToFirst()) return null;
+            out.put("name", emptyIfNull(cursor.getString(0)));
+            out.put("fields", splitFieldNames(cursor.getString(1)));
+            out.put("css", emptyIfNull(cursor.getString(2)));
+        }
+        out.put("templates", readNoteTypeTemplates(resolver, mid));
+        return out;
+    }
+
+    /**
+     * 读一个 note type 的全部卡模板，按 provider 给出的 ord 升序。
+     * 每项含 {@code ord}（0 基，写回时就是 URI 末段）、{@code name}、
+     * {@code front}、{@code back}。
+     */
+    private List<Map<String, Object>> readNoteTypeTemplates(
+            ContentResolver resolver, long mid) {
+        final List<Map<String, Object>> templates = new ArrayList<>();
+        try (Cursor cursor = resolver.query(
+                noteTypeTemplatesUri(mid),
+                new String[] {
+                    FlashCardsContract.CardTemplate.ORD,
+                    FlashCardsContract.CardTemplate.NAME,
+                    FlashCardsContract.CardTemplate.QUESTION_FORMAT,
+                    FlashCardsContract.CardTemplate.ANSWER_FORMAT,
+                },
+                null, null, null)) {
+            if (cursor == null) return templates;
+            while (cursor.moveToNext()) {
+                final Map<String, Object> tmpl = new LinkedHashMap<>();
+                tmpl.put("ord", cursor.getInt(0));
+                tmpl.put("name", emptyIfNull(cursor.getString(1)));
+                tmpl.put("front", emptyIfNull(cursor.getString(2)));
+                tmpl.put("back", emptyIfNull(cursor.getString(3)));
+                templates.add(tmpl);
+            }
+        }
+        return templates;
+    }
+
+    /**
+     * 覆写已存在 note type 的 styling（CSS）。note type 不存在或 provider 没
+     * 认下这次改动返回 {@code false}；provider 抛错照抛（调用方转错误码）。
+     */
+    private boolean updateNoteTypeStyling(String name, String newCss) {
+        final Long mid = ankiDroid.findModelIdByName(name, 1);
+        if (mid == null) return false;
+        final ContentValues values = new ContentValues();
+        values.put(FlashCardsContract.Model.CSS, newCss);
+        return context.getContentResolver()
+            .update(noteTypeUri(mid), values, null, null) > 0;
+    }
+
+    /**
+     * 覆写已存在 note type 的卡模板正/反面，**按模板名匹配**。
+     *
+     * <p>provider 的写入 URI 用的是 ord（0 基下标），但备份文件里只有模板名
+     * ——ord 是位置，模板被用户重排之后按位置写回就会把正面写进另一张卡。
+     * 所以这里先读一遍现有模板建立「名 → ord」，只写名字对得上的那些；备份里
+     * 有、当前 note type 里没有的模板名直接跳过（provider 不支持增删模板）。
+     *
+     * @return 是否至少有一张模板被真正改写。
+     */
+    private boolean updateNoteTypeTemplates(
+            String name, List<Map<String, String>> templates) {
+        final Long mid = ankiDroid.findModelIdByName(name, 1);
+        if (mid == null) return false;
+        final ContentResolver resolver = context.getContentResolver();
+        final Map<String, Integer> ordByName = new LinkedHashMap<>();
+        for (Map<String, Object> existing : readNoteTypeTemplates(resolver, mid)) {
+            ordByName.put((String) existing.get("name"),
+                (Integer) existing.get("ord"));
+        }
+        boolean changed = false;
+        for (Map<String, String> tmpl : templates) {
+            final Integer ord = ordByName.get(tmpl.get("name"));
+            if (ord == null) continue;
+            final ContentValues values = new ContentValues();
+            values.put(FlashCardsContract.CardTemplate.QUESTION_FORMAT,
+                emptyIfNull(tmpl.get("front")));
+            values.put(FlashCardsContract.CardTemplate.ANSWER_FORMAT,
+                emptyIfNull(tmpl.get("back")));
+            final Uri uri = Uri.withAppendedPath(
+                noteTypeTemplatesUri(mid), Integer.toString(ord));
+            if (resolver.update(uri, values, null, null) > 0) changed = true;
+        }
+        return changed;
+    }
+
+    /** provider 的字段名串（0x1f 连接）→ 列表；空串 = 无字段。 */
+    private static ArrayList<String> splitFieldNames(@Nullable String joined) {
+        final ArrayList<String> fields = new ArrayList<>();
+        if (joined == null || joined.isEmpty()) return fields;
+        fields.addAll(Arrays.asList(joined.split("\u001f", -1)));
+        return fields;
+    }
+
+    private static String emptyIfNull(@Nullable String value) {
+        return value == null ? "" : value;
+    }
+
+    /**
+     * 把后台执行器上产生的回复投回主线程：Flutter 要求 {@link MethodChannel.Result}
+     * 在平台主线程上回复。已在主线程时直接回复，不多绕一圈消息队列。只认第一次回复：
+     * 分支回复后又抛异常时，{@link #dispatch} 的兜底 error 不得二次回复（Flutter 对
+     * 重复回复抛 IllegalStateException，会在主线程上崩）。
+     */
+    static final class MainThreadResult implements MethodChannel.Result {
+        private static final Handler MAIN = new Handler(Looper.getMainLooper());
+        private final MethodChannel.Result inner;
+        private final AtomicBoolean replied = new AtomicBoolean(false);
+
+        MainThreadResult(@NonNull MethodChannel.Result inner) {
+            this.inner = inner;
+        }
+
+        private static void onMain(@NonNull Runnable r) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                r.run();
+            } else {
+                MAIN.post(r);
+            }
+        }
+
+        @Override
+        public void success(@Nullable Object value) {
+            if (replied.compareAndSet(false, true)) onMain(() -> inner.success(value));
+        }
+
+        @Override
+        public void error(@NonNull String code, @Nullable String message,
+                @Nullable Object details) {
+            if (replied.compareAndSet(false, true)) {
+                onMain(() -> inner.error(code, message, details));
+            }
+        }
+
+        @Override
+        public void notImplemented() {
+            if (replied.compareAndSet(false, true)) onMain(inner::notImplemented);
+        }
+    }
+}

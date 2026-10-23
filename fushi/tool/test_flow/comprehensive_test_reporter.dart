@@ -1,0 +1,177 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'comprehensive_test_matrix.dart';
+
+enum ScenarioStatus {
+  pending,
+  blocked,
+  passed,
+  failed,
+}
+
+class ScenarioReport {
+  const ScenarioReport({
+    required this.platform,
+    required this.scenario,
+    required this.status,
+    required this.commands,
+    required this.assertions,
+    required this.evidence,
+    this.blockedReason = '',
+    this.failureReason = '',
+    this.exitCode,
+    this.durationMs,
+  });
+
+  final TestPlatformId platform;
+  final ScenarioId scenario;
+  final ScenarioStatus status;
+  final List<String> commands;
+  final List<String> assertions;
+  final List<String> evidence;
+  final String blockedReason;
+  final String failureReason;
+  final int? exitCode;
+  final int? durationMs;
+
+  Map<String, Object?> toJson() => <String, Object?>{
+        'platform': platform.name,
+        'scenario': scenario.name,
+        'status': status.name,
+        'commands': commands,
+        'assertions': assertions,
+        'evidence': evidence,
+        'blockedReason': blockedReason,
+        'failureReason': failureReason,
+        'exitCode': exitCode,
+        'durationMs': durationMs,
+      };
+}
+
+class ComprehensiveReport {
+  const ComprehensiveReport({required this.entries});
+
+  final List<ScenarioReport> entries;
+
+  /// An empty report counts as a failure: zero executed scenarios means
+  /// nothing was verified, and that must never be indistinguishable from a
+  /// passing run.
+  bool get hasFailures =>
+      entries.isEmpty ||
+      entries.any((ScenarioReport entry) {
+        return entry.status == ScenarioStatus.failed ||
+            entry.status == ScenarioStatus.blocked;
+      });
+
+  Map<String, Object> toJson() => <String, Object>{
+        'entries':
+            entries.map((ScenarioReport entry) => entry.toJson()).toList(),
+      };
+}
+
+ComprehensiveReport buildDryRunReport({
+  required List<PlatformPlan> matrix,
+  required Set<TestPlatformId> selectedPlatforms,
+  required Set<ScenarioId> selectedScenarios,
+  required HostPlatformId hostPlatform,
+}) {
+  final List<ScenarioReport> entries = <ScenarioReport>[];
+  for (final PlatformPlan plan in matrix) {
+    if (!selectedPlatforms.contains(plan.platform)) continue;
+    final bool hostMissing = !plan.supportsHost(hostPlatform);
+    for (final TestScenario scenario in plan.scenarios) {
+      if (!selectedScenarios.contains(scenario.id)) continue;
+      entries.add(ScenarioReport(
+        platform: plan.platform,
+        scenario: scenario.id,
+        status: hostMissing ? ScenarioStatus.blocked : ScenarioStatus.pending,
+        commands: scenario.commands,
+        assertions: scenario.assertions,
+        evidence: scenario.evidence,
+        blockedReason:
+            hostMissing ? plan.blockedReasonForHost(hostPlatform) : '',
+      ));
+    }
+  }
+  return ComprehensiveReport(entries: entries);
+}
+
+void writeComprehensiveReport(ComprehensiveReport report, String outputDir) {
+  final Directory dir = Directory(outputDir);
+  if (!dir.existsSync()) {
+    dir.createSync(recursive: true);
+  }
+  File('${dir.path}/report.json').writeAsStringSync(
+    jsonEncode(report.toJson()),
+    flush: true,
+  );
+  File('${dir.path}/report.md').writeAsStringSync(
+    _renderMarkdown(report),
+    flush: true,
+  );
+}
+
+String renderComprehensiveFailureSummary(ComprehensiveReport report) {
+  final Iterable<ScenarioReport> failures = report.entries.where(
+    (ScenarioReport entry) {
+      return entry.status == ScenarioStatus.failed ||
+          entry.status == ScenarioStatus.blocked;
+    },
+  );
+  if (failures.isEmpty) return '';
+
+  final StringBuffer buffer = StringBuffer();
+  buffer.writeln('Comprehensive test failures:');
+  for (final ScenarioReport entry in failures) {
+    buffer.writeln(
+      '- ${entry.platform.name}/${entry.scenario.name}: '
+      '${entry.status.name}',
+    );
+    if (entry.failureReason.isNotEmpty) {
+      buffer.writeln('  reason: ${entry.failureReason}');
+    }
+    if (entry.blockedReason.isNotEmpty) {
+      buffer.writeln('  reason: ${entry.blockedReason}');
+    }
+    if (entry.exitCode != null) {
+      buffer.writeln('  exitCode: ${entry.exitCode}');
+    }
+    if (entry.evidence.isNotEmpty) {
+      buffer.writeln('  evidence: ${entry.evidence.join(' | ')}');
+    }
+  }
+  return buffer.toString().trimRight();
+}
+
+String _renderMarkdown(ComprehensiveReport report) {
+  final StringBuffer buffer = StringBuffer()
+    ..writeln('# Fushi Comprehensive Test Report')
+    ..writeln();
+  for (final ScenarioReport entry in report.entries) {
+    buffer
+      ..writeln('## ${_platformLabel(entry.platform)} / ${entry.scenario.name}')
+      ..writeln()
+      ..writeln('- status: ${entry.status.name}');
+    if (entry.blockedReason.isNotEmpty) {
+      buffer.writeln('- blockedReason: ${entry.blockedReason}');
+    }
+    if (entry.exitCode != null) {
+      buffer.writeln('- exitCode: ${entry.exitCode}');
+    }
+    if (entry.failureReason.isNotEmpty) {
+      buffer.writeln('- failureReason: ${entry.failureReason}');
+    }
+    if (entry.durationMs != null) {
+      buffer.writeln('- durationMs: ${entry.durationMs}');
+    }
+    buffer
+      ..writeln('- commands: ${entry.commands.join(' | ')}')
+      ..writeln('- assertions: ${entry.assertions.join(' | ')}')
+      ..writeln('- evidence: ${entry.evidence.join(' | ')}')
+      ..writeln();
+  }
+  return buffer.toString();
+}
+
+String _platformLabel(TestPlatformId platform) => platform.label;

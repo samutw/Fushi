@@ -1,0 +1,345 @@
+Repository: https://github.com/miru-project/M-Extension-Server
+Tag: v1.0.5.0
+Commit: ee55c65106bb18bf81a5ddc660d321b4e14ea2f9
+License: Mozilla Public License 2.0
+
+Upstream availability
+---------------------
+The upstream repository was deleted from GitHub and now returns 404. The
+pinned commit above was recovered from the network mirror
+https://github.com/kodjodevf/M-Extension-Server by SHA
+(`git fetch --depth=1 <mirror> ee55c65106bb18bf81a5ddc660d321b4e14ea2f9`), and
+its LICENSE is byte-identical to the LICENSE already vendored here
+(sha256 3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04).
+
+Because no reachable upstream remains, the source is vendored in this
+directory instead of being cloned at build time.
+
+Layout
+------
+upstream_src/               pristine upstream tree at the pinned commit,
+                            byte-for-byte, no Fushi edits.
+overlay/                    Fushi-modified source files; copied over
+                            upstream_src after the patch is applied.
+server-build.gradle.patch   Fushi changes to upstream files that are too
+                            small to justify a full-file overlay.
+LICENSE / NOTICE            MPL-2.0 text and the modification notice.
+
+Android host reuse (2026-09-19)
+-------------------------------
+fushi/android/app/build.gradle (`prepareAniyomiSourceApi`) compiles two
+subtrees straight into the Android app, layering overlay/ over upstream_src/
+exactly as the sidecar build does (overlay wins on the same relative path):
+  server/src/main/kotlin/eu/kanade/tachiyomi/animesource/**   Aniyomi
+      (video) extension ABI; see "Anime ABI" below
+  server/src/main/kotlin/eu/kanade/tachiyomi/util/lang/CoroutinesExtensions.kt
+      `eu.kanade.tachiyomi.util.lang.awaitSingle`, which the anime sources
+      import and Mihon's source-api does not provide
+This keeps the desktop sidecar and the Android host on one anime ABI. The
+manga ABI on Android still comes from the pinned Mihon commit
+(`prepareMihonSourceApi`), not from this tree. Changing these files here
+(upstream_src or overlay) changes the Android build too.
+
+Anime ABI (2026-09-19, overlay/.../animesource/**)
+--------------------------------------------------
+upstream_src ships the extensions-lib 14 shape of `eu.kanade.tachiyomi.
+animesource` (`Video(url, quality, videoUrl, headers, ...)` as a plain class
+with download-progress fields, `getVideoList(episode)`, no hosters). The
+extension repositories in the wild no longer compile against that: the
+yuzono / Anikku ecosystem builds every APK -- versionName still "14.x" --
+against komikku-app/aniyomi-extensions-lib (pinned f5961b5dfb, 2026-08-28),
+whose surface is the extensions-lib 16 one:
+  model/Video.kt        data class Video(videoUrl, videoTitle, resolution,
+                        bitrate, headers, preferred, subtitleTracks,
+                        audioTracks, timestamps, mpvArgs, ffmpegStreamArgs,
+                        ffmpegVideoArgs, internalData, initialized) plus a
+                        @Deprecated (url, quality, videoUrl, headers, ...)
+                        constructor mapping null videoUrl to "null";
+                        Track, TimeStamp, ChapterType
+  model/Hoster.kt       Hoster + List<Video>.toHosterList()
+  model/FetchType.kt    Seasons / Episodes
+  model/SAnime.kt       + background_url, fetch_type, season_number
+  model/SEpisode.kt     + fillermark, summary, preview_url
+  AnimeSource.kt        + getSeasonList, getHosterList, getVideoList(hoster),
+                        getRelatedAnimeList (KMK)
+  AnimeCatalogueSource  + supportsRelatedAnimes / disableRelatedAnimes* /
+                        getRelatedAnimeList* / fetchRelatedAnimeList (KMK)
+  online/AnimeHttpSource, ParsedAnimeHttpSource
+                        + seasonList*, hosterList*, videoListParse(response,
+                        hoster), resolveVideo, sortHosters, sortVideos,
+                        getVideo(request, listener), relatedAnimeList*
+Measured against upstream_src's ABI: KickAssAnime's getVideoList dies with
+NoSuchMethodError Video.getVideoTitle() (swallowed by the extension's
+parallelCatchingFlatMap, so the host just sees zero videos); AniDB's episode
+parser assigns SEpisode.fillermark. Those are the "source opens but nothing
+plays" / "episode list fails" reports.
+
+The overlay therefore replaces those files with the *union* of both
+generations (the lib-16 surface above, byte-compatible in constructor /
+copy / componentN descriptors, plus the lib-14 surface kept as compatibility:
+the deprecated constructors, `Video.url` / `Video.quality`, `videoUrl` as a
+var, `getVideoList(episode)` / `videoListParse(response)` / `getVideoUrl` /
+`videoUrlParse`). Every member one generation declares abstract and the other
+never heard of is `open` with a throwing default, otherwise the JVM would
+refuse to instantiate the other generation's classes. `AnimeHttpSource.
+getHosterList` decides per class by reflection (does anything below the host
+ABI package override `hosterListParse` / the parsed selector pair?) whether to
+issue the lib-16 hoster request or wrap the legacy video list in a
+NO_HOSTER_LIST hoster -- never by issuing a request and watching it fail.
+
+overlay/.../animesource/host/AnimeVideoLoader.kt is Fushi's (not part of any
+lib): the one entry point both hosts call for `getVideoList` -- hosters ->
+sortHosters -> per hoster `videoList ?: getVideoList(hoster)` -> sortVideos ->
+per video `resolveVideo` (when not initialized) -> lib-14 `getVideoUrl` (when
+still unresolved); lazy hosters only when nothing eager produced a video;
+unresolvable candidates dropped; the first real failure rethrown only when
+nothing at all survives. DalvikHandler routes `getVideoList` here instead of
+MihonInvoker.invokeGetVideoList (which returned the raw legacy list), and
+projects the lib-16 fields (videoTitle / resolution / bitrate / preferred /
+mpvArgs) next to the lib-14 ones on the wire. InspectHandler accepts anime
+lib 14 / 15 / 16.
+
+Compatibility ceiling: the Aniyomi main line has since added HttpServer /
+ThumbnailInfo / SAnimeEpisodeUpdate / AnimeRelation (lib 17 territory); those
+are not vendored and such an APK is refused at inspect time.
+
+upstream_src/ excludes exactly two things from the upstream commit:
+  .git/       clone metadata, not source
+  .DS_Store   macOS Finder metadata that upstream had committed
+Everything else is vendored verbatim, including the Gradle wrapper JAR, the
+AndroidCompat Noto font resources (loaded by the static initialiser in
+AndroidCompat/src/main/java/android/graphics/Typeface.java, so dropping them
+would change the shipped JAR's behaviour) and upstream's own .gitattributes
+(same EOL policy as Fushi's, so no normalisation drift).
+
+Build
+-----
+tool/mihon/build_desktop_runtime.sh (macOS) and
+tool/mihon/build_desktop_runtime.ps1 (Windows) do, in this order:
+  1. copy upstream_src/ into a temporary directory;
+  2. `git apply server-build.gradle.patch` (git apply works outside a git
+     repository);
+  3. copy overlay/ over the result, overwriting same-named files;
+  4. run `:server:test :server:shadowJar` with the pinned Temurin JDK.
+The overlay is applied last, so the security boundary below always wins.
+
+server-build.gradle.patch MUST keep its default 3 lines of context and MUST
+NOT be applied with `--unidiff-zero` (BUG-1428). A zero-context patch has
+nothing to verify in an insertion-only hunk: `git apply --check` returns 0
+even after upstream_src has drifted, and the real apply then blind-inserts by
+line number (measured: the JGroupFilter `stateString` field landed between
+`name` and `type` — a Kotlin data class's field order is positional, so it
+still compiles while already behaving wrong). With context, a pure line shift
+is relocated automatically and a real content change fails loudly.
+Regenerate the patch with `git diff` (never `git diff -U0`).
+
+upstream server/build.gradle.kts derives its revision string from
+`git rev-list HEAD --count`, which yields nothing in a .git-less vendored
+tree. Both scripts therefore set upstream's own `ProductRevision` escape
+hatch to the pinned commit's short SHA (ee55c65), so the produced JAR name
+and manifest point straight at the commit recorded above.
+
+Fushi modifications
+--------------------
+overlay/.../animesource/** (full-file replacements + FetchType.kt + host/):
+  The lib 14 + lib 16 union anime ABI and the shared host video loader; see
+  "Anime ABI" above.
+
+overlay/.../DalvikHandler.kt:
+  `getVideoList` goes through AnimeVideoLoader (hoster expansion,
+  resolveVideo, getVideoUrl) and the Video wire projection carries the lib-16
+  fields; see "Anime ABI" above.
+  Typed source HttpException responses retain their original HTTP 400-599
+  transport status and carry errorKind/sourceStatusCode. Internal failures
+  retain bridge/500; legacy code/type/stack fields remain available.
+  Route both bare FilterList results and legacy FiltersResponse wrappers through
+  the explicit filter wire codec. Select options use their display toString,
+  never arbitrary extension-object bean serialization; array/wrapper shapes,
+  filter kinds, states and nested groups remain stable.
+
+overlay/.../DexAllocationRepair.kt:
+  Original DEX may allocate a concrete subtype whose constructor was inlined,
+  then invoke the direct superclass constructor on that same register. Recover
+  the concrete JVM allocation only with original-DEX receiver/control-flow
+  proof and unambiguous allocation counts. A synthetic forwarding constructor
+  preserves the verified superclass call when the subtype no longer declares
+  it. Unknown/ambiguous flows remain unchanged; no source names are special-cased.
+  Concrete ancestors (including Object) require the same original-DEX receiver
+  proof even if a matching constructor exists; allocation counts alone cannot
+  authorize changing an otherwise valid concrete NEW. This preserves typed
+  filter options instead of allowing Object values to fail later in typed arrays.
+  exactAllocationReader (wired into PackageTools.dex2jar by the patch) applies
+  the same receiver proof *before* dex2jar: dex2jar takes the NEW type from the
+  <init> owner, so a proven `invoke-direct Super.<init>` on a `new-instance X`
+  register is pointed at X and every class from X up to (excluding) Super gets
+  the forwarding constructor R8 erased (each layer a non-interface DEX class
+  whose parent constructor is accessible; a layer that already declares the
+  descriptor is reused only if its body is exactly `super.<init>(args);
+  return`, otherwise the site is left alone). R8 can erase several layers at
+  once: SpeedBinb's `a0 extends t0` invokes Object.<init> directly (BUG-3364,
+  `Bad type on operand stack in putfield` in u0.intercept). Without it, constructor-less
+  subclasses such as every suspend function's continuation all matched the
+  generalized NEW and upstream BytecodeEditor.repairAllocation handed them out
+  by iteration order (BUG-2826: mokuro 1.6.6 getPageList,
+  `w1 cannot be cast to y1`). Across 128 extension APKs the converted jars now
+  match DEX allocations per method except the intended SimpleDateFormat host
+  replacement.
+
+overlay/.../MihonImageProxy.kt:
+  Consume and close the extension's network response inside the Rx emission,
+  before blocking for detached ImageData. The call adapter cancels its socket
+  on unsubscribe; reading ResponseBody after toBlocking().single() loses the
+  live response. The overlay retains the source client and image interceptors.
+  A real loopback HTTP body regression supplements the in-memory fixtures.
+
+overlay/.../HostProxyPolicy.kt and .../network/NetworkHelper.kt:
+  JVM HTTP clients resolve the host's authenticated loopback proxy policy per
+  URL (FUSHI_MIHON_PROXY_POLICY_PORT; token uses FUSHI_MIHON_TOKEN). The host
+  retains auto/manual/direct, local bypass, NO_PROXY and Basic credentials.
+  JVM socket:// selector callbacks connect the already-selected TCP endpoint
+  directly; they must not reapply HTTP policy to the origin or proxy transport.
+  NetworkHelper uses HTTP/1.1 with zero idle connections so even an active
+  HTTP/2 connection cannot bypass a new proxy selection after settings change.
+  Existing calls finish normally; each new call incurs connection/TLS setup.
+  It scopes proxy authentication to the selected host/port with one 407 attempt. Request
+  logging is BASIC with authorization headers redacted. Missing host policy
+  fails closed. upstream_src remains pristine.
+  ProxySelector.select never throws. OkHttp turns a throwing selector into an
+  unbounded routing retry that exhausts the heap (measured: an OutOfMemoryError
+  in the NanoHTTPD worker after the call had already hung for the client's full
+  timeout), so both failure shapes are expressed as routes instead: no endpoint
+  at all means the sidecar runs outside Fushi and routes DIRECT, while an
+  endpoint that cannot answer yields an unresolvable .invalid route -- failing
+  closed without ever silently downgrading to DIRECT. The proxy authenticator
+  answers a policy outage with no credentials for the same reason.
+
+overlay/.../network/interceptor/CloudflareInterceptor.kt:
+  Upstream's pass-through replaced with the Android host's detection, byte for
+  byte (403/429/503 + Server: cloudflare + cf-mitigated: challenge; a bare
+  403/503 from Cloudflare's CDN is not a challenge). Throws
+  CloudflareChallengeRequiredException carrying the blocked URL and the exact
+  User-Agent the request went out with; DalvikHandler walks the cause chain and
+  reports errorKind "cloudflare" + challengeUrl + userAgent so the host can open
+  a browser with the same identity -- cf_clearance is bound to both.
+
+overlay/.../network/Requests.kt, .../network/interceptor/RateLimitInterceptor.kt,
+.../network/interceptor/SpecificHostRateLimitInterceptor.kt (BUG-2601):
+  The extensions-lib 16 network surface: `suspend fun OkHttpClient.get(String |
+  HttpUrl, headers, cache)` / `OkHttpClient.post(...)` (extensions link to the
+  synthetic `RequestsKt.get$default(OkHttpClient, String, Headers,
+  CacheControl, Continuation, int, Object)`; measured: AnimeKai / yuzono
+  kotokai v16.8 episode list died with NoSuchMethodError wrapped as
+  BRIDGE_HTTP_500) and the `kotlin.time.Duration` overloads of `rateLimit` /
+  `rateLimitHost` (value-class mangled names `rateLimit-SxA4cEA` /
+  `rateLimitHost-Wn2Vu4Y`). The legacy TimeUnit overloads stay for lib 14
+  sources. Same declarations as kodjodevf/M-Extension-Server v1.0.7 (the
+  mirror that Mangayomi ships); the Android host carries the same three files
+  under fushi/android/app/src/main/kotlin/eu/kanade/tachiyomi/network/ and
+  fushi/test/media/manga/mihon_host_network_abi_guard_test.dart pins both
+  trees to one shape. Reflection tests pin the JVM descriptors
+  (overlay/.../test/kotlin/eu/kanade/tachiyomi/network/**).
+
+overlay/.../AppModule.kt:
+  Registers ProtoBuf alongside Json in the Injekt container. Extensions using
+  protobuf APIs resolve it from a static initialiser, so the missing
+  registration surfaced as ExceptionInInitializerError / NoClassDefFoundError
+  with the InjektionException swallowed (measured on five installed
+  extensions). The dependency was already on the classpath. The type argument
+  is explicit because `ProtoBuf` is a companion object and inference would
+  register it under ProtoBuf.Default.
+
+server-build.gradle.patch:
+  build.gradle.kts                 org.jogamp resolution: SciJava mirror first,
+                                   then jogamp.org, both content-filtered to
+                                   org.jogamp — jogamp.org's recurring
+                                   whole-host outages (2026-08-09) must neither
+                                   fail gluegen/jogl resolution nor poison
+                                   unrelated coordinates it never hosted
+  gradle/libs.versions.toml        kotlinx-serialization 1.9.0 -> 1.11.0
+  server/build.gradle.kts          + implementation(libs.apksig) for the
+                                   authenticated APK inspection route;
+                                   version string 1.0.4.10 -> 1.0.5.0 (upstream
+                                   forgot to bump it when tagging v1.0.5.0)
+  .../impl/MihonInvoker.kt         preserve the catalogue identity
+                                   (url/title/...) that legacy detail parsers
+                                   drop; chapters cross the bridge as JChapter
+  .../model/DataBody.kt            JGroupFilter.stateString
+  .../util/BytecodeEditor.kt       emit INVOKEINTERFACE when the replacement
+                                   owner is an interface (dex2jar writes a
+                                   Methodref where an InterfaceMethodref is
+                                   required)
+  two upstream tests updated to match
+
+overlay/ (full-file replacements):
+  .../controller/MExtensionServerController.kt  the security boundary below;
+                                                also prints the readiness line
+                                                the host waits for
+  .../controller/DalvikHandler.kt               explicit wire serialisation for
+                                                filters; fixes an upstream
+                                                index-out-of-bounds on cookies
+                                                without a value
+  .../controller/InspectHandler.kt              new: apksig-verified,
+                                                metadata-only APK inspection
+                                                (loads nothing; see below)
+  .../controller/SourceImageHandler.kt          new: fetch a source image with
+                                                the extension's own client,
+                                                buffered with a hard ceiling
+  .../controller/SourceDataHandler.kt           new: clear per-source
+                                                preferences, cookies and cache
+  .../AppModule.kt                              ProtoBuf registered in the
+                                                Injekt container next to Json
+  .../network/interceptor/CloudflareInterceptor.kt
+                                                detects Cloudflare challenges
+                                                and reports URL + User-Agent
+  .../network/Requests.kt                       suspend OkHttpClient.get/post
+                                                (extensions-lib 16)
+  .../network/interceptor/RateLimitInterceptor.kt
+  .../network/interceptor/SpecificHostRateLimitInterceptor.kt
+                                                Duration overloads next to the
+                                                TimeUnit ones
+
+Security boundary (must not be weakened)
+----------------------------------------
+- The listener binds 127.0.0.1 only. Upstream passed the port alone to
+  NanoHTTPD, i.e. it listened on 0.0.0.0.
+- Every request is checked against a per-process Bearer token before routing;
+  the check sits in the single NanoHTTPD dispatch entry point, so no route can
+  bypass it. The token is 256 bits from Dart's Random.secure(), handed to the
+  child only through the FUSHI_MIHON_TOKEN environment variable, and the
+  server refuses to start without it.
+- The child, not the host, chooses the listening port. It is started with port
+  0 and prints "FUSHI_MIHON_READY port=<n>" on stdout once NanoHTTPD has
+  bound; the host parses that line and only then sends its first authenticated
+  request. Letting the host bind/close/hand over a port number instead is a
+  TOCTOU: any local process can take the port in between, and the host would
+  hand it the Bearer token. Both ends of this contract are guarded by
+  fushi/test/build/mihon_vendored_server_guard_test.dart.
+- /inspect never loads the APK. It is called *before* Fushi shows the "third
+  party extensions execute code with Fushi permissions" trust dialog, so it
+  stays on apksig plus PackageTools.getPackageInfo (zip + binary manifest
+  parsing) and never touches MExtensionServerLoader, whose path runs dex2jar,
+  Class.forName + newInstance on the extension main class and
+  SourceFactory.createSources() — arbitrary code, before consent, and cached
+  with no eviction. Loading is /dalvik's job, which the host only reaches
+  after the user has accepted the dialog or explicitly asked for a preview.
+  The guard test asserts this over the whole closure reachable from /inspect,
+  not just the handler.
+- The complete route table is /dalvik, /inspect, /source-image,
+  /source-data/clear, /capabilities, / (banner), /stop and upstream's
+  /image/<uuid> proxy prefix. All of them sit behind the token gate; nothing
+  else is served.
+- /source-image buffers the fetched body with a hard 32 MiB ceiling instead of
+  OkHttp's unbounded body.bytes(); the sidecar runs with -Xmx512m, so an
+  oversized response would otherwise OOM the whole JVM. Note this bounds only
+  the size, not the destination: the URL is chosen by the source site, exactly
+  as in upstream's own /image/<uuid> page path, which is inherent to Mihon's
+  "the site tells the client where the image is" contract.
+- The upstream process identity is retained: Main.kt, ServerWindow.kt and
+  MExtensionServerLoader are untouched; MihonImageProxy has a response-lifetime
+  overlay described above. The Fushi
+  host only ever terminates the Process handle it started (never a port or
+  process-name scan). The upstream wire key __mangatan_bridge_context__ is
+  deliberately kept; only the capability identifier is renamed to
+  fushiMihonBridge.
+- Shutdown stays explicit: POST /stop, itself authenticated, with the host
+  falling back to killing its own child only on timeout.

@@ -1,0 +1,177 @@
+// TODO-617 global lookup overlay — Dart side of the bare WebView2 window.
+//
+// The main Dart engine owns the dictionary (FushiDicts FFI + AppModel). This
+// channel pushes a self-contained popupJson to the native overlay for rendering
+// and answers the overlay's reverse calls: image:// gaiji bytes (getMedia) and
+// JS bridge messages (jsMessage — dismiss/audio in later phases).
+//
+// spec 2026-07-10 — the implementation moved to the instance-level
+// [OverlayWindowChannel] (an instance-level wrapper reusable by any second
+// overlay window). This file stays as the zero-churn static facade the 1700-line
+// GlobalLookupController calls; every method is a one-line delegate to the
+// shared instance bound to the global_lookup MethodChannel.
+//
+// Native counterpart: windows/runner/global_lookup_window.cpp +
+// FlutterWindow::RegisterGlobalLookupChannel().
+
+import 'dart:async';
+
+import 'package:flutter/foundation.dart';
+import 'package:fushi/src/lookup/overlay_window_channel.dart';
+import 'package:fushi/src/utils/misc/channel_constants.dart';
+
+export 'package:fushi/src/lookup/overlay_window_channel.dart'
+    show GlobalLookupRoute, GlobalLookupShowResult, OverlayReverseEvent;
+
+abstract final class GlobalLookupChannel {
+  static final Object _routeZoneKey = Object();
+  static const GlobalLookupRoute _defaultRoute = GlobalLookupRoute.desktop();
+  static final Map<String, int> _invalidatedLookupHighWater = <String, int>{};
+
+  static String _routeFamily(GlobalLookupRoute route) =>
+      '${route.source}:${route.routeEpoch}';
+
+  static GlobalLookupRoute get currentRoute =>
+      Zone.current[_routeZoneKey] as GlobalLookupRoute? ?? _defaultRoute;
+
+  static OverlayWindowChannel get _impl {
+    final route = currentRoute;
+    return OverlayWindowChannel(
+      FushiChannels.globalLookup,
+      target: route.target,
+      routeEpoch: route.routeEpoch,
+      lookupEpoch: route.lookupEpoch,
+      routeIsValid: () => isRouteValid(route),
+    );
+  }
+
+  /// Runs the complete lookup (including callbacks, Futures and Timers) on an
+  /// immutable route. Dart zones preserve this value across async boundaries.
+  static T runWithRoute<T>(GlobalLookupRoute route, T Function() body) =>
+      runZoned(body, zoneValues: <Object, Object>{_routeZoneKey: route});
+
+  /// Permanently retires one immutable route token. Futures and Timers already
+  /// queued in that route's zone are then rejected at the channel boundary,
+  /// and reverse callbacks stamped with it are ignored by the controller.
+  /// Callers must mint monotonically new epochs; an invalidated token is never
+  /// reactivated (otherwise a stale continuation could revive itself).
+  static void invalidateRoute(GlobalLookupRoute route) {
+    final String family = _routeFamily(route);
+    final int previous = _invalidatedLookupHighWater[family] ?? -1;
+    if (route.lookupEpoch > previous) {
+      _invalidatedLookupHighWater[family] = route.lookupEpoch;
+    }
+  }
+
+  static bool isRouteValid(GlobalLookupRoute route) =>
+      route.lookupEpoch >
+      (_invalidatedLookupHighWater[_routeFamily(route)] ?? -1);
+
+  @visibleForTesting
+  static String get debugTarget => _impl.target;
+
+  static Future<void> prepare(String assetsDir) => _impl.prepare(assetsDir);
+
+  static Future<void> prewarmWebView({int width = 420, int height = 600}) =>
+      _impl.prewarmWebView(width: width, height: height);
+
+  static Future<bool> isWebViewReady() => _impl.isWebViewReady();
+
+  static Future<GlobalLookupShowResult> showAt({
+    required int x,
+    required int y,
+    int width = 420,
+    int height = 600,
+    bool atCursor = false,
+    int capWidth = 0,
+    int capHeight = 0,
+    int capOriginX = 0,
+    int capOriginY = 0,
+  }) => _impl.showAt(
+    x: x,
+    y: y,
+    width: width,
+    height: height,
+    atCursor: atCursor,
+    capWidth: capWidth,
+    capHeight: capHeight,
+    capOriginX: capOriginX,
+    capOriginY: capOriginY,
+  );
+
+  static Future<void> render(String popupJson) => _impl.render(popupJson);
+
+  /// 手柄重设计 P5：转发一枚手柄动作到当前路由的 overlay host（见
+  /// [OverlayWindowChannel.gamepadAction]）。
+  static Future<void> gamepadAction(String action, {double dy = 0}) =>
+      _impl.gamepadAction(action, dy: dy);
+
+  static Future<void> resize({required int width, required int height}) =>
+      _impl.resize(width: width, height: height);
+
+  static Future<void> resolveBridge(int id, Object? value) =>
+      _impl.resolveBridge(id, value);
+
+  static Future<void> reveal({required int width, required int height}) =>
+      _impl.reveal(width: width, height: height);
+
+  static Future<void> revealStack({
+    required int dx,
+    required int dy,
+    required int width,
+    required int height,
+    required int geometryEpoch,
+    double left = 0,
+    double top = 0,
+    int rootHeight = 0,
+  }) => _impl.revealStack(
+    dx: dx,
+    dy: dy,
+    width: width,
+    height: height,
+    geometryEpoch: geometryEpoch,
+    left: left,
+    top: top,
+    rootHeight: rootHeight,
+  );
+
+  /// 防截屏（与剪贴板面板同一 pref）：把 display affinity 应用到瞬态覆盖窗。
+  static Future<void> setBlockCapture(bool block) =>
+      _impl.setBlockCapture(block);
+
+  /// attached 表面打开的桌面弹窗：点卡外关闭的点击成对吞掉、不推进游戏
+  /// （见 [OverlayWindowChannel.setOutsideClickOwner]）。
+  static Future<void> setOutsideClickOwner(int hwnd) =>
+      _impl.setOutsideClickOwner(hwnd);
+
+  static Future<void> hide({bool notify = true}) => _impl.hide(notify: notify);
+
+  static Future<bool> isShowing() => _impl.isShowing();
+
+  static Future<bool> suspendForCapture(int captureGeneration) =>
+      _impl.suspendForCapture(captureGeneration);
+
+  static Future<bool> restoreAfterCapture(int captureGeneration) =>
+      _impl.restoreAfterCapture(captureGeneration);
+
+  static void setHandlers({
+    required Future<Uint8List> Function(String url) onGetMedia,
+    required void Function(Map<String, Object?> message) onJsMessage,
+    void Function()? onOverlayHidden,
+    void Function(OverlayReverseEvent event)? onRoutedJsMessage,
+    void Function(OverlayReverseEvent event)? onRoutedOverlayHidden,
+    void Function()? onGlobalMouseTrigger,
+  }) => _impl.setHandlers(
+    onGetMedia: onGetMedia,
+    onJsMessage: onJsMessage,
+    onOverlayHidden: onOverlayHidden,
+    onRoutedJsMessage: onRoutedJsMessage,
+    onRoutedOverlayHidden: onRoutedOverlayHidden,
+    onGlobalMouseTrigger: onGlobalMouseTrigger,
+  );
+
+  /// TODO-1066 — 注册/注销全局鼠标侧键触发（[OverlayWindowChannel
+  /// .setGlobalMouseTrigger]）。0 = 注销。
+  static Future<void> setGlobalMouseTrigger(int button) =>
+      _impl.setGlobalMouseTrigger(button);
+}

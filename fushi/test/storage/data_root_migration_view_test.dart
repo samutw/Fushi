@@ -1,0 +1,202 @@
+// TODO-959：数据迁移黑屏修复的 widget + 源码守卫测试。
+//
+// 黑屏两机制：
+//   (A) 搬移中：迁移引擎 closeDatabase() 置 isInitialised=false → 根 widget 回退到裸
+//       loading（背景 _savedSplashColor 可能 null/深色 → 近黑 + 转圈）。
+//   (B) 重启后：detached 新进程不抢前台 → 短暂黑/不可见窗口。
+//
+// widget 测试覆盖 (A)：迁移遮罩视图渲染明确文案 + 进度条，背景非 null 非纯黑。
+// 源码守卫覆盖：① 根 widget 在 loading 分支之前命中迁移遮罩分支；② 所有 loading/error/
+// migration 背景都有 `?? cs.` 兜底（防回归纯黑）；③ 设置项先 begin 遮罩再 migrate +
+// 线程 onProgress；④ 重启带前台标志 + main.dart 消费它做 show()/focus()。
+import 'dart:io';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/storage/data_root_migration_view.dart';
+import 'package:fushi/src/utils/components/glass/fushi_glass_feedback.dart'
+    show FushiLinearProgressIndicator;
+
+void main() {
+  group('DataRootMigrationView (TODO-959 机制A：搬移中遮罩)', () {
+    testWidgets('渲染「请勿关闭」文案 + 不确定进度条；背景非纯黑（无 splash 时回退 surface）',
+        (WidgetTester tester) async {
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home:
+                const DataRootMigrationView(), // progress=null, background=null
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 明确告知用户「不要关闭」——这正是裸 loading 缺的语义。
+      expect(find.text(t.data_storage_migrate_overlay_title), findsOneWidget);
+      expect(find.text(t.data_storage_migrate_overlay_warning), findsOneWidget);
+      // 有进度条。progress=null → 不确定进度（value 为 null）。
+      final FushiLinearProgressIndicator bar =
+          tester.widget<FushiLinearProgressIndicator>(
+        find.byType(FushiLinearProgressIndicator),
+      );
+      expect(bar.value, isNull);
+
+      // 背景非 null 且非纯黑（修复的核心：消除「真黑底」）。
+      final Scaffold scaffold = tester.widget<Scaffold>(find.byType(Scaffold));
+      expect(scaffold.backgroundColor, isNotNull);
+      expect(scaffold.backgroundColor, isNot(equals(const Color(0xFF000000))));
+      expect(scaffold.backgroundColor, isNot(equals(Colors.black)));
+    });
+
+    testWidgets('有进度时显示确定进度条 + 文件计数文案', (WidgetTester tester) async {
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
+            ),
+            home: const DataRootMigrationView(
+              progress: (copied: 3, total: 10),
+              background: Color(0xFF223344),
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      final FushiLinearProgressIndicator bar =
+          tester.widget<FushiLinearProgressIndicator>(
+        find.byType(FushiLinearProgressIndicator),
+      );
+      expect(bar.value, closeTo(0.3, 1e-9));
+
+      // 给定的 splash 背景被尊重（非回退）。
+      final Scaffold scaffold = tester.widget<Scaffold>(find.byType(Scaffold));
+      expect(scaffold.backgroundColor, equals(const Color(0xFF223344)));
+    });
+
+    testWidgets('TODO-1182 失败态：显示标题 + 原因 + 建议 + 重启按钮，点按触发 onRestart',
+        (WidgetTester tester) async {
+      int restarts = 0;
+      await tester.pumpWidget(
+        TranslationProvider(
+          child: MaterialApp(
+            theme: ThemeData(
+              useMaterial3: true,
+              colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            ),
+            home: DataRootMigrationView(
+              failure: 'boom: 有文件被占用',
+              onRestart: () => restarts++,
+            ),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 标题 + 具体原因 + 可执行建议都醒目呈现（不再是无声失败）。
+      expect(find.text(t.data_storage_migrate_failed_title), findsOneWidget);
+      expect(find.text('boom: 有文件被占用'), findsOneWidget);
+      expect(
+          find.text(t.data_storage_migrate_failed_suggestions), findsOneWidget);
+      // 失败态不显示进度条。
+      expect(find.byType(FushiLinearProgressIndicator), findsNothing);
+
+      // 点重启按钮触发注入的回调（测试里不真重启）。
+      await tester.tap(find.text(t.data_storage_migrate_failed_restart));
+      await tester.pump();
+      expect(restarts, equals(1));
+    });
+  });
+
+  group('源码守卫 (TODO-959)', () {
+    File readSource(String rel) {
+      final File f = File(rel);
+      expect(f.existsSync(), isTrue, reason: 'missing source file: $rel');
+      return f;
+    }
+
+    test('main.dart：迁移遮罩分支在裸 loading 分支之前', () {
+      final String src = readSource('lib/main.dart').readAsStringSync();
+      // BUG-1666 起 main.dart 在 build 之外也有 `if (!appModel.isInitialised)`
+      // （深链未初始化时暂存词的分支），裸 indexOf 会锚错窗口；判据只关心根 widget
+      // build 内的分支顺序，所以从 build 起点往后找。
+      final int buildIdx = src.indexOf('Widget build(BuildContext context)');
+      expect(buildIdx, greaterThan(0), reason: 'main.dart 必须有根 widget 的 build');
+      final int migrateIdx =
+          src.indexOf('appModel.dataRootMigrationActive', buildIdx);
+      final int loadingIdx =
+          src.indexOf('if (!appModel.isInitialised)', buildIdx);
+      expect(migrateIdx, greaterThan(0), reason: '根 widget 必须有迁移遮罩分支');
+      expect(loadingIdx, greaterThan(0));
+      expect(migrateIdx, lessThan(loadingIdx),
+          reason: '迁移遮罩必须在裸 loading 分支之前命中，否则迁移期回退近黑屏');
+      // 迁移分支渲染独立遮罩视图。
+      expect(src.contains('DataRootMigrationView('), isTrue);
+    });
+
+    test('main.dart：所有 splash 背景都有 ?? cs. 兜底（防纯黑回归）', () {
+      final String src = readSource('lib/main.dart').readAsStringSync();
+      // 不允许出现裸 `backgroundColor: _savedSplashColor,`（无兜底）。
+      expect(
+        src.contains('backgroundColor: _savedSplashColor,'),
+        isFalse,
+        reason: 'loading/error 分支的 _savedSplashColor 必须 ?? cs.xxx 兜底',
+      );
+    });
+
+    test('main.dart：重启后的新进程走统一显窗点 show()/focus() 抢前台（机制B）', () {
+      // 隐藏建窗后，含迁移自动重启在内的每个进程都由 _revealStartupWindow
+      // 在首帧光栅化后 show + focus；不再有重启标志专用分支。
+      final String src = readSource('lib/main.dart').readAsStringSync();
+      final int at = src.indexOf('Future<void> _revealStartupWindow()');
+      expect(at, greaterThan(-1), reason: '必须有唯一显窗点 _revealStartupWindow');
+      final int end = src.indexOf('Future<void> _revealStartupWindowFallback', at);
+      expect(end, greaterThan(at));
+      final String body = src.substring(at, end);
+      expect(body.contains('windowManager.show()'), isTrue);
+      expect(body.contains('windowManager.focus()'), isTrue);
+    });
+
+    test('desktop_lifecycle_service：重启给新进程带上前台标志', () {
+      final String src =
+          readSource('lib/src/platform/desktop/desktop_lifecycle_service.dart')
+              .readAsStringSync();
+      expect(src.contains('restartMarkerArg'), isTrue);
+      // 标志被实际加进 Process.start 的 args。
+      expect(src.contains('restartMarkerArg,'), isTrue);
+    });
+
+    test('data_root.part：先 begin 遮罩再 migrate，并线程 onProgress', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/data_root.part.dart')
+              .readAsStringSync();
+      final int beginIdx = src.indexOf('beginDataRootMigration()');
+      final int migrateIdx = src.indexOf('DataRootMigrator().migrate(');
+      expect(beginIdx, greaterThan(0), reason: '必须先把遮罩顶上来（顺序铁律：遮罩→关库→搬文件）');
+      expect(migrateIdx, greaterThan(0));
+      expect(beginIdx, lessThan(migrateIdx),
+          reason: 'beginDataRootMigration 必须在 migrate 之前调用');
+      // onProgress 回灌进度到遮罩。
+      expect(src.contains('updateDataRootMigrationProgress('), isTrue);
+      expect(src.contains('onProgress:'), isTrue);
+    });
+
+    test('data_root.part：迁移失败同步写错误日志再重启', () {
+      final String src =
+          readSource('lib/src/sync/sync_settings_schema/data_root.part.dart')
+              .readAsStringSync();
+      final int logIdx = src.indexOf("logFatal('DataRootMigration.migrate'");
+      final int recoverIdx = src.indexOf('_recoverAfterFailedMigration(');
+      expect(logIdx, greaterThan(0), reason: '迁移失败必须同步落错误日志');
+      expect(recoverIdx, greaterThan(logIdx),
+          reason: '错误日志必须在自动重启前落盘，否则失败原因会消失');
+    });
+  });
+}

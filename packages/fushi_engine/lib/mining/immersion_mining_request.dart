@@ -1,0 +1,744 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:fushi_anki/fushi_anki_core.dart'
+    show
+        AnkiMiningSource,
+        AnkiMiningContext,
+        CardSourceLink,
+        MineOutcome,
+        MiningMosaicRegion;
+
+/// 沉浸制卡片段音频的容器扩展名，按平台分（TODO-1217 / BUG-460）：
+/// - iOS：`m4a`——AnkiMobile 只自动下载它识别为媒体的 localhost URL，`.aac` 裸流会被当成
+///   可见文本不下载（da22cd42a）；iOS 端 ffmpeg-kit 自带 ipod muxer，能产出 `.m4a`。
+/// - 桌面 / Android：`aac`（adts）——桌面捆绑的 ffmpeg-min
+///   （`tool/ffmpeg-min/build-ffmpeg-min.sh` 的 MUXERS 白名单只有 adts，无 ipod/mp4/m4a）
+///   写 `.m4a` 会自动选一个不存在的 ipod muxer → `Unable to choose output format` /
+///   exit -22 → `extractAudioSegmentViaFfmpeg` 返 null → 音频丢（桌面网飞/YouTube/应用内
+///   视频制卡有图无声，正是 da22cd42a 的桌面回归）；Android AnkiDroid 历来接受 `.aac`（BUG-460）。
+///
+/// 纯逻辑放在 [immersionMiningAudioExtensionFor]，便于对两分支单测（测试宿主上
+/// `Platform.isIOS` 恒为 false，无法直接覆盖 iOS 分支）。
+String immersionMiningAudioExtensionFor({required bool isIOS}) =>
+    isIOS ? 'm4a' : 'aac';
+
+/// 当前运行平台下沉浸制卡片段音频的容器扩展名（见 [immersionMiningAudioExtensionFor]）。
+String immersionMiningAudioExtension() =>
+    immersionMiningAudioExtensionFor(isIOS: Platform.isIOS);
+
+/// Immutable locator/title payload for the mined-sentence history row written
+/// after a queued video mining request completes.
+///
+/// The video page can stay mounted while switching episodes, or be disposed
+/// while the queue is waiting. Capturing primitive values before enqueue/await
+/// prevents the old card from inheriting the new episode's title, locator, or
+/// popup fields.
+class VideoMiningHistorySnapshot {
+  VideoMiningHistorySnapshot.capture({
+    required Map<String, String> fields,
+    required this.sentence,
+    required this.documentTitle,
+    required this.bookKey,
+    required this.sectionIndex,
+    required int? cueStartMs,
+    required int? cueEndMs,
+    required this.dateKey,
+  }) : expression = fields['expression'] ?? '',
+       reading = fields['reading'] ?? '',
+       glossary = fields['glossary'] ?? '',
+       normCharOffset = cueStartMs,
+       normCharLength = cueStartMs == null || cueEndMs == null
+           ? null
+           : (cueEndMs - cueStartMs).clamp(0, 1 << 31).toInt();
+
+  final String expression;
+  final String reading;
+  final String glossary;
+  final String sentence;
+  final String documentTitle;
+  final String bookKey;
+  final int? sectionIndex;
+  final int? normCharOffset;
+  final int? normCharLength;
+  final String dateKey;
+}
+
+/// 视频制卡的封面模式（用户在 Anki 设置里选择；全新安装默认 [videoClip]，存量用户 [gif]）：
+/// - [gif]：字幕区间动图（`extractClipGifViaFfmpeg`）。抽取失败按旧阶梯降级为
+///   静态帧，并弹「降级为静态帧」OSD。
+/// - [currentFrame]：制卡那一刻的当前解码帧（`controller.screenshot`，点词已自动暂停）。
+///   用户主动选的静态图，非降级 → 不弹降级 OSD。
+/// - [subtitleStart]：当前字幕 cue 起始时间点的帧（`extractVideoFrameViaFfmpeg`，
+///   `atSeconds = clipStartMs/1000`）。同为主动选择的静态图。
+/// - [videoClip]：同一时间段的画面与句子声音封装成**一个**片段文件，音画天然同步。
+///   容器/编码由 [MiningClipFormat] 选（默认 WebM，卡片内 `<video>` 播放；MP4 走 Anki
+///   原生播放器）。galgame 场景卡把台词出现到制卡这段时间的游戏窗口录制帧与句子音频
+///   混流（`galgame_window_video.dart`）；录制未启动 / 帧不足时由 galgame 协调器降级动图。
+///   拿不到可裁视频的来源（无字幕时间窗、浏览器只给截图/音轨）按动图模式的阶梯降级，
+///   不声称同步。
+///
+/// 持久化用 [wireName]（存进偏好的字符串），解析用 [fromWireName]。
+///
+/// [fromWireName] 对 null / 未知返回 [videoClip]，偏好层直接拿它当默认。2026-09-28 曾让
+/// 存量安装保持 [gif]（显式写进偏好），所有者 2026-10-01 改口老用户也用片段，那批 gif 由
+/// app 侧 `PreferencesRepository.settleMiningImageModeInstallDefault` 迁回 [videoClip]。
+/// [ImmersionMiningRequest.imageMode] 的值对象默认仍是 [gif]——不读偏好的调用方
+/// （内置网页视频页等）行为不变。
+enum VideoMiningImageMode {
+  gif('gif'),
+  currentFrame('current_frame'),
+  subtitleStart('subtitle_start'),
+  videoClip('video_clip');
+
+  const VideoMiningImageMode(this.wireName);
+
+  /// 偏好持久化用的稳定字符串键（勿随枚举名改动）。
+  final String wireName;
+
+  /// 从偏好字符串解析；未知/null → [videoClip]（默认，见枚举文档）。
+  static VideoMiningImageMode fromWireName(String? name) {
+    for (final VideoMiningImageMode mode in VideoMiningImageMode.values) {
+      if (mode.wireName == name) return mode;
+    }
+    return VideoMiningImageMode.videoClip;
+  }
+
+  /// 是否为静态截图模式（用户主动选静态图，非 GIF 降级）。动图与视频片段都不是。
+  bool get isStill =>
+      this == VideoMiningImageMode.currentFrame ||
+      this == VideoMiningImageMode.subtitleStart;
+
+  /// 是否为音画同步的视频片段模式（格式见 [MiningClipFormat]）。
+  bool get isVideoClip => this == VideoMiningImageMode.videoClip;
+}
+
+/// 音画同步片段（[VideoMiningImageMode.videoClip]）的**容器 + 编码**，与动图 / 静图格式
+/// 两轴互不相干：那两轴只管无声的封面图，本轴只管「画面 + 句子声音一个文件」的那条链。
+///
+/// | 格式 | 卡片里怎么播 | 取舍 |
+/// |---|---|---|
+/// | [webmVp9]（默认） | `<video>` 内嵌，翻面自动播放、点例句重播 | Anki 桌面 Qt WebEngine / AnkiDroid WebView 都能解 |
+/// | [webmAv1] | 同上 | 体积最小（约为 VP9 的 60%），编码耗时约为 VP9 的 2 倍；移动端 ffmpeg-kit（Android / iOS）无 SVT-AV1 → 降级 VP9，仍内嵌 |
+/// | [mp4H264] | `[sound:]` 交给 Anki 原生播放器（Windows 弹独立窗口） | 兼容兜底；iOS 默认 |
+///
+/// 为什么内嵌只能是 WebM：Anki 桌面的 Qt WebEngine 不带专利编解码器，**没有 H.264 也没有
+/// AAC**，`<video>` 放 MP4 会失败（见 `coverMediaRef`）。渲染方式由产物扩展名决定
+/// （`webm` 内嵌、`mp4` 原生），不另走 wire 标记——转发 / 草稿 / 队列只携带文件与扩展名。
+///
+/// 编码失败按 [encodeAttempts] 降级（与 [MiningAnimatedFormat.encodeAttempts] 同范式），
+/// 卡上扩展名跟随**实际编成**的格式。
+enum MiningClipFormat {
+  webmVp9('webm_vp9', 'webm'),
+  webmAv1('webm_av1', 'webm'),
+  mp4H264('mp4_h264', 'mp4');
+
+  const MiningClipFormat(this.wireName, this.fileExtension);
+
+  /// 偏好持久化用的稳定字符串键（勿随枚举名改动）。
+  final String wireName;
+
+  /// 输出文件扩展名（不含点）。决定 muxer，也决定卡片上怎么播（见 [playsInline]）。
+  final String fileExtension;
+
+  /// 卡片内 `<video>` 内嵌播放（WebM）；否则走 Anki 原生 `[sound:]` 播放器。
+  bool get playsInline => fileExtension == 'webm';
+
+  /// 编码尝试链：AV1 → VP9 → MP4，VP9 → MP4，MP4 自身是链尾（H.264 + AAC 五端都编得出）。
+  List<MiningClipFormat> get encodeAttempts => switch (this) {
+    MiningClipFormat.webmAv1 => const <MiningClipFormat>[
+      MiningClipFormat.webmAv1,
+      MiningClipFormat.webmVp9,
+      MiningClipFormat.mp4H264,
+    ],
+    MiningClipFormat.webmVp9 => const <MiningClipFormat>[
+      MiningClipFormat.webmVp9,
+      MiningClipFormat.mp4H264,
+    ],
+    MiningClipFormat.mp4H264 => const <MiningClipFormat>[
+      MiningClipFormat.mp4H264,
+    ],
+  };
+
+  /// 平台默认值：iOS → [mp4H264]（AnkiMobile 靠导入裸 URL 拿媒体、iOS 播不了 WebM），
+  /// 其余 → [webmVp9]。纯逻辑带 [isIOS] 参数，测试宿主上 `Platform.isIOS` 恒 false。
+  static MiningClipFormat defaultFor({required bool isIOS}) =>
+      isIOS ? MiningClipFormat.mp4H264 : MiningClipFormat.webmVp9;
+
+  /// 从偏好字符串解析；未知/null → [fallback]。
+  static MiningClipFormat fromWireName(
+    String? name, {
+    required MiningClipFormat fallback,
+  }) {
+    for (final MiningClipFormat format in MiningClipFormat.values) {
+      if (format.wireName == name) return format;
+    }
+    return fallback;
+  }
+}
+
+/// 路径扩展名是否为音画同步片段容器（任一 [MiningClipFormat.fileExtension]）。
+bool isMiningClipPath(String path) {
+  final String lower = path.toLowerCase();
+  return MiningClipFormat.values.any(
+    (MiningClipFormat f) => lower.endsWith('.${f.fileExtension}'),
+  );
+}
+
+/// 制卡封面**动图的编码格式**，与 [VideoMiningImageMode] 正交：后者选「用不用动图 +
+/// 静态帧取哪一帧」，本枚举选「动图用什么编码」。默认 [avif]。
+///
+/// 为什么是两个枚举而不是把 avif/webp 并进 [VideoMiningImageMode]：并进去会变成
+/// 「格式 × 静态来源」的笛卡尔积（avif/webp/gif × currentFrame/subtitleStart），而格式
+/// 只对动图有意义、静态来源只对静态图有意义。两轴独立取值，各自一个设置项。
+///
+/// 每种格式自己声明**顶格档（最高清晰度档）的参数上限**（[maxTierFps]/[maxTierWidth]）。
+/// 这不是装饰性属性——它是顶格档语义的唯一真相源，`MiningMediaCompression.resolve`
+/// 直接查它，不做「谁是特例」的分支判断；[capFps]/[capWidth] 再保证任何来路的参数都
+/// 越不过本格式的上限。
+///
+/// 为什么不是一个 `hasInterFrameCompression` 布尔（本改动的初版就是那样，被实测推翻）：
+/// 「有没有帧间压缩」是编解码规格问题，而顶格档要回答的是**「这一档跑得动吗」**，
+/// 两者并不等价。本机 ffmpeg（libsvtav1 / libwebp_anim / native gif）实测，1080p30
+/// 合成源 4 秒窗：
+///
+/// | 格式 | 标准档 480px·8fps | 源分辨率·源帧率 1080p·30fps |
+/// |---|---|---|
+/// | gif  | 1973 ms / 471 KB | 11978 ms / 17.8 MB |
+/// | webp |  877 ms / 163 KB | **16383 ms** / 5.19 MB |
+/// | avif | 2124 ms /  36 KB | **3502 ms** / 3.32 MB |
+///
+/// WebP 规格上确有帧间差分，实测却是三者里**最慢**的——`libwebp_anim` 本质是逐帧 VP8
+/// 帧内编码的静态图编码器，没有真正的运动补偿，也不并行；SVT-AV1 是真视频编码器，
+/// 在源分辨率下反而比 GIF 快 3.4 倍。所以 WebP 与 GIF 吃同一组封顶值，AVIF 拿一组
+/// **更宽松但同样有限**的封顶值。GIF/WebP 的封顶值仍是 BUG-1039 的实测折中（那次
+/// 1080p/4 秒 = 48.9 秒 / 54 MB，10 秒 cue 约 135 MB，撞 120 秒超时且 AnkiConnect 卡死）。
+///
+/// ⚠️ **没有任何格式的顶格档是「源分辨率 + 源帧率」直通。** AVIF 一度被配成 `0/0`
+/// （源直通），按 **10 秒 cue 上限**（`buildFfmpegClipAnimatedArgs` 的 `maxDurationMs`
+/// 默认值，而不是上表那个 4 秒窗）重测后撤掉：
+///
+/// | AVIF 顶格档候选（10 秒窗） | 耗时 | 体积 |
+/// |---|---|---|
+/// | 4K30 源直通（旧 `0/0`） | 8537 ms | **34.54 MB** |
+/// | 1080p30 源直通（旧 `0/0`） | 2485 ms | **8.80 MB** |
+/// | **1440px·24fps（现值）** | 2918 ms | **2.91 MB** |
+/// | 960px·12fps（= GIF/WebP 封顶值） | 711 ms | 0.41 MB |
+/// | 同窗真 GIF @960px·12fps 参照 | 1690 ms | 4.97 MB |
+///
+/// 换了更好的编码器，该做的是**抬高**上限而不是删掉上限——BUG-1039 的教训是「顶格档
+/// 不该是不可用配置」，34 MB 的封面照样把 AnkiConnect 和同步打穿。现值 1440px·24fps
+/// 比 GIF/WebP 封顶值宽 1.5 倍、帧率翻倍，产出体积却仍**小于**同窗真 GIF（2.91 MB 对
+/// 4.97 MB）。体积预算守卫见 `test/mining/mining_animated_format_test.dart`。
+///
+/// ⚠️ 默认值是 [avif] 而非 [gif]：这是本改动**唯一一处有意的现状变更**（老用户升级后
+/// 新卡默认变 AVIF）。[gif] 保留为可选项，既供用户回退，也供捆绑 ffmpeg 不支持新编码器
+/// 时 fail-open 降级（见 `galgame_window_gif.dart` / `desktop_audio_clipper.dart`）。
+enum MiningAnimatedFormat {
+  avif('avif', 'avif', maxTierFps: 24, maxTierWidth: 1440),
+  webp('webp', 'webp', maxTierFps: 12, maxTierWidth: 960),
+  gif('gif', 'gif', maxTierFps: 12, maxTierWidth: 960);
+
+  const MiningAnimatedFormat(
+    this.wireName,
+    this.fileExtension, {
+    required this.maxTierFps,
+    required this.maxTierWidth,
+  });
+
+  /// 偏好持久化用的稳定字符串键（勿随枚举名改动）。
+  final String wireName;
+
+  /// 输出文件扩展名（不含点）。ffmpeg 按扩展名选 muxer，故这也是 muxer 选择依据。
+  final String fileExtension;
+
+  /// 顶格档帧率上限。恒为正——没有格式开放源帧率直通，理由见枚举文档的两张实测表。
+  final int maxTierFps;
+
+  /// 顶格档宽度上限（px）。恒为正——同 [maxTierFps]。
+  final int maxTierWidth;
+
+  /// 把 [requested] 帧率夹到本格式的顶格档上限。`<= 0`（历史「源帧率直通」哨兵）同样
+  /// 夹成上限。
+  ///
+  /// 这是 BUG-1039 的收口点：换格式重试时若沿用**上一个格式**的参数，就会把 AVIF 顶格
+  /// 档的 24fps/1440px 原样喂给 GIF（GIF 无帧间压缩，体积线性爆炸）。夹取对三种格式、
+  /// 四个档位一致，不是「谁是特例」的分支。
+  int capFps(int requested) =>
+      (requested <= 0 || requested > maxTierFps) ? maxTierFps : requested;
+
+  /// 把 [requested] 宽度夹到本格式的顶格档上限。语义同 [capFps]。
+  int capWidth(int requested) =>
+      (requested <= 0 || requested > maxTierWidth) ? maxTierWidth : requested;
+
+  /// 编码尝试链：先试本格式，失败降级 [gif] 再试一次；[gif] 自己只有一次尝试（它是链尾
+  /// 兜底，没有更低一级可降，也恒可用）。
+  ///
+  /// 这与 [maxTierFps]/[maxTierWidth] 是同一手法——**降级链是格式自身的属性**，不是各调用
+  /// 点各写一遍的三元表达式。改动前视频引擎与 galgame 窗口各持一份拷贝，而 Netflix 录制
+  /// 片段那条压根没有链（硬写死 GIF）。三份实现只要漂开一次，就会有一条链路悄悄退回恒 GIF。
+  ///
+  /// ⚠️ 遍历时每次尝试**必须**用 `attempt` 自己的 [capFps]/[capWidth]/[fileExtension] 重新
+  /// 取参：沿用上一个格式的参数（AVIF 顶格档 24fps/1440px）喂给无帧间压缩的 GIF 编码器，
+  /// 正是 BUG-1039 那组「48.9 秒 / 54 MB、撞 120 秒超时」的配置。收口点见
+  /// `extractAnimatedClipWithFallback`。
+  List<MiningAnimatedFormat> get encodeAttempts =>
+      this == MiningAnimatedFormat.gif
+      ? const <MiningAnimatedFormat>[MiningAnimatedFormat.gif]
+      : <MiningAnimatedFormat>[this, MiningAnimatedFormat.gif];
+
+  /// 从偏好字符串解析；未知/null → [avif]（新默认）。
+  static MiningAnimatedFormat fromWireName(String? name) {
+    for (final MiningAnimatedFormat format in MiningAnimatedFormat.values) {
+      if (format.wireName == name) return format;
+    }
+    return MiningAnimatedFormat.avif;
+  }
+}
+
+/// 制卡封面**静态截图的编码格式**，与 [VideoMiningImageMode] 正交，也与
+/// [MiningAnimatedFormat] 互不相干：模式选「用不用动图 / 静态帧取哪一帧」，本枚举只回答
+/// 「静态帧用什么编码」。默认 [jpg] = 现状零破坏。
+///
+/// 为什么单独一个枚举而不是把 jpg/png 并进 [MiningAnimatedFormat]：那个枚举的每个成员都
+/// 带 [MiningAnimatedFormat.maxTierFps]/[MiningAnimatedFormat.maxTierWidth] 这种**只对动图
+/// 成立**的属性（帧率对单帧无意义），并进去就得给静图编两个假值，再在取参处分支「这个是
+/// 静图别读帧率」。两轴独立取值、各自一个设置项，是同一手法的第三次应用。
+///
+/// 为什么只有 jpg/png 两档（而不是跟动图一样上 webp/avif）：静图这条链有两个产出点，
+/// **一个在 ffmpeg、一个在纯 Dart**（`immersion_mining_engine` 的 `tryCurrentFrame` 拿的是
+/// media_kit 的解码帧字节，经 `package:image` 降采样重编码）。`package:image` 能编的只有
+/// jpg/png；webp/avif 得把截图字节再喂一次 ffmpeg，多一次进程往返和一层失败降级，而静图
+/// 本身体积已经不是瓶颈（4K 帧降到长边 1000px 后 JPEG 约 200KB）。
+///
+/// [png] 走 [encodeAttempts] 的降级链：ffmpeg 缺 png 编码器时退回 [jpg] 再抽一次，
+/// 而不是让封面直接丢失。
+///
+/// **两个平台的现状不同，别再把这条链当纯兜底**（BUG-2366，此处原先写反）：
+/// - 桌面：入库的 `ffmpeg-min` 配方 ENCODERS 含 `png`，降级链确实只是给「配方漂了 /
+///   用户自带的外部 ffmpeg」兜底。
+/// - **移动端（Android/iOS）：png 编码器根本不存在**。入库的自编 ffmpeg-kit 配方带
+///   `--disable-zlib`，而 ffmpeg 的 png 编解码器硬依赖 zlib——实测 AAR 里
+///   `libavcodec.so` 的未定义符号中一条 `deflate*`/`inflate*` 都没有。所以移动端选
+///   [png] 时，第一次尝试是**注定失败**的常态路径，降级到 [jpg] 才出卡。
+///
+/// 由此推出两条不变式，改这里前先想清楚：
+/// 1. 那次注定失败**不是错误**，不得进用户可见错误日志——收口在
+///    `extractStillWithFallback`（`immersion_mining_engine.dart`），非末次尝试一律
+///    `diagnosticOnly`。
+/// 2. 卡上的文件扩展名必须跟随**实际编成**的格式（见 [fileExtension]）。
+///
+/// 想让移动端真正支持 png，唯一办法是在构建机重编 ffmpeg-kit 时加 `--enable-zlib`
+/// 并重新 vendor AAR/xcframework；配方与 Dart 假设的一致性由守卫
+/// `fushi/test/tools/ffmpeg_kit_mobile_recipe_guard_test.dart` 钉住。
+enum MiningStillFormat {
+  jpg('jpg', 'jpg'),
+  png('png', 'png');
+
+  const MiningStillFormat(this.wireName, this.fileExtension);
+
+  /// 偏好持久化用的稳定字符串键（勿随枚举名改动）。
+  final String wireName;
+
+  /// 输出文件扩展名（不含点）。ffmpeg 按扩展名选 muxer，Anki 也按扩展名判 MIME，故这既是
+  /// 编码器选择依据，也是媒体库里那张图的真实身份——**扩展名必须跟随实际产出格式**，
+  /// 不能跟随用户所选（降级发生时会写出 `.png` 里装 JPEG 的卡，Anki 侧封面不显示）。
+  final String fileExtension;
+
+  /// 编码尝试链：先试本格式，失败降级 [jpg] 再试一次；[jpg] 自己只有一次尝试（链尾兜底，
+  /// 没有更低一级可降）。与 [MiningAnimatedFormat.encodeAttempts] 同范式。
+  List<MiningStillFormat> get encodeAttempts => this == MiningStillFormat.jpg
+      ? const <MiningStillFormat>[MiningStillFormat.jpg]
+      : <MiningStillFormat>[this, MiningStillFormat.jpg];
+
+  /// 从偏好字符串解析；未知/null → [jpg]（默认，向后兼容）。
+  static MiningStillFormat fromWireName(String? name) {
+    for (final MiningStillFormat format in MiningStillFormat.values) {
+      if (format.wireName == name) return format;
+    }
+    return MiningStillFormat.jpg;
+  }
+}
+
+/// 播放器把**已缓冲**的一段远端流原样落成的本地文件（libmpv `dump-cache`）。
+///
+/// 在线视频（媒体服务器 / 在线源扩展）制卡慢，是因为句子音频与封面动图各起一个 ffmpeg
+/// 去远端重新开流、seek、下载——而用户刚听完的那句，播放器缓冲里就有。落盘只是把缓冲
+/// 里的包写成一个 mkv，毫秒级；之后两路抽取都是本地 seek。
+///
+/// [zeroMs] 是文件 0 点对应的**播放器轴**时刻：`dump-cache` 会把时间戳归零到它写出的
+/// 第一个包，调用方从某个缓冲段起点开始落盘，那个起点就是这里的 0 点。引擎据此把播放器
+/// 轴的抽取时刻换算成文件内时刻（见 [ImmersionMiningRequest.mediaTimeOffsetMs]）。
+class CachedMediaSnapshot {
+  const CachedMediaSnapshot({required this.path, required this.zeroMs});
+
+  final String path;
+  final int zeroMs;
+}
+
+/// 统一沉浸制卡请求。任何来源（本地/YouTube/Netflix）都构造这个喂 [ImmersionMiningEngine]。
+///
+/// [mediaSource] 是 ffmpeg 的 inputPath——本地绝对路径 或 可 seek 的 http 流 URL。
+/// 若 [mediaSource] 为 null（如 Netflix 前台无本地源），引擎只用 [stillFallback] /
+/// [providedCoverBytes] / [providedAudioBytes] 组卡。
+class ImmersionMiningRequest {
+  const ImmersionMiningRequest({
+    required this.fields,
+    required this.clipStartMs,
+    required this.clipEndMs,
+    this.stillFrameAtMs,
+    required this.sentence,
+    this.mediaSource,
+    this.audioSource,
+    this.cueSentence,
+    this.documentTitle,
+    this.audioStreamIndex,
+    this.audioStreamCount,
+    // BUG-1137：不给默认值。曾默认 video，gal 场景卡忘传 source 就被静默标成
+    // 视频；来源必须由每个调用点显式声明，漏传直接编译不过。
+    required this.source,
+    this.bookTitleTag,
+    this.collectionTag,
+    this.updateNoteId,
+    this.sourceLink,
+    this.sourceLinkResolver,
+    this.sourceReviewMine,
+    this.stillFallback,
+    this.providedCoverBytes,
+    this.providedCoverName,
+    this.providedAudioBytes,
+    this.providedAudioName,
+    this.requireAudio = true,
+    this.omitAudio = false,
+    this.omitCover = false,
+    this.coverMosaic = const <MiningMosaicRegion>[],
+    this.imageMode = VideoMiningImageMode.gif,
+    this.animatedFormat = MiningAnimatedFormat.gif,
+    this.stillFormat = MiningStillFormat.jpg,
+    this.clipFormat = MiningClipFormat.mp4H264,
+    this.mediaSourceTlsPinSha256,
+    this.mediaSourceHttpHeaders = const {},
+    this.mediaSourceRouteReady,
+    this.fieldsMediaReady,
+    this.remoteAudioClipper,
+    this.cachedMediaSnapshot,
+    this.mediaTimeOffsetMs = 0,
+    this.stageNote,
+  });
+
+  final Map<String, String> fields;
+  final int clipStartMs;
+  final int clipEndMs;
+
+  /// 「字幕起始帧」静态封面的取帧时刻（播放器轴，毫秒）。null = 用 [clipStartMs]。
+  ///
+  /// 为什么单独一个字段：`[clipStartMs, clipEndMs]` 是**音频/动图窗**，会被用户的句子
+  /// 音频头 padding 往前扩；而「字幕起始帧」承诺的是字幕**开始那一刻**的画面——台词
+  /// 起点常与切镜重合，往前哪怕 120ms 抽到的就是上一个镜头。两层语义只共用一对数字
+  /// 时，padding 一旦可调就会把封面带偏；视频调用方传未 pad 的 cue 起点，其余来源
+  /// （无 padding 概念）不传即回落到窗起点，行为零变化。
+  final int? stillFrameAtMs;
+
+  /// 静态起始帧实际取帧时刻：[stillFrameAtMs] 优先，否则窗起点 [clipStartMs]。
+  int get stillFrameAnchorMs => stillFrameAtMs ?? clipStartMs;
+  final String sentence;
+  final String? mediaSource;
+
+  /// 音频段抽取源（ffmpeg inputPath）。null = 用 [mediaSource]（本地文件/muxed）。
+  /// YouTube 分离流时 = audio-only 流 URL（视频流无音轨，音频得从这里裁）。
+  final String? audioSource;
+  final String? cueSentence;
+  final String? documentTitle;
+  final int? audioStreamIndex;
+  final int? audioStreamCount;
+  final AnkiMiningSource source;
+  final String? bookTitleTag;
+
+  /// 合集/系列名标签（视频=播放列表系列名）：与 [bookTitleTag] 同「自动添加书名到标签」
+  /// 开关，非 null 时经 [BaseAnkiRepository.buildNoteTags] 追加为独立 tag。不属合集/单视频
+  /// 无系列名时为 null。透传进 [AnkiMiningContext.collectionTag]。
+  final String? collectionTag;
+
+  /// 非 null = 覆盖现有卡（走 updateMinedNote，不计统计）。
+  final int? updateNoteId;
+  final CardSourceLink? sourceLink;
+
+  /// Computes full-file identity inside the mining queue from frozen inputs.
+  final Future<CardSourceLink?> Function()? sourceLinkResolver;
+  final Future<MineOutcome> Function({
+    required String rawPayloadJson,
+    required AnkiMiningContext context,
+  })?
+  sourceReviewMine;
+
+  /// 当前解码帧兜底（本地路径链全失败时）。本地传 `controller.screenshot`。
+  final Future<Uint8List?> Function()? stillFallback;
+
+  /// 外部已抓好的封面/音频字节（Netflix 后台实例直接给字节，无本地文件）。
+  final Uint8List? providedCoverBytes;
+  final String? providedCoverName;
+  final Uint8List? providedAudioBytes;
+  final String? providedAudioName;
+
+  /// true = 无音频则中止制卡（本地/YouTube 默认）；false = 允许无音频卡（Netflix 2A 截图卡）。
+  final bool requireAudio;
+
+  /// 用户为**这一张卡**明确选了「不要句子音频」（高级制卡，`MiningRequestOverrides
+  /// .omitAudio`）。与 [requireAudio] 不是一回事：后者是来源能力（拿不到音频算不算
+  /// 失败），本字段是用户意图——引擎不启动音频抽取，也就不会因为「缺音频」中止。
+  ///
+  /// 为什么不在 [VideoMiningImageMode] 里加一个 none：那个枚举是持久化偏好的值域，
+  /// 「不要」只对单张卡有意义，不能变成一键制卡的设置值。
+  final bool omitAudio;
+
+  /// 用户为这一张卡明确选了「不要图片」：封面阶梯（动图 / 起点帧 / 当前帧）与外部
+  /// 给好的封面字节一律跳过。与 [omitAudio] 都为真时出纯文本卡（用户要的就是它，
+  /// 不再按「无封面也无音频」当空壳卡中止）。
+  final bool omitCover;
+
+  /// 用户为这一张卡框的打码区域（高级制卡，相对那一帧画面的 0..1 归一化矩形）。
+  ///
+  /// 非空时引擎只出**静态**封面（动图 / 片段改按「字幕开头」抽单帧——逐帧打码做不到
+  /// 所见即所得），封面落盘后打码；打码失败就不要封面，绝不退回没打码的画面。
+  final List<MiningMosaicRegion> coverMosaic;
+
+  /// 视频制卡封面图片模式（见 [VideoMiningImageMode]）。值对象默认
+  /// [VideoMiningImageMode.gif]（不读偏好的调用方行为不变；偏好默认是 videoClip）。仅本地/有 range 的封面解析路径读取；providedCoverBytes 路径不受影响。
+  final VideoMiningImageMode imageMode;
+
+  /// 动图编码格式（见 [MiningAnimatedFormat]）。仅 [imageMode] 为
+  /// [VideoMiningImageMode.gif]（= 用动图）时生效。
+  ///
+  /// 这里默认 [MiningAnimatedFormat.gif] 而**用户偏好默认 avif**，两者不矛盾：值对象的
+  /// 默认只服务「没显式指定的调用点/测试」，保证它们逐字节等价于改动前；用户可见的默认
+  /// 由 `MiningAnimatedFormat.fromWireName(null)` 给出（= avif），真实调用点一律显式透传
+  /// 偏好。与 [imageMode] 的默认取法一致。
+  final MiningAnimatedFormat animatedFormat;
+
+  /// 静态截图编码格式（见 [MiningStillFormat]）。仅 [imageMode] 为静态档
+  /// （[VideoMiningImageMode.isStill]），或动图抽取失败降级成静态帧时生效。
+  ///
+  /// 默认取法与 [animatedFormat] 一致：值对象默认 [MiningStillFormat.jpg]（= 改动前的
+  /// 硬编码 `.jpg`，没显式指定的调用点/测试逐字节等价），用户可见的默认由
+  /// `MiningStillFormat.fromWireName(null)` 给出（同为 jpg），真实调用点显式透传偏好。
+  final MiningStillFormat stillFormat;
+
+  /// 音画同步片段格式（见 [MiningClipFormat]）。仅 [imageMode] 为
+  /// [VideoMiningImageMode.videoClip] 时生效。
+  ///
+  /// 值对象默认 [MiningClipFormat.mp4H264] = 改动前唯一的产出形态（没显式指定的调用点/
+  /// 测试逐字节等价）；用户可见的默认由偏好层给出（平台默认 WebM VP9），真实调用点一律
+  /// 显式透传偏好。与 [animatedFormat] 的默认取法一致。
+  final MiningClipFormat clipFormat;
+
+  /// BUG-891：[mediaSource]/[audioSource] 若是远端自签 Fushi 主机的 https 流，这里带上
+  /// 该 host 经 TOFU 钉扎的证书 SHA-256 指纹（`aa:bb:..`）。引擎把它透传给 ffmpeg 抽取器的
+  /// `-tls_pin_sha256`，使自编 ffmpeg-kit（`--enable-gnutls` + pin 补丁）按指纹接受自签，
+  /// 而非无条件放行。null = 本地源 / 公网有效证书源（YouTube 等），不钉扎、走 ffmpeg 默认。
+  final String? mediaSourceTlsPinSha256;
+
+  /// BUG-2625：[mediaSource]/[audioSource] 是远端 http(s) 流时，**播放器取到这条流时用的
+  /// 请求头**（在线视频源扩展声明的 Referer / User-Agent / Origin / Cookie，粘贴 URL 流
+  /// 用户自填的头）。引擎透传给 ffmpeg 抽取器 → `-user_agent` / `-referer` / `-headers`。
+  ///
+  /// 为什么必须是请求字段、不能像 B 站那条 Referer 一样按 URL 宿主推
+  /// （[ffmpegRefererForRemoteInput]）：扩展的头**不是 host 的属性**——Referer 常是站点的
+  /// 播放页地址、UA 是扩展自定值、还可能带一次性 Cookie，只有**当前播放会话**知道。
+  /// 播放器早就在带它们（`Media(httpHeaders:)` + libmpv `http-header-fields`），而制卡的
+  /// ffmpeg 一直在裸请求同一条 URL，于是站点按防盗链直接 403（`Server returned 403
+  /// Forbidden`），句子音频抽不出来、制卡整条中止（`required audio missing`）。
+  ///
+  /// 空 map = 本地文件 / 无防盗链的公网源（YouTube 走自己的 UA 常量），行为零变化。
+  final Map<String, String> mediaSourceHttpHeaders;
+
+  /// [mediaSource] 的连接方式（经宿主本机中继 / 放开 HLS 分片扩展名，见
+  /// `FfmpegRemoteInputRoute`）已登记完成的信号；null = 直连，无需等待。
+  ///
+  /// 登记要读播放器识别出的容器、确认中继端点、问一次 ffmpeg 能力，全是异步的；
+  /// 而制卡请求必须在点击当下**同步**入队（连续点击按序、换集前冻结输入）。所以
+  /// 调用方当场把 [mediaSource] 改写成中继形式、把登记作为 Future 挂在这里，引擎
+  /// 在队列里轮到本任务、构造 ffmpeg 参数之前先等它。它从不失败（宿主自己兜错）。
+  final Future<void>? mediaSourceRouteReady;
+
+  /// [fields] 里登记的词典媒体（外字等，`dictionaryMedia`）落进 Anki 媒体缓存完成的
+  /// 信号；null = 已就位（调用方在入队前就写好了缓存）。
+  ///
+  /// 与 [mediaSourceRouteReady] 同一个理由：写缓存是异步的，而制卡请求必须在点击当下
+  /// **同步**冻结播放器输入并入队。先 await 写缓存再冻结，中间那段时间里换集，卡片就
+  /// 会拿旧集字幕的时间去截新集的音频和画面（手机遥控制卡曾如此）。所以调用方当场
+  /// 开始写、把 Future 挂在这里，引擎在队列里轮到本任务时先等它，再抽媒体、落卡。
+  /// 它失败时本次制卡按失败结束（与改动前 await 写缓存抛错同一结局）。
+  final Future<void>? fieldsMediaReady;
+
+  /// BUG-1004：互联 host（LAN Fushi 库）远端流的句子音频改由 **host 端**裁好再下载——host
+  /// 用本地文件裁、不经网络/TLS，从根上绕开「client ffmpeg 抓 host 自签 https / token 流」的
+  /// 整类失败（移动端自编 ffmpeg-kit 的 TLS pin 仍有残余缺口、URL 编码/网络脆弱等，见
+  /// BUG-891）。非空且 [audioSource]/[mediaSource] 命中远端 http(s) 时优先调用：返回裁好的
+  /// 本地音频文件路径即成功，返回 null 则回退现有 ffmpeg-over-URL 抽取（老 host 无 `clipaudio`
+  /// 端点时的兼容路径，Never break userspace）。本地/YouTube/直链源不注入（为 null）。
+  final Future<String?> Function({
+    required int startMs,
+    required int endMs,
+    required String outputPath,
+  })?
+  remoteAudioClipper;
+
+  /// 远端 [mediaSource] 的**本地缓冲副本**（见 [CachedMediaSnapshot]）。调用方在点击当下
+  /// 就让播放器落盘（那一刻数据还在缓冲里），引擎在队列里轮到本任务时等它：拿到副本
+  /// 就改成对本地文件抽取（[withCachedSnapshot]），拿不到（null：缓冲已被挤掉 / 非 libmpv
+  /// / 落盘失败）照旧对远端抽取。本地副本抽取中止时引擎还会再用远端源试一次。
+  ///
+  /// 只在 [audioSource] 为 null（音画同一条流）时有意义：落盘写的是播放器当前选中的
+  /// 轨道，分离音轨（YouTube）不在这条流里。
+  final Future<CachedMediaSnapshot?>? cachedMediaSnapshot;
+
+  /// [mediaSource] 文件 0 点对应的播放器轴时刻（毫秒）。抽取（动图 / 起始帧 / 句子音频 /
+  /// 同步视频）一律用「播放器轴时刻 − 本值」；卡面 `{clip-timestamp}` 仍用播放器轴原值。
+  /// 远端流与本地文件为 0（两轴重合）。
+  final int mediaTimeOffsetMs;
+
+  /// 非 null = **只准备媒体、不落卡**：引擎照常抽好封面与句子音频、组好
+  /// [AnkiMiningContext]，然后交给它而不是 Anki 后端（「看完再制卡」把这一张先暂存进
+  /// 队列，看完再统一写入）。它必须在返回前把 context 里的媒体文件拷走——引擎的临时
+  /// 文件名是固定的，下一张卡会覆盖。返回值原样作为本次结果的 outcome。
+  final Future<MineOutcome> Function({
+    required String rawPayloadJson,
+    required AnkiMiningContext context,
+  })?
+  stageNote;
+
+  /// 换成对本地缓冲副本抽取的请求：媒体源指向 [snapshot]，所有「怎么连远端」的参数
+  /// （请求头 / 中继登记 / TLS 指纹 / host 端裁音频）一并清掉；副本里只有播放器当前
+  /// 选中的那一条音轨，所以音轨定位也清掉（按文件里唯一的音轨取）。
+  ImmersionMiningRequest withCachedSnapshot(CachedMediaSnapshot snapshot) =>
+      ImmersionMiningRequest(
+        fields: fields,
+        clipStartMs: clipStartMs,
+        clipEndMs: clipEndMs,
+        stillFrameAtMs: stillFrameAtMs,
+        sentence: sentence,
+        mediaSource: snapshot.path,
+        cueSentence: cueSentence,
+        documentTitle: documentTitle,
+        source: source,
+        bookTitleTag: bookTitleTag,
+        collectionTag: collectionTag,
+        updateNoteId: updateNoteId,
+        sourceLink: sourceLink,
+        sourceLinkResolver: sourceLinkResolver,
+        sourceReviewMine: sourceReviewMine,
+        stillFallback: stillFallback,
+        providedCoverBytes: providedCoverBytes,
+        providedCoverName: providedCoverName,
+        providedAudioBytes: providedAudioBytes,
+        providedAudioName: providedAudioName,
+        requireAudio: requireAudio,
+        omitAudio: omitAudio,
+        omitCover: omitCover,
+        coverMosaic: coverMosaic,
+        imageMode: imageMode,
+        animatedFormat: animatedFormat,
+        stillFormat: stillFormat,
+        clipFormat: clipFormat,
+        fieldsMediaReady: fieldsMediaReady,
+        mediaTimeOffsetMs: snapshot.zeroMs,
+        stageNote: stageNote,
+      );
+
+  /// 卡面时间窗非空——**纯几何判据**，只回答「这张卡有没有时间窗可显示」，不回答
+  /// 「引擎要不要去裁」。渲染侧 [AnkiHandlebarRenderer.formatClipTimestamp] 用的正是
+  /// 这一条（`end > start`）。
+  ///
+  /// 「有窗」与「有可裁的源」是两件独立的事：Netflix 前台就是「有窗、无源」——窗来自
+  /// 扩展上报的播放器时间轴，本地一个字节也没有。
+  bool get hasClipWindow => clipEndMs > clipStartMs;
+
+  /// **抽取意图**：引擎是否应当按区间去裁 GIF / 句子音频。
+  ///
+  /// BUG-2127：这条判据此前被压缩成 [hasClipWindow] 一半，于是同一对数字兼了两层语义
+  /// （卡面时间窗 + 抽取开关）。Netflix 只能靠把窗硬编码成 0 来关掉抽取，代价是卡面
+  /// `{clip-timestamp}` 对该来源**结构性恒空**。现在补上另一半：**没有可裁的源就不是
+  /// 抽取意图**——与两处抽取点各自已有的前置守卫同源（[ImmersionMiningEngine] 里
+  /// `src = mediaSource`、`audioSrc = audioSource ?? src`，两处都先判 `== null`）。
+  ///
+  /// **无可观测行为变更，但不是因为「无源就一定没窗」**——`web_video_fushi_page.dart`
+  /// 的网页流媒体队列卡就是「无源 + 真实字幕 cue 窗」，收敛前后 `hasRange` 由真变假。
+  /// 那里没有差异是另外两条理由：它显式 `requireAudio: false`（掐死 `:437/:440` 的中止
+  /// 条件），且没有 `stillFallback`（`:410` 的 `coverPath` 恒 null，不可达）。
+  /// 另外两处双 null 来源（Netflix 前台、galgame 外部窗口）两端才是恒 0。
+  bool get hasRange => hasClipWindow && mediaSource != null;
+
+  /// 入队前冻结所有可变输入。视频页可能在任务真正执行前已经换集或关闭弹窗；队列里的
+  /// 卡必须继续使用点击制卡那一刻的字段和外部媒体字节，不能读到调用方后续修改。
+  ImmersionMiningRequest frozen() => ImmersionMiningRequest(
+    fields: Map<String, String>.unmodifiable(Map<String, String>.from(fields)),
+    clipStartMs: clipStartMs,
+    clipEndMs: clipEndMs,
+    stillFrameAtMs: stillFrameAtMs,
+    sentence: sentence,
+    mediaSource: mediaSource,
+    audioSource: audioSource,
+    cueSentence: cueSentence,
+    documentTitle: documentTitle,
+    audioStreamIndex: audioStreamIndex,
+    audioStreamCount: audioStreamCount,
+    source: source,
+    bookTitleTag: bookTitleTag,
+    collectionTag: collectionTag,
+    updateNoteId: updateNoteId,
+    sourceLink: sourceLink,
+    sourceLinkResolver: sourceLinkResolver,
+    sourceReviewMine: sourceReviewMine,
+    stillFallback: stillFallback,
+    providedCoverBytes: providedCoverBytes == null
+        ? null
+        : Uint8List.fromList(providedCoverBytes!),
+    providedCoverName: providedCoverName,
+    providedAudioBytes: providedAudioBytes == null
+        ? null
+        : Uint8List.fromList(providedAudioBytes!),
+    providedAudioName: providedAudioName,
+    requireAudio: requireAudio,
+    omitAudio: omitAudio,
+    omitCover: omitCover,
+    coverMosaic: List<MiningMosaicRegion>.unmodifiable(coverMosaic),
+    imageMode: imageMode,
+    animatedFormat: animatedFormat,
+    stillFormat: stillFormat,
+    clipFormat: clipFormat,
+    mediaSourceTlsPinSha256: mediaSourceTlsPinSha256,
+    // 与 [fields] 同理：入队前把头也冻成不可变副本，换集/关窗后队列里的卡仍用点击
+    // 那一刻的头（换集会让 client 的 httpHeaderFields 指向新一集的 hoster）。
+    mediaSourceHttpHeaders: Map<String, String>.unmodifiable(
+      mediaSourceHttpHeaders,
+    ),
+    mediaSourceRouteReady: mediaSourceRouteReady,
+    fieldsMediaReady: fieldsMediaReady,
+    remoteAudioClipper: remoteAudioClipper,
+    cachedMediaSnapshot: cachedMediaSnapshot,
+    mediaTimeOffsetMs: mediaTimeOffsetMs,
+    stageNote: stageNote,
+  );
+}
+
+/// 引擎产出。[outcome] 用 Object? 承 MineOutcome，避免此值对象文件依赖 anki_models 全量。
+class ImmersionMiningResult {
+  const ImmersionMiningResult({
+    required this.aborted,
+    this.outcome,
+    this.degradedToStill = false,
+    this.abortReason,
+  });
+
+  /// true = 因缺音频等前置条件中止，未调后端。
+  final bool aborted;
+
+  /// MineOutcome（成功路径）。
+  final Object? outcome;
+  final bool degradedToStill;
+
+  /// TODO-1303：仅在 [aborted] 时非空——中止的人类可读原因（缺音频 / 空壳卡）。远端
+  /// 制卡（浏览器扩展）据此把失败原因写进错误日志并随响应体回传，终结「制卡失败报成功
+  /// + 诊断黑洞」。null（成功路径）时无诊断。
+  final String? abortReason;
+}

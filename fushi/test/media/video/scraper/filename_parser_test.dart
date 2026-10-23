@@ -1,0 +1,665 @@
+/// 文件名解析层（[FilenameParser]）单元测试：全部使用真实世界命名样例。
+library;
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/media/media_extensions.dart';
+import 'package:fushi_engine/media/video/scraper/filename_parser.dart';
+import 'package:fushi_engine/media/video/scraper/scraper_types.dart';
+
+void main() {
+  group('中文字幕组命名（半角/全角括号）', () {
+    test('桜都字幕组：波浪号副标题 + 括号集数 + 语言标签', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[桜都字幕组] 无职转生～到了异世界就拿出真本事～ [11][1080p][简繁内封].mkv',
+      );
+      expect(p.releaseGroup, '桜都字幕组');
+      expect(p.title, '无职转生');
+      expect(p.secondaryTitle, '到了异世界就拿出真本事');
+      expect(p.episode, 11);
+      expect(p.season, isNull);
+      expect(p.resolution, '1080p');
+      expect(p.isMovieHint, isFalse);
+    });
+
+    test('幻樱字幕组：全括号命名（标题也在括号里）+ 全角括号', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '【幻樱字幕组】【4月新番】【夏日重现】【04】【GB_MP4】【1920X1080】.mp4',
+      );
+      expect(p.releaseGroup, '幻樱字幕组');
+      expect(p.title, '夏日重现');
+      expect(p.episode, 4);
+      expect(p.resolution, '1920X1080');
+    });
+
+    test('北宇治字幕组：第三季 + WebRip 来源块', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[北宇治字幕组] 摇曳露营 第三季 [08][WebRip][1080p][简繁内封].mkv',
+      );
+      expect(p.releaseGroup, '北宇治字幕组');
+      expect(p.title, '摇曳露营');
+      expect(p.season, 3);
+      expect(p.episode, 8);
+      expect(p.resolution, '1080p');
+    });
+  });
+
+  group('SubsPlease / ANi 命名', () {
+    test('SubsPlease：dash 集数 + 圆括号分辨率 + 校验码', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[SubsPlease] Sousou no Frieren - 28 (1080p) [A1B2C3D4].mkv',
+      );
+      expect(p.releaseGroup, 'SubsPlease');
+      expect(p.title, 'Sousou no Frieren');
+      expect(p.episode, 28);
+      expect(p.resolution, '1080p');
+      expect(p.year, isNull);
+    });
+
+    test('ANi：中文标题 + Baha/WEB-DL/编码/语言多块', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[ANi] 葬送的芙莉莲 - 28 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4',
+      );
+      expect(p.releaseGroup, 'ANi');
+      expect(p.title, '葬送的芙莉莲');
+      expect(p.episode, 28);
+      expect(p.resolution, '1080P');
+    });
+  });
+
+  group('VCB-Studio 多块命名', () {
+    test('VCB-Studio：Ma10p_1080p 混合块提取分辨率', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[VCB-Studio] Yuru Camp [01][Ma10p_1080p][x265_flac].mkv',
+      );
+      expect(p.releaseGroup, 'VCB-Studio');
+      expect(p.title, 'Yuru Camp');
+      expect(p.episode, 1);
+      expect(p.resolution, '1080p');
+    });
+
+    test('联合发布组（含 &）+ 标题带感叹号', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[Nekomoe kissaten&VCB-Studio] Bocchi the Rock! [08][Ma10p_1080p][x265_flac_aac].mkv',
+      );
+      expect(p.releaseGroup, 'Nekomoe kissaten&VCB-Studio');
+      expect(p.title, 'Bocchi the Rock!');
+      expect(p.episode, 8);
+      expect(p.resolution, '1080p');
+    });
+  });
+
+  group('点分隔西式命名', () {
+    test('S03E04 + 尾部噪音 token 截断', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        'Mushoku.Tensei.S03E04.1080p.WEB-DL.x265.mkv',
+      );
+      expect(p.title, 'Mushoku Tensei');
+      expect(p.season, 3);
+      expect(p.episode, 4);
+      expect(p.resolution, '1080p');
+    });
+
+    test('多词标题：End 一词不被误当噪音截断', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        'Frieren.Beyond.Journeys.End.S01E05.720p.BluRay.x264.mkv',
+      );
+      expect(p.title, 'Frieren Beyond Journeys End');
+      expect(p.season, 1);
+      expect(p.episode, 5);
+      expect(p.resolution, '720p');
+    });
+  });
+
+  group('第N话 / 第N季', () {
+    test('第26话', () {
+      final ParsedMediaName p = FilenameParser.parse('鬼灭之刃 第26话.mp4');
+      expect(p.title, '鬼灭之刃');
+      expect(p.episode, 26);
+      expect(p.season, isNull);
+    });
+
+    test('中文数字季 + 尾部裸集数', () {
+      final ParsedMediaName p = FilenameParser.parse('某科学的超电磁炮 第三季 04.mkv');
+      expect(p.title, '某科学的超电磁炮');
+      expect(p.season, 3);
+      expect(p.episode, 4);
+    });
+
+    test('阿拉伯数字季 + 繁体第N話', () {
+      final ParsedMediaName p = FilenameParser.parse('进击的巨人 第4季 第05話.mkv');
+      expect(p.title, '进击的巨人');
+      expect(p.season, 4);
+      expect(p.episode, 5);
+    });
+  });
+
+  group('罗马数字季度', () {
+    test('Unicode 罗马数字直接贴在标题后（目录名场景）', () {
+      final ParsedMediaName p = FilenameParser.parse('无职转生Ⅲ');
+      expect(p.title, '无职转生');
+      expect(p.season, 3);
+    });
+
+    test('ASCII 罗马数字独立结尾 token', () {
+      final ParsedMediaName p = FilenameParser.parse('Overlord IV - 03.mkv');
+      expect(p.title, 'Overlord');
+      expect(p.season, 4);
+      expect(p.episode, 3);
+    });
+
+    test('ASCII 罗马数字后的冒号副标题不吞掉季号', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[Erai-raws] Mushoku Tensei III: '
+        'Isekai Ittara Honki Dasu - 02 [1080p].mkv',
+      );
+      expect(p.title, 'Mushoku Tensei');
+      expect(p.secondaryTitle, 'Isekai Ittara Honki Dasu');
+      expect(p.season, 3);
+      expect(p.episode, 2);
+    });
+
+    test('普通冒号标题不被当成罗马数字季度分隔符', () {
+      final ParsedMediaName p = FilenameParser.parse('Re: Zero - 01.mkv');
+      expect(p.title, 'Re: Zero');
+      expect(p.season, isNull);
+      expect(p.episode, 1);
+    });
+
+    test('单字母 X 不被误认为罗马数字', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('Hunter X Hunter - 01.mkv');
+      expect(p.title, 'Hunter X Hunter');
+      expect(p.season, isNull);
+      expect(p.episode, 1);
+    });
+  });
+
+  group('结尾裸数字季号（BUG-1543）', () {
+    test('「标题 2 - 集号」= 第 2 季，不是标题的一部分', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        'Hibike! Euphonium 2 - 01 (BD 1280x720 x264 AAC).mkv',
+      );
+      expect(p.title, 'Hibike! Euphonium');
+      expect(p.season, 2);
+      expect(p.episode, 1);
+    });
+
+    test('同系列第 1 季（无季号）仍是 season null，两者据此分到不同组', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        'Hibike! Euphonium - 01 (BD 1280x720 x264 AACx3).mkv',
+      );
+      expect(p.title, 'Hibike! Euphonium');
+      expect(p.season, isNull);
+      expect(p.episode, 1);
+    });
+
+    test('第 3 季同理', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('Hibike! Euphonium 3 - 05.mkv');
+      expect(p.title, 'Hibike! Euphonium');
+      expect(p.season, 3);
+      expect(p.episode, 5);
+    });
+
+    test('含感叹号的标题（K-ON!!）不受影响', () {
+      final ParsedMediaName p = FilenameParser.parse('[Group] K-ON!! - 03.mkv');
+      expect(p.title, 'K-ON!!');
+      expect(p.season, isNull);
+      expect(p.episode, 3);
+    });
+
+    test('标题自带 3 位数字（Mob Psycho 100）不被当季号', () {
+      final ParsedMediaName p = FilenameParser.parse('Mob Psycho 100 - 04.mkv');
+      expect(p.title, 'Mob Psycho 100');
+      expect(p.season, isNull);
+      expect(p.episode, 4);
+    });
+
+    test('标题自带 00（Gundam 00）不被当季号', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('Mobile Suit Gundam 00 - 12.mkv');
+      expect(p.title, 'Mobile Suit Gundam 00');
+      expect(p.season, isNull);
+      expect(p.episode, 12);
+    });
+
+    test('数字左边不是空白（Ranma 1/2）不被当季号', () {
+      final ParsedMediaName p = FilenameParser.parse('Ranma 1/2 - 07.mkv');
+      expect(p.season, isNull);
+      expect(p.episode, 7);
+    });
+
+    test('电影续作（无集号）保留数字在片名里，不当季号', () {
+      final ParsedMediaName p = FilenameParser.parse('Ip Man 2.mkv');
+      expect(p.title, 'Ip Man 2');
+      expect(p.season, isNull);
+      expect(p.episode, isNull);
+    });
+
+    test('takeTrailingNumericSeason：纯数字名不算季号', () {
+      expect(FilenameParser.takeTrailingNumericSeason('2'), isNull);
+      expect(FilenameParser.takeTrailingNumericSeason('Show 2')?.season, 2);
+      expect(FilenameParser.takeTrailingNumericSeason('Show 2')?.title, 'Show');
+    });
+  });
+
+  group('S01E04 普通命名', () {
+    test('空格分隔的 SxxExx', () {
+      final ParsedMediaName p = FilenameParser.parse('Spy x Family S01E04.mkv');
+      expect(p.title, 'Spy x Family');
+      expect(p.season, 1);
+      expect(p.episode, 4);
+    });
+
+    test('独立 S2 token', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[LoliHouse] Mushoku Tensei S2 - 12 [WebRip 1080p HEVC-10bit AAC].mkv',
+      );
+      expect(p.releaseGroup, 'LoliHouse');
+      expect(p.title, 'Mushoku Tensei');
+      expect(p.season, 2);
+      expect(p.episode, 12);
+      expect(p.resolution, '1080p');
+    });
+  });
+
+  group('电影提示', () {
+    test('剧场版 + 圆括号年份', () {
+      final ParsedMediaName p = FilenameParser.parse('紫罗兰永恒花园 剧场版 (2019).mkv');
+      expect(p.title, '紫罗兰永恒花园');
+      expect(p.isMovieHint, isTrue);
+      expect(p.year, 2019);
+    });
+
+    test('英文 Movie 关键词 + 标题尾数字 0 不被误当集数', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[SubsPlease] Jujutsu Kaisen 0 Movie (1080p) [1B2C3D4E].mkv',
+      );
+      expect(p.title, 'Jujutsu Kaisen 0');
+      expect(p.isMovieHint, isTrue);
+      expect(p.resolution, '1080p');
+      expect(p.episode, isNull);
+    });
+
+    test('dash 副标题 + 剧场版', () {
+      final ParsedMediaName p = FilenameParser.parse('魔法少女小圆 - 叛逆的物语 剧场版.mkv');
+      expect(p.title, '魔法少女小圆');
+      expect(p.secondaryTitle, '叛逆的物语');
+      expect(p.isMovieHint, isTrue);
+    });
+  });
+
+  group('纯日期/设备命名返回空标题', () {
+    test('VID_ 设备前缀', () {
+      final ParsedMediaName p = FilenameParser.parse('VID_20260701.mp4');
+      expect(p.title, isEmpty);
+    });
+
+    test('OBS 式日期时间命名', () {
+      final ParsedMediaName p = FilenameParser.parse('2026-07-01 21-03-55.mkv');
+      expect(p.title, isEmpty);
+      expect(p.episode, isNull);
+    });
+
+    test('IMG_ 设备前缀（.mov 扩展名）', () {
+      final ParsedMediaName p = FilenameParser.parse('IMG_0231.mov');
+      expect(p.title, isEmpty);
+    });
+  });
+
+  group('candidatesForPath：目录名优先与坏目录名跳过', () {
+    test('Windows 路径：目录名（含罗马数字季度）优先，文件名只有集数', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\Videos\无职转生Ⅲ\[Sakurato] 04.mkv',
+      );
+      expect(c, hasLength(2));
+      expect(c[0].title, '无职转生');
+      expect(c[0].season, 3);
+      // 文件名标题为空但集数保留，供上层做一致性校验。
+      expect(c[1].title, isEmpty);
+      expect(c[1].episode, 4);
+      expect(c[1].releaseGroup, 'Sakurato');
+    });
+
+    test('目录候选在前、文件候选在后', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\Anime\葬送的芙莉莲\[ANi] 葬送的芙莉莲 - 28 [1080P][WEB-DL].mp4',
+      );
+      expect(c, hasLength(2));
+      expect(c[0].title, '葬送的芙莉莲');
+      expect(c[0].episode, isNull);
+      expect(c[1].title, '葬送的芙莉莲');
+      expect(c[1].episode, 28);
+    });
+
+    test('Downloads 目录被跳过', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'C:\Users\wrds\Downloads\[ANi] 葬送的芙莉莲 - 28 [1080P].mp4',
+      );
+      expect(c, hasLength(1));
+      expect(c[0].title, '葬送的芙莉莲');
+      expect(c[0].episode, 28);
+    });
+
+    test('新建文件夹被跳过', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\新建文件夹\Mushoku.Tensei.S03E04.mkv',
+      );
+      expect(c, hasLength(1));
+      expect(c[0].title, 'Mushoku Tensei');
+      expect(c[0].season, 3);
+    });
+
+    test('盘符根目录被跳过', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\[SubsPlease] Frieren - 01 (1080p).mkv',
+      );
+      expect(c, hasLength(1));
+      expect(c[0].title, 'Frieren');
+    });
+
+    test('单字母目录被跳过', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\V\鬼灭之刃 第26话.mp4',
+      );
+      expect(c, hasLength(1));
+      expect(c[0].title, '鬼灭之刃');
+    });
+
+    test('Unix 正斜杠路径：中文目录名带第二季', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        '/home/user/Videos/摇曳露营 第二季/[VCB-Studio] Yuru Camp [05][Ma10p_1080p][x265_flac].mkv',
+      );
+      expect(c, hasLength(2));
+      expect(c[0].title, '摇曳露营');
+      expect(c[0].season, 2);
+      expect(c[1].title, 'Yuru Camp');
+      expect(c[1].episode, 5);
+    });
+
+    test('纯日期目录 + 设备命名文件：无任何可用候选', () {
+      final List<ParsedMediaName> c = FilenameParser.candidatesForPath(
+        r'D:\2026-07-01\VID_20260701.mp4',
+      );
+      expect(c, isEmpty);
+    });
+  });
+
+  group('杂项边界', () {
+    test('括号集数带 END 尾巴', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('[组名] 石纪元 [24 END][1080p].mkv');
+      expect(p.title, '石纪元');
+      expect(p.episode, 24);
+    });
+
+    test('2nd Season 序数词季度', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[SubsPlease] Oshi no Ko 2nd Season - 05 (720p).mkv',
+      );
+      expect(p.title, 'Oshi no Ko');
+      expect(p.season, 2);
+      expect(p.episode, 5);
+      expect(p.resolution, '720p');
+    });
+
+    test('Part 2 季度', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('Spice and Wolf Part.2 - 01.mkv');
+      expect(p.title, 'Spice and Wolf');
+      expect(p.season, 2);
+      expect(p.episode, 1);
+    });
+  });
+
+  group('自导入端引擎并入的规则（G10 第二步）', () {
+    test('无「第」的 N話/N集 简写', () {
+      final ParsedMediaName ja = FilenameParser.parse('Show 12話.mkv');
+      expect(ja.title, 'Show');
+      expect(ja.episode, 12);
+      final ParsedMediaName zh = FilenameParser.parse('某番 08集.mp4');
+      expect(zh.title, '某番');
+      expect(zh.episode, 8);
+    });
+
+    test('EP 与数字间可有空格（Ep 3）', () {
+      final ParsedMediaName p = FilenameParser.parse('Show Ep 3.mkv');
+      expect(p.title, 'Show');
+      expect(p.episode, 3);
+    });
+
+    test('第N巻 卷号当集数（OVA/光盘）', () {
+      expect(FilenameParser.parse('OVA 第2巻.mkv').episode, 2);
+      expect(FilenameParser.parse('[组名] 某作品 [第3巻].mkv').episode, 3);
+    });
+
+    test('年份连写不受 N話 简写误伤', () {
+      // `2016年12話数` 这类连写：`年` 不是分隔边界，不得把 12 当集数。
+      final ParsedMediaName p = FilenameParser.parse('某番 2016年12話数解说.mkv');
+      expect(p.episode, isNull);
+    });
+  });
+
+  group('季 + 集写在同一个括号块里（BUG-2146）', () {
+    test('用户实测文件名：[4th - 14] 解出第 4 季第 14 集，不再抛不出集号', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[晚街与灯][Re Zero kara Hajimeru Isekai Seikatsu][4th - 14][总第80]'
+        '[WebRip][1080P_AVC_AAC][简日双语内嵌].mp4',
+      );
+      expect(p.title, 'Re Zero kara Hajimeru Isekai Seikatsu');
+      expect(p.season, 4, reason: '裸序数词 4th 是季标记，落进 Season 01 就归错目录');
+      expect(p.episode, 14);
+      expect(p.releaseGroup, '晚街与灯');
+      expect(p.resolution, '1080P');
+    });
+
+    test('括号外已有标题时，块里的季+集照样解得出（旧实现根本不看这些块）', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('[Group] Show Name [S4 - 14][1080P].mp4');
+      expect(p.title, 'Show Name');
+      expect(p.season, 4);
+      expect(p.episode, 14);
+    });
+
+    test('[4th Season - 14] / [第4季 - 14] 同族一起解', () {
+      final ParsedMediaName a =
+          FilenameParser.parse('[Group] Show [4th Season - 14][1080P].mp4');
+      expect(a.season, 4);
+      expect(a.episode, 14);
+
+      final ParsedMediaName b =
+          FilenameParser.parse('[Group] Show [第4季 - 14][1080P].mp4');
+      expect(b.season, 4);
+      expect(b.episode, 14);
+    });
+
+    test('[总第80] 这类绝对集号不参与解析，两种块顺序都不得抢走集号', () {
+      // 顺序敏感是真实风险：绝对集号写在季集块**之前**在真实命名里完全正常，
+      // 只测一种顺序会让「不污染」变成空壳断言（它其实只是被前面的块先占了）。
+      for (final String name in <String>[
+        '[Group][Show][4th - 14][总第80][1080P].mp4',
+        '[Group][Show][总第80][4th - 14][1080P].mp4',
+        '[Group][Show][总第 80][4th - 14][1080P].mp4',
+      ]) {
+        final ParsedMediaName p = FilenameParser.parse(name);
+        expect(p.episode, 14, reason: '$name：80 是绝对集号，抢走 episode 会把整季归错');
+        expect(p.season, 4, reason: name);
+      }
+    });
+
+    test('多个未识别块时标题仍取第一个非空候选，不被后面的块顶掉', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[Group][Real Title][4th - 14][Some Note][1080P].mp4',
+      );
+      expect(p.title, 'Real Title');
+      expect(p.episode, 14);
+    });
+  });
+
+  // 块判据的安全性全靠「整块锚定 + 季标记必需」。把括号外那套位置启发式
+  // （尾部裸数字季号、` - ` 副标题分割、尾部裸集数、电影 token）搬进块里，下面
+  // 每一条都会解错——它们是 BUG-2146 第一版修法的实测回归，逐条钉死。
+  group('未识别括号块不得被当作自由文本解析（BUG-2146 负样本）', () {
+    test('[Disc 2] / [Reseed 2] / [Special 3] 不是季号', () {
+      const Map<String, String> cases = <String, String>{
+        '[VCB-Studio] Yuru Camp - 05 [Disc 2][Ma10p_1080p][x265_flac].mkv':
+            'Yuru Camp',
+        '[VCB-Studio] Yuru Camp - 05 [Reseed 2][Ma10p_1080p][x265_flac].mkv':
+            'Yuru Camp',
+        '[Nekomoe kissaten] Bocchi the Rock! - 05 [Special 3][1080p][JPSC].mp4':
+            'Bocchi the Rock!',
+        '[Group] Show - 05 [Repack 2][1080p].mkv': 'Show',
+      };
+      cases.forEach((String name, String title) {
+        final ParsedMediaName p = FilenameParser.parse(name);
+        expect(p.season, isNull, reason: '$name：块尾的 2/3 是碟号/重发号，不是季号');
+        expect(p.episode, 5, reason: name);
+        expect(p.title, title, reason: name);
+      });
+    });
+
+    test('字幕组招募块 / 索引站标签不得变成副标题', () {
+      final ParsedMediaName a = FilenameParser.parse(
+        '[幻樱字幕组] 间谍过家家 - 05 [招募新人 - 详情见置顶][1080P][简体].mp4',
+      );
+      expect(a.secondaryTitle, isNull, reason: '副标题会被当作并列标题参与资源贴合度判据');
+      expect(a.episode, 5);
+
+      final ParsedMediaName b = FilenameParser.parse(
+        '[Erai-raws] Frieren - 05 [1080p][Nyaa - Torrent][Multiple Subtitle].mkv',
+      );
+      expect(b.secondaryTitle, isNull);
+      expect(b.episode, 5);
+
+      final ParsedMediaName c = FilenameParser.parse(
+        '[Group] Show - 05 [~Director Cut~][1080p].mkv',
+      );
+      expect(c.secondaryTitle, isNull);
+      expect(c.episode, 5);
+    });
+
+    test('整季合集包不得被解成末集', () {
+      for (final String name in <String>[
+        '[桜都字幕组] 摇曳露营△ [第01-12话][1080p][简繁内封].mkv',
+        '[北宇治字幕组] 孤独摇滚 [01-12话][WebRip][1080p][简繁内封].mkv',
+        '[桜都字幕组] 作品名 [全 12 话][1080p][简体内嵌].mkv',
+        '【某某字幕组】【作品名】【TV 01 - 25 END】【1080P】.mp4',
+        '[Group] Title [01 - 12] [1080p].mkv',
+      ]) {
+        expect(FilenameParser.parse(name).episode, isNull, reason: name);
+      }
+    });
+
+    test('块里的 Movie/剧场版 token 判定面不变（`TV-Movie` 不算电影提示）', () {
+      final ParsedMediaName p = FilenameParser.parse(
+        '[LoliHouse] Mushoku Tensei - 05 [TV-Movie]'
+        '[WebRip 1080p HEVC-10bit AAC].mkv',
+      );
+      expect(p.isMovieHint, isFalse, reason: '这是画质/来源标记里的 Movie，不是剧场版');
+      expect(p.episode, 5);
+    });
+
+    test('块顺序不得改变解析结果', () {
+      final ParsedMediaName a =
+          FilenameParser.parse('[Group] Show [Fix 2] [S1] - 05 [1080p].mkv');
+      final ParsedMediaName b =
+          FilenameParser.parse('[Group] Show [S1] [Fix 2] - 05 [1080p].mkv');
+      expect(a.season, b.season, reason: '同一批块换顺序解出不同季号 = 行为不确定');
+      expect(a.episode, b.episode);
+    });
+  });
+
+  group('扩展名剥离与导入共用 kVideoExtensions（G10 第一步）', () {
+    test('导入认的每个扩展名刮削端都能剥掉（.rmvb 不再留在标题里）', () {
+      for (final String ext in kVideoExtensions) {
+        final ParsedMediaName p = FilenameParser.parse('孤独のグルメ$ext');
+        expect(p.title, '孤独のグルメ', reason: '$ext 是可导入的视频扩展名，刮削剥不掉会拉低搜索相似度');
+      }
+    });
+
+    test('扩展名大小写不敏感', () {
+      expect(FilenameParser.parse('タイトル.MKV').title, 'タイトル');
+      expect(FilenameParser.parse('タイトル.Rmvb').title, 'タイトル');
+    });
+  });
+
+  // BUG-3192：带年份的作品目录名。括号年份走块分类；不带括号的裸年份
+  // （scene 命名 `Title.2023.1080p` / `Title 2023`）此前原样留在标题里，
+  // 严格标题门对不上，回落标题匹配整条查无。
+  group('带年份的目录名（BUG-3192）', () {
+    const Map<String, (String, int)> cases = <String, (String, int)>{
+      '葬送のフリーレン (2023)': ('葬送のフリーレン', 2023),
+      '葬送のフリーレン（2023）': ('葬送のフリーレン', 2023),
+      '葬送のフリーレン [2023]': ('葬送のフリーレン', 2023),
+      '[2023] 葬送のフリーレン': ('葬送のフリーレン', 2023),
+      '【2023】葬送のフリーレン': ('葬送のフリーレン', 2023),
+      'Sousou no Frieren (2023) [1080p]': ('Sousou no Frieren', 2023),
+      'Sousou.no.Frieren.2023.1080p.WEB-DL.x265': ('Sousou no Frieren', 2023),
+      'Sousou no Frieren 2023': ('Sousou no Frieren', 2023),
+      'Sousou_no_Frieren_2023': ('Sousou no Frieren', 2023),
+      'Frieren.2023': ('Frieren', 2023),
+      'DEATH NOTE (2006)': ('DEATH NOTE', 2006),
+      'FX戦士くるみちゃん (2026)': ('FX戦士くるみちゃん', 2026),
+    };
+    for (final MapEntry<String, (String, int)> e in cases.entries) {
+      test('「${e.key}」年份进 year、不混进标题', () {
+        final ParsedMediaName p = FilenameParser.parse(e.key);
+        expect(p.title, e.value.$1);
+        expect(p.year, e.value.$2);
+      });
+    }
+
+    test('裸年份 + 集号：两者都解出', () {
+      final ParsedMediaName p =
+          FilenameParser.parse('Sousou no Frieren 2023 - 03 [1080p].mkv');
+      expect(p.title, 'Sousou no Frieren');
+      expect(p.year, 2023);
+      expect(p.episode, 3);
+    });
+
+    test('括号年份优先于标题尾部数字', () {
+      final ParsedMediaName p = FilenameParser.parse('Godzilla 2000 (1999)');
+      expect(p.year, 1999);
+      expect(p.title, 'Godzilla 2000');
+    });
+
+    test('片名本身的数字不当年份', () {
+      // 晚于明年：片名的一部分。
+      expect(
+          FilenameParser.parse('Blade Runner 2049').title, 'Blade Runner 2049');
+      expect(FilenameParser.parse('Blade Runner 2049').year, isNull);
+      // 纯年份片名：左边没有标题文字。
+      expect(FilenameParser.parse('2012').year, isNull);
+      // 三位数 / 非 19xx-20xx：不动。
+      expect(FilenameParser.parse('Mob Psycho 100').title, 'Mob Psycho 100');
+      expect(FilenameParser.parse('Gundam 0083').title, 'Gundam 0083');
+    });
+
+    // BUG-3266：裸年份与「片名以年份结尾」语法上分不开，剥了就留一份完整标题。
+    test('剥了裸年份时保留带年份的完整标题', () {
+      final ParsedMediaName death = FilenameParser.parse('Death Race 2000.mkv');
+      expect(death.title, 'Death Race');
+      expect(death.year, 2000);
+      expect(death.titleWithTrailingYear, 'Death Race 2000');
+      final ParsedMediaName scene = FilenameParser.parse(
+        'Sousou.no.Frieren.2023.1080p.WEB-DL.x265',
+      );
+      expect(scene.titleWithTrailingYear, 'Sousou no Frieren 2023');
+      final ParsedMediaName withEp = FilenameParser.parse(
+        'Sousou no Frieren 2023 - 03 [1080p].mkv',
+      );
+      expect(withEp.titleWithTrailingYear, 'Sousou no Frieren 2023');
+      expect(withEp.episode, 3);
+      // 括号年份 / 没有裸年份：没有第二份标题。
+      expect(
+        FilenameParser.parse('Godzilla 2000 (1999)').titleWithTrailingYear,
+        isNull,
+      );
+      expect(
+        FilenameParser.parse('Blade Runner 2049').titleWithTrailingYear,
+        isNull,
+      );
+      expect(FilenameParser.parse('Frieren').titleWithTrailingYear, isNull);
+    });
+  });
+}

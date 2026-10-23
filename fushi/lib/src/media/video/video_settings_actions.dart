@@ -1,0 +1,1108 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/utils/components/fushi_dialog_color_picker.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:path/path.dart' as p;
+
+import 'package:fushi/src/media/video/video_asbplayer_config.dart';
+import 'package:fushi/src/media/video/video_control_customization.dart';
+import 'package:fushi/src/media/video/video_custom_action_bindings.dart';
+import 'package:fushi/src/media/video/video_control_layout_editor.dart';
+import 'package:fushi/src/media/video/video_danmaku_model.dart';
+import 'package:fushi/src/media/video/video_immersive_mode.dart';
+import 'package:fushi/src/media/video/video_hdr_output.dart';
+import 'package:fushi/src/media/video/video_lua_script_manager.dart';
+import 'package:fushi/src/media/video/video_mpv_config.dart';
+import 'package:fushi/src/media/video/video_quick_settings_host.dart';
+import 'package:fushi/src/media/video/video_shader_manager.dart';
+import 'package:fushi/src/media/video/video_shader_tier.dart';
+import 'package:fushi/src/media/video/video_subtitle_obscure_mode.dart';
+import 'package:fushi/src/media/video/video_subtitle_style.dart';
+import 'package:fushi/src/media/video/video_subtitle_sync_row.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/video_shader_dialog.dart';
+import 'package:fushi/src/settings/settings_context.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_engine/media/video/metadata/anidb_udp_file_client.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_languages.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_scrape_config.dart';
+
+/// 视频 schema 项的双路写穿层（阶段 B）：同一条 item 声明服务两个宿主——
+/// 全局设置页（`SettingsContext.video == null`，直接读写 appModel 纯 pref、下次
+/// 播放生效）与播放页快捷面板（挂 [VideoQuickSettingsHost]，经页面回调持久化 +
+/// 实时应用到活播放器）。host 分支复刻旧手写面板逐项行为；pref 分支与旧首页
+/// 行为一致。控制器绑定行的 builder 也集中在本文件，settings/ 不引入播放器依赖。
+VideoQuickSettingsHost? videoQuickSettingsHostOf(SettingsContext context) {
+  final Object? host = context.video;
+  return host is VideoQuickSettingsHost ? host : null;
+}
+
+/// 播放中才可见的行的统一门控。
+bool videoHostVisible(SettingsContext context) =>
+    videoQuickSettingsHostOf(context) != null;
+
+/// 刮削运行期偏好（AniDB 客户端身份 / TMDB key / 刮削语言）的统一写穿：落
+/// prefsRepo 后重建下载流水线的刮削快照，下一次刮削即用新值。视频·媒体库
+/// （刮削语言）与在线服务（AniDB / TMDB 凭据）两个分区共用。
+Future<void> commitVideoMetadataRuntimePreference(
+  SettingsContext settingsContext,
+  String key,
+  String value, {
+  bool trimValue = true,
+}) async {
+  await settingsContext.appModel.prefsRepo.setPref(
+    key,
+    trimValue ? value.trim() : value,
+  );
+  await settingsContext.appModel.reloadVideoDownloadPipelineRuntime();
+}
+
+/// 「测试 AniDB 登录」：用当前偏好装出的 UDP 配置发一次 AUTH 后立即 LOGOUT，
+/// 不算任何文件哈希。刮削报告里的每文件提示是唯一能看出登录是否成功的地方，
+/// 用户填完账号没法确认（BUG-2581）；这里把结果直接弹在设置页。
+/// 与扫描批次共用同一固定本地端口与限流簿记：若同一时刻正有刮削在线，
+/// 绑端口失败会按「UDP 连接失败」报出，等刮削结束再测即可。
+Future<void> testAniDbLogin(SettingsContext settingsContext) async {
+  try {
+    final ({bool ok, String message}) result = await verifyAniDbLogin(
+      settingsContext.appModel.prefsRepo,
+      onStart: () => _showVideoSettingsSnackBar(
+        settingsContext,
+        t.video_anidb_login_test_running,
+      ),
+    );
+    _showVideoSettingsSnackBar(settingsContext, result.message);
+  } on ArgumentError catch (error) {
+    _showVideoSettingsSnackBar(settingsContext, '${error.message}');
+  }
+}
+
+/// 组配置 → 校验凭据齐全 → [AnidbUdpFileClient.verifyLogin] → close。设置页按钮与
+/// CLI 共用。凭据不全抛 [ArgumentError]（message = 界面同款提示）；登录失败返回
+/// `ok=false` + 失败原因文案。[onStart] 在凭据校验通过、开始联网前调用。
+Future<({bool ok, String message})> verifyAniDbLogin(
+  PreferencesRepository prefs, {
+  void Function()? onStart,
+}) async {
+  final VideoSourceScrapeGlobalConfig config =
+      VideoSourceScrapeGlobalConfig.fromPreferences(
+    prefs,
+    resolvedTmdbApiKey: '',
+    // 只查凭据是否配齐，不拉资料；界面语言与登录无关。
+    uiLocaleTag: kFallbackVideoMetadataLocale,
+  );
+  final AnidbUdpConfig udp = config.anidbUdpConfig;
+  if (!udp.isAvailable) {
+    throw ArgumentError(t.video_anidb_login_test_incomplete);
+  }
+  onStart?.call();
+  final AnidbUdpFileClient client = AnidbUdpFileClient(config: udp);
+  try {
+    await client.verifyLogin();
+    return (
+      ok: true,
+      message: client.clientUpdateAvailable
+          ? t.video_anidb_login_test_client_update(client: udp.clientName)
+          : t.video_anidb_login_test_success(
+              client: udp.clientName,
+              version: udp.clientVersion,
+            ),
+    );
+  } on AnidbUdpException catch (error) {
+    return (ok: false, message: aniDbLoginFailureMessage(error));
+  } finally {
+    await client.close();
+  }
+}
+
+/// UDP 失败原因 → 设置页文案；与刮削报告里 `_hashFailureReason` 的分组一致。
+String aniDbLoginFailureMessage(AnidbUdpException error) =>
+    switch (error.reason) {
+      AnidbUdpFailure.authentication => t.video_anidb_login_test_failed_auth,
+      AnidbUdpFailure.unavailable ||
+      AnidbUdpFailure.clientOutdated ||
+      AnidbUdpFailure.clientBanned =>
+        t.video_anidb_login_test_failed_client,
+      AnidbUdpFailure.network ||
+      AnidbUdpFailure.timeout =>
+        t.video_anidb_login_test_failed_network,
+      AnidbUdpFailure.backoff => t.video_anidb_login_test_failed_backoff,
+      AnidbUdpFailure.banned ||
+      AnidbUdpFailure.maintenance =>
+        t.video_anidb_login_test_failed_blocked,
+      _ => t.video_anidb_login_test_failed_other(
+          reason: error.code == null
+              ? error.reason.name
+              : '${error.reason.name} ${error.code}',
+        ),
+    };
+
+void _showVideoSettingsSnackBar(SettingsContext settingsContext, String text) {
+  final BuildContext ctx = settingsContext.context;
+  if (!ctx.mounted) return;
+  ScaffoldMessenger.of(ctx)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(FushiSnackBar(content: Text(text)));
+}
+
+// ── videoAsbplayerConfig（手势/播放行为 JSON pref）────────────────────────────
+
+VideoAsbplayerConfig currentVideoAsbConfig(SettingsContext context) {
+  return VideoAsbplayerConfig.decode(context.appModel.videoAsbplayerConfig);
+}
+
+/// 读改写 videoAsbplayerConfig：host 在场走页面回调（持久化 + 即时应用手势配置），
+/// 否则直接落 pref（下次播放生效）。
+Future<void> commitVideoAsbConfig(
+  SettingsContext context,
+  VideoAsbplayerConfig Function(VideoAsbplayerConfig config) mutate,
+) async {
+  final VideoAsbplayerConfig next = mutate(currentVideoAsbConfig(context));
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onAsbConfigChanged(next);
+  } else {
+    await context.appModel.setVideoAsbplayerConfig(
+      VideoAsbplayerConfig.encode(next),
+    );
+  }
+  context.refresh();
+}
+
+// ── videoMpvConfig ────────────────────────────────────────────────────────────
+
+VideoMpvConfig currentVideoMpvConfig(SettingsContext context) {
+  return VideoMpvConfig.decode(context.appModel.videoMpvConfig);
+}
+
+/// 读改写 videoMpvConfig：host 在场走页面回调（持久化 + applyMpvConfig 实时应用，
+/// 与旧面板「即改即生效」一致），否则直接落 pref。
+Future<void> commitVideoMpvConfig(
+  SettingsContext context,
+  VideoMpvConfig Function(VideoMpvConfig config) mutate,
+) async {
+  final VideoMpvConfig next = mutate(currentVideoMpvConfig(context));
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onMpvConfigChanged(next);
+  } else {
+    await context.appModel.setVideoMpvConfig(VideoMpvConfig.encode(next));
+  }
+  context.refresh();
+}
+
+// ── videoSubtitleStyle（字幕外观，播放中带实时预览）──────────────────────────
+
+/// 当前生效字幕样式：播放中取页面权威值（含拖动中的预览态），否则读 pref。
+VideoSubtitleStyle currentVideoSubtitleStyle(SettingsContext context) {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) return host.subtitleStyle();
+  return VideoSubtitleStyle.decode(context.appModel.videoSubtitleStyle);
+}
+
+/// 字幕字重/阴影 resolve 用的 UI scale：视频路由把 [FushiAppUiScale] 中和为 1.0，
+/// 播放中必须用 host 显式带入的实际 scale；全局设置页用 appModel 值。
+double videoSubtitleUiScale(SettingsContext context) {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  return host?.uiScale ?? context.appModel.appUiScale;
+}
+
+/// 拖动中的实时预览（不落盘）：播放中发给页面 overlay；同时写进
+/// [videoSubtitleStyleDraft]，让设置里的字幕样式预览（`SubtitleStylePreview`）
+/// 跟着拖动实时变化——全局设置页没有 overlay，那块预览是唯一的即时反馈。
+void previewVideoSubtitleStyle(
+  SettingsContext context,
+  VideoSubtitleStyle Function(VideoSubtitleStyle style) mutate,
+) {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  // 播放中以页面权威值为基（与旧行为一致）；全局设置页叠在上一次拖动预览上。
+  final VideoSubtitleStyle next = mutate(host?.subtitleStyle() ??
+      videoSubtitleStyleDraft.value ??
+      currentVideoSubtitleStyle(context));
+  videoSubtitleStyleDraft.value = next;
+  if (host == null) return;
+  host.onSubtitleStylePreview(next);
+  context.refresh();
+}
+
+/// 定稿落盘：host 在场先同步页面预览态再 commit（复刻旧面板 `_applySubtitleStyle`
+/// 语义，重置/无背景等离散动作也即时刷新 overlay），否则直接落 pref。
+Future<void> commitVideoSubtitleStyle(
+  SettingsContext context,
+  VideoSubtitleStyle Function(VideoSubtitleStyle style) mutate,
+) async {
+  final VideoSubtitleStyle next = mutate(currentVideoSubtitleStyle(context));
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    host.onSubtitleStylePreview(next);
+    await host.onSubtitleStyleCommit(next);
+  } else {
+    await context.appModel.setVideoSubtitleStyle(
+      VideoSubtitleStyle.encode(next),
+    );
+  }
+  // 已落盘：预览回到读偏好（与 next 相同），拖动预览态作废。
+  videoSubtitleStyleDraft.value = null;
+  context.refresh();
+}
+
+// ── 弹幕 ─────────────────────────────────────────────────────────────────────
+
+VideoDanmakuStyle currentVideoDanmakuStyle(SettingsContext context) {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  return host?.danmakuStyle() ?? context.appModel.videoDanmakuStyle;
+}
+
+void previewVideoDanmakuStyle(
+  SettingsContext context,
+  VideoDanmakuStyle Function(VideoDanmakuStyle style) mutate,
+) {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host == null) return;
+  host.onDanmakuStylePreview?.call(mutate(host.danmakuStyle()).normalized());
+  context.refresh();
+}
+
+Future<void> commitVideoDanmakuStyle(
+  SettingsContext context,
+  VideoDanmakuStyle Function(VideoDanmakuStyle style) mutate,
+) async {
+  final VideoDanmakuStyle next =
+      mutate(currentVideoDanmakuStyle(context)).normalized();
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onDanmakuStyleCommit != null) {
+    await host!.onDanmakuStyleCommit!(next);
+  } else {
+    await context.appModel.setVideoDanmakuStyle(next);
+  }
+  context.refresh();
+}
+
+Future<void> setVideoDanmakuEnabledDual(
+  SettingsContext context,
+  bool value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  // host 在场时**也要把 pref 写穿**：`video.danmaku.online` 与
+  // `video.danmaku.max_active` 的 `visible` 门读的是 pref
+  // （`appModel.videoDanmakuEnabled`），只通知 host 的话，用户在播放页里打开弹幕后
+  // 那两项永远不出现——门控读的值从来没被写过。host 回调只负责让当前播放页即时
+  // 生效（重载/清空弹幕层），与持久化不是二选一。
+  if (host?.onDanmakuEnabledChanged != null) {
+    await host!.onDanmakuEnabledChanged!(value);
+  }
+  await context.appModel.setVideoDanmakuEnabled(value);
+  // 门控依赖的值变了，得让 schema 重算 visible。
+  context.refresh();
+}
+
+Future<void> setVideoDanmakuOnlineEnabledDual(
+  SettingsContext context,
+  bool value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onDanmakuOnlineEnabledChanged != null) {
+    await host!.onDanmakuOnlineEnabledChanged!(value);
+  } else {
+    await context.appModel.setVideoDanmakuOnlineEnabled(value);
+  }
+}
+
+Future<void> setVideoDanmakuMaxActiveDual(
+  SettingsContext context,
+  int value,
+) async {
+  final int next = normalizeVideoDanmakuMaxActive(value);
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onDanmakuMaxActiveChanged != null) {
+    await host!.onDanmakuMaxActiveChanged!(next);
+  } else {
+    await context.appModel.setVideoDanmakuMaxActive(next);
+  }
+}
+
+// ── 遮蔽 / 画面 / 沉浸 / 窗口 / 控件（单值 pref 的双路写穿）──────────────────
+
+/// 遮蔽模式两个 setter 刻意不做全局广播（见
+/// [PreferencesRepository.setVideoSubtitleObscureMode]：那是播放中的高频快捷键路径，
+/// 广播会重建整个 app）。host 在场 = 视频页自己 setState 刷新，够了；host 缺席 = 从
+/// **全局设置页**改的（视频页可能仍在路由栈下方挂着），这条低频路径显式补一次全局广播，
+/// 保持「改完返回视频页字幕即新模式」的既有行为不回归。
+Future<void> setVideoSubtitleObscureModeDual(
+  SettingsContext context,
+  VideoSubtitleObscureMode mode,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onSetSubtitleObscureMode(mode);
+  } else {
+    await context.appModel.setVideoSubtitleObscureMode(mode);
+    context.appModel.notifyPreferencesChanged();
+  }
+}
+
+/// 同构于 [setVideoSubtitleObscureModeDual]（含 host 缺席时的显式全局广播）。
+Future<void> setVideoSecondarySubtitleObscureModeDual(
+  SettingsContext context,
+  VideoSubtitleObscureMode mode,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onSetSecondarySubtitleObscureMode(mode);
+  } else {
+    await context.appModel.setVideoSecondarySubtitleObscureMode(mode);
+    context.appModel.notifyPreferencesChanged();
+  }
+}
+
+/// 遮蔽态「悬停 / 点击临时显形」总闸的双通道写入（同构于
+/// [setVideoRespectAssStyleDual]）：播放中经 host 落盘 + 重建 overlay，全局设置页
+/// 直接写 [AppModel]（其 setter 照常广播，无需显式补 notify）。
+Future<void> setVideoSubtitleObscureRevealDual(
+  SettingsContext context,
+  bool value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onSubtitleObscureRevealChanged != null) {
+    await host!.onSubtitleObscureRevealChanged!(value);
+  } else {
+    await context.appModel.setVideoSubtitleObscureReveal(value);
+  }
+}
+
+Future<void> setVideoRespectAssStyleDual(
+  SettingsContext context,
+  bool value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onRespectAssStyleChanged != null) {
+    await host!.onRespectAssStyleChanged!(value);
+  } else {
+    await context.appModel.setVideoRespectAssStyle(value);
+  }
+}
+
+Future<void> setVideoFitModeDual(
+  SettingsContext context,
+  VideoFitMode mode,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onVideoFitModeChanged(mode);
+  } else {
+    await context.appModel.setVideoFitMode(mode);
+  }
+}
+
+Future<void> setVideoHdrOutputModeDual(
+  SettingsContext context,
+  VideoHdrOutputMode mode,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onHdrOutputModeChanged != null) {
+    await host!.onHdrOutputModeChanged!(mode);
+  } else {
+    await context.appModel.setVideoHdrOutputMode(mode);
+  }
+}
+
+Future<void> setVideoLockWindowAspectRatioDual(
+  SettingsContext context,
+  bool value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onLockWindowAspectRatioChanged(value);
+  } else {
+    await context.appModel.setVideoLockWindowAspectRatio(value);
+  }
+}
+
+Future<void> setVideoImmersiveModeDual(
+  SettingsContext context,
+  VideoImmersiveMode mode,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host != null) {
+    await host.onImmersiveModeChanged(mode);
+  } else {
+    await context.appModel.setVideoImmersiveMode(mode);
+  }
+}
+
+Future<void> resetVideoControlLayoutDual(SettingsContext context) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onControlLayoutChanged != null) {
+    await host!.onControlLayoutChanged!(VideoControlLayout.currentChrome);
+  } else {
+    await context.appModel.setVideoControlLayout(
+      VideoControlLayout.currentChrome,
+    );
+  }
+  context.refresh();
+}
+
+// ── 倍速吸附 ─────────────────────────────────────────────────────────────────
+
+/// 把滑条浮点值吸附到 0.1 档并夹进 0.5–2.0（消除二进制浮点尾差如 0.7000000000000001，
+/// 旧持久化的档位间值也归到最近档）。
+double snapVideoSpeed(double v) =>
+    ((v * 10).roundToDouble() / 10).clamp(0.5, 2.0).toDouble();
+
+double snapVideoLongPressSpeed(double v) =>
+    ((v * 10).roundToDouble() / 10).clamp(1.0, 4.0).toDouble();
+
+// ── 播放中专属行的 builder（SettingsCustomItem 用，均 host 门控）─────────────
+
+/// TODO-1158：HLS 多档画质入口（仅当前流是 HLS master 时显示）。点开画质侧栏。
+Widget buildVideoQualityEntryRow(SettingsContext context) {
+  final VideoQuickSettingsHost host = videoQuickSettingsHostOf(context)!;
+  return FushiListTileControl(
+    dense: true,
+    leading: const FushiIcon(FushiIcons.highQuality),
+    title: Text(t.video_quality),
+    subtitle: host.qualityCurrentLabel != null
+        ? Text(host.qualityCurrentLabel!)
+        : null,
+    trailing: const FushiIcon(FushiIcons.chevronRight),
+    onTap: host.onOpenQuality,
+  );
+}
+
+/// TODO-1232 / BUG-597：视频黑屏（有声无画）降级入口——仅当页面判定本次跑
+/// Impeller 且渲染 channel 已接线（Android）时接线。点按 → 确认弹窗 → 关
+/// Impeller 走 Skia + 重启。
+Widget buildVideoSkiaFallbackRow(SettingsContext context) {
+  final VideoQuickSettingsHost host = videoQuickSettingsHostOf(context)!;
+  return FushiListTileControl(
+    dense: true,
+    leading: const FushiIcon(FushiIcons.animation),
+    title: Text(t.video_render_skia_fix_title),
+    subtitle: Text(t.video_render_skia_fix_hint),
+    trailing: const FushiIcon(FushiIcons.restart),
+    onTap: host.onSwitchToSkiaRenderer,
+  );
+}
+
+/// TODO-1351：「音频」分类的音轨切换区。内容由视频页构建（读 controller 的
+/// audioTracks + 当前轨 + 切轨回调），空时显示占位。
+Widget buildVideoAudioTrackSection(SettingsContext context) {
+  final VideoQuickSettingsHost host = videoQuickSettingsHostOf(context)!;
+  final Widget? section = host.audioTrackSection;
+  if (section != null) return section;
+  return FushiListTileControl(
+    dense: true,
+    leading: const FushiIcon(FushiIcons.music),
+    title: Text(t.video_audio_track_empty),
+    enabled: false,
+  );
+}
+
+/// TODO-1351：「字幕」分类顶部的字幕轨/字幕源切换区（外挂字幕 + 打开字幕文件 +
+/// 关闭 + 内嵌/远端源），由视频页构建。
+Widget buildVideoSubtitleTrackSection(SettingsContext context) {
+  return videoQuickSettingsHostOf(context)!.subtitleTrackSection!;
+}
+
+/// 字幕调轴行（A/V 延迟 + 自动对轴 + 波形对轴入口）。
+Widget buildVideoSubtitleSyncRow(SettingsContext context) {
+  return VideoSubtitleSyncRow(host: videoQuickSettingsHostOf(context)!);
+}
+
+/// 一行「点开调色盘取任意色」的字幕颜色设置行（TODO-1326 文字色 / TODO-1059 背景
+/// 色）。行尾显示当前色色块，点整行开对话框内嵌 [FushiDialogColorPicker]：拖动经
+/// [onPreview] 实时预览背后字幕，关闭时经 [onCommit] 落盘一次。
+Widget _buildSubtitleColorRow(
+  SettingsContext context, {
+  required String title,
+  required IconData icon,
+  required Color current,
+  required void Function(Color color) onPreview,
+  required void Function(Color color) onCommit,
+  _SubtitleColorClearAction? clearAction,
+}) {
+  final BuildContext buildContext = context.context;
+  return AdaptiveSettingsRow(
+    title: title,
+    icon: icon,
+    showIcon: true,
+    trailing: FushiColorSwatch(
+      color: current,
+      size: 24,
+      borderColor: Theme.of(buildContext).dividerColor,
+    ),
+    onTap: () => unawaited(
+      _pickSubtitleColor(
+        buildContext,
+        title: title,
+        initial: current,
+        onPreview: onPreview,
+        onCommit: onCommit,
+        clearAction: clearAction,
+      ),
+    ),
+  );
+}
+
+/// 取色对话框里的「关掉这一层」动作（如「无描边」）：点了不落颜色，改走 [onClear]。
+class _SubtitleColorClearAction {
+  const _SubtitleColorClearAction({required this.label, required this.onClear});
+
+  final String label;
+  final Future<void> Function() onClear;
+}
+
+/// 弹字幕颜色对话框：内嵌 [FushiDialogColorPicker] 取任意色。字幕文字/背景色都存
+/// **不透明** ARGB（背景实际可见透明度另由 backgroundOpacity 滑条控制），故这里强制
+/// 不透明、关闭 alpha 通道。拖动经 [onPreview] 实时预览（不落盘），点「完成」或关闭时
+/// 经 [onCommit] 落盘一次（避免拖动过程每帧写 DB）。
+///
+/// 只有用户**真的选过色**才 commit（PM-iIH9G0b）：描边 / 背景的 commit 会把粗细 /
+/// 透明度从 0 顶到可见基线，若「打开看一眼就关」也 commit，用户刚滑到 0 关掉的描边
+/// 会被悄悄重新打开。给了 [clearAction] 时多一个「关掉」按钮（如「无描边」）。
+Future<void> _pickSubtitleColor(
+  BuildContext context, {
+  required String title,
+  required Color initial,
+  required void Function(Color color) onPreview,
+  required void Function(Color color) onCommit,
+  _SubtitleColorClearAction? clearAction,
+}) async {
+  Color picked = initial;
+  bool changed = false;
+  bool cleared = false;
+  await showAppDialog<void>(
+    context: context,
+    builder: (BuildContext dialogContext) {
+      return FushiAlertDialog(
+        // 矮屏（手机横屏）省掉 hero 图标，纵向空间全给取色器。
+        icon: FushiDialogColorPicker.compactHeight(dialogContext)
+            ? null
+            : const FushiIcon(FushiIcons.appearance),
+        title: Text(title),
+        content: FushiDialogColorPicker(
+          pickerColor: initial,
+          onColorChanged: (Color c) {
+            // 强制不透明：字幕文字透明无意义；背景透明度另由滑条控制。
+            picked = Color(0xFF000000 | (c.toARGB32() & 0xFFFFFF));
+            changed = true;
+            onPreview(picked);
+          },
+        ),
+        actions: <Widget>[
+          if (clearAction != null)
+            FushiDialogAction(
+              label: clearAction.label,
+              onPressed: () {
+                cleared = true;
+                Navigator.of(dialogContext).pop();
+              },
+            ),
+          FushiDialogAction(
+            label: t.dialog_done,
+            kind: FushiDialogActionKind.primary,
+            autofocus: true,
+            onPressed: () => Navigator.of(dialogContext).pop(),
+          ),
+        ],
+      );
+    },
+  );
+  if (cleared) {
+    await clearAction!.onClear();
+    return;
+  }
+  if (changed) onCommit(picked);
+}
+
+/// 字幕**文字**颜色取色行（TODO-1326）。与「尊重 .ass 自带样式」协调：respect 开且
+/// cue 带主色时 overlay 用 ASS 主色，本项作为统一外观基线在 respect 关 / ASS 无主
+/// 色时生效。文字色默认白（非 null），取色器初值即当前色。
+Widget buildVideoSubtitleTextColorRow(SettingsContext context) {
+  final VideoSubtitleStyle style = currentVideoSubtitleStyle(context);
+  return _buildSubtitleColorRow(
+    context,
+    title: t.video_setting_subtitle_text_color,
+    icon: FushiIcons.textFields,
+    current: style.textColor ?? const Color(0xFFFFFFFF),
+    onPreview: (Color c) => previewVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyVideoSubtitleTextColor(s, c),
+    ),
+    onCommit: (Color c) => unawaited(commitVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyVideoSubtitleTextColor(s, c),
+    )),
+  );
+}
+
+/// 字幕文字色（取色行与控制通道共用）。
+VideoSubtitleStyle applyVideoSubtitleTextColor(
+  VideoSubtitleStyle s,
+  Color c,
+) =>
+    s.copyWith(textColor: c);
+
+/// 字幕阴影色：保留当前阴影色的 alpha，只换 RGB（取色行与控制通道共用）。
+VideoSubtitleStyle applyVideoSubtitleShadowColor(
+  VideoSubtitleStyle s,
+  Color c,
+) {
+  final Color base = s.shadowColor ?? VideoSubtitleStyle.defaults.shadowColor!;
+  return s.copyWith(
+    shadowColor: Color(
+      (base.toARGB32() & 0xFF000000) | (c.toARGB32() & 0x00FFFFFF),
+    ),
+  );
+}
+
+/// 字幕描边色：粗细为 0 时顶到可见基线 2px（取色行与控制通道共用）。
+VideoSubtitleStyle applyVideoSubtitleOutlineColor(
+  VideoSubtitleStyle s,
+  Color c,
+) =>
+    s.copyWith(
+      outlineColor: c,
+      outlineThickness: s.outlineThickness <= 0 ? 2 : s.outlineThickness,
+    );
+
+/// 字幕背景色：透明度为 0 时顶到可见基线 0.6（取色行与控制通道共用）。
+VideoSubtitleStyle applyVideoSubtitleBackgroundColor(
+  VideoSubtitleStyle s,
+  Color c,
+) =>
+    s.copyWith(
+      backgroundColor: c,
+      backgroundOpacity: s.backgroundOpacity <= 0 ? 0.6 : s.backgroundOpacity,
+    );
+
+/// 字幕**阴影**颜色取色行（#xif6-gtSz7）。取色器只给不透明色，这里保留当前阴影色的
+/// alpha（默认 0.9），只换 RGB——默认柔和投影的「半透明黑」观感不因换色变成实心硬影。
+Widget buildVideoSubtitleShadowColorRow(SettingsContext context) {
+  final VideoSubtitleStyle style = currentVideoSubtitleStyle(context);
+  final Color current =
+      style.shadowColor ?? VideoSubtitleStyle.defaults.shadowColor!;
+  const VideoSubtitleStyle Function(VideoSubtitleStyle, Color) applyColor =
+      applyVideoSubtitleShadowColor;
+
+  return _buildSubtitleColorRow(
+    context,
+    title: t.video_setting_subtitle_shadow_color,
+    icon: FushiIcons.shadow,
+    current: Color(0xFF000000 | (current.toARGB32() & 0x00FFFFFF)),
+    onPreview: (Color c) => previewVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyColor(s, c),
+    ),
+    onCommit: (Color c) => unawaited(commitVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyColor(s, c),
+    )),
+  );
+}
+
+/// 字幕**描边**颜色取色行（#xif6-gtSz7）。描边粗细为 0 时选色看不出变化，故把粗细从 0
+/// 顶到可见基线（2px），与背景色行「选了色立刻生效」同一口径。
+Widget buildVideoSubtitleOutlineColorRow(SettingsContext context) {
+  final VideoSubtitleStyle style = currentVideoSubtitleStyle(context);
+  const VideoSubtitleStyle Function(VideoSubtitleStyle, Color) applyColor =
+      applyVideoSubtitleOutlineColor;
+  return _buildSubtitleColorRow(
+    context,
+    title: t.video_setting_subtitle_outline_color,
+    icon: FushiIcons.outlineColor,
+    current: style.resolveOutlineColor(),
+    onPreview: (Color c) => previewVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyColor(s, c),
+    ),
+    onCommit: (Color c) => unawaited(
+      commitVideoSubtitleStyle(
+        context,
+        (VideoSubtitleStyle s) => applyColor(s, c),
+      ),
+    ),
+    // PM-iIH9G0b：描边可以直接在取色对话框里关掉（粗细归 0 = 无描边，颜色保留，
+    // 下次拉起粗细仍是这个颜色）。
+    clearAction: _SubtitleColorClearAction(
+      label: t.video_setting_subtitle_no_outline,
+      onClear: () => commitVideoSubtitleStyle(
+        context,
+        (VideoSubtitleStyle s) => s.copyWith(outlineThickness: 0),
+      ),
+    ),
+  );
+}
+
+/// TODO-1059：字幕背景**颜色**取色行。背景默认 null 走
+/// [kDefaultSubtitleBackgroundColor] 固定黑，取色器初值即该固定黑。选背景色不直接
+/// 改透明度，但透明度为 0 时用户看不到颜色变化，故把透明度从 0 顶到可见基线
+/// （0.6），让「选了色」立刻生效。
+Widget buildVideoSubtitleBgColorRow(SettingsContext context) {
+  final VideoSubtitleStyle style = currentVideoSubtitleStyle(context);
+  const VideoSubtitleStyle Function(VideoSubtitleStyle, Color) applyColor =
+      applyVideoSubtitleBackgroundColor;
+  return _buildSubtitleColorRow(
+    context,
+    title: t.video_setting_subtitle_bg_color,
+    icon: FushiIcons.appearance,
+    current: style.backgroundColor ?? kDefaultSubtitleBackgroundColor,
+    onPreview: (Color c) => previewVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyColor(s, c),
+    ),
+    onCommit: (Color c) => unawaited(commitVideoSubtitleStyle(
+      context,
+      (VideoSubtitleStyle s) => applyColor(s, c),
+    )),
+  );
+}
+
+/// 着色器内嵌管理视图（导入/发现/下载/勾选/一键选档）。启用集 / 画质增强开关 /
+/// mpv 目录均以 pref 为权威（页面回调持久化后同步缓存立即可读），切分类重建后回显
+/// 正确，无需面板级本地镜像。
+///
+/// 视图自带三个卡片外标题的分组，面板把它作为「画质增强」页的整页正文承载
+/// （video_quick_settings_sheet 的 `_panelDestination`），不套进 schema 行卡片。
+Widget buildVideoShaderManager(SettingsContext context) {
+  final VideoQuickSettingsHost host = videoQuickSettingsHostOf(context)!;
+  return VideoShaderManagerView(
+    initialEnabled: decodeEnabledShaders(context.appModel.videoShadersEnabled),
+    qualityEnhancementEnabled: currentVideoMpvConfig(context).highQuality,
+    onQualityEnhancementChanged: (bool value) => unawaited(commitVideoMpvConfig(
+      context,
+      (VideoMpvConfig c) => c.copyWith(highQuality: value),
+    )),
+    onApply: (List<String> names) async {
+      await host.onApplyShaders(names);
+      context.refresh();
+    },
+    onSelectTier: (
+      VideoShaderTier tier,
+      bool highQuality,
+      List<String> enabledNames,
+    ) async {
+      await host.onSelectShaderTier(tier, highQuality, enabledNames);
+      context.refresh();
+    },
+    initialMpvDir: context.appModel.videoMpvShaderDir,
+    onMpvDirChanged: (String dir) async {
+      await host.onMpvShaderDirChanged?.call(dir);
+      context.refresh();
+    },
+  );
+}
+
+/// BUG-2032：mpv Lua 脚本清单 + 每脚本运行态 + 输入边界说明。
+///
+/// 清单来自 `mpv_scripts` 目录（[listLuaScriptPaths]），每次 schema 刷新（导入后
+/// `settingsContext.refresh()`）重扫。状态来自 [VideoQuickSettingsHost.luaScriptStates]
+/// （controller 对 mpv 日志的归因）：不在表里 = 本次播放未装载；值 null = 已下发且
+/// 无报错；字符串 = 归因到该脚本的最近一条 error/fatal 日志原文。无播放器只列文件名。
+Widget buildVideoLuaScriptList(SettingsContext context) {
+  return _VideoLuaScriptList(settingsContext: context);
+}
+
+class _VideoLuaScriptList extends StatefulWidget {
+  const _VideoLuaScriptList({required this.settingsContext});
+
+  final SettingsContext settingsContext;
+
+  @override
+  State<_VideoLuaScriptList> createState() => _VideoLuaScriptListState();
+}
+
+class _VideoLuaScriptListState extends State<_VideoLuaScriptList> {
+  List<String>? _paths;
+
+  @override
+  void initState() {
+    super.initState();
+    _reload();
+  }
+
+  @override
+  void didUpdateWidget(covariant _VideoLuaScriptList oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 每次 schema 刷新都拿到新的 SettingsContext 实例 → 重扫目录。旧清单先留着，
+    // 新结果到了再换，不闪空白。
+    if (!identical(oldWidget.settingsContext, widget.settingsContext)) {
+      _reload();
+    }
+  }
+
+  Future<void> _reload() async {
+    final List<String> paths = await listLuaScriptPaths();
+    if (!mounted) return;
+    setState(() => _paths = paths);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final List<String>? paths = _paths;
+    if (paths == null) return const SizedBox.shrink();
+    final ThemeData theme = Theme.of(context);
+    // 输入边界说明：共享提示横幅（中性底 + 语义色图标），不再是一行灰字。
+    final Widget note = Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: FushiInlineNotice(
+        message: t.video_setting_mpv_lua_scripts_input_note,
+      ),
+    );
+    if (paths.isEmpty) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Text(
+              t.video_setting_mpv_lua_scripts_empty,
+              style: context.fushiType.bodyMedium
+                  .copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ),
+          note,
+        ],
+      );
+    }
+    final ValueListenable<Map<String, String?>>? states =
+        videoQuickSettingsHostOf(widget.settingsContext)?.luaScriptStates;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        if (states == null)
+          for (final String path in paths) _row(context, path, null)
+        else
+          ValueListenableBuilder<Map<String, String?>>(
+            valueListenable: states,
+            builder: (BuildContext _, Map<String, String?> map, Widget? __) {
+              return Column(
+                children: <Widget>[
+                  for (final String path in paths) _row(context, path, map),
+                ],
+              );
+            },
+          ),
+        note,
+      ],
+    );
+  }
+
+  /// [states] null = 无播放器（只列名）；否则按三态给图标 + 副标题。
+  Widget _row(BuildContext context, String path, Map<String, String?>? states) {
+    final ColorScheme scheme = Theme.of(context).colorScheme;
+    final bool live = states != null;
+    final bool loaded = states != null && states.containsKey(path);
+    final String? error = loaded ? states[path] : null;
+    final String? status = !live
+        ? null
+        : !loaded
+            ? t.video_setting_mpv_lua_scripts_status_pending
+            : error == null
+                ? t.video_setting_mpv_lua_scripts_status_loaded
+                : '${t.video_setting_mpv_lua_scripts_status_error}: $error';
+    final IconData icon = error != null
+        ? FushiIcons.error
+        : loaded
+            ? FushiIcons.success
+            : FushiIcons.file;
+    final Color? tint = error != null
+        ? scheme.error
+        : loaded
+            ? scheme.primary
+            : null;
+    return FushiListItem(
+      density: FushiListDensity.compact,
+      leading: FushiIcon(icon, color: tint),
+      title: Text(p.basename(path)),
+      subtitle: status == null
+          ? null
+          : Text(
+              status,
+              style: error != null ? TextStyle(color: scheme.error) : null,
+            ),
+      subtitleMaxLines: 3,
+    );
+  }
+}
+
+/// 原始 mpv.conf 多行逃生口（AdaptiveSettingsTextField 不支持多行故用原生
+/// TextField）。TODO-561：标题用 TextField 上方独立、可换行、完整显示的 Text（不挂
+/// InputDecoration.labelText 单行浮动 label）。
+Widget buildVideoMpvRawConfField(SettingsContext context) {
+  return _VideoMpvRawConfField(settingsContext: context);
+}
+
+class _VideoMpvRawConfField extends StatefulWidget {
+  const _VideoMpvRawConfField({required this.settingsContext});
+
+  final SettingsContext settingsContext;
+
+  @override
+  State<_VideoMpvRawConfField> createState() => _VideoMpvRawConfFieldState();
+}
+
+class _VideoMpvRawConfFieldState extends State<_VideoMpvRawConfField> {
+  late final TextEditingController _controller = TextEditingController(
+    text: currentVideoMpvConfig(widget.settingsContext).rawConf,
+  );
+
+  @override
+  void didUpdateWidget(_VideoMpvRawConfField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 外部重置（「恢复 mpv 默认」action 清空 rawConf）后回填输入框；正常键入路径
+    // pref 值与输入框文本一致，不会误触发回写打断光标。
+    // 契约依赖：页面 onMpvConfigChanged 在其第一个 await 前同步落 pref 缓存
+    // （currentVideoMpvConfig 立即读到刚键入的值）——否则键入后的 rebuild 会在
+    // 这里读到旧值并回写输入框、打断光标。改动持久化时序前先看这里。
+    final String external =
+        currentVideoMpvConfig(widget.settingsContext).rawConf;
+    if (external != _controller.text) _controller.text = external;
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+        tokens.spacing.gap,
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            t.video_setting_mpv_raw,
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          SizedBox(height: tokens.spacing.gap / 2),
+          FushiTextFieldControl(
+            controller: _controller,
+            minLines: 3,
+            maxLines: 8,
+            style: context.fushiType.bodyMedium.copyWith(
+              fontFamily: 'monospace',
+            ),
+            decoration: InputDecoration(
+              helperText: t.video_setting_mpv_raw_hint,
+              helperMaxLines: 4,
+              border: const OutlineInputBorder(),
+            ),
+            onChanged: (String v) => unawaited(commitVideoMpvConfig(
+              widget.settingsContext,
+              (VideoMpvConfig c) => c.copyWith(rawConf: v),
+            )),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 写弹幕屏蔽规则：host 在场走页面回调（即时重过滤），否则落 pref。输入框与
+/// 控制通道共用。
+Future<void> commitVideoDanmakuBlockRules(
+  SettingsContext context,
+  String value,
+) async {
+  final VideoQuickSettingsHost? host = videoQuickSettingsHostOf(context);
+  if (host?.onDanmakuBlockRulesChanged != null) {
+    await host!.onDanmakuBlockRulesChanged!(value);
+  } else {
+    await context.appModel.setVideoDanmakuBlockRulesText(value);
+  }
+}
+
+/// TODO-1376：弹幕屏蔽词/正则过滤（多行文本，每行一条，`/pattern/` 为正则）。
+Widget buildVideoDanmakuBlockRulesField(SettingsContext context) {
+  return _VideoDanmakuBlockRulesField(settingsContext: context);
+}
+
+class _VideoDanmakuBlockRulesField extends StatefulWidget {
+  const _VideoDanmakuBlockRulesField({required this.settingsContext});
+
+  final SettingsContext settingsContext;
+
+  @override
+  State<_VideoDanmakuBlockRulesField> createState() =>
+      _VideoDanmakuBlockRulesFieldState();
+}
+
+class _VideoDanmakuBlockRulesFieldState
+    extends State<_VideoDanmakuBlockRulesField> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.settingsContext.appModel.videoDanmakuBlockRulesText,
+  );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _commit(String value) =>
+      commitVideoDanmakuBlockRules(widget.settingsContext, value);
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+        tokens.spacing.gap,
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+        tokens.spacing.gap + tokens.spacing.gap / 2,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Text(
+            t.video_setting_danmaku_block_rules_hint,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+          ),
+          SizedBox(height: tokens.spacing.gap / 2),
+          FushiTextFieldControl(
+            key: const Key('danmaku-block-rules-field'),
+            controller: _controller,
+            minLines: 3,
+            maxLines: 8,
+            style: context.fushiType.bodyMedium.copyWith(
+              fontFamily: 'monospace',
+            ),
+            decoration: InputDecoration(
+              hintText: t.video_setting_danmaku_block_rules_placeholder,
+              border: const OutlineInputBorder(),
+            ),
+            onChanged: (String v) => unawaited(_commit(v)),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 控制条 9 槽位拖拽编辑器（TODO-274/312 phase 2）。
+Widget buildVideoControlLayoutEditor(SettingsContext context) {
+  final VideoQuickSettingsHost host = videoQuickSettingsHostOf(context)!;
+  return VideoControlLayoutEditor(
+    layout: host.controlLayout(),
+    onLayoutChanged: host.onControlLayoutChanged,
+    isTouchControls: host.isTouchControls,
+    customActionBindings:
+        host.customActionBindings?.call() ?? VideoCustomActionBindings.empty,
+    onCustomActionBindingsChanged: host.onCustomActionBindingsChanged,
+  );
+}

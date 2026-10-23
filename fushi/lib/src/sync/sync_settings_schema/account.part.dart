@@ -1,0 +1,231 @@
+// GENERATED-NOTE: extracted from sync_settings_schema.dart (TODO-585).
+part of '../sync_settings_schema.dart';
+
+// OAuth account sign-in row + OAuth-backend predicate.
+// Shares the parent library's imports + private scope (_syncSettings / _showSnackBar / _SyncSettingsState); moved verbatim.
+
+// ── Sync account widget ──────────────────────────────────────────────
+
+class _SyncAccountWidget extends StatefulWidget {
+  const _SyncAccountWidget({required this.settingsContext});
+  final SettingsContext settingsContext;
+
+  @override
+  State<_SyncAccountWidget> createState() => _SyncAccountWidgetState();
+}
+
+class _SyncAccountWidgetState extends State<_SyncAccountWidget> {
+  bool _isAuthenticated = false;
+  bool _isLoading = false;
+  bool _initialCheckDone = false;
+  String? _email;
+  SyncBackend? _backend;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkAuth();
+  }
+
+  Future<SyncBackend> _resolveBackend() async {
+    final repo = SyncRepository(widget.settingsContext.appModel.database);
+    final currentType = await repo.getBackendType();
+    final expected = resolveSyncBackend(currentType);
+    if (_backend != null && _backend == expected) return _backend!;
+    _backend = expected;
+    return _backend!;
+  }
+
+  Future<void> _checkAuth() async {
+    try {
+      final backend = await _resolveBackend();
+      final repo = SyncRepository(widget.settingsContext.appModel.database);
+      await backend.restoreAuth(repo);
+
+      final authed = await backend.isAuthenticated;
+      final email = authed ? await backend.currentEmail : null;
+      if (mounted) {
+        setState(() {
+          _isAuthenticated = authed;
+          _email = email;
+        });
+      }
+    } catch (e, stack) {
+      // Don't silently show "not signed in" on a transient check failure —
+      // record it so the cause is diagnosable (HBK-AUDIT-163).
+      ErrorLogService.instance.log('SyncAccount.checkAuth', e, stack);
+    } finally {
+      if (mounted) setState(() => _initialCheckDone = true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // 三态（检查中 / 已登录 / 未登录）之间走 effects 弹簧交叉淡入，不再硬切；
+    // 墨水屏与「减弱动态效果」下时长归零、瞬间到位。
+    final FushiSpringSpec fade = context.fushiMotion.effectsDefault;
+    return AnimatedSwitcher(
+      duration: fade.duration,
+      switchInCurve: fade.curve,
+      switchOutCurve: fade.curve,
+      child: KeyedSubtree(
+        key: ValueKey<int>(
+          !_initialCheckDone ? 0 : (_isAuthenticated ? 1 : 2),
+        ),
+        child: _buildRow(context),
+      ),
+    );
+  }
+
+  Widget _buildRow(BuildContext context) {
+    if (!_initialCheckDone) {
+      return AdaptiveSettingsRow(
+        title: t.sync_account,
+        subtitle: t.sync_checking_account,
+        icon: FushiIcons.account,
+        controlBelow: true,
+        trailing: SizedBox(
+          width: 24,
+          height: 24,
+          child: adaptiveIndicator(context: context, strokeWidth: 2),
+        ),
+      );
+    }
+
+    final String subtitle =
+        _isAuthenticated ? t.sync_signed_in : t.sync_not_signed_in;
+
+    if (_isAuthenticated) {
+      return AdaptiveSettingsRow(
+        title: _email ?? t.sync_signed_in,
+        subtitle: subtitle,
+        icon: FushiIcons.verified,
+        controlBelow: true,
+        trailing: _signOutButton(context),
+      );
+    }
+
+    return AdaptiveSettingsRow(
+      title: t.sync_account,
+      subtitle: subtitle,
+      icon: FushiIcons.account,
+      controlBelow: true,
+      trailing: _signInButton(context),
+    );
+  }
+
+  Widget _signInButton(BuildContext context) {
+    final Widget progress = adaptiveIndicator(context: context, strokeWidth: 2);
+    if (isCupertinoPlatform(context)) {
+      return CupertinoButton.filled(
+        minSize: 32,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        onPressed: _isLoading ? null : _signIn,
+        child: _isLoading ? progress : Text(t.sync_sign_in),
+      );
+    }
+    return FushiFilledButton.icon(
+      style: FilledButton.styleFrom(
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      onPressed: _isLoading ? null : _signIn,
+      icon: _isLoading
+          ? SizedBox(width: 16, height: 16, child: progress)
+          : const FushiIcon(FushiIcons.login),
+      label: Text(t.sync_sign_in),
+    );
+  }
+
+  Widget _signOutButton(BuildContext context) {
+    if (isCupertinoPlatform(context)) {
+      return CupertinoButton(
+        padding: EdgeInsets.zero,
+        minSize: 32,
+        onPressed: _isLoading ? null : _signOut,
+        child: Text(t.sync_sign_out),
+      );
+    }
+    // M3E：退出登录是次要操作，用描边按钮 + 图标（与登录的实心按钮成对）。
+    return FushiOutlinedButton.icon(
+      style: OutlinedButton.styleFrom(
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      ),
+      onPressed: _isLoading ? null : _signOut,
+      icon: const FushiIcon(FushiIcons.logout),
+      label: Text(t.sync_sign_out),
+    );
+  }
+
+  Future<void> _signIn() async {
+    setState(() => _isLoading = true);
+    // BUG-2120：桌面 loopback 授权一旦拉起浏览器，就把链接句柄交给等待对话框（复制 /
+    // 重开 / 取消）。对话框的生命周期钉在这一次登录上：流程怎么收场它都随之关闭。
+    final Completer<void> flowDone = Completer<void>();
+    try {
+      final backend = await _resolveBackend();
+      final repo = SyncRepository(widget.settingsContext.appModel.database);
+      await DesktopOAuthLaunchObserver.observe(
+        (DesktopOAuthLaunch launch) {
+          if (!mounted) return;
+          showDesktopOAuthWaitDialog(
+            context: context,
+            launch: launch,
+            done: flowDone.future,
+          );
+        },
+        () => backend.authenticate(repo: repo),
+      );
+      await _checkAuth();
+    } on SyncAuthError catch (e, st) {
+      // 用户自己点的取消：不是错误，不提示、不记日志。
+      if (e.kind == SyncAuthFailureKind.cancelled) return;
+      // Persist the full diagnostic (e.g. invalid_client 401 from a CI build
+      // shipping the placeholder secret) to the error log so the real cause is
+      // recoverable later — the snackbar only shows the friendly summary
+      // (TODO-045).
+      ErrorLogService.instance.log('SyncSettings.signIn', e, st);
+      if (mounted) {
+        _showSnackBar(
+            context, t.sync_auth_error(message: friendlySyncErrorDetail(e)));
+      }
+    } catch (e, st) {
+      ErrorLogService.instance.log('SyncSettings.signIn', e, st);
+      if (mounted) {
+        _showSnackBar(context, friendlySyncError(e));
+      }
+    } finally {
+      flowDone.complete();
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _signOut() async {
+    setState(() => _isLoading = true);
+    try {
+      final backend = await _resolveBackend();
+      final repo = SyncRepository(widget.settingsContext.appModel.database);
+      await backend.signOut(repo: repo);
+      backend.clearCache();
+      // BUG-1576：只清**这个账号所属通道**那格的目录缓存。登出云盘不该顺手抹掉
+      // 互联通道刚建好的目录映射。
+      await repo.clearFolderCache(syncChannelScopeOf(backend));
+      _backend = null;
+      await _checkAuth();
+    } catch (e) {
+      if (mounted) {
+        _showSnackBar(context, friendlySyncError(e));
+      }
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+}
+
+/// OAuth cloud backends authenticate via a browser sign-in (handled by the
+/// account row) rather than an inline credential box. Drives whether the
+/// account/sign-in row appears in the sync-method group.
+@visibleForTesting
+bool isOAuthSyncBackend(SyncBackendType type) =>
+    type == SyncBackendType.googleDrive ||
+    type == SyncBackendType.oneDrive ||
+    type == SyncBackendType.dropbox;

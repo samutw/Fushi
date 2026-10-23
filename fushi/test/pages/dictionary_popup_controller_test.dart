@@ -1,0 +1,1019 @@
+// ignore: depend_on_referenced_packages
+import 'package:fake_async/fake_async.dart';
+import 'package:flutter/widgets.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/diagnostics/lookup_perf_trace.dart';
+import 'package:fushi/src/diagnostics/video_diag_log.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_controller.dart';
+import 'package:fushi/src/pages/implementations/dictionary_popup_webview.dart'
+    show DictionaryPopupWebViewState;
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+
+/// Unit tests for the shared [DictionaryPopupController] — the single set of
+/// stack primitives across the reader / audiobook / video / home tab /
+/// standalone window (unification plan
+/// docs/specs/2026-06-07-dictionary-popup-unification-plan.md). Pure logic, no
+/// WebView rendering. The controller only owns the stack mechanism; whether a
+/// search-target is visible while searching is the host's choice (`visible`).
+void main() {
+  test('seedWarmSlot 放一个隐藏的常驻热槽（幂等、低内存跳过）', () {
+    final c = DictionaryPopupController(lowMemory: false);
+    c.seedWarmSlot();
+    c.seedWarmSlot();
+    expect(c.entries.length, 1);
+    expect(c.entries.first.isWarmSlot, true);
+    expect(c.entries.first.visible, false);
+    expect(c.entries.first.searchTerm, '');
+    expect(c.entries.first.result, isNotNull,
+        reason: 'hidden warm slots must keep the WebView mounted for prewarm');
+    expect(c.entries.first.result!.searchTerm, '');
+    expect(c.hasVisiblePopup, false);
+
+    final lm = DictionaryPopupController(lowMemory: true)..seedWarmSlot();
+    expect(lm.entries, isEmpty);
+  });
+
+  // PR #1598 审查：在途的查词计时游标是进程级的，关栈不收尾就会被下一次别的宿主
+  // 的 revealRendered 当成自己的收尾——打出「视频页旧词 total=几分钟」的假行。
+  test('dismissAt / clear 把在途的 LookupPerfTrace 收尾成 dismissed', () {
+    VideoDiagLog.instance.resetForTesting();
+    VideoDiagLog.instance.enableForTesting();
+    addTearDown(() {
+      VideoDiagLog.instance.resetForTesting();
+      LookupPerfTrace.current = null;
+    });
+
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final LookupPerfTrace trace = LookupPerfTrace.begin(
+      term: '辞書',
+      host: 'video',
+      lowMemory: false,
+    )!;
+    c.dismissAt(0);
+    expect(trace.isFinished, isTrue, reason: 'Esc / 点 barrier 关栈 = 这次查词结束');
+    expect(LookupPerfTrace.current, isNull, reason: '游标不得悬着给下一位宿主');
+
+    final c2 = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final LookupPerfTrace trace2 = LookupPerfTrace.begin(
+      term: '事典',
+      host: 'video',
+      lowMemory: false,
+    )!;
+    c2.clear();
+    expect(trace2.isFinished, isTrue);
+    expect(LookupPerfTrace.current, isNull);
+  });
+
+  test('beginTop 复用热槽（视频：搜索期即可见）', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final e = c.beginTop(
+      term: 'あ',
+      rect: const Rect.fromLTWH(1, 2, 3, 4),
+      reuseWarmSlot: true,
+      replaceStack: false,
+      visible: true,
+    );
+    expect(c.entries.length, 1);
+    expect(identical(e, c.entries.first), true);
+    expect(e.visible, true);
+    expect(e.isSearching, true);
+    expect(e.searchTerm, 'あ');
+  });
+
+  test('beginTop 书内：搜索期隐藏，就绪 fillResult + show 才显示', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final e = c.beginTop(
+      term: 'あ',
+      rect: Rect.zero,
+      reuseWarmSlot: true,
+      replaceStack: false,
+      visible: false,
+    );
+    expect(e.visible, false, reason: '搜索期隐藏（书内另画占位）');
+    c.fillResult(e, result: null, allLoaded: true);
+    expect(e.visible, false, reason: 'fillResult 不改 visible（支持延迟显示）');
+    expect(e.isSearching, false);
+    c.show(e);
+    expect(e.visible, true);
+    expect(c.hasVisiblePopup, true);
+  });
+
+  test('beginTop replaceStack 无热槽时清栈压新条', () {
+    final c = DictionaryPopupController(lowMemory: true);
+    c.beginTop(
+      term: 'x',
+      rect: Rect.zero,
+      reuseWarmSlot: false,
+      replaceStack: true,
+      visible: true,
+    );
+    c.beginTop(
+      term: 'y',
+      rect: Rect.zero,
+      reuseWarmSlot: false,
+      replaceStack: true,
+      visible: true,
+    );
+    expect(c.entries.length, 1);
+    expect(c.entries.first.searchTerm, 'y');
+  });
+
+  test('pushChild 先裁深层再压新嵌套层', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.pushChild(term: 'b', rect: Rect.zero, parentIndex: 0, visible: true);
+    expect(c.entries.length, 2);
+    // 从第 0 层再次下钻：第 1 层及之上被裁掉，压入新的。
+    c.pushChild(term: 'c', rect: Rect.zero, parentIndex: 0, visible: true);
+    expect(c.entries.length, 2);
+    expect(c.entries.last.searchTerm, 'c');
+  });
+
+  test('lastVisibleIndex 忽略隐藏热槽', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    expect(c.lastVisibleIndex, -1);
+    final e = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: false);
+    expect(c.lastVisibleIndex, -1, reason: '隐藏不算');
+    c.show(e);
+    expect(c.lastVisibleIndex, 0);
+  });
+
+  test('dismissAt(0) 隐藏并保留热槽；低内存清空', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final e = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(
+      e,
+      result: DictionarySearchResult(searchTerm: 'a'),
+      allLoaded: true,
+    );
+    c.dismissAt(0);
+    expect(c.entries.length, 1);
+    expect(c.entries.first.isWarmSlot, true);
+    expect(c.entries.first.visible, false);
+    expect(c.entries.first.searchTerm, '',
+        reason: 'closing a visible empty lookup restores the warm seed');
+    expect(c.entries.first.result!.searchTerm, '');
+    expect(c.entries.first.allLoaded, false);
+
+    final lm = DictionaryPopupController(lowMemory: true);
+    lm.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: true,
+        visible: true);
+    lm.dismissAt(0);
+    expect(lm.entries, isEmpty);
+  });
+
+  test('dismissAt(非0) 只裁该层及之上', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final e = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(e, result: null, allLoaded: true);
+    c.pushChild(term: 'b', rect: Rect.zero, parentIndex: 0, visible: true);
+    expect(c.entries.length, 2);
+    c.dismissAt(1);
+    expect(c.entries.length, 1);
+    expect(c.entries.first.visible, true);
+  });
+
+  test('TODO-485: child back keeps parent; top close keeps existing semantics',
+      () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final parent = c.beginTop(
+        term: 'parent',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(parent, result: null, allLoaded: true);
+    c.pushChild(
+        term: 'child',
+        rect: const Rect.fromLTWH(1, 1, 1, 1),
+        parentIndex: 0,
+        visible: true);
+
+    c.dismissAt(1);
+    expect(c.entries, hasLength(1),
+        reason: 'closing a child layer must return to the parent layer');
+    expect(c.entries.single.searchTerm, 'parent');
+    expect(c.entries.single.visible, isTrue);
+
+    c.dismissAt(0);
+    expect(c.entries, hasLength(1),
+        reason:
+            'top close still preserves the hidden warm slot in normal mode');
+    expect(c.entries.single.isWarmSlot, isTrue);
+    expect(c.entries.single.visible, isFalse);
+  });
+
+  // ── TODO-058：嵌套（第二个）冷层挂起到渲染完成才显示，消除白屏一瞬 ──────────
+  test('markPendingReveal 挂起：fillResult 后先不显示，等 revealRendered', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final a = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(a, result: null, allLoaded: true);
+    // 嵌套层：append 一条新建 WebView 的冷层。
+    final child =
+        c.pushChild(term: 'b', rect: Rect.zero, parentIndex: 0, visible: false);
+    c.fillResult(child, result: null, allLoaded: true);
+    c.markPendingReveal(child);
+    expect(child.visible, isFalse, reason: '冷层结果就绪也先不显示（避免白屏一瞬）');
+    expect(child.revealOnRender, isTrue, reason: '挂起等渲染信号');
+    expect(c.lastVisibleIndex, 0, reason: '顶层可见仍是父层');
+
+    // WebView 渲染完成信号到达 → 翻可见、清标记。
+    final bool revealed = c.revealRendered(child);
+    expect(revealed, isTrue);
+    expect(child.visible, isTrue);
+    expect(child.revealOnRender, isFalse);
+    expect(c.lastVisibleIndex, 1);
+  });
+
+  test('revealRendered 仅对挂起层生效：非挂起层（热槽再渲染/load-more）不动', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final a = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(a, result: null, allLoaded: true);
+    // a 立即可见（热槽复用），未挂起 → revealRendered 应是 no-op 返回 false。
+    expect(a.revealOnRender, isFalse);
+    expect(c.revealRendered(a), isFalse);
+    expect(a.visible, isTrue);
+  });
+
+  test('show 清掉挂起标记（幂等收口）', () {
+    final c = DictionaryPopupController(lowMemory: true);
+    final e = c.beginTop(
+        term: 'x',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: true,
+        visible: false);
+    c.markPendingReveal(e);
+    expect(e.revealOnRender, isTrue);
+    c.show(e);
+    expect(e.visible, isTrue);
+    expect(e.revealOnRender, isFalse, reason: 'show 直显也清挂起标记');
+  });
+
+  test('复用热槽 / 隐藏热槽都清挂起标记，避免陈旧 revealOnRender 残留', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    // 让热槽带上一个陈旧挂起标记，再复用。
+    c.entries.first.revealOnRender = true;
+    final e = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    expect(e.revealOnRender, isFalse, reason: 'beginTop 复用热槽清陈旧挂起');
+
+    // dismissAt(0) 隐藏热槽也清挂起。
+    e.revealOnRender = true;
+    c.dismissAt(0);
+    expect(c.entries.first.isWarmSlot, isTrue);
+    expect(c.entries.first.revealOnRender, isFalse);
+
+    // pruneToWarmSlot 隐藏热槽也清挂起。
+    c.entries.first.revealOnRender = true;
+    c.pruneToWarmSlot();
+    expect(c.entries.first.revealOnRender, isFalse);
+  });
+
+  test('pruneToWarmSlot 保留隐藏热槽丢弃其余', () {
+    final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+    final e = c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true);
+    c.fillResult(e, result: null, allLoaded: true);
+    c.pushChild(term: 'b', rect: Rect.zero, parentIndex: 0, visible: true);
+    c.pruneToWarmSlot();
+    expect(c.entries.length, 1);
+    expect(c.entries.first.isWarmSlot, true);
+    expect(c.entries.first.visible, false);
+    expect(c.entries.first.searchTerm, '');
+    expect(c.entries.first.result!.searchTerm, '');
+    expect(c.entries.first.allLoaded, false);
+  });
+
+  // ── TODO-058 fail-safe：popupRendered 永不发时的超时兜底 + Timer 取消/防泄漏 ──
+  test('超时兜底：挂起层未收到 popupRendered，到时强制翻可见', () {
+    fakeAsync((FakeAsync async) {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final a = c.beginTop(
+          term: 'a',
+          rect: Rect.zero,
+          reuseWarmSlot: true,
+          replaceStack: false,
+          visible: true);
+      c.fillResult(a, result: null, allLoaded: true);
+      final child = c.pushChild(
+          term: 'b', rect: Rect.zero, parentIndex: 0, visible: false);
+      c.fillResult(child, result: null, allLoaded: true);
+
+      bool forced = false;
+      c.markPendingReveal(child, onForcedReveal: () => forced = true);
+      expect(child.visible, isFalse, reason: '挂起期不可见');
+      expect(child.revealOnRender, isTrue);
+
+      // 略短于超时：还没翻可见（验证不是立刻显示）。
+      async.elapse(DictionaryPopupController.kRevealFailsafeTimeout -
+          const Duration(milliseconds: 1));
+      expect(child.visible, isFalse, reason: '超时前不显示，不破坏「就绪才显示」正常路径');
+
+      // 跨过超时：强制翻可见 + 回调 + 清挂起标记。
+      async.elapse(const Duration(milliseconds: 2));
+      expect(child.visible, isTrue, reason: 'popupRendered 永不发也最终显示，不卡死');
+      expect(child.revealOnRender, isFalse);
+      expect(forced, isTrue, reason: '强制翻可见后回调宿主重建');
+      expect(c.lastVisibleIndex, 1);
+    });
+  });
+
+  test('revealRendered 先于超时到达：取消 Timer，不再强制翻（无重复/无泄漏）', () {
+    fakeAsync((FakeAsync async) {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final a = c.beginTop(
+          term: 'a',
+          rect: Rect.zero,
+          reuseWarmSlot: true,
+          replaceStack: false,
+          visible: true);
+      c.fillResult(a, result: null, allLoaded: true);
+      final child = c.pushChild(
+          term: 'b', rect: Rect.zero, parentIndex: 0, visible: false);
+      c.fillResult(child, result: null, allLoaded: true);
+
+      bool forced = false;
+      c.markPendingReveal(child, onForcedReveal: () => forced = true);
+      // 渲染信号在超时前到达 → 正常翻可见并取消 Timer。
+      expect(c.revealRendered(child), isTrue);
+      expect(child.visible, isTrue);
+
+      // 跨过超时：onForcedReveal 不应再被调用（Timer 已取消）。
+      async.elapse(DictionaryPopupController.kRevealFailsafeTimeout +
+          const Duration(milliseconds: 10));
+      expect(forced, isFalse, reason: 'Timer 已被 revealRendered 取消，不重复强制');
+      expect(async.pendingTimers, isEmpty, reason: '无残留 Timer 泄漏');
+    });
+  });
+
+  test('show/dismiss/裁剪/dispose 取消挂起 Timer（防泄漏）', () {
+    fakeAsync((FakeAsync async) {
+      // show 取消。
+      final c1 = DictionaryPopupController(lowMemory: true);
+      final e1 = c1.beginTop(
+          term: 'x',
+          rect: Rect.zero,
+          reuseWarmSlot: false,
+          replaceStack: true,
+          visible: false);
+      c1.markPendingReveal(e1);
+      c1.show(e1);
+      expect(async.pendingTimers, isEmpty, reason: 'show 取消 Timer');
+
+      // dismissAt 取消。
+      final c2 = DictionaryPopupController(lowMemory: true);
+      final e2 = c2.beginTop(
+          term: 'y',
+          rect: Rect.zero,
+          reuseWarmSlot: false,
+          replaceStack: true,
+          visible: false);
+      c2.markPendingReveal(e2);
+      c2.dismissAt(0);
+      expect(async.pendingTimers, isEmpty, reason: 'dismissAt 取消 Timer');
+
+      // truncateTo 取消被裁子层。
+      final c3 = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final a3 = c3.beginTop(
+          term: 'a',
+          rect: Rect.zero,
+          reuseWarmSlot: true,
+          replaceStack: false,
+          visible: true);
+      c3.fillResult(a3, result: null, allLoaded: true);
+      final child3 = c3.pushChild(
+          term: 'b', rect: Rect.zero, parentIndex: 0, visible: false);
+      c3.markPendingReveal(child3);
+      c3.truncateTo(1);
+      expect(async.pendingTimers, isEmpty, reason: 'truncateTo 取消被裁层 Timer');
+
+      // dispose 取消全部。
+      final c4 = DictionaryPopupController(lowMemory: true);
+      final e4 = c4.beginTop(
+          term: 'z',
+          rect: Rect.zero,
+          reuseWarmSlot: false,
+          replaceStack: true,
+          visible: false);
+      c4.markPendingReveal(e4);
+      c4.dispose();
+      expect(async.pendingTimers, isEmpty, reason: 'dispose 取消全部 Timer');
+    });
+  });
+
+  group('TODO-1204 onLookupStarted 查词计数注入回调', () {
+    test('每次 beginTop 触发一次（顶层查词 +1）', () {
+      int calls = 0;
+      final c = DictionaryPopupController(lowMemory: false)
+        ..seedWarmSlot()
+        ..onLookupStarted = () => calls++;
+      c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: false,
+      );
+      expect(calls, 1);
+      // 复查同一个词（重复查）仍 +1，不去重。
+      c.beginTop(
+        term: 'a',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: false,
+      );
+      expect(calls, 2);
+    });
+
+    test('嵌套查词（beginTop append + pushChild）各触发一次', () {
+      int calls = 0;
+      final c = DictionaryPopupController(lowMemory: false)
+        ..onLookupStarted = () => calls++;
+      // 顶层。
+      c.beginTop(
+        term: 'top',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: true,
+        visible: false,
+      );
+      // 嵌套（append 一层）。
+      c.beginTop(
+        term: 'child',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: false,
+        visible: false,
+      );
+      // pushChild 路径也计一次。
+      c.pushChild(
+          term: 'deep', rect: Rect.zero, parentIndex: 1, visible: false);
+      expect(calls, 3, reason: '顶层 + 嵌套 + pushChild 各 +1');
+    });
+
+    test('未注入回调时栈操作正常（纯逻辑测试不触发）', () {
+      final c = DictionaryPopupController(lowMemory: false);
+      expect(
+        () => c.beginTop(
+          term: 'a',
+          rect: Rect.zero,
+          reuseWarmSlot: false,
+          replaceStack: true,
+          visible: false,
+        ),
+        returnsNormally,
+      );
+    });
+
+    test('seedWarmSlot 不算查词（不触发回调）', () {
+      int calls = 0;
+      final c = DictionaryPopupController(lowMemory: false);
+      c.onLookupStarted = () => calls++;
+      c.seedWarmSlot();
+      expect(calls, 0);
+    });
+  });
+
+  group('BUG-717 ② reanchorEntry（显示与高亮 eval 解耦后的重锚）', () {
+    DictionaryPopupController visibleTop() {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      c.beginTop(
+        term: 'あ',
+        rect: const Rect.fromLTWH(1, 2, 3, 4),
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+      );
+      return c;
+    }
+
+    test('可见条目重锚到新 rect 并通知（弹窗重定位）', () {
+      final c = visibleTop();
+      int notifies = 0;
+      c.addListener(() => notifies++);
+      const Rect refined = Rect.fromLTWH(10, 20, 30, 8);
+      c.reanchorEntry(c.entries.first, refined);
+      expect(c.entries.first.selectionRect, refined);
+      expect(notifies, 1, reason: 'rect 变化必须通知以触发重定位');
+    });
+
+    test('rect 未变：不改不通知（避免无谓重建 / 位置抖动）', () {
+      final c = visibleTop();
+      final Rect current = c.entries.first.selectionRect;
+      int notifies = 0;
+      c.addListener(() => notifies++);
+      c.reanchorEntry(c.entries.first, current);
+      expect(c.entries.first.selectionRect, current);
+      expect(notifies, 0);
+    });
+
+    test('隐藏条目不重锚（迟到高亮回调不动隐身热槽）', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final e = c.entries.first; // 隐身热槽 visible=false
+      int notifies = 0;
+      c.addListener(() => notifies++);
+      c.reanchorEntry(e, const Rect.fromLTWH(9, 9, 9, 9));
+      expect(e.selectionRect, isNot(const Rect.fromLTWH(9, 9, 9, 9)));
+      expect(notifies, 0);
+    });
+
+    test('条目已被新查词清出栈：重锚 no-op（防错位新弹窗）', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      // 嵌套子条目（非热槽），随后 pruneToWarmSlot 把它清出栈，模拟迟到高亮回调。
+      final DictionaryPopupEntry stale = c.pushChild(
+        term: 'い',
+        rect: const Rect.fromLTWH(5, 6, 7, 8),
+        parentIndex: 0,
+        visible: true,
+      );
+      c.pruneToWarmSlot();
+      expect(c.entries.contains(stale), false, reason: '前置：子条目已被清出栈');
+      int notifies = 0;
+      c.addListener(() => notifies++);
+      c.reanchorEntry(stale, const Rect.fromLTWH(70, 70, 7, 7));
+      expect(notifies, 0, reason: '不在栈内的旧条目不得触发重定位');
+    });
+  });
+
+  group('占位单例身份稳定（WebView 每次查词只推一次的根基）', () {
+    test('seed / beginTop(initialResult) / dismiss 复位共用同一单例', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      expect(
+          identical(c.entries.first.result, kPopupSearchingPlaceholderResult),
+          true,
+          reason: 'seed 缺省即 canonical 单例');
+      final e = c.beginTop(
+        term: 'あ',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: false,
+        initialResult: kPopupSearchingPlaceholderResult,
+      );
+      expect(identical(e.result, kPopupSearchingPlaceholderResult), true,
+          reason: '搜索期 result 身份不变 → WebView didUpdateWidget 天然 no-op，'
+              '不再空→空整卡重画（每次查词双次 renderPopup 的根因）');
+      c.fillResult(
+        e,
+        result: DictionarySearchResult(searchTerm: 'あ'),
+        allLoaded: true,
+      );
+      c.dismissAt(0);
+      expect(
+          identical(c.entries.first.result, kPopupSearchingPlaceholderResult),
+          true,
+          reason: '关栈复位回同一单例，下次查词 停驻→搜索 依旧无身份变化');
+    });
+  });
+
+  // 停驻的热槽页里循环加载动画：宿主曾按「结果是占位单例」推 lookupPending=true，而
+  // seed / 复位 / 停驻 realm 挂的都是那个单例——Windows WebView2 停驻仍可见，空闲持续
+  // 出帧。pending 只由「层可见 && 查询进行中 && 还没有内容」派生。
+  group('lookupPending：占位 / 空闲 与 查询进行中 分开', () {
+    final DictionarySearchResult hit = DictionarySearchResult(
+      searchTerm: 'あ',
+      entries: <DictionaryEntry>[
+        DictionaryEntry(word: '亜', reading: 'あ', meaning: 'sub'),
+      ],
+    );
+
+    test('seed 热槽（停驻空闲）pending=false', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry slot = c.entries.first;
+      expect(identical(slot.result, kPopupSearchingPlaceholderResult), true);
+      expect(slot.lookupPending, false, reason: '预热种子是空闲，不是查询中');
+    });
+
+    test('复用热槽激活查词 pending=true（占位单例不变）→ 结果到达 false → 复位 false',
+        () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final e = c.beginTop(
+        term: 'あ',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+        initialResult: kPopupSearchingPlaceholderResult,
+      );
+      expect(identical(e.result, kPopupSearchingPlaceholderResult), true,
+          reason: '前置：结果对象身份没变，只能靠查询状态区分');
+      expect(e.lookupPending, true);
+
+      c.fillResult(e, result: hit, allLoaded: true);
+      expect(e.lookupPending, false, reason: '结果到达即不再 pending');
+
+      c.dismissAt(0);
+      final DictionaryPopupEntry slot = c.entries.first;
+      expect(identical(slot.result, kPopupSearchingPlaceholderResult), true);
+      expect(slot.lookupPending, false, reason: '关栈复位回停驻空闲');
+    });
+
+    test('结果到达前就关掉：复位后 pending=false', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final e = c.beginTop(
+        term: 'あ',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+        initialResult: kPopupSearchingPlaceholderResult,
+      );
+      expect(e.lookupPending, true);
+      c.pruneToWarmSlot();
+      expect(c.entries.first.lookupPending, false);
+    });
+
+    test('搜索期隐藏（书内「就绪才显示」）pending=false', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final e = c.beginTop(
+        term: 'あ',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: false,
+      );
+      expect(e.isSearching, true);
+      expect(e.lookupPending, false, reason: '层不在屏上，页面不该起加载动画');
+    });
+
+    test('已有词条的分页 load-more 不算 pending（否则全量重渲染滚回顶）', () {
+      final c = DictionaryPopupController(lowMemory: false);
+      final e = c.beginTop(
+        term: 'あ',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: true,
+        visible: true,
+      );
+      c.fillResult(e, result: hit, allLoaded: false);
+      e.isSearching = true;
+      expect(e.lookupPending, false);
+    });
+
+    test('popupLookupPending 真值表', () {
+      expect(
+        popupLookupPending(
+          layerVisible: false,
+          isSearching: true,
+          result: kPopupSearchingPlaceholderResult,
+        ),
+        false,
+      );
+      expect(
+        popupLookupPending(
+          layerVisible: true,
+          isSearching: false,
+          result: kPopupSearchingPlaceholderResult,
+        ),
+        false,
+      );
+      expect(
+        popupLookupPending(layerVisible: true, isSearching: true, result: null),
+        true,
+      );
+      expect(
+        popupLookupPending(
+          layerVisible: true,
+          isSearching: true,
+          result: kPopupSearchingPlaceholderResult,
+        ),
+        true,
+      );
+      expect(
+        popupLookupPending(layerVisible: true, isSearching: true, result: hit),
+        false,
+      );
+    });
+  });
+
+  group('entries 是零拷贝的不可变 live 视图', () {
+    test('同一视图实例、实时反映内部变更、外部不可写', () {
+      final c = DictionaryPopupController(lowMemory: false);
+      final List<DictionaryPopupEntry> view = c.entries;
+      expect(identical(view, c.entries), true,
+          reason: '不再每次访问整表拷贝（build 循环 / contains 高频调用）');
+      c.seedWarmSlot();
+      expect(view.length, 1, reason: 'live 视图实时反映内部列表变更');
+      expect(() => view.clear(), throwsUnsupportedError, reason: '外部不可变语义保持不变');
+      expect(identical(view, c.entries), true);
+    });
+  });
+
+  // BUG-2039 ③：嵌套层被裁掉时 WebView 键停驻，下一条嵌套层接管同一把键（同一个
+  // WebView element，静态段/字体/JIT 全热）；停驻的是**键**不是 entry，在途的旧查词
+  // 握着旧 entry 对象、`entries.contains` 恒假，绝不会把旧词结果灌进新层。
+  group('嵌套 realm 停驻与接管', () {
+    DictionaryPopupEntry pushNested(DictionaryPopupController c, String term) {
+      return c.beginTop(
+        term: term,
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: false,
+        visible: false,
+      );
+    }
+
+    test('裁掉的嵌套层把键停驻；下一条嵌套层接管同一把键、entry 是新对象', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      pushNested(c, '一'); // 顶层（热槽不复用的路径，也走非热槽建层）
+      final DictionaryPopupEntry child = pushNested(c, '二');
+      final GlobalKey<DictionaryPopupWebViewState> childKey = child.webViewKey;
+      expect(c.parkedRealms, isEmpty);
+
+      c.truncateTo(2);
+      expect(c.entries.length, 2);
+      expect(c.parkedRealms, <GlobalKey<DictionaryPopupWebViewState>>[childKey],
+          reason: '被裁的嵌套层不再随 entry 一起死，键进池等待接管');
+
+      final DictionaryPopupEntry again = pushNested(c, '三');
+      expect(identical(again.webViewKey, childKey), true,
+          reason: '新嵌套层接管停驻 realm（同一把 GlobalKey ⇒ 同一个 WebView element）');
+      expect(identical(again, child), false,
+          reason: '停驻的是键不是 entry：旧异步查词握着的旧 entry 不在栈内');
+      expect(c.entries.contains(child), false);
+      expect(c.parkedRealms, isEmpty, reason: '接管后池空');
+    });
+
+    test('热槽永不入池；dismissAt(0) / pruneToWarmSlot 都把嵌套层停驻', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry top = c.beginTop(
+        term: '一',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+      );
+      final DictionaryPopupEntry child = pushNested(c, '二');
+      c.dismissAt(0);
+      expect(c.entries.length, 1);
+      expect(c.entries.first.isWarmSlot, true);
+      expect(c.parkedRealms.contains(top.webViewKey), false,
+          reason: '热槽自己就是常驻 realm，不进池');
+      expect(c.parkedRealms, [child.webViewKey]);
+
+      pushNested(c, '三');
+      c.pruneToWarmSlot();
+      expect(c.parkedRealms.length, 1);
+    });
+
+    test('池上限 kMaxParkedRealms：只留最近用过的', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      pushNested(c, '一');
+      final DictionaryPopupEntry a = pushNested(c, '二');
+      final DictionaryPopupEntry b = pushNested(c, '三');
+      c.truncateTo(1);
+      expect(c.parkedRealms.length, DictionaryPopupController.kMaxParkedRealms);
+      expect(c.parkedRealms.last, b.webViewKey, reason: '最深（最近建的）那层最热，优先保留');
+      expect(c.parkedRealms.contains(a.webViewKey),
+          DictionaryPopupController.kMaxParkedRealms >= 2);
+    });
+
+    test('低内存不停驻；clear 连池一起清；replaceStack 也走停驻', () {
+      final lm = DictionaryPopupController(lowMemory: true);
+      pushNested(lm, '一');
+      pushNested(lm, '二');
+      lm.truncateTo(1);
+      expect(lm.parkedRealms, isEmpty, reason: '低内存与热槽同策略：不留 WebView');
+
+      final c = DictionaryPopupController(lowMemory: false);
+      final DictionaryPopupEntry first = pushNested(c, '一');
+      final DictionaryPopupEntry replaced = c.beginTop(
+        term: '二',
+        rect: Rect.zero,
+        reuseWarmSlot: false,
+        replaceStack: true,
+        visible: true,
+      );
+      expect(identical(replaced.webViewKey, first.webViewKey), true,
+          reason: 'replaceStack 清掉的层先停驻、再被新顶层立即接管');
+      c.clear();
+      expect(c.parkedRealms, isEmpty);
+      expect(c.entries, isEmpty);
+    });
+
+    test('pushChild 同样接管停驻 realm', () {
+      final c = DictionaryPopupController(lowMemory: false);
+      pushNested(c, '一');
+      final DictionaryPopupEntry child = c.pushChild(
+          term: '二', rect: Rect.zero, parentIndex: 0, visible: true);
+      c.dismissAt(1);
+      final DictionaryPopupEntry again = c.pushChild(
+          term: '三', rect: Rect.zero, parentIndex: 0, visible: true);
+      expect(identical(again.webViewKey, child.webViewKey), true);
+    });
+  });
+
+  group('弹窗内原地跳转历史（Hoshi iOS backStack/forwardStack 对齐）', () {
+    DictionarySearchResult resultFor(String term) =>
+        DictionarySearchResult(searchTerm: term);
+
+    DictionaryPopupEntry visibleTop(DictionaryPopupController c, String term) {
+      final DictionaryPopupEntry e = c.beginTop(
+        term: term,
+        rect: const Rect.fromLTWH(10, 20, 30, 40),
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+      );
+      c.fillResult(e, result: resultFor(term), allLoaded: true);
+      return e;
+    }
+
+    test('navigateInPlace：同一 entry 换词，当前页入后退栈、前进栈清空、弹窗不动', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, '足');
+      final DictionarySearchResult first = e.result!;
+      expect(e.hasNavigationHistory, false, reason: '没跳过不画 ← →');
+
+      int notified = 0;
+      c.addListener(() => notified++);
+      final bool ok = c.navigateInPlace(
+        e,
+        term: '揚げ足を取る',
+        result: resultFor('揚げ足を取る'),
+        allLoaded: false,
+        scrollTop: 120,
+      );
+      expect(ok, true);
+      expect(notified, 1);
+      expect(c.entries.length, 1, reason: '不叠子层，仍是同一层');
+      expect(identical(c.entries.single, e), true);
+      expect(e.searchTerm, '揚げ足を取る');
+      expect(e.allLoaded, false);
+      expect(e.isSearching, false);
+      expect(e.visible, true);
+      expect(e.selectionRect, const Rect.fromLTWH(10, 20, 30, 40),
+          reason: '弹窗锚点不变');
+      expect(e.restoreScrollTop, isNull, reason: '新词从顶部开始');
+      expect(e.canGoBack, true);
+      expect(e.canGoForward, false);
+      expect(e.hasNavigationHistory, true);
+
+      // 后退：回到「足」并带回离开时的滚动位；当前页进前进栈。
+      expect(c.goBack(e, scrollTop: 33), true);
+      expect(e.searchTerm, '足');
+      expect(identical(e.result, first), true,
+          reason: '回退用缓存的同一 result 对象（WebView 按身份重推）');
+      expect(e.allLoaded, true);
+      expect(e.restoreScrollTop, 120);
+      expect(e.canGoBack, false);
+      expect(e.canGoForward, true);
+
+      // 前进：回到「揚げ足を取る」，恢复的是刚才离开它时的 33。
+      expect(c.goForward(e, scrollTop: 0), true);
+      expect(e.searchTerm, '揚げ足を取る');
+      expect(e.restoreScrollTop, 33);
+      expect(e.canGoForward, false);
+
+      // 栈底 / 栈顶再走：no-op、不通知。
+      final int before = notified;
+      expect(c.goForward(e, scrollTop: 0), false);
+      expect(notified, before);
+    });
+
+    test('后退后再原地跳转：前进栈被清空（与浏览器 / Hoshi 同语义）', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: true, scrollTop: 0);
+      c.navigateInPlace(e,
+          term: 'c', result: resultFor('c'), allLoaded: true, scrollTop: 0);
+      c.goBack(e, scrollTop: 0);
+      c.goBack(e, scrollTop: 0);
+      expect(e.searchTerm, 'a');
+      expect(e.canGoForward, true);
+      c.navigateInPlace(e,
+          term: 'd', result: resultFor('d'), allLoaded: true, scrollTop: 0);
+      expect(e.canGoForward, false);
+      expect(c.goBack(e, scrollTop: 0), true);
+      expect(e.searchTerm, 'a');
+    });
+
+    test('fillResult（load-more）清掉 restoreScrollTop，不把历史页滚动位带进增量渲染', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: false, scrollTop: 50);
+      c.goBack(e, scrollTop: 0);
+      expect(e.restoreScrollTop, 50);
+      c.fillResult(e, result: resultFor('a'), allLoaded: true);
+      expect(e.restoreScrollTop, isNull);
+      expect(e.canGoForward, true, reason: 'load-more 不动历史');
+    });
+
+    test('历史不跨查词会话：复用热槽 / 关栈复位都清空', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: true, scrollTop: 0);
+      expect(e.hasNavigationHistory, true);
+
+      // 顶层新查词复用热槽：同一 entry，历史必须归零。
+      final DictionaryPopupEntry again = c.beginTop(
+        term: 'x',
+        rect: Rect.zero,
+        reuseWarmSlot: true,
+        replaceStack: false,
+        visible: true,
+      );
+      expect(identical(again, e), true);
+      expect(e.hasNavigationHistory, false);
+      expect(e.restoreScrollTop, isNull);
+
+      c.navigateInPlace(e,
+          term: 'y', result: resultFor('y'), allLoaded: true, scrollTop: 0);
+      c.dismissAt(0);
+      expect(c.entries.single.isWarmSlot, true);
+      expect(c.entries.single.hasNavigationHistory, false,
+          reason: '热槽复位（_restoreWarmSeed）连历史一起清');
+    });
+
+    test('不在栈内的 entry：navigateInPlace / goBack 都 no-op', () {
+      final c = DictionaryPopupController(lowMemory: false)..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: true, scrollTop: 0);
+      c.clear();
+      expect(
+          c.navigateInPlace(e,
+              term: 'c', result: resultFor('c'), allLoaded: true, scrollTop: 0),
+          false);
+      expect(c.goBack(e, scrollTop: 0), false);
+      expect(e.searchTerm, 'b', reason: '离栈 entry 内容不再被改');
+    });
+
+    test('每次原地跳转算一次查词（onLookupStarted）；后退 / 前进不算', () {
+      int started = 0;
+      final c = DictionaryPopupController(lowMemory: false);
+      c.onLookupStarted = () => started++;
+      c.seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      expect(started, 1);
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: true, scrollTop: 0);
+      expect(started, 2);
+      c.goBack(e, scrollTop: 0);
+      c.goForward(e, scrollTop: 0);
+      expect(started, 2);
+    });
+
+    test('面包屑：原地跳转 / 后退后栈顶词跟着变，深度仍是 1', () {
+      final List<(int, String?)> seen = <(int, String?)>[];
+      final c = DictionaryPopupController(
+        lowMemory: false,
+        onLookupStackDepthChanged: (int d, String? t) => seen.add((d, t)),
+      )..seedWarmSlot();
+      final DictionaryPopupEntry e = visibleTop(c, 'a');
+      seen.clear();
+      c.navigateInPlace(e,
+          term: 'b', result: resultFor('b'), allLoaded: true, scrollTop: 0);
+      expect(seen.last, (1, 'b'));
+      c.goBack(e, scrollTop: 0);
+      expect(seen.last, (1, 'a'));
+    });
+  });
+}

@@ -1,0 +1,30 @@
+[package]
+name = "fushi_p2p"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[lib]
+# rlib：给 native/fushi_ios_umbrella（iOS 伞形 staticlib，与 fushi_fsrs 共用一份 Rust std）当依赖用。
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["dht"]
+# Mainline DHT 地址查找（iroh 1.x 把它拆到了独立 crate）。
+dht = ["dep:iroh-mainline-address-lookup"]
+
+[dependencies]
+iroh = "1.2"
+iroh-mainline-address-lookup = { version = "0.5", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+serde_json = "1"
+hex = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"

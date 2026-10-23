@@ -1,0 +1,74 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.buildlog/
+.history
+.svn/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+/build/
+
+# Web related
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# FVM Version Cache
+.fvm/
+
+# ADB test artifacts
+ui-*.xml
+*.ldb
+*.png
+# Golden master baselines MUST be tracked or golden tests hard-fail in CI
+# (matchesGoldenFile against a non-existent file). Generated diff artifacts
+# under test/goldens/failures/ stay ignored via the *.png rule above.
+!test/goldens/golden_files/
+!test/goldens/golden_files/*.png
+# TODO-942: Kenney Input Prompts controller icons (CC0) are bundled assets
+# and MUST be tracked despite the blanket *.png ignore above.
+!assets/gamepad/**
+# TODO-2525: TMDB 官方署名 logo 是合约义务素材（Terms of Use 第 3 节），必须入库，
+# 同样不受上面的 *.png 全局忽略影响。来源/哈希见 assets/attribution/tmdb/README.md。
+!assets/attribution/tmdb/*.png
+# Windows 安装器的 MD3 图像（generate_md3_assets.py 生成）：ISCC 在编译期把它们
+# 打进 setup.exe，不入库就等于 CI 上编译失败，同样不受上面的 *.png 全局忽略影响。
+!windows/installer/assets/*.png
+# 浏览器扩展图标（tools/browser-extension 真源的镜像，sync-mirrors.mjs 同步）：manifest
+# icons 引用，不入库则安装助手解压出的扩展缺图标文件、Chrome 拒装。
+!assets/browser_extension/*.png
+test_screenshots/
+
+# Codex test outputs
+.codex-test/

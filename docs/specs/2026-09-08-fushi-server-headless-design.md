@@ -1,0 +1,261 @@
+# Fushi 无头服务端（Linux CLI + WebUI）与互联计算卸载设计
+
+日期：2026-09-08 · 状态：四期全部落地（见 §7）；2026-09-30 补齐第 0 期「扫描器接刮削协调器」（第 6 批）· 分支 `worktree-fushi-server-headless`
+
+## 0. 一句话
+
+服务端不是新产品，是现有互联 host 角色的无头化：把已经存在的 shelf 服务器
+（配对 PIN / TLS 指纹钉扎 / 能力位 / 库流播 / 远程 OCR 作业）从 Flutter app 里
+抽成纯 Dart 包 `fushi_engine`，再用 `fushi_server` 这个 CLI 进程跑起来；客户端
+沿用既有配对与 `RemoteLibrarySource` 消费路径，只为新卸载能力加能力位。
+
+## 1. 用户拍板（2026-09-08）
+
+| 问题 | 决定 |
+|---|---|
+| 包切分粒度 | 一个 `packages/fushi_engine` 大包 |
+| 服务端与 GUI Fushi 同机共存 | 不需要。端口只走配置文件，不自动躲 |
+| WebUI 上传文件 | 要 |
+| 分期 | 四期全部做 |
+
+## 2. 勘察结论（决定设计的硬事实）
+
+- 传输层已完整：`fushi_sync_server.dart` + 7 个 part 是 shelf 服务器，HTTP
+  Basic（用户名固定 `hibiki`，密码 = per-peer token），可选自签 EC P-256 TLS +
+  SHA-256 指纹 TOFU；配对 v2 = 6 位 PIN + HMAC 证明，PIN 不过线；发现走
+  mDNS `_fushi-sync._tcp`（bonsoir 插件）。**没有协议版本号**，靠
+  `/api/capabilities` 能力位 + 404/405 降级；wire 冻结面见
+  `docs/plans/2026-09-06-sync-interconnect-refactor.md`。
+- 远程 OCR 作业协议已存在（`fushi_manga_ocr_host.dart`，
+  `POST /api/ocr/job` → 逐页 `PUT` → `/start` → 轮询 → `/result`），客户端
+  `interconnect_manga_ocr_client.dart` 已会消费。
+- host 侧抽象 `FushiLibraryHostService`（37 个方法）只有一个实现
+  `LocalLibraryHostService`，它靠构造回调解耦，**不直接依赖 AppModel**。
+- ASR：上游 `hajisensai/fushi-asr` 已有纯 Dart FFI ORT 后端 `asr_onnx_ffi`
+  与 `asr_cli` / `asr_server`；本仓 `asr_host.dart` 只是插件后端装配。
+  有声书对齐执行器 `audiobook_alignment_service.dart` 也几乎纯 Dart。
+- 下载执行器 `VideoDownloadPipelineService` DI 干净；Linux 缺
+  `libfushi_torrent_ffi.so`（从未构建），回退外接 qBittorrent 的分支已存在。
+- **传递闭包**：15 个候选根的 import 闭包是 1267 个文件（几乎整个 app）。
+  但「干净文件 → 污染文件」的切割边只集中在几个枢纽：
+  `utils/misc/error_log_service.dart`（124 处调用）、
+  `models/preferences_repository.dart`（2 处）、`storage/app_paths.dart`
+  （3 处）、`media/video/ffmpeg_backend.dart`（4 个调用方，ffmpeg-kit 插件）、
+  `media/manga/mokuro_payload.dart`（`dart:ui`）、`media/video/video_storage.dart`
+  （`FileImage.evict` 一行）、`epub/epub_book.dart`（只用
+  `ReaderFushiSource.kHost` 常量）、`media/audiobook/subtitle_rematch.dart`
+  （同文件混了两个 Slider 组件）、`models/content_font_chain.dart`
+  （`cjk_font_families.dart` 的 `dart:ui Locale`）。
+  `local_library_host_service.dart` 与 `source_library_scanner.dart` 各有
+  85+ 条切割边（深耦合 `MediaSource` UI 类），**不净化，服务端另写无头实现**。
+- 本仓无任何 `bin/*.dart`；`fushi_core` 只有 2 处 Flutter import，
+  DB 走 `NativeDatabase`；`fushi_audio` 依赖 just_audio/audio_session/
+  path_provider/charset 插件。
+
+## 3. 架构
+
+```
+packages/fushi_core      Drift DB / 偏好（既有）
+packages/fushi_audio     字幕解析 / 匹配 / 有声书仓储（既有）
+packages/fushi_engine    ★新：纯 Dart 引擎（服务器 + 任务 + OCR + 下载 + 刮削 + ffmpeg）
+packages/fushi_server    ★新：CLI 进程 bin/fushi_server.dart（config + headless host + WebUI + admin API）
+fushi/                   Flutter app：依赖 fushi_engine，只保留 UI 与平台实现
+```
+
+### 3.1 工具链决定（明说）
+
+`fushi_engine` 与 `fushi_server` 的 pubspec **不依赖 `flutter` sdk**，但它们
+依赖的 `fushi_core` / `fushi_audio` 目前仍声明 flutter；因此**解析依赖时需要
+Flutter SDK（构建工具链），运行时二进制不含 Flutter**。服务端构建命令固定为
+`flutter pub get && dart compile exe packages/fushi_server/bin/fushi_server.dart`
+（CI Linux job 已有 Flutter）。守卫测试禁止 `fushi_engine`/`fushi_server` 源码
+出现 `package:flutter`、`dart:ui`、任何 method-channel 插件 import；
+`dart compile exe` 是最终门（`dart:ui` 一旦进闭包直接编不过）。
+把 `fushi_core` / `fushi_audio` 的 pubspec 彻底去 Flutter 是后续独立清理，
+不在本项目内。**（2026-09-30 已完成：两包 pubspec 不再声明 `sdk: flutter`，
+见 §7 第 7 批；`fushi_anki` / `fushi_dictionary` / `fushi_platform` 仍声明 flutter，
+所以解析依赖仍需 Flutter SDK。）**
+
+### 3.2 平台边界钩子（引擎侧全局装配点，与 `asr_host.dart` 同一范式）
+
+| 钩子 | 引擎定义 | app 装配 | server 装配 |
+|---|---|---|---|
+| 日志 | `engineLog: EngineLogSink`（`log` / `logDiagnostic` / `logFatal`） | `ErrorLogService implements EngineLogSink` | stderr + 滚动文件 |
+| 路径 | `enginePaths: EnginePaths`（documents/support/temp 根 + 子目录） | `AppPaths` 桥接 | 配置文件 `data_dir` |
+| 偏好读取 | `PrefReader.getPref` | `PreferencesRepository implements PrefReader` | 服务端 `preferences` 表 |
+| ffmpeg | `FfmpegBackend` 抽象 + `CliFfmpegBackend` + `ffmpegBackendProvider` | Android/iOS 装 `KitFfmpegBackend`（留在 app） | CLI（`FUSHI_FFMPEG` / PATH） |
+| ONNX | `OnnxSessionFactory`（`asr_core` 既有） | `OrtOnnxSessionFactory`（flutter_onnxruntime） | `asr_onnx_ffi` |
+| 封面缓存失效 | `coverImageEvictHook` | `FileImage.evict` | no-op |
+| mDNS | `LanAdvertiser` 接口 | bonsoir | `avahi-publish` 子进程（缺 avahi 时只靠手动 IP） |
+| 字符集探测 | `fushi_audio` 既有分级：纯 Dart → 平台 → utf8 兜底 | 插件 | 纯 Dart 一级 + 兜底 |
+
+### 3.3 三种卸载的本质不同（决定协议形状）
+
+- **下载 = 改变服务端的库**。客户端要的是「能播」，不是拿回文件。所以下载走
+  服务端自己的 `VideoDownloadPipelineService` + `video_download_jobs` 表，
+  完成后进服务端库，客户端用既有 `/api/library/videos` + `/stream` 消费。
+  协议只加 `/api/downloads`（add / list / cancel / 订阅 CRUD）。
+- **OCR = 计算任务，产物是 sidecar**。协议已存在，原样保留。
+- **ASR = 计算任务，产物是 SRT（+ token sidecar），回挂到某个媒体**。走新的
+  通用任务协议。
+
+### 3.4 通用任务协议 `/api/jobs`
+
+```
+POST   /api/jobs                       {kind, params}          → {jobId}
+PUT    /api/jobs/<id>/input/<name>     body=bytes              上传输入
+POST   /api/jobs/<id>/start
+GET    /api/jobs/<id>                  {state, progress, message, kind}
+GET    /api/jobs/<id>/result           产物（kind 决定 content-type）
+GET    /api/jobs/<id>/result/<name>    多产物按名取（如 tokens sidecar）
+DELETE /api/jobs/<id>                  取消 / 清理
+GET    /api/jobs                       列表（admin）
+```
+
+状态机照抄 OCR：`pending → uploading → running → done | error | cancelled`。
+任务落 Drift 表 `host_jobs`（schema +1），重启可续；产物落
+`<support>/host_jobs/<id>/`。能力位 `jobs.kinds: [asr]`。`kind=asr` 参数：
+`{source: {upload|videoId|path}, language, model, align?: {epubUpload}}`。
+`/api/ocr/job/*` **不迁移**到通用协议（冻结面）。
+
+### 3.5 身份与鉴权
+
+沿用 per-peer token（`fushi_paired_peers` 表）。服务端**只暴露配对 v2**
+（PIN 打到 CLI 日志与 WebUI），不广播 v1（v1 需要 host 有 UI 点批准）。
+WebUI / admin API 用独立 admin token（首次启动生成写入配置文件，或
+`fushi_server admin reset-token`），与 peer token 分离；WebUI 登录 cookie 只
+承载 admin token。多用户账号不做。
+
+## 4. 分期
+
+### 第 0 期：`fushi_engine` 抽离 + `fushi_server serve`（无头 host）
+
+1. 建 `packages/fushi_engine`，用 `git mv` 把候选根的**干净闭包**平移进去
+   （保持 `src/` 相对路径），全仓 import 改写 `package:fushi/src/X` →
+   `package:fushi_engine/src/X`。
+2. 切割边逐条处理：
+   - `ErrorLogService.instance.log*` → `engineLog.log*`（124 处，脚本改）。
+   - `AppPaths.*RootDirectory()` → `enginePaths.*`（3 处）。
+   - `PreferencesRepository` 参数 → `PrefReader`（`video_source_scrape_config`、
+     `media_tracking_service`）。
+   - `ffmpeg_backend.dart`：`KitFfmpegBackend` 拆到 app 文件，引擎留抽象 +
+     CLI + 解析函数 + `ffmpegBackendProvider`。
+   - `mokuro_payload.dart`：`dart:ui Rect` → 引擎 `MokuroRect`（app 侧加
+     扩展转 `Rect`）。
+   - `video_storage.dart`：`FileImage.evict` → `coverImageEvictHook`。
+   - `epub_book.dart`：`ReaderFushiSource.kHost` → 引擎常量 `kReaderFushiHost`，
+     `ReaderFushiSource` 反向引用。
+   - `subtitle_rematch.dart`：两个 Slider 组件拆到 app `subtitle_rematch_widgets.dart`。
+   - `cjk_font_families.dart`：`CjkScript`/`CjkFontStyle` 枚举拆到引擎
+     `cjk_script.dart`，字体映射留 app。
+   - `interconnect_service_config.dart` / `pref_redaction_policy.dart` 引用的
+     `k*Pref` 常量从 `media_tracking_service.dart` 抽到引擎 `tracking_pref_keys.dart`。
+   - `lan_discovery_service.dart`（bonsoir）留 app，引擎定义 `LanAdvertiser`。
+3. `fushi_core`：`debugPrint` → `fushiCoreLog` 钩子；`fushi_text_selection.dart`
+   搬回 app。`fushi_audio`：`foundation` 的 `debugPrint/listEquals/
+   visibleForTesting` → 钩子 / `collection` / `meta`；charset 插件级改注入。
+   **状态（2026-09-30）**：源码层早已零 Flutter（`fushiDebugPrint` 装配点；
+   `fushi_text_selection.dart` 实际落在 `fushi_dictionary`）；pubspec 层本批收尾——
+   `fushi_core` 去掉 dev 依赖 `flutter_test`；`fushi_audio` 把三个平台重文件
+   （`audiobook_controller.dart` / `audiobook_storage_platform.dart` /
+   `platform_charset_detector.dart`）平移到 app `fushi/lib/src/media/audiobook/`，
+   并删掉 `flutter` / `just_audio` / `audio_session` / `path_provider` /
+   `flutter_charset_detector` 依赖。
+4. `packages/fushi_server`：
+   - `bin/fushi_server.dart`：`serve` / `pair` / `scan` / `jobs` / `download` /
+     `transcribe` / `models` / `admin` 子命令（`package:args`）。
+   - 配置文件 `fushi_server.yaml`（`data_dir` / `port` / `bind` / `tls` /
+     `device_name` / `libraries[]` / `ffmpeg` / `admin_token` / `qbittorrent`）。
+   - `HeadlessLibraryHostService implements FushiLibraryHostService`：
+     videos（列表/封面/流/字幕/断点）、books（epub 导入 + 进度）、activity /
+     aggregate / collections 走既有纯 Dart 服务；dictionaries / localaudio /
+     audiobooks 第 0 期返回空集（能力位不宣告）。
+   - `HeadlessLibraryScanner`：遍历 `libraries[]`，视频经 `VideoBookRepository`
+     upsert + ffmpeg 封面 + 刮削协调器；epub 经 `epub_importer`。
+   - mDNS：`avahi-publish` 子进程；无 avahi 打 warning。
+5. 守卫：`fushi/test/build/fushi_engine_purity_guard_test.dart`（扫两包源码禁
+   Flutter/插件 import）；CI Linux job 加 `dart compile exe` + `--help` 冒烟。
+
+### 第 1 期：`/api/jobs` + ASR
+
+- 引擎 `jobs/`：`HostJobManager`（表 `host_jobs`）、`HostJobKind` 注册表、shelf
+  路由；`AsrJobRunner` 用 `asr_core` + `asr_onnx_ffi` + `FfmpegAsrPcmSource`，
+  可选 EPUB 强制对齐（`audiobook_alignment_service`）。
+- 客户端：`InterconnectJobClient`（照 `interconnect_manga_ocr_client` 的轮询
+  退避）；`asr_transcribe_sheet.dart` 能力位存在时多一个「在 <设备名> 上运行」。
+
+### 第 2 期：下载卸载
+
+- 服务端起 `VideoDownloadPipelineService` + 订阅；torrent 先 qBittorrent
+  后端，另起 CI job 构建 Linux `.so`（`native/fushi_torrent`），好了切内置。
+- `/api/downloads`（add / list / cancel / subscriptions CRUD）；能力位 `downloads`。
+- 客户端下载中心「目标：本机 / <服务端>」；远端任务列表只读展示。
+
+### 第 3 期：WebUI + admin API + 上传
+
+- `/ui` 静态单页（原生 JS，无框架，与 popup / 浏览器扩展同风格），
+  `/api/admin/*`：status / logs / pairing(PIN、peers、revoke) / libraries
+  (list、add、scan) / jobs / downloads / models / settings / upload。
+- 上传：`PUT /api/admin/upload?library=<id>&path=<rel>`（分块 `Content-Range`
+  可续传），落到库根后触发增量扫描；磁盘配额 `upload_quota_bytes`。
+
+### 第 4 期：原生缺口
+
+- `native/fushi_torrent` Linux 构建脚本 + CI job → `.so` 随 server 包。
+- `fushidicts` Linux 构建 → 远程查词能力位。
+- ORT CUDA EP 可选包（`asr_onnx_ffi` 已支持 CUDA provider 名）。
+
+## 5. 不做
+
+多用户账号；服务端阅读器 / 播放器；公网加固超出现有模型；
+Android / iOS / macOS 装服务端；`/api/ocr/job` 迁通用协议。
+
+## 6. 验证分级
+
+- 第 0 期：全量 `flutter analyze`；`flutter test test/sync test/ocr
+  test/media/video test/media/audiobook --no-pub`；Windows 上
+  `dart compile exe` 出 `fushi_server.exe` 并与 Windows Fushi 真机配对、列库、
+  流播、OCR 作业（协议层验证，平台无关）；Linux 编译走 CI。
+- 第 1/2 期：引擎层 shelf 路由单测（`shelf` 内存请求）+ Windows 真机
+  端到端（ASR 任务、下载任务）。
+- 第 3 期：WebUI 走 node 宿主测试（与 popup 同法）+ 手工截图证据。
+
+## 7. 落地记录（2026-09-08）
+
+| 期 | 提交 | 交付 |
+|---|---|---|
+| 0A/0B/0C | `7330439057` `70a53e10c1` `362dd2a863` | `packages/fushi_engine`（平移 + 切割边钩子）、`packages/fushi_server`（init/serve/scan/status/pair/admin/models/transcribe）、纯度守卫、CI linux 出 bundle |
+| 1 | `b5cbe92883` | `/api/jobs` 通用任务协议 + ASR runner；app 转录弹层「运行位置：本机 / host」 |
+| 2 | `834f32bc65` | `/api/downloads` + `ServerDownloadHost`；app 手动下载对话框「下载到」+ 下载中心混排 host 任务 |
+| 3 | `8e193edbe5` | admin 端口独立、token/cookie 鉴权、`/api/admin/*` 九组、单页 WebUI、分块可续上传 + 配额 |
+| 4 | `38da0dde35` | `torrent.engine` 三态 + 内置 libtorrent 随包；ORT 随包 + CUDA 说明；CI 编 `.so`/下 ORT/真进程冒烟；README |
+| 5（用户复审后追加，2026-09-08） | 见 git log | ① 内容订阅进 host：`/api/subscriptions`（引擎接口/路由）、`ServerSubscriptionHost`（后端四元组与落地源由 host 覆写）、host 真 provider registry（Torznab/Nyaa provider 搬进引擎、内置表去 i18n、偏好读侧下沉）+ `VideoDownloadSubscriptionService` 在 host 上跑；客户端发现页订阅加「运行位置：本机 / host」，下载页订阅 tab 顶部混排 host 订阅；WebUI「订阅」页。② `libraries[].kind: manga`：页图目录归组规则下沉引擎 `manga_folder_plan.dart`，服务端扫 `.mokuro` 卷 + 页图目录。③ ffmpeg：引擎解析层加宿主显式路径第 0 级（`ffmpegPathOverride` / `ffprobePathOverride`），配置 `ffmpeg:` / `ffprobe:` 真正生效。④ Linux `.so` 改 vcpkg 静态链（`build_linux_so.sh` + `x64-linux-fpic` triplet + `-static-libstdc++`），目标机零 libtorrent 依赖。⑤ `release-server.yml` 专用发布（beta/formal，永不 Latest）。 |
+| 6（2026-09-30，BUG-2809 / BUG-2812） | 见 git log | ① 扫描对账：文件已消失的视频条目回收（带空挂载点 / 子挂载点 / 比例护栏，`scan_prune`；接手第三方 PR #1817 后补修）。② **第 0 期「扫描器接刮削协调器」此前没有落地**：扫描器写行不带 `sourceId`、不归合集，刮削计划器对服务端的库规划出零个作品；协调器只在下载管线里建、无 torrent 后端时不建；库服务的 `scrapeController` 没接，客户端远程重刮恒空。现在视频根登记为本地来源、入库带 `sourceId`、按引擎 `VideoFolderGroupCoordinator` 归组 + `VideoSourceMetadataIndexer` 吃 NFO（两者从 app 下沉到引擎，app 与服务端共用），进程共享一套 `ServerVideoScrape`（协调器 + 任务控制器 + `VideoLibraryScrapeSweep`），扫描后只补刮从未识别过的作品；配置 `scan_scrape` / `tmdb_api_key`（服务端没有 app 的内置 TMDB key）。③（BUG-2816）书 / 漫画根也对账：根登记为 book / manga 来源、入库带 `sourceId`，引擎 `BookSourceIndex` 记源 → 书 uid，护栏与视频共用（`library_prune_guard.dart`），admin purge 支持书 / 漫画根。 |
+| 7（2026-09-30） | 见提交记录 | `fushi_core` / `fushi_audio` 去 Flutter SDK：两包 pubspec 不再声明 `sdk: flutter`（含 dev 依赖，包测试改 `package:test`）；`fushi_audio` 的播放控制器 / 存储平台装配 / 字符集插件实现搬到 app `fushi/lib/src/media/audiobook/`，经包内既有装配点（`AudiobookStorage.documentsRootResolver` / `audioDurationProbeMs`、`platformCharsetDecoder`）由 `engine_bindings.dart` 注入，app 行为不变；`fushi_audio.dart` 全 barrel 与 `fushi_audio_core.dart` 等价。纯度守卫扩到两包整棵 `lib/` + pubspec 零 `sdk: flutter` / 插件。 |
+
+### 与原设计的偏差（明说；第 6 批之后仍成立的）
+
+- **解析依赖仍需 Flutter SDK**：`fushi_core` / `fushi_audio` 已零 Flutter（第 7 批），但服务端 / 引擎依赖的 `fushi_anki` / `fushi_dictionary` / `fushi_platform` 仍声明 `sdk: flutter`（其 lib 里还有插件 / Flutter 实现，只靠 `*_core.dart` 子 barrel 隔离），所以 workspace 解析依赖仍要 Flutter SDK；要做到「只装 Dart SDK 就能 `dart build cli`」还得把这三个包按同一办法拆。
+- ~~本地音频库不托管~~（BUG-2815 已补）：服务端对本地音频库做与词典包一样的存储中转——引擎 `LocalAudioLibraryStore`（库副本 `<support>/local_audio_<n>.db` + `local_audio_dbs` 偏好，与 app `LocalAudioManager` 同目录同键）接上 host 服务的清单 / 导入 / 删除三件，`liveLibrary.audio` 报 true 与实际一致。服务端仍不做查词发音。顺带：host 服务的本地音频清单改为现读（`localAudioEntriesProvider`），此前 app 传的是互联启动时的快照，之后增删的库对端看不见。
+- **书 / 漫画根的对账只认服务端扫描认领过的书**（BUG-2816 起对账，此前完全不对账）：书行本身仍不记源文件路径（没升 schema），关系记在 `preferences` 的来源扫描索引 `media_source_scan_index_<sourceId>`（源相对路径 → 书 uid）里，书行带 `sourceId`。客户端上传 / 手动导入的同名书、升级前源文件就已删掉的存量书认领不上，不会被回收。
+- **代下载不收游戏、接不了 PDF**（2026-09-30 起不再「只收视频」）：发现导入执行器（`DiscoveryImportExecutor` / 解压器 / `MangaArchiveImporter`）与 EPUB / 文本 / 漫画图包 / 有声书四个域原语已下沉引擎（`media/discovery/import/discovery_engine_importers.dart`，app 与服务端共用），`downloads.kinds` = `video` + `novel` / `manga` / `audiobook`。仍不做：`game`（服务端没有游戏库，exe 登记只在 app 有意义，能力位不宣告、投了 400）；小说包里的 PDF（`PdfImporter` 依赖 pdfrx 插件，任务以新原因码 `unsupportedOnThisHost` 进 needsAttention，不假装导入）；cbr / cb7 / rar 依赖服务端自备 7-Zip。服务端此前没装 `AudiobookStorage.documentsRootResolver`，有声书落盘会抛 StateError——现在在 `installServerHostBindings` 接到 `<documents>`。
+- **远程查词（第 4 期）不做**：README「服务端不做什么」已明说，本节以此为准。
+- CLI 没有 `jobs` / `download` 子命令：由 admin API / WebUI 代替。
+- **AI 助手会话（2026-09-30 补）**：服务端现在也挂 `/api/assistant`（AI 下视频），状态机 / AI 调用层 / 发现服务 / 端口装配随之从 app 下沉到引擎（`fushi_engine/lib/ai/`、`media/video/acquisition/`、`media/video/discovery/`、`sync/assistant/video_acquisition_assistant_host.dart`），app 与服务端共用 `createHostVideoAcquisitionService`。服务端的 AI 配置是 yaml `ai:` 段（**只有一家、只指派给「AI 下载」**），不是 app 那套「提供商清单 + 功能指派」偏好键；没配时能力位 `no_provider`、零 AI 请求。仍不做的：服务端管线没接字幕源，会话里选了「配字幕」也不装；刮削的 AI 身份识别不在服务端装配。
+- **互联「配置文件」（Profile）在服务端是寄存中转，不是配置的消费者**（2026-09-30 补）：此前服务端没接 `LocalLibraryHostService` 的三条 Profile 回调，端点恒 403。现在 `PUT` 寄存为 `<support>/interconnect_profiles/<id>.fushiprofile.json`、`GET` 交出 WebUI 指定（缺省最近收到）的那份，开关 `profile_transfer` 默认关、WebUI 可控。**刻意不落 `profiles` 表、不 apply**：服务端无阅读器 / 制卡可用这些设置，且 `profiles` 表非空会让 `resolveActiveProfileId`（统计分区键）从 0 漂到寄存的 Profile、`AggregateSyncService` 的 Profile 名↔id 映射也会变。解析 / 校验 / 准入判据 / 信封格式下沉到引擎 `profile/profile_document.dart`，与 app `ProfileRepository` 同一份。服务端的 Torznab 配置**不能**经这条通道设（出境时按凭据剔除），只能在 WebUI「订阅」页编辑（见下文「实例接管」条）或直接改库——README 旧说法已更正。
+
+第 5 批已根治的旧偏差：订阅进 host、漫画目录扫描、`ffmpeg` 配置项生效、Linux `.so` 静态链、专用发布——不再列。仍成立的：
+
+- **订阅的「实例接管」判据没有变成第二套**：订阅行落 host 的表、后端四元组由 host 用自己的 `_identity()` 覆写，客户端只传内容身份；host 管线的 `_validateBackendBinding` 与 app 侧同一段代码。代价是**客户端搜到的 provider 必须在 host 上也注册了**（能力位 `providers` 报清单，客户端提交前校验、host 再校验一次 400 `provider_unavailable`）。Torznab indexer 配置与停用清单 host 侧读同一张 `preferences` 表；2026-09-30 起 WebUI「订阅」页有编辑面（`GET|PUT /api/admin/resource-indexers`，读写都走引擎 `video_resource_prefs.dart`，与 app 同一编码），保存后 `ServerDownloadHost.reloadResourceIndexers()` 整套重建 registry + 管线 + 订阅服务（与 app `reloadVideoDownloadPipelineRuntime` 同形，torrent 后端不动），互联 server 捕获的订阅面是转发对象，能力位 `providers` 与在场校验随之更新，不需重启。
+- **漫画根只认 `.mokuro` 卷与纯页图目录**：cbz / cbr / cb7 / pdf 不扫（压缩包导入器 `MangaArchiveImporter` 已在引擎、代下载已在用，但扫描器没有接；rar 需外部 7-Zip、pdf 需 app 侧栅格化）。
+- **Linux 桌面版 Fushi 的内置引擎只在本机构建时随包**：runner CMake 已 copy-if-present `native/fushi_torrent/prebuilt/linux-x64/libfushi_torrent_ffi.so`（与服务端同一份静态 `.so`，`build_linux_so.sh` 产出）进 `bundle/lib/`，`EmbeddedTorrentEngine` 在 Linux 先按 `<exe>/lib/` 绝对路径加载（守卫 `fushi/test/build/linux_torrent_bundle_guard_test.dart`）；缺了回退外接 qBittorrent。但**没有任何 CI / 发布流水线构建 Linux app**（所有者 2026-09-30 拍板，守卫 `multiplatform_pr_gating_guard_test.dart` 禁 `flutter build linux`），所以流水线侧取回 `.so` 的步骤不做；哪天恢复 Linux app 发布，构建前从 native artifact store 取 `names.sh linux` 的 `torrent` 件即可，不必重编。
+- **WebUI 没有浏览器级自动化测试**：内联 JS 过 `node --check`，API 面走真进程 HTTP 冒烟；页面交互靠人工。
+- **audiobooks 库服务仍返回空集**（第 0 期既定），有声书不经 host 托管。
+- **发布链路（2026-09-14 改为独立仓 `hajisensai/fushi-server` 回调本仓 `workflow_call`）**：首个 beta 由那边 `release.yml` dispatch 触发；结果见该仓 Releases。
+
+### 验证证据（本机 Windows）
+
+- `packages/fushi_server`：`dart analyze` 零 issue；`dart test` 9 条全过（配置往返 / 上传分块 / 随包库定位）。
+- 真进程 HTTP 冒烟 `serve`：登录页 / 401 / Bearer / cookie 302+HttpOnly / 库 CRUD 写回 yaml / 上传三段+重放 409+穿越 400+配额账本 / 设置写回 / 扫描单飞 / 互联端口拒绝 admin 路由——27 项 PASS。
+- 随包原生库冒烟：`bundle/lib/` 放入 `fushi_torrent_ffi.dll`（+3 个运行时 DLL）与 `onnxruntime.dll`，`torrent.engine: auto` 解析成 `embedded`（libtorrent 2.0.11），17 语 ASR plan 无 error，磁力任务经内置引擎入 `video_download_jobs` 并可删——9 项 PASS。
+- Linux 真机没有：CI linux job 的冒烟步骤是 Linux 侧唯一证据（合并后看该 job）。

@@ -1,0 +1,408 @@
+import 'dart:convert';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/src/mining/bilibili_clip_miner.dart';
+import 'package:fushi_engine/utils/misc/desktop_audio_clipper.dart';
+
+/// bilibili 句子音频链路的解析层测试（纯离线，不打网络）。
+///
+/// 夹具是**实测响应体的真实形状**（2026-09-02 对 `api.bilibili.com` 实跑取得）：
+///   · `x/web-interface/view?bvid=` → `{code:0, data:{title, cid, pages:[{page,cid,part,duration}]}}`
+///   · `x/player/playurl?bvid=&cid=&fnval=4048&fourk=1`
+///     → `{code:0, data:{dash:{duration, audio:[{id,baseUrl,bandwidth,codecs:'mp4a.40.2'}], video:[…]}}}`
+/// 实测同时确认了两件影响设计的事实，两条都写成了断言的前提：
+///   1. 音轨是 audio-only DASH 分片（`.m4s`），ffmpeg 可直接 `-ss/-t` 裁，产出真 AAC；
+///   2. 未登录也拿得到最高档音轨（视频轨才受清晰度限制）——所以这条路只解析音轨。
+void main() {
+  const String viewBody = '''
+{"code":0,"message":"OK","data":{
+  "bvid":"BV1Este6wExx","aid":117191437455648,"cid":41473934959,
+  "title":"从零开始的异世界生活 第四季",
+  "pages":[
+    {"cid":41473934959,"page":1,"part":"第13话","duration":258},
+    {"cid":41473934960,"page":2,"part":"第14话","duration":261}
+  ]}}
+''';
+
+  const String playurlBody = '''
+{"code":0,"message":"OK","data":{"quality":32,"timelength":257382,
+  "dash":{"duration":258,
+    "video":[{"id":32,"baseUrl":"https://cdn/video-32.m4s","bandwidth":500000,
+              "codecs":"avc1.640033","width":854,"height":480}],
+    "audio":[
+      {"id":30216,"baseUrl":"https://cdn/audio-30216.m4s","bandwidth":67224,
+       "codecs":"mp4a.40.2","mimeType":"audio/mp4"},
+      {"id":30280,"baseUrl":"https://cdn/audio-30280.m4s","bandwidth":173162,
+       "codecs":"mp4a.40.2","mimeType":"audio/mp4"},
+      {"id":30232,"baseUrl":"https://cdn/audio-30232.m4s","bandwidth":85370,
+       "codecs":"mp4a.40.2","mimeType":"audio/mp4"}
+    ]}}}
+''';
+
+  group('parseBilibiliViewResponse', () {
+    test('按分 P 取 cid 与分 P 标题', () {
+      final BilibiliVideoIdentity? p1 = parseBilibiliViewResponse(viewBody);
+      expect(p1!.cid, 41473934959);
+      expect(p1.partTitle, '第13话');
+      expect(p1.durationSec, 258);
+      expect(p1.displayTitle, '从零开始的异世界生活 第四季 - 第13话');
+
+      final BilibiliVideoIdentity? p2 =
+          parseBilibiliViewResponse(viewBody, page: 2);
+      expect(p2!.cid, 41473934960, reason: '分 P 必须取对应那一 P 的 cid');
+      expect(p2.partTitle, '第14话');
+    });
+
+    test('分 P 越界回落第 1 P（而不是抛或给出错的 cid）', () {
+      expect(parseBilibiliViewResponse(viewBody, page: 99)!.cid, 41473934959);
+      expect(parseBilibiliViewResponse(viewBody, page: 0)!.cid, 41473934959);
+    });
+
+    test('无 pages 的旧响应体回落到稿件级 cid', () {
+      const String legacy =
+          '{"code":0,"data":{"cid":123,"title":"单P稿件"}}';
+      final BilibiliVideoIdentity? id = parseBilibiliViewResponse(legacy);
+      expect(id!.cid, 123);
+      expect(id.displayTitle, '单P稿件', reason: '没有分 P 名就不该拼出一个空后缀');
+    });
+
+    test('分 P 名与稿件名相同时不重复拼接', () {
+      const String same =
+          '{"code":0,"data":{"cid":1,"title":"标题","pages":['
+          '{"cid":1,"page":1,"part":"标题","duration":10}]}}';
+      expect(parseBilibiliViewResponse(same)!.displayTitle, '标题');
+    });
+
+    test('失败响应 / 畸形 JSON / 缺 cid 一律 null，不抛', () {
+      expect(parseBilibiliViewResponse('{"code":-404,"data":null}'), isNull);
+      expect(parseBilibiliViewResponse('not json'), isNull);
+      expect(parseBilibiliViewResponse('{"code":0,"data":{"title":"x"}}'),
+          isNull);
+      expect(parseBilibiliViewResponse('{"code":0,"data":{"cid":0}}'), isNull,
+          reason: 'cid=0 不是合法分片身份');
+    });
+  });
+
+  group('parseBilibiliPlayurlResponse', () {
+    test('取最高码率音轨（不是列表里的第一条）', () {
+      final BilibiliPlayStreams? s =
+          parseBilibiliPlayurlResponse(playurlBody);
+      expect(s!.audioUrl, 'https://cdn/audio-30280.m4s',
+          reason: '30280 的 bandwidth 最高；列表顺序不代表码率顺序');
+      expect(s.durationSec, 258);
+    });
+
+    test('没有 DASH 音轨时返回 null —— 宁可失败也不出无声卡', () {
+      expect(
+          parseBilibiliPlayurlResponse(
+              '{"code":0,"data":{"dash":{"audio":[]}}}'),
+          isNull);
+      expect(
+          parseBilibiliPlayurlResponse(
+              '{"code":0,"data":{"durl":[{"url":"https://cdn/x.flv"}]}}'),
+          isNull,
+          reason: 'durl 是混流，不当作可裁音轨静默降级');
+      expect(parseBilibiliPlayurlResponse('{"code":-403,"data":null}'), isNull);
+      expect(parseBilibiliPlayurlResponse('garbage'), isNull);
+    });
+
+    test('容忍 base_url 蛇形键与缺 bandwidth 的条目', () {
+      const String mixed = '{"code":0,"data":{"dash":{"audio":['
+          '{"base_url":"https://cdn/a.m4s"},'
+          '{"baseUrl":"https://cdn/b.m4s","bandwidth":100}]}}}';
+      expect(parseBilibiliPlayurlResponse(mixed)!.audioUrl,
+          'https://cdn/b.m4s');
+    });
+  });
+
+  // 番剧（PGC）的 `pgc/player/web/playurl` 响应体（实测 `ep_id=815751`，2026-09-16）：与稿件
+  // **唯一的形状差异是顶层键**——番剧回 `result`，稿件回 `data`；`dash` 那一层同形。真实直链带
+  // `deadline`/`upsig` 一长串查询参数，这里为可读性省掉（不影响挑流判据）。
+  const String pgcPlayurlBody = '''
+{"code":0,"message":"success","result":{"type":"DASH",
+  "dash":{"duration":1425,
+    "audio":[
+      {"id":30216,"baseUrl":"https://cdn/pgc-audio-30216.m4s","bandwidth":45709,
+       "codecs":"mp4a.40.5"},
+      {"id":30280,"baseUrl":"https://cdn/pgc-audio-30280.m4s","bandwidth":174093,
+       "codecs":"mp4a.40.2"},
+      {"id":30232,"baseUrl":"https://cdn/pgc-audio-30232.m4s","bandwidth":102447,
+       "codecs":"mp4a.40.2"}
+    ]}}}
+''';
+
+  group('parseBilibiliPgcPlayurlResponse', () {
+    test('取最高码率音轨（番剧的顶层键是 result，不是 data）', () {
+      final BilibiliPlayStreams? s =
+          parseBilibiliPgcPlayurlResponse(pgcPlayurlBody);
+      expect(s!.audioUrl, 'https://cdn/pgc-audio-30280.m4s',
+          reason: '30280 的 bandwidth 最高；列表顺序不代表码率顺序');
+      expect(s.durationSec, 1425);
+    });
+
+    test('data 键也认 —— B 站若把番剧改回 data，整条链不该断', () {
+      expect(parseBilibiliPgcPlayurlResponse(playurlBody)!.audioUrl,
+          'https://cdn/audio-30280.m4s');
+    });
+
+    test('未登录 / 大会员过期 / 接口改版 → null，不静默出无声卡', () {
+      expect(parseBilibiliPgcPlayurlResponse('{"code":-404,"result":null}'),
+          isNull, reason: '大会员过期时 B 站返回非 0 code');
+      expect(
+          parseBilibiliPgcPlayurlResponse(
+              '{"code":0,"result":{"dash":{"audio":[]}}}'),
+          isNull);
+      expect(parseBilibiliPgcPlayurlResponse('{"code":0,"result":{}}'), isNull,
+          reason: '没有 dash（例如只给 durl 混流）就当不可用');
+      expect(parseBilibiliPgcPlayurlResponse('garbage'), isNull);
+    });
+  });
+
+  group('BilibiliClipMiner.buildPgcRequest', () {
+    test('用扩展回传的响应体挑音轨，一行网络请求都不发', () {
+      // 番剧的音轨是扩展在页面主世界里取的（要带 SESSDATA），服务端只挑流：
+      // 这里若真的去打网络，说明又把「服务端匿名请求」那条老路走回来了。
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async => throw StateError('pgc 不该打网络'),
+      );
+      final BilibiliClipRequest req = miner.buildPgcRequest(
+        playurlBody: pgcPlayurlBody,
+        startMs: 61000,
+        endMs: 64500,
+        fields: const <String, String>{'expression': '正道'},
+        sentence: '正道ではなく邪道',
+        documentTitle: '从零开始的异世界生活 第13话',
+      );
+      expect(req.audioSource, 'https://cdn/pgc-audio-30280.m4s');
+      expect(req.httpHeaders['Referer'], 'https://www.bilibili.com/',
+          reason: 'BUG-2730：番剧音轨同样落在防盗链节点上');
+      expect(req.clipStartMs, 61000);
+      expect(req.clipEndMs, 64500);
+      expect(req.documentTitle, '从零开始的异世界生活 第13话');
+    });
+
+    test('没有可裁音轨就抛，不静默出一张没声音的卡', () {
+      final BilibiliClipMiner miner =
+          BilibiliClipMiner(fetchJson: (Uri uri) async => null);
+      expect(
+        () => miner.buildPgcRequest(
+          playurlBody: '{"code":0,"result":{"dash":{"audio":[]}}}',
+          startMs: 0,
+          endMs: 1,
+          fields: const <String, String>{},
+          sentence: 's',
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('页面标题缺失 → null（不伪造标题，交由服务端回落）', () {
+      final BilibiliClipMiner miner =
+          BilibiliClipMiner(fetchJson: (Uri uri) async => null);
+      final BilibiliClipRequest req = miner.buildPgcRequest(
+        playurlBody: pgcPlayurlBody,
+        startMs: 0,
+        endMs: 1,
+        fields: const <String, String>{},
+        sentence: 's',
+      );
+      expect(req.documentTitle, isNull);
+    });
+  });
+
+  group('BilibiliClipMiner 防盗链头（BUG-2730）', () {
+    test('白名单外的新 PCDN 域名也带 -referer：Referer 来自请求声明，不靠 host 猜', () {
+      // 实测 B 站把音轨分到 `b-<id>.edge.mountaintoys.cn:4483` 这种 PCDN 节点时，
+      // 旧的按 host 白名单推 Referer 漏掉它 → ffmpeg 不带 Referer → 403 →
+      // required audio missing。PCDN 域名会轮换，这里故意用一个任何白名单都不认的域名。
+      const String url =
+          'https://b-abc.edge.some-future-pcdn.example:4483/upgcxcode/1-30280.m4s';
+      expect(isBilibiliCdnHost(Uri.parse(url).host), isFalse,
+          reason: '前提：这个域名不在白名单里');
+      final BilibiliClipRequest req = BilibiliClipMiner().buildPgcRequest(
+        playurlBody: jsonEncode(<String, Object?>{
+          'code': 0,
+          'result': <String, Object?>{
+            'dash': <String, Object?>{
+              'audio': <Object?>[
+                <String, Object?>{'baseUrl': url, 'bandwidth': 1},
+              ],
+            },
+          },
+        }),
+        startMs: 0,
+        endMs: 1000,
+        fields: const <String, String>{},
+        sentence: 's',
+      );
+      final List<String> args = buildFfmpegRemoteInputArgs(req.audioSource,
+          httpHeaders: req.httpHeaders);
+      final int i = args.indexOf('-referer');
+      expect(i, greaterThanOrEqualTo(0));
+      expect(args[i + 1], 'https://www.bilibili.com/');
+    });
+  });
+
+  group('BilibiliClipMiner', () {
+    test('两次往返解析出音轨与标题，分 P 进 cid', () async {
+      final List<Uri> calls = <Uri>[];
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async {
+          calls.add(uri);
+          return uri.path.contains('web-interface/view')
+              ? viewBody
+              : playurlBody;
+        },
+      );
+      final BilibiliClipRequest req = await miner.buildRequest(
+        bvid: 'BV1Este6wExx',
+        page: 2,
+        startMs: 61000,
+        endMs: 64500,
+        fields: const <String, String>{'expression': '正道'},
+        sentence: '正道ではなく邪道',
+      );
+      expect(req.audioSource, 'https://cdn/audio-30280.m4s');
+      expect(req.httpHeaders['Referer'], 'https://www.bilibili.com/',
+          reason: 'BUG-2730：upos / PCDN 节点不带 Referer 一律 403');
+      expect(req.clipStartMs, 61000);
+      expect(req.clipEndMs, 64500);
+      expect(req.documentTitle, '从零开始的异世界生活 第四季 - 第14话');
+      expect(calls.length, 2);
+      expect(calls[1].queryParameters['cid'], '41473934960',
+          reason: 'playurl 必须用第 2 P 的 cid');
+      expect(calls[1].queryParameters['fnval'], '4048');
+    });
+
+    test('扩展带上来的页面标题优先于稿件标题', () async {
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async =>
+            uri.path.contains('view') ? viewBody : playurlBody,
+      );
+      final BilibiliClipRequest req = await miner.buildRequest(
+        bvid: 'BV1Este6wExx',
+        startMs: 0,
+        endMs: 1000,
+        fields: const <String, String>{},
+        sentence: 's',
+        documentTitle: '用户此刻看到的标题',
+      );
+      expect(req.documentTitle, '用户此刻看到的标题');
+    });
+
+    test('TTL 内同一视频只解析一次（一场批量 N 张卡不重复打网络）', () async {
+      int rounds = 0;
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async {
+          rounds++;
+          return uri.path.contains('view') ? viewBody : playurlBody;
+        },
+      );
+      for (int i = 0; i < 3; i++) {
+        await miner.buildRequest(
+          bvid: 'BV1Este6wExx',
+          startMs: i * 1000,
+          endMs: i * 1000 + 500,
+          fields: const <String, String>{},
+          sentence: 's',
+        );
+      }
+      expect(rounds, 2, reason: '3 张卡仍只有 view+playurl 两次请求');
+    });
+
+    test('不同分 P 不共用缓存', () async {
+      int rounds = 0;
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async {
+          rounds++;
+          return uri.path.contains('view') ? viewBody : playurlBody;
+        },
+      );
+      await miner.buildRequest(
+          bvid: 'BV1x', page: 1, startMs: 0, endMs: 1,
+          fields: const <String, String>{}, sentence: 's');
+      await miner.buildRequest(
+          bvid: 'BV1x', page: 2, startMs: 0, endMs: 1,
+          fields: const <String, String>{}, sentence: 's');
+      expect(rounds, 4, reason: '分 P 是不同的 cid，缓存键必须含它');
+    });
+
+    test('解析失败即抛，且不把失败的 future 留在缓存里卡住重试', () async {
+      int rounds = 0;
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async {
+          rounds++;
+          // 第一轮 view 请求失败，之后恢复正常。
+          if (rounds == 1) return null;
+          return uri.path.contains('view') ? viewBody : playurlBody;
+        },
+      );
+      await expectLater(
+        miner.buildRequest(
+            bvid: 'BV1x', startMs: 0, endMs: 1,
+            fields: const <String, String>{}, sentence: 's'),
+        throwsA(isA<StateError>()),
+      );
+      // 立刻重试（仍在 TTL 内）必须真的重新请求，而不是拿到同一个 rejected future。
+      final BilibiliClipRequest ok = await miner.buildRequest(
+          bvid: 'BV1x', startMs: 0, endMs: 1,
+          fields: const <String, String>{}, sentence: 's');
+      expect(ok.audioSource, 'https://cdn/audio-30280.m4s');
+    });
+
+    test('无 DASH 音轨时抛，不静默出一张没有音频的卡', () async {
+      final BilibiliClipMiner miner = BilibiliClipMiner(
+        fetchJson: (Uri uri) async => uri.path.contains('view')
+            ? viewBody
+            : '{"code":0,"data":{"dash":{"audio":[]}}}',
+      );
+      await expectLater(
+        miner.buildRequest(
+            bvid: 'BV1x', startMs: 0, endMs: 1,
+            fields: const <String, String>{}, sentence: 's'),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
+
+  // range 物化是 googlevideo 限速的专属绕行（`range=` 是**查询参数**、UA 要与 YouTube 铸流
+  // 一致）。判据过去写成「有没有分离音轨」这个形状，任何别的站点的分离音轨走进去都会把
+  // `range=` 当未知参数忽略、每片都返回整个文件，直到下满 maxBytes。
+  group('audioSourceNeedsRangeMaterialization', () {
+    test('googlevideo 及其子域要物化', () {
+      expect(
+          audioSourceNeedsRangeMaterialization(
+              'https://rr3---sn-i3belne7.googlevideo.com/videoplayback?x=1'),
+          isTrue);
+      expect(audioSourceNeedsRangeMaterialization('https://googlevideo.com/a'),
+          isTrue);
+    });
+
+    test('bilibili 的 audio-only m4s 不物化（实测可直接 seek）', () {
+      expect(
+          audioSourceNeedsRangeMaterialization(
+              'https://xy1x2x3x4xy.mcdn.bilivideo.cn:8082/v1/resource/x.m4s?e=1'),
+          isFalse);
+      expect(
+          audioSourceNeedsRangeMaterialization(
+              'https://upos-sz-mirror08c.bilivideo.com/upgcxcode/x.m4s'),
+          isFalse);
+    });
+
+    test('近似域名不得误命中（后缀匹配必须带点）', () {
+      expect(
+          audioSourceNeedsRangeMaterialization('https://notgooglevideo.com/a'),
+          isFalse);
+      expect(
+          audioSourceNeedsRangeMaterialization('https://googlevideo.com.evil.test/a'),
+          isFalse);
+    });
+
+    test('null / 空串 / 非 http / 本地路径一律 false', () {
+      expect(audioSourceNeedsRangeMaterialization(null), isFalse);
+      expect(audioSourceNeedsRangeMaterialization(''), isFalse);
+      expect(audioSourceNeedsRangeMaterialization('C:/tmp/a.m4a'), isFalse);
+      expect(audioSourceNeedsRangeMaterialization('file:///tmp/a.m4a'), isFalse);
+    });
+  });
+}

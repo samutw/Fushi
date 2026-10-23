@@ -1,0 +1,1279 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'package:archive/archive.dart';
+import 'package:fushi_engine/epub/epub_storage.dart';
+import 'package:fushi/src/sync/interconnect_download_manager.dart';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/media.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/home_page.dart'
+    show homeShellTabNotifier, HomeTab;
+import 'package:fushi/src/pages/implementations/reader_fushi_history_page.dart';
+import 'package:fushi/src/pages/implementations/media_collection_grid_detail_page.dart';
+import 'package:fushi/src/pages/implementations/series_shelf_card.dart';
+import 'package:fushi_engine/sync/fushi_library_host_service.dart';
+import 'package:fushi/src/sync/remote_book_client.dart';
+import 'package:fushi/src/sync/remote_library_source.dart';
+import 'package:fushi_engine/sync/ttu_filename.dart';
+import 'package:fushi_audio/fushi_audio.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+import '../helpers/test_platform_services.dart';
+import '../helpers/glass_unwrap.dart';
+
+void main() {
+  final TestWidgetsFlutterBinding binding =
+      TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Directory pathProviderDir;
+  setUpAll(() {
+    pathProviderDir =
+        Directory.systemTemp.createTempSync('fushi_remote_book_pp');
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      (MethodCall call) async => pathProviderDir.path,
+    );
+  });
+
+  tearDownAll(() {
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('plugins.flutter.io/path_provider'),
+      null,
+    );
+    if (pathProviderDir.existsSync()) {
+      try {
+        pathProviderDir.deleteSync(recursive: true);
+      } catch (_) {}
+    }
+  });
+
+  late FushiDatabase db;
+  late AppModel appModel;
+  late _FakeRemoteBookClient remoteClient;
+  late List<File> importedFiles;
+  late File remoteBookCover;
+  // 注入的本地 EPUB bookKey（importer 返回它，音频导入据此作 bookKeyOverride）。
+  late String? importedBookKey;
+  bool useRealImporter = false;
+  bool failNextAudiobook = false;
+  // 有声书接线观测：fetcher 收到的远端 bookKey + importer 收到的 (file, override)。
+  late List<String> fetchedAudiobookKeys;
+  late List<({File package, String? bookKeyOverride})> importedAudiobooks;
+  // BUG-990：本地 SRT 卡受控列表（默认空）+ 有声书下载闸门（非空时 fetcher 卡住，
+  // 用来观测两阶段下载空窗期本地卡的加载覆盖层）。
+  late List<SrtBook> shelfSrtBooks;
+  Completer<void>? audiobookDownloadGate;
+  late PreferencesRepository prefs;
+
+  setUp(() async {
+    useRealImporter = false;
+    failNextAudiobook = false;
+    LocaleSettings.setLocale(AppLocale.en);
+    db = FushiDatabase.forTesting(NativeDatabase.memory());
+    prefs = PreferencesRepository(db);
+    await prefs.loadFromDb();
+    final Directory storeDir =
+        Directory.systemTemp.createTempSync('fushi_remote_book_store');
+    remoteBookCover = File('${storeDir.path}/remote-book-cover.png')
+      ..writeAsBytesSync(_tinyPngBytes);
+    appModel = AppModel(testPlatformServices())
+      ..wireDatabaseForTesting(db)
+      ..wireLocalAudioForTesting(prefsRepo: prefs, databaseDirectory: storeDir);
+    appModel.populateLanguages();
+    // BUG-2505 用例要长按本地书卡开 MediaItemDialogPage，它按 mediaTypes /
+    // mediaSources 解析条目来源。
+    appModel.populateMediaTypes();
+    appModel.populateMediaSources();
+    remoteClient = _FakeRemoteBookClient(coverPath: remoteBookCover.path);
+    importedFiles = <File>[];
+    importedBookKey = 'local-book-key';
+    fetchedAudiobookKeys = <String>[];
+    importedAudiobooks = <({File package, String? bookKeyOverride})>[];
+    shelfSrtBooks = <SrtBook>[];
+    audiobookDownloadGate = null;
+  });
+
+  tearDown(() async {
+    // BUG-992：全局 tab notifier 跨测试持久，复位避免污染其它用例。
+    homeShellTabNotifier.value = HomeTab.books;
+    await db.close();
+  });
+
+  Widget wrapScope(Widget body) => ProviderScope(
+        overrides: <Override>[
+          appProvider.overrideWith((ref) => appModel),
+          fushiBooksProvider.overrideWith(
+            (ref, language) => Future<List<MediaItem>>.value(
+              const <MediaItem>[],
+            ),
+          ),
+          srtBooksProvider.overrideWith(
+            (ref) => Future<List<SrtBook>>.value(shelfSrtBooks),
+          ),
+        ],
+        child: TranslationProvider(
+          child: MaterialApp(
+            builder: (BuildContext context, Widget? child) =>
+                child ?? const SizedBox.shrink(),
+            home: Scaffold(body: body),
+          ),
+        ),
+      );
+
+  // 书架页本体。书架与漫画书架是**同一个 State 类**的两个实例：既要能单独挂载，
+  // 也要能挂在同一个 ProviderScope 里同时活着（真实 app 的 HomePage 保活形态），
+  // 因为「两架共享一轮网络」的去重发生在 scope 级的 remoteLibraryCacheProvider。
+  ReaderFushiHistoryPage buildPage({bool mangaOnly = false}) =>
+      ReaderFushiHistoryPage(
+        mangaOnly: mangaOnly,
+        remoteBookClientLoader: () async => remoteClient,
+        remoteBookDownloadDestination: (RemoteBookInfo book) async => File(
+          '${pathProviderDir.path}/${book.title.hashCode}.epub',
+        ),
+        remoteBookImporter: useRealImporter
+            ? null
+            : (File file) async {
+          importedFiles.add(file);
+          final String? key = importedBookKey;
+          // 真 importer 是「落库 + 返回 bookKey」；假 importer 以前只返回
+          // 字符串，等于「书根本没进库」。v82（P3 Stage 1b，7a3505ca7a）把
+          // reader_positions 等四子表的键从 bookKey 切成稳定 uid 之后，下游
+          // 回填要先 `resolveEpubBookUid(localBookKey)`，查不到就整段跳过
+          // （remote.part.dart:551 的闸门，契约明写不得用 bookKey 兜底写入）。
+          // 于是 BUG-813 的进度回填在假 importer 下永远不发生（BUG-1497）。
+          // 这里补上落库，让假 importer 与真 importer 的**后置条件**一致。
+          if (key != null) {
+            await db.insertEpubBook(EpubBooksCompanion.insert(
+              bookKey: key,
+              title: key,
+              epubPath: file.path,
+              extractDir: pathProviderDir.path,
+              chapterCount: 1,
+              chaptersJson: '["a"]',
+              importedAt: 0,
+            ));
+          }
+          return key;
+        },
+        remoteAudiobookFetcher: (String remoteBookKey) async {
+          fetchedAudiobookKeys.add(remoteBookKey);
+          if (failNextAudiobook) {
+            failNextAudiobook = false;
+            throw StateError('fixture audiobook failure after book import');
+          }
+          // BUG-990：闸门非空时卡在有声书下载阶段（模拟空窗期），供断言本地卡
+          // 加载覆盖层；测试 complete 后放行。
+          if (audiobookDownloadGate != null) {
+            await audiobookDownloadGate!.future;
+          }
+          final File pkg = File(
+            '${pathProviderDir.path}/$remoteBookKey.fushiaudio',
+          );
+          await pkg.writeAsBytes(<int>[9, 9, 9]);
+          return pkg;
+        },
+        remoteAudiobookImporter: (File package, String? bookKeyOverride) async {
+          importedAudiobooks.add(
+            (package: package, bookKeyOverride: bookKeyOverride),
+          );
+        },
+      );
+
+  Widget buildApp({bool mangaOnly = false}) =>
+      wrapScope(buildPage(mangaOnly: mangaOnly));
+
+  for (final bool manga in <bool>[false, true]) {
+    testWidgets('真实${manga ? '漫画包' : 'EPUB'}下载将占位提升为入库 UID', (
+      WidgetTester tester,
+    ) async {
+      useRealImporter = true;
+      failNextAudiobook = true;
+      final Directory booksRoot = Directory.systemTemp.createTempSync(
+        'adoption-books',
+      );
+      EpubStorage.debugBaseDirectoryOverride = booksRoot.path;
+      addTearDown(() {
+        EpubStorage.debugBaseDirectoryOverride = null;
+        booksRoot.deleteSync(recursive: true);
+      });
+      remoteClient = _FakeRemoteBookClient(
+        coverPath: remoteBookCover.path,
+        title: 'Download fixture',
+        bookKey: 'host-download-key',
+        hasAudiobook: true,
+        mangaTitle: manga ? 'Download fixture' : null,
+        collection: const RemoteCollectionMembership(
+          collectionName: 'Imported series',
+          collectionType: 'collection',
+          sortIndex: 4,
+        ),
+        downloadBytes: _collectionDownloadFixture(manga: manga),
+      );
+      // 占位卡归属合集：成员折进合集格子不外露（整行展开已移除），下载入口在合集
+      // 详情页——点格子进详情页，再点占位卡 = 下载入库（详情页卡片手势统一经
+      // onOpenMember）。这条同时钉住「详情页里远端占位书确实能下载」。
+      await tester.pumpWidget(buildApp(mangaOnly: manga));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byType(SeriesShelfCard));
+      await tester.pumpAndSettle();
+      expect(find.byType(MediaCollectionGridDetailPage), findsOneWidget,
+          reason: '前置：点合集格子进详情页');
+      final InterconnectDownloadManager manager = ProviderScope.containerOf(
+        // 书架在详情页之下（offstage），默认 finder 看不到它。
+        tester.element(
+            find.byType(ReaderFushiHistoryPage, skipOffstage: false)),
+      ).read(interconnectDownloadManagerProvider);
+      final VoidCallback retryDownload = tester.widget<IconButton>(glassUnwrap<IconButton>(find.byKey(
+        const ValueKey<String>('remote_book_download_Download_fixture'),
+      ))).onPressed!;
+      final Finder remoteMember = find.byKey(
+        const ValueKey<String>('remote_book_card_Download_fixture'),
+      );
+      await tester.ensureVisible(remoteMember);
+      await tester.pumpAndSettle();
+      await tester.runAsync(() async {
+        // 详情页成员卡包在 IgnorePointer 里，点击由外层格子接管（命中点不在卡本体上，
+        // 属预期，故关掉「未命中」告警）。
+        await tester.tap(remoteMember, warnIfMissed: false);
+        final Stopwatch watch = Stopwatch()..start();
+        while (watch.elapsed < const Duration(seconds: 15)) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          final InterconnectDownloadTask? task =
+              manager.tasks[InterconnectDownloadManager.bookTaskId(
+            'host-download-key',
+          )];
+          if (task != null &&
+              task.status != InterconnectDownloadStatus.running) {
+            expect(task.status, InterconnectDownloadStatus.failed);
+            break;
+          }
+        }
+      });
+      await tester.pump();
+      final List<EpubBookRow> rows = await db.getAllEpubBooks();
+      expect(rows, hasLength(1));
+      expect(rows.single.format, manga ? 'manga' : 'epub');
+      final List<MediaCollectionRow> collections =
+          await db.getAllMediaCollections();
+      expect(collections, hasLength(1));
+      final List<MediaCollectionItemRow> members = await db.getCollectionItems(
+        collections.single.id,
+      );
+      expect(members, hasLength(1));
+      expect(members.single.entryKey, rows.single.uid);
+      expect(members.single.entryKey, isNot('Download fixture'));
+      await tester.runAsync(() async {
+        retryDownload();
+        final Stopwatch watch = Stopwatch()..start();
+        while (watch.elapsed < const Duration(seconds: 15)) {
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          if (manager.tasks[InterconnectDownloadManager.bookTaskId(
+            'host-download-key')]?.status == InterconnectDownloadStatus.completed) {
+            break;
+          }
+        }
+      });
+      await tester.pump();
+      expect(importedAudiobooks, hasLength(1), reason: '重试必须继续下载有声书');
+      expect((await db.getAllEpubBooks()).map((EpubBookRow row) => row.uid),
+          <String>[rows.single.uid], reason: '重试不能生成带后缀的第二本书');
+      // 先退出详情页再整棵换掉（详情页开着换根会在卸载帧里重建它）。
+      Navigator.of(
+        tester.element(find.byType(MediaCollectionGridDetailPage)),
+      ).pop();
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(wrapScope(const SizedBox.shrink()));
+      await tester.pumpWidget(buildApp(mangaOnly: manga));
+      await tester.pumpAndSettle();
+      expect((await db.getCollectionItems(collections.single.id))
+          .map((MediaCollectionItemRow item) => item.entryKey), <String>[rows.single.uid],
+          reason: '重新读取目录不能重新引入远端占位');
+      expect(find.byKey(const ValueKey<String>('remote_book_card_Download_fixture')),
+          findsNothing, reason: '本地入库键不同也不能重复展示远端卡');
+    });
+  }
+
+  testWidgets('bookshelf mixes interconnect remote books into the main grid',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    // 多端库联合视图（spec §2.1，撤独立远端分区）：远端书以占位卡混排进主网格——
+    // 卡片在、带云角标 ☁、右上角保留下载按钮（能力未丢失）。
+    expect(find.text('Remote Book'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>(
+        'remote_book_cloud_badge_Remote_Book',
+      )),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey<String>(
+        'remote_book_download_Remote_Book',
+      )),
+      findsOneWidget,
+    );
+
+    final String source =
+        File('lib/src/pages/implementations/reader_fushi_history_page.dart')
+            .readAsStringSync();
+    expect(source, isNot(contains('浏览电脑')));
+    expect(source.toLowerCase(), isNot(contains('computer')));
+  });
+
+  testWidgets(
+      'cloud backend remote books also mix into the main grid as placeholders',
+      (WidgetTester tester) async {
+    // 撤独立远端分区后不再有「互联 vs 云端」分区文案区分——云盘后端
+    // （CloudRemoteBookClient，来源 cloud）的远端书同样以占位卡混排进主网格，
+    // 与互联来源共用同一占位卡渲染（云角标 + 远端封面 + 下载按钮）。
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      sourceKind: RemoteBookSourceKind.cloud,
+    );
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Remote Book'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey<String>(
+        'remote_book_cloud_badge_Remote_Book',
+      )),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('remote book uses the shelf card cover layout',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    final Finder card = find.byKey(
+      const ValueKey<String>('remote_book_card_Remote_Book'),
+    );
+    expect(card, findsOneWidget);
+    expect(
+      find.descendant(
+        of: card,
+        matching: find.byKey(
+          const ValueKey<String>('remote_book_cover_Remote_Book'),
+        ),
+      ),
+      findsOneWidget,
+    );
+    expect(find.descendant(of: card, matching: find.byType(AspectRatio)),
+        findsOneWidget);
+  });
+
+  testWidgets('remote book title renders below the cover',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    final Rect coverRect = tester.getRect(find.byKey(
+      const ValueKey<String>('remote_book_cover_Remote_Book'),
+    ));
+    final Rect titleRect = tester.getRect(find.text('Remote Book'));
+
+    // Remote shelf cards share the same stable cover + footer layout as local
+    // books: cover art stays unobscured and the title lives below it.
+    expect(
+      titleRect.top,
+      greaterThanOrEqualTo(coverRect.bottom - 0.5),
+      reason: 'remote book title must render in the footer below the cover',
+    );
+    expect(
+      titleRect.bottom,
+      greaterThan(coverRect.bottom),
+      reason: 'the title footer must not be drawn over the cover artwork',
+    );
+  });
+
+  testWidgets(
+      'remote book renders normal-book type badge by default '
+      '(TODO-655a)', (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    final Finder card = find.byKey(
+      const ValueKey<String>('remote_book_card_Remote_Book'),
+    );
+    expect(card, findsOneWidget);
+    final Finder badge = find.descendant(
+      of: card,
+      matching: find.byKey(
+        const ValueKey<String>('remote_book_type_badge_Remote_Book'),
+      ),
+    );
+    expect(badge, findsOneWidget,
+        reason: 'remote book card must show a type badge like local books');
+    // Normal book → book icon, never the headphones (audiobook) icon.
+    expect(
+      find.descendant(
+          of: badge, matching: find.byIcon(Icons.headphones_outlined)),
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+          of: badge, matching: find.byIcon(Icons.menu_book_outlined)),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('remote audiobook renders headphones type badge (TODO-655a)',
+      (WidgetTester tester) async {
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      hasAudiobook: true,
+    );
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    final Finder badge = find.byKey(
+      const ValueKey<String>('remote_book_type_badge_Remote_Book'),
+    );
+    expect(badge, findsOneWidget);
+    expect(
+      find.descendant(
+          of: badge, matching: find.byIcon(Icons.headphones_outlined)),
+      findsOneWidget,
+      reason: 'a remote book with an audiobook must show the headphones badge',
+    );
+  });
+
+  testWidgets(
+      'remote book renders as a placeholder card in the main scatter grid '
+      '(spec §2.1 mixed grid)', (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    final Finder card = find.byKey(
+      const ValueKey<String>('remote_book_card_Remote_Book'),
+    );
+    expect(card, findsOneWidget);
+    // 撤独立远端 GridView 分区后，远端占位卡是主散卡网格（SliverGrid）的一个 cell，
+    // 与本地书卡同一网格、同一卡宽基准（不再被独立 section 的内边距压窄）。
+    expect(
+      find.ancestor(of: card, matching: find.byType(SliverGrid)),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('remote book download action pulls epub and imports locally',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await tester.tap(find.byKey(const ValueKey<String>(
+        'remote_book_download_Remote_Book',
+      )));
+      for (int i = 0; i < 30; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (remoteClient.downloadedTitles.isNotEmpty &&
+            importedFiles.isNotEmpty) {
+          break;
+        }
+      }
+    });
+    await tester.pump();
+
+    expect(remoteClient.downloadedTitles, <String>['Remote Book']);
+    expect(importedFiles.single.existsSync(), isTrue);
+  });
+
+  testWidgets('remote book download uses stable bookKey for special titles',
+      (WidgetTester tester) async {
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      title: r'Vol 1/2\3?..: Finale',
+      bookKey: 'Vol_1_2_3_Finale',
+    );
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await tester.tap(find.byTooltip(t.remote_book_download));
+      for (int i = 0; i < 30; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (remoteClient.downloadedTitles.isNotEmpty &&
+            importedFiles.isNotEmpty) {
+          break;
+        }
+      }
+    });
+    await tester.pump();
+
+    expect(remoteClient.downloadedTitles, <String>['Vol_1_2_3_Finale']);
+    expect(importedFiles.single.existsSync(), isTrue);
+  });
+
+  testWidgets(
+      'remote audiobook download wires getRemoteAudiobook + import with '
+      'stable remote key and local bookKey override (BUG-406)',
+      (WidgetTester tester) async {
+    // host 把书名重复时加了后缀，真实 bookKey 与 sanitizeTtuFilename(title) 不同。
+    // 下载有声书必须用 host 传来的真实 bookKey（= downloadId），否则 404（BUG-414）。
+    const String hostAudiobookKey = 'Vol_1_2_Audio_2';
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      title: r'Vol 1/2: Audio',
+      bookKey: hostAudiobookKey,
+      hasAudiobook: true,
+    );
+    importedBookKey = 'local-renamed-key';
+    // 守护：真实 key 与 sanitize(title) 必须不同，回归用例才有意义。
+    expect(hostAudiobookKey,
+        isNot(equals(sanitizeTtuFilename(r'Vol 1/2: Audio'))));
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await tester.tap(find.byTooltip(t.remote_book_download));
+      for (int i = 0; i < 40; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (importedAudiobooks.isNotEmpty) break;
+      }
+    });
+    await tester.pump();
+
+    // EPUB still imported.
+    expect(importedFiles.single.existsSync(), isTrue);
+    // Audiobook fetched with the host's real bookKey (= downloadId = bookKey ?? title),
+    // NOT sanitizeTtuFilename(title). Reverting the fix flips this back to sanitize(title)
+    // and turns this red (BUG-414 regression guard).
+    expect(fetchedAudiobookKeys, <String>[hostAudiobookKey]);
+    expect(fetchedAudiobookKeys,
+        isNot(equals(<String>[sanitizeTtuFilename(r'Vol 1/2: Audio')])));
+    // Audiobook imported once, bound to the *local* imported EPUB bookKey.
+    expect(importedAudiobooks, hasLength(1));
+    expect(importedAudiobooks.single.bookKeyOverride, 'local-renamed-key');
+    expect(importedAudiobooks.single.package.existsSync(), isTrue);
+  });
+
+  testWidgets('BUG-813: 下载远端书把 host 阅读进度回填进本地 reader_positions',
+      (WidgetTester tester) async {
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      progress: const RemoteBookProgress(
+        sectionIndex: 3,
+        normCharOffset: 4200,
+        charOffset: 137,
+        updatedAtMs: 1700000000000,
+      ),
+    );
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await tester.tap(find.byKey(const ValueKey<String>(
+        'remote_book_download_Remote_Book',
+      )));
+      // 轮询直到进度回填落库（下载 → 导入 → 拉进度 upsert 是异步链）。
+      // v82：reader_positions 的键是导入后书行的稳定 uid，不是 bookKey。
+      for (int i = 0; i < 60; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        final String? uid = await db.resolveEpubBookUid('local-book-key');
+        if (uid != null && await db.getReaderPosition(uid) != null) break;
+      }
+    });
+    await tester.pump();
+
+    // 下载动作把 host 端阅读进度回填进本地 reader_positions（键 = 导入后本地书行的
+    // 稳定 uid，由本地 bookKey 换算，非 host downloadId）——手动下载不再丢「阅读记录」。
+    final String? localUid = await db.resolveEpubBookUid('local-book-key');
+    expect(localUid, isNotNull, reason: '导入后本地书行必须存在且带稳定 uid');
+    final ReaderPositionRow? row = await db.getReaderPosition(localUid!);
+    expect(row, isNotNull,
+        reason: 'BUG-813：下载远端书必须把 host 阅读进度落进 reader_positions');
+    expect(row!.sectionIndex, 3);
+    expect(row.normCharOffset, 4200);
+    expect(row.charOffset, 137);
+    expect(row.updatedAt, 1700000000000);
+  });
+
+  testWidgets('BUG-990: 有声书两阶段下载空窗期，本地卡持续显示加载覆盖层', (WidgetTester tester) async {
+    // 本地已有一张 SRT 卡（bookKey = importer 将返回的 localBookKey），模拟 EPUB 落库
+    // 后 provider 自动刷新把远端占位卡顶替成本地卡的空窗态。
+    shelfSrtBooks = <SrtBook>[
+      SrtBook()
+        ..uid = 'srtbook_epub_local-book-key'
+        ..title = 'Local Audiobook'
+        ..srtPath = '${pathProviderDir.path}/local.srt'
+        ..importedAt = 0
+        ..bookKey = 'local-book-key',
+    ];
+    audiobookDownloadGate = Completer<void>();
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      hasAudiobook: true,
+    );
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    const ValueKey<String> overlayKey =
+        ValueKey<String>('audiobook_downloading_local-book-key');
+    // 下载前：本地 SRT 卡在，无加载覆盖层。
+    expect(find.byKey(overlayKey), findsNothing);
+
+    // 点远端占位卡下载 → EPUB 导入(importer 返回 local-book-key) → 标记有声书下载中 →
+    // 有声书 fetch 卡在闸门。
+    await tester.runAsync(() async {
+      await tester.tap(find.byKey(const ValueKey<String>(
+        'remote_book_download_Remote_Book',
+      )));
+      for (int i = 0; i < 60; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+        if (fetchedAudiobookKeys.isNotEmpty) break;
+      }
+    });
+    await tester.pump();
+
+    expect(find.byKey(overlayKey), findsOneWidget,
+        reason: 'BUG-990：有声书下载中本地卡必须显示加载覆盖层');
+
+    // 放行有声书下载 → 完成 → 覆盖层清除。
+    await tester.runAsync(() async {
+      audiobookDownloadGate!.complete();
+      for (int i = 0; i < 60; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 25));
+        if (importedAudiobooks.isNotEmpty) break;
+      }
+    });
+    await tester.pump();
+
+    expect(find.byKey(overlayKey), findsNothing,
+        reason: 'BUG-990：有声书下载完成后覆盖层必须清除');
+  });
+
+  testWidgets('书架统计带已按用户要求移除（原 BUG-991 口径随之退役）', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(1400, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    // 「统计」三格（总数/在读/已完成）与右上角「阅读统计」入口重复，2026-07-22
+    // 用户拍板删除；此守卫防止统计带被无意识复活（复活需连同 BUG-991 的远端
+    // 计数口径一起补回）。
+    shelfSrtBooks = <SrtBook>[
+      SrtBook()
+        ..uid = 'local-srt-uid'
+        ..title = 'Local Book'
+        ..srtPath = '${pathProviderDir.path}/local.srt'
+        ..importedAt = 0
+        ..bookKey = '',
+    ];
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey<String>('shelf_overview_total')),
+      findsNothing,
+      reason: '书架不应再渲染「统计」三格（与阅读统计页重复）',
+    );
+  });
+
+  testWidgets('BUG-992/1175: 切回书架 tab 远端卡在场，且 TTL 内不重打网络',
+      (WidgetTester tester) async {
+    // BUG-992 当初断言的是「切回 tab 后 listRemoteBooks 调用次数增加」——那是实现
+    // 细节，不是用户诉求。用户要的是「切回书架能看到远端占位卡」，而**不是**「每切
+    // 一次页面就联网一次」（后者正是 BUG-1180 的症状）。清单现在过 RemoteLibraryCache
+    // 的 TTL：切回 tab 仍然重新组装（本地库变化立即反映），但 TTL 内不再打网络。
+    // 这里把断言换成用户可见的不变式 + 「不得重复联网」的新约束。
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+    // 首帧懒加载已拉一次。
+    expect(remoteClient.listRemoteBooksCalls, greaterThanOrEqualTo(1));
+    final int before = remoteClient.listRemoteBooksCalls;
+    final Finder remoteCard =
+        find.byKey(const ValueKey<String>('remote_book_card_Remote_Book'));
+    expect(remoteCard, findsOneWidget);
+
+    // 切到别的 tab 再切回书架。
+    homeShellTabNotifier.value = HomeTab.video;
+    await tester.pump();
+    expect(remoteClient.listRemoteBooksCalls, before, reason: '切到非书架 tab 不应重拉');
+
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpAndSettle();
+    expect(remoteCard, findsOneWidget,
+        reason: 'BUG-992：切回书架 tab 远端占位卡必须仍在场（不必手动下拉刷新）');
+    expect(remoteClient.listRemoteBooksCalls, before,
+        reason: 'BUG-1180：TTL 内切回 tab 不得再问对端要一次清单');
+  });
+
+  testWidgets('BUG-1180: 下拉刷新强制穿透缓存（用户要最新的就必须联网）', (WidgetTester tester) async {
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+    final int before = remoteClient.listRemoteBooksCalls;
+
+    await tester.fling(
+      find.byType(RefreshIndicator).first,
+      const Offset(0, 300),
+      1000,
+    );
+    await tester.pumpAndSettle();
+
+    expect(remoteClient.listRemoteBooksCalls, greaterThan(before),
+        reason: '显式下拉刷新是强制入口，必须穿透 TTL 重新联网');
+  });
+
+  testWidgets('BUG-1640: 漫画书架只拿 host 的漫画', (WidgetTester tester) async {
+    // BUG-1181 原来的不变量是「漫画书架永不拉远端书」——那时它确实不消费，拉了也
+    // 只是在 build 里被 `!_mangaOnly` 丢掉。互联漫画完整支持（BUG-1640）把它推翻了：
+    // host 的漫画现在以占位卡出现在漫画书架并可下载，所以漫画实例取数是对的。
+    // 这里守的是接替不变量：两架各只拿自己那半。
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      mangaTitle: 'Remote Manga',
+    );
+
+    homeShellTabNotifier.value = HomeTab.manga;
+    await tester.pumpWidget(buildApp(mangaOnly: true));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Manga')),
+      findsOneWidget,
+      reason: '漫画书架要渲染 host 的漫画占位卡（format=manga + hasMangaContent）',
+    );
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Book')),
+      findsNothing,
+      reason: '普通 EPUB 不得流进漫画书架',
+    );
+  });
+
+  testWidgets('BUG-2474: host 的在线书架漫画（只有已下载的章）也出现在漫画书架',
+      (WidgetTester tester) async {
+    // 修复前：在线条目的根目录只有占位 manga.json，host 报 hasMangaContent=false，
+    // 漫画架按 hasMangaContent 过滤把它整个丢掉；普通书架又按 hasContent 过滤——
+    // 两架都不显示，用户看到的就是「书架漫画没同步」。
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      chapteredMangaTitle: 'Remote Online Manga',
+    );
+
+    homeShellTabNotifier.value = HomeTab.manga;
+    await tester.pumpWidget(buildApp(mangaOnly: true));
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(
+        const ValueKey<String>('remote_book_card_Remote_Online_Manga'),
+      ),
+      findsOneWidget,
+      reason: '漫画书架要渲染 host 的章节式在线漫画占位卡（hasMangaChapters）',
+    );
+  });
+
+  testWidgets('BUG-2474: 普通书架不收 host 的在线书架漫画',
+      (WidgetTester tester) async {
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      chapteredMangaTitle: 'Remote Online Manga',
+    );
+
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+    expect(
+      find.byKey(
+        const ValueKey<String>('remote_book_card_Remote_Online_Manga'),
+      ),
+      findsNothing,
+      reason: '章节式漫画（hasContent=false）不得流进普通书架',
+    );
+  });
+
+  testWidgets('BUG-1640: 普通书架不收 host 的漫画', (WidgetTester tester) async {
+    // 漫画的 hasContent 恒 false（host 按 format 门控的坏包防线），普通书架按
+    // hasContent 过滤，于是漫画绝不会以「点了下不到 EPUB」的死卡出现在这里。
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      mangaTitle: 'Remote Manga',
+    );
+
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Book')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Manga')),
+      findsNothing,
+      reason: '漫画（hasContent=false）不得流进普通书架',
+    );
+  });
+
+  testWidgets('BUG-1181: 漫画书架的远端清单只打一轮网络', (WidgetTester tester) async {
+    // BUG-1181 的实质是「漫画书架白拉一整轮网络」。互联漫画完整支持（BUG-1640）
+    // 之后它拉的东西自己要用（漫画占位卡），于是防浪费的担子交给 scope 级的
+    // [RemoteLibraryCache]：in-flight 去重 + 60s TTL。这里守住轮数——首帧一轮，
+    // 之后 tab 来回切（BUG-992 的重载信号照发）不得再穿透（BUG-1180）。
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      mangaTitle: 'Remote Manga',
+    );
+
+    homeShellTabNotifier.value = HomeTab.manga;
+    await tester.pumpWidget(buildApp(mangaOnly: true));
+    await tester.pumpAndSettle();
+    expect(remoteClient.listRemoteBooksCalls, 1, reason: '首帧只允许一轮远端清单请求');
+
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpAndSettle();
+    homeShellTabNotifier.value = HomeTab.manga;
+    await tester.pumpAndSettle();
+    expect(remoteClient.listRemoteBooksCalls, 1,
+        reason: 'BUG-1181/1180：TTL 内切 tab 不得再打一轮网络');
+  });
+
+  testWidgets('BUG-1182: 关闭「显示远端条目」后根本不联网（而不是拉完再丢）',
+      (WidgetTester tester) async {
+    await appModel.prefsRepo.setShowRemoteEntries(false);
+    homeShellTabNotifier.value = HomeTab.books;
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    expect(remoteClient.listRemoteBooksCalls, 0,
+        reason: '开关关闭时门控必须在取数之前，不能拉完再在渲染期丢弃');
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Book')),
+      findsNothing,
+    );
+
+    // 开关翻回来：`??=` 不会自己重跑，门控翻转必须触发重新取数，否则用户要下拉刷新。
+    await appModel.prefsRepo.setShowRemoteEntries(true);
+    await tester.pumpAndSettle();
+    expect(remoteClient.listRemoteBooksCalls, greaterThanOrEqualTo(1),
+        reason: 'BUG-1182：开关从关翻到开必须重新取数');
+    expect(
+      find.byKey(const ValueKey<String>('remote_book_card_Remote_Book')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+      'remote book without audiobook never touches the audiobook wiring '
+      '(BUG-406)', (WidgetTester tester) async {
+    await tester.pumpWidget(buildApp());
+    await tester.pumpAndSettle();
+
+    await tester.runAsync(() async {
+      await tester.tap(find.byTooltip(t.remote_book_download));
+      for (int i = 0; i < 30; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (importedFiles.isNotEmpty) break;
+      }
+    });
+    await tester.pump();
+
+    expect(importedFiles.single.existsSync(), isTrue);
+    expect(fetchedAudiobookKeys, isEmpty);
+    expect(importedAudiobooks, isEmpty);
+  });
+
+  testWidgets(
+      'BUG-2505: 本地已有书、对端有配套有声书 → 本地书卡菜单露「从对端下载有声书」，'
+      '只拉音频不重下 EPUB', (WidgetTester tester) async {
+    // 场景：这本书之前从对端只下到了 EPUB（有声书包当时失败 / host 后来才配音）。
+    // 远端卡按「本端已有」被去重藏掉，配套有声书不是 standalone 占位卡——修复前
+    // 书架上没有任何入口能再拿到它。
+    const String title = 'Remote Book';
+    const String hostRealKey = 'Remote_Book_host_key';
+    final String localKey = sanitizeTtuFilename(title);
+    await db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: localKey,
+      title: title,
+      epubPath: '${pathProviderDir.path}/remote_book.epub',
+      extractDir: pathProviderDir.path,
+      chapterCount: 1,
+      chaptersJson: '["a"]',
+      importedAt: 0,
+    ));
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      title: title,
+      bookKey: hostRealKey,
+      hasAudiobook: true,
+    );
+    final MediaItem localItem = MediaItem(
+      mediaIdentifier: ReaderFushiSource.mediaIdentifierFor(localKey),
+      title: title,
+      mediaTypeIdentifier: ReaderFushiSource.instance.mediaType.uniqueKey,
+      mediaSourceIdentifier: ReaderFushiSource.instance.uniqueKey,
+      position: 0,
+      duration: 100,
+      canDelete: true,
+      canEdit: true,
+    );
+    await tester.pumpWidget(ProviderScope(
+      overrides: <Override>[
+        appProvider.overrideWith((ref) => appModel),
+        fushiBooksProvider.overrideWith(
+          (ref, language) => Future<List<MediaItem>>.value(
+            <MediaItem>[localItem],
+          ),
+        ),
+        srtBooksProvider.overrideWith(
+          (ref) => Future<List<SrtBook>>.value(shelfSrtBooks),
+        ),
+      ],
+      child: TranslationProvider(
+        child: MaterialApp(
+          builder: (BuildContext context, Widget? child) =>
+              child ?? const SizedBox.shrink(),
+          home: Scaffold(body: buildPage()),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    // 远端卡确实被去重藏掉（前提成立）；本地卡在场。
+    expect(find.byTooltip(t.remote_book_download), findsNothing);
+    final Finder localCard = find.byKey(
+      ValueKey<String>('book_entry_${localItem.mediaIdentifier}'),
+    );
+    expect(localCard, findsOneWidget);
+
+    await tester.longPress(localCard);
+    await tester.pumpAndSettle();
+    final Finder action = find.text(t.remote_book_audiobook_download);
+    expect(action, findsOneWidget,
+        reason: '本地已有书 + 对端有配套有声书 + 本端无有声书 → 菜单必须露补拉入口');
+
+    // 与远端卡同一道门：关掉「显示远端条目」后远端卡消失，这条入口不能还挂在
+    // 本地书卡菜单上（_lastRemoteState 不会因开关关闭而清空，点下去只会弹不可用）。
+    Navigator.of(tester.element(action)).pop();
+    await tester.pumpAndSettle();
+    await appModel.prefsRepo.setShowRemoteEntries(false);
+    await tester.pumpAndSettle();
+    await tester.longPress(localCard);
+    await tester.pumpAndSettle();
+    expect(find.text(t.remote_book_audiobook_download), findsNothing,
+        reason: '远端条目关掉后补拉入口必须一起消失');
+    Navigator.of(tester.element(find.text(t.audiobook_import))).pop();
+    await tester.pumpAndSettle();
+    await appModel.prefsRepo.setShowRemoteEntries(true);
+    await tester.pumpAndSettle();
+    await tester.longPress(localCard);
+    await tester.pumpAndSettle();
+    expect(action, findsOneWidget);
+
+    await tester.runAsync(() async {
+      await tester.tap(action);
+      for (int i = 0; i < 40; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+        if (importedAudiobooks.isNotEmpty) break;
+      }
+    });
+    await tester.pump();
+
+    // 只拉音频：EPUB 一个字节都不重下。
+    expect(importedFiles, isEmpty);
+    // 用 host 的真实 bookKey（downloadId）拉包（BUG-414 契约），绑到本地 bookKey。
+    expect(fetchedAudiobookKeys, <String>[hostRealKey]);
+    expect(importedAudiobooks, hasLength(1));
+    expect(importedAudiobooks.single.bookKeyOverride, localKey);
+  });
+
+  testWidgets('BUG-2505: 本端已有有声书时书卡菜单不露「从对端下载有声书」',
+      (WidgetTester tester) async {
+    const String title = 'Remote Book';
+    final String localKey = sanitizeTtuFilename(title);
+    await db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: localKey,
+      title: title,
+      epubPath: '${pathProviderDir.path}/remote_book2.epub',
+      extractDir: pathProviderDir.path,
+      chapterCount: 1,
+      chaptersJson: '["a"]',
+      importedAt: 0,
+    ));
+    // BUG-2551：这一行原本既没有 audioRoot 也没有 audioPathsJson——是一本**零音频**
+    // 的有声书行，却被用来代表「本端已有有声书」。判据改成问磁盘之后它就是「缺音频」，
+    // 该露补拉入口（见下一条用例）。本条要验的是「真有有声书就不露」，所以音频得真在。
+    final File localTrack = File('${pathProviderDir.path}/local_track01.mp3')
+      ..writeAsStringSync('audio bytes');
+    await db.upsertAudiobook(AudiobooksCompanion.insert(
+      bookKey: localKey,
+      audioRoot: Value(pathProviderDir.path),
+      audioPathsJson: Value(jsonEncode(<String>[localTrack.path])),
+      alignmentFormat: 'srt',
+      alignmentPath: '${pathProviderDir.path}/a.srt',
+    ));
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      title: title,
+      hasAudiobook: true,
+    );
+    final MediaItem localItem = MediaItem(
+      mediaIdentifier: ReaderFushiSource.mediaIdentifierFor(localKey),
+      title: title,
+      mediaTypeIdentifier: ReaderFushiSource.instance.mediaType.uniqueKey,
+      mediaSourceIdentifier: ReaderFushiSource.instance.uniqueKey,
+      position: 0,
+      duration: 100,
+      canDelete: true,
+      canEdit: true,
+    );
+    await tester.pumpWidget(ProviderScope(
+      overrides: <Override>[
+        appProvider.overrideWith((ref) => appModel),
+        fushiBooksProvider.overrideWith(
+          (ref, language) => Future<List<MediaItem>>.value(
+            <MediaItem>[localItem],
+          ),
+        ),
+        srtBooksProvider.overrideWith(
+          (ref) => Future<List<SrtBook>>.value(shelfSrtBooks),
+        ),
+      ],
+      child: TranslationProvider(
+        child: MaterialApp(
+          builder: (BuildContext context, Widget? child) =>
+              child ?? const SizedBox.shrink(),
+          home: Scaffold(body: buildPage()),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.longPress(find.byKey(
+      ValueKey<String>('book_entry_${localItem.mediaIdentifier}'),
+    ));
+    await tester.pumpAndSettle();
+    expect(find.text(t.remote_book_audiobook_download), findsNothing,
+        reason: '已经有有声书的书不该再露补拉入口');
+    // 既有的本地导入入口仍在（菜单其余部分不受影响）。
+    expect(find.text(t.audiobook_import), findsOneWidget);
+  });
+
+  testWidgets('BUG-2551: 本端有声书行零音频时书卡菜单仍露「从对端下载有声书」',
+      (WidgetTester tester) async {
+    const String title = 'Remote Book';
+    final String localKey = sanitizeTtuFilename(title);
+    await db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: localKey,
+      title: title,
+      epubPath: '${pathProviderDir.path}/remote_book3.epub',
+      extractDir: pathProviderDir.path,
+      chapterCount: 1,
+      chaptersJson: '["a"]',
+      importedAt: 0,
+    ));
+    // 一次没下成功留下的形状：Audiobooks 行在、字幕在、音频是空的。旧判据只看
+    // 「有没有这行」，于是补拉入口连同远端卡一起消失，用户再也下不了第二次。
+    await db.upsertAudiobook(AudiobooksCompanion.insert(
+      bookKey: localKey,
+      audioPathsJson: const Value('[]'),
+      alignmentFormat: 'srt',
+      alignmentPath: '${pathProviderDir.path}/a.srt',
+    ));
+    remoteClient = _FakeRemoteBookClient(
+      coverPath: remoteBookCover.path,
+      title: title,
+      hasAudiobook: true,
+    );
+    final MediaItem localItem = MediaItem(
+      mediaIdentifier: ReaderFushiSource.mediaIdentifierFor(localKey),
+      title: title,
+      mediaTypeIdentifier: ReaderFushiSource.instance.mediaType.uniqueKey,
+      mediaSourceIdentifier: ReaderFushiSource.instance.uniqueKey,
+      position: 0,
+      duration: 100,
+      canDelete: true,
+      canEdit: true,
+    );
+    await tester.pumpWidget(ProviderScope(
+      overrides: <Override>[
+        appProvider.overrideWith((ref) => appModel),
+        fushiBooksProvider.overrideWith(
+          (ref, language) => Future<List<MediaItem>>.value(
+            <MediaItem>[localItem],
+          ),
+        ),
+        srtBooksProvider.overrideWith(
+          (ref) => Future<List<SrtBook>>.value(shelfSrtBooks),
+        ),
+      ],
+      child: TranslationProvider(
+        child: MaterialApp(
+          builder: (BuildContext context, Widget? child) =>
+              child ?? const SizedBox.shrink(),
+          home: Scaffold(body: buildPage()),
+        ),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    await tester.longPress(find.byKey(
+      ValueKey<String>('book_entry_${localItem.mediaIdentifier}'),
+    ));
+    await tester.pumpAndSettle();
+    expect(find.text(t.remote_book_audiobook_download), findsOneWidget,
+        reason: '有行但没音频 = 还没真拿到有声书，补拉入口必须还在');
+  });
+}
+
+class _FakeRemoteBookClient implements RemoteBookClient {
+  _FakeRemoteBookClient({
+    required this.coverPath,
+    this.title = 'Remote Book',
+    this.bookKey,
+    this.hasAudiobook = false,
+    this.sourceKind = RemoteBookSourceKind.interconnect,
+    this.progress = RemoteBookProgress.empty,
+    this.mangaTitle,
+    this.chapteredMangaTitle,
+    this.collection,
+    this.downloadBytes,
+  });
+
+  final String coverPath;
+  final String title;
+  final String? bookKey;
+  final RemoteCollectionMembership? collection;
+  final List<int>? downloadBytes;
+  final bool hasAudiobook;
+  final RemoteBookSourceKind sourceKind;
+  // BUG-1640 wire：非空时清单额外带一条 host 漫画。漫画走漫画包通道，host 的
+  // hasContent 按 format 门控恒 false（坏包防线），可下载性由 hasMangaContent 表达。
+  final String? mangaTitle;
+  // BUG-2474 wire：非空时清单额外带一条 host 的在线书架漫画（Mihon / Aidoku 条目）：
+  // 根目录只有占位 manga.json → hasMangaContent 恒 false，可读性由 hasMangaChapters
+  // 表达（host 已按章下载）。
+  final String? chapteredMangaTitle;
+  // BUG-813：host 端该书的阅读进度，供「下载回填进度」用例配置。
+  final RemoteBookProgress progress;
+  final List<String> downloadedTitles = <String>[];
+
+  @override
+  RemoteBookSourceKind get remoteSourceKind => sourceKind;
+
+  @override
+  String get remoteLibrarySourceId => kInterconnectRemoteLibrarySourceId;
+
+  // BUG-992：listRemoteBooks 调用次数（观测「切回书架 tab 自动重拉远端」）。
+  int listRemoteBooksCalls = 0;
+
+  @override
+  Future<List<RemoteBookInfo>> listRemoteBooks() async {
+    listRemoteBooksCalls++;
+    return <RemoteBookInfo>[
+      RemoteBookInfo.fromJson(<String, Object?>{
+        'title': title,
+        if (bookKey != null) 'bookKey': bookKey,
+        'hasContent': true,
+        if (collection != null) 'collection': collection!.toJson(),
+        'coverPath': coverPath,
+        if (hasAudiobook) 'hasAudiobook': true,
+      }),
+      if (mangaTitle != null)
+        RemoteBookInfo.fromJson(<String, Object?>{
+          'title': mangaTitle,
+          if (bookKey != null) 'bookKey': bookKey,
+          'hasContent': false,
+          'hasMangaContent': true,
+          if (hasAudiobook) 'hasAudiobook': true,
+          'format': 'manga',
+          if (collection != null) 'collection': collection!.toJson(),
+          'coverPath': coverPath,
+        }),
+      if (chapteredMangaTitle != null)
+        RemoteBookInfo.fromJson(<String, Object?>{
+          'title': chapteredMangaTitle,
+          'bookKey': 'mihon-remote',
+          'hasContent': false,
+          'hasMangaChapters': true,
+          'format': 'manga',
+          'coverPath': coverPath,
+        }),
+    ];
+  }
+
+  @override
+  Future<void> getRemoteBook(
+    String title,
+    File destination, {
+    void Function(double progress)? onProgress,
+  }) async {
+    downloadedTitles.add(title);
+    await destination.writeAsBytes(downloadBytes ?? <int>[1, 2, 3]);
+    onProgress?.call(1);
+  }
+
+  @override
+  Future<RemoteBookProgress> remoteBookProgress(String bookKey) async =>
+      progress;
+
+  @override
+  Future<void> putRemoteBookProgress(
+    String bookKey,
+    RemoteBookProgress progress,
+  ) async {}
+}
+
+final List<int> _tinyPngBytes =
+    base64Decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ'
+        'AAAADUlEQVR42mP8z8BQDwAFgwJ/l5YV3wAAAABJRU5ErkJggg==');
+
+List<int> _collectionDownloadFixture({required bool manga}) {
+  final Archive archive = Archive();
+  void addText(String name, String text) {
+    final List<int> bytes = utf8.encode(text);
+    archive.addFile(ArchiveFile(name, bytes.length, bytes));
+  }
+
+  if (manga) {
+    addText(
+      'manga.json',
+      jsonEncode(<String, Object?>{
+        'pages': <Object?>[
+          <String, Object?>{
+            'url': 'page.png',
+            'width': 1,
+            'height': 1,
+            'blocks': <Object?>[],
+          },
+        ],
+      }),
+    );
+    archive.addFile(
+      ArchiveFile('page.png', _tinyPngBytes.length, _tinyPngBytes),
+    );
+  } else {
+    addText('mimetype', 'application/epub+zip');
+    addText(
+      'META-INF/container.xml',
+      '''
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+<rootfiles><rootfile full-path="book.opf" media-type="application/oebps-package+xml"/></rootfiles></container>''',
+    );
+    addText('book.opf', '''
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Download fixture</dc:title></metadata>
+<manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="chapter"/></spine></package>''');
+    addText(
+      'chapter.xhtml',
+      '<html xmlns="http://www.w3.org/1999/xhtml"><body><p>Test.</p></body></html>',
+    );
+  }
+  return ZipEncoder().encode(archive)!;
+}

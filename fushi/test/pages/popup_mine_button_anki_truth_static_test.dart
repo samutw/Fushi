@@ -1,0 +1,220 @@
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+
+// BUG-186 (TODO-084/087): the popup mine button's "已制卡 ✓ / 可制卡 +" state is
+// DETECTED AT LOOKUP TIME and reflects Anki's REAL card existence.
+//
+// PRIMARY MECHANISM: when the popup renders a word (createEntryHeader runs as
+// part of renderPopup, which rebuilds the DOM on every lookup), the initial
+// `duplicateCheck` is scheduled when that header approaches the viewport and
+// queries Anki live (AnkiConnect findNotes / AnkiDroid
+// findDuplicateNotes — see packages/fushi_anki/test/ankiconnect_service_test
+// .dart's "isDuplicate" group) and sets a real `data-mined` state via
+// setMineState: card in Anki -> 已制卡 ✓, card absent -> 可制卡 +. The ✓ is NOT
+// decorative; data-mined is the source of truth for what a click does.
+//
+// TODO-084 (re-look-up the word after deleting its card in Anki) is satisfied
+// for free: a fresh lookup re-renders -> re-runs lookup-time detection ->
+// data-mined cleared -> mineable again.
+//
+// TODO-087 edge case (same popup, card deleted in Anki WITHOUT re-looking up):
+// a click on a 已制卡 ✓ button re-verifies via duplicateCheck BEFORE mining, so
+// a stale ✓ whose card was deleted is re-mined; an existing card (dupes off) is
+// not duplicated. This is a fallback, not the primary path.
+//
+// The old bug: the button started `disabled: true` and once a card existed it
+// set `disabled = wasAdded && !allowDupes` — a permanent lock that only a
+// re-render could clear. We regression-lock the fix here.
+//
+// Behavior coverage lives in
+// fushi/test/utils/misc/popup_asset_behavior_test.js
+// (lookup-time detection / re-lookup re-mine / edge-case re-verify-on-click).
+void main() {
+  late String source;
+  late String mineButtonBlock;
+
+  setUpAll(() {
+    source = File('assets/popup/popup.js').readAsStringSync();
+    // class 列表可带布局基类前缀（BUG-1895 起是 'inline-action-button mine-button'）；
+    // 这里只是定位块起点，别把 class 名的确切拼写当判据。
+    final int start = source.indexOf(
+      RegExp(r"className: '[^']*\bmine-button',"),
+    );
+    expect(
+      start,
+      greaterThanOrEqualTo(0),
+      reason: 'mine button element not found',
+    );
+    // Bound the block at the header appendChild that follows the initial
+    // scheduled duplicateCheck, covering setMineState wiring + onclick + the
+    // lookup-time detection call.
+    final int end = source.indexOf(
+      'header.appendChild(buttonsContainer)',
+      start,
+    );
+    expect(end, greaterThan(start));
+    mineButtonBlock = source.substring(start, end);
+  });
+
+  test('mine button is never permanently disabled by a duplicate', () {
+    // The old permanent-lock patterns must be gone.
+    expect(
+      mineButtonBlock.contains('disabled: true'),
+      isFalse,
+      reason: 'mine button must not start permanently disabled',
+    );
+    expect(
+      mineButtonBlock.contains('disabled = wasAdded'),
+      isFalse,
+      reason: 'a successful mine must not lock the button',
+    );
+    expect(
+      mineButtonBlock.contains('disabled = isDuplicate'),
+      isFalse,
+      reason: 'an existing card must not lock the button',
+    );
+    expect(
+      RegExp(r'disabled\s*=\s*[^;]*allowDupes').hasMatch(mineButtonBlock),
+      isFalse,
+      reason: 'duplicate state must never gate the disabled flag',
+    );
+  });
+
+  test(
+    'button state is detected at lookup time via the initial duplicateCheck',
+    () {
+      // The whole block (which ends at header.appendChild) must contain the
+      // lookup-time detection: a trailing visibility-scheduled duplicateCheck
+      // whose result drives setMineState without flooding invisible headers.
+      // 用正则而不是带精确缩进的字面量：制卡模块关掉时这段被包进
+      // `if (miningEnabled) { ... }`（连查重请求一起停），缩进从 8 格变 12 格，
+      // 调用本身没变。写死缩进会让这类合法改动无辜变红。
+      final Iterable<RegExpMatch> initHits =
+          RegExp(r'scheduleEntryStateCheck\(\s*mineButton,')
+              .allMatches(mineButtonBlock);
+      final int initIdx = initHits.isEmpty ? -1 : initHits.last.start;
+      expect(
+        initIdx,
+        greaterThanOrEqualTo(0),
+        reason:
+            'lookup-time duplicateCheck must be scheduled for the mine button',
+      );
+      final String initBody = mineButtonBlock.substring(initIdx);
+      expect(
+        initBody.contains("'duplicateCheck', { expression, reading }"),
+        isTrue,
+        reason: 'the scheduled state probe must still query real Anki state',
+      );
+      expect(
+        initBody.contains('setMineState('),
+        isTrue,
+        reason:
+            'the lookup-time detection must set the real button state, not '
+            'a purely-visual indicator',
+      );
+    },
+  );
+
+  test(
+    'a meaningful data-mined state is the source of truth, not decoration',
+    () {
+      // setMineState records data-mined; onclick branches on data-mined to decide
+      // whether the click is the edge-case re-verify path or a normal mine.
+      expect(
+        mineButtonBlock.contains('dataset.mined'),
+        isTrue,
+        reason:
+            'the button must carry a real data-mined state set at lookup '
+            'time, not just a ✓ glyph',
+      );
+      final int onclickIdx = mineButtonBlock.indexOf('onclick: async () => {');
+      expect(onclickIdx, greaterThanOrEqualTo(0));
+      final String onclickBody = mineButtonBlock.substring(onclickIdx);
+      expect(
+        onclickBody.contains("dataset.mined === '1'"),
+        isTrue,
+        reason: 'onclick must read the lookup-time-detected mined state',
+      );
+    },
+  );
+
+  test(
+    'TODO-087 edge case: clicking a mined ✓ re-verifies Anki before mining',
+    () {
+      final int onclickIdx = mineButtonBlock.indexOf('onclick: async () => {');
+      expect(onclickIdx, greaterThanOrEqualTo(0));
+      final String onclickBody = mineButtonBlock.substring(onclickIdx);
+      // The mined branch re-queries Anki, and the duplicateCheck inside it runs
+      // BEFORE mineEntry so a card deleted in Anki is re-mined.
+      final int minedBranchIdx = onclickBody.indexOf("dataset.mined === '1'");
+      expect(minedBranchIdx, greaterThanOrEqualTo(0));
+      final int dupCheckIdx = onclickBody.indexOf(
+        "callHandler('duplicateCheck'",
+        minedBranchIdx,
+      );
+      final int mineIdx = onclickBody.indexOf('mineEntry(', minedBranchIdx);
+      expect(
+        dupCheckIdx,
+        greaterThan(minedBranchIdx),
+        reason: 'the mined branch must re-query Anki',
+      );
+      expect(
+        mineIdx,
+        greaterThan(dupCheckIdx),
+        reason:
+            'duplicateCheck must run BEFORE mineEntry so a card deleted in '
+            'Anki is re-mined',
+      );
+    },
+  );
+
+  test('the in-flight guard is always released', () {
+    final int onclickIdx = mineButtonBlock.indexOf('onclick: async () => {');
+    final String onclickBody = mineButtonBlock.substring(onclickIdx);
+    expect(
+      onclickBody.contains('finally {'),
+      isTrue,
+      reason: 'onclick must release its guard in a finally block',
+    );
+    expect(
+      onclickBody.contains('mineButton.disabled = false'),
+      isTrue,
+      reason: 'finally must always re-enable the button',
+    );
+  });
+
+  // BUG-077: the popup mine button sets `mineButton.disabled = true` and then
+  // `await mineEntry(...)`. Before the fix the onclick had no try/catch, so a
+  // rejected mineEntry (Dart handler threw / JS payload-builder error) left the
+  // '+' stuck disabled with zero feedback. Guard that the failure path always
+  // restores the button to a clickable '+', so it can never get permanently
+  // stuck. Pairs with the Dart-side contract test
+  // (`packages/fushi_anki/test/mine_entry_never_throws_test.dart`).
+  // (Merged verbatim from popup_mine_button_recovers_static_test.dart.)
+  test('popup mine button restores itself when mining throws (BUG-077)', () {
+    final int onclickIdx = mineButtonBlock.indexOf('onclick: async () => {');
+    expect(
+      onclickIdx,
+      greaterThanOrEqualTo(0),
+      reason: 'mine button onclick handler not found',
+    );
+    final String onclickBody = mineButtonBlock.substring(onclickIdx);
+
+    expect(
+      onclickBody,
+      contains('try {'),
+      reason: 'mine onclick must guard the await in a try block',
+    );
+    expect(
+      onclickBody,
+      contains('} catch (e) {'),
+      reason: 'mine onclick must catch a rejected mineEntry',
+    );
+    expect(
+      onclickBody,
+      contains('mineButton.disabled = false'),
+      reason: 'failure path must re-enable the button (never leave it stuck)',
+    );
+  });
+}

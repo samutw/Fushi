@@ -1,0 +1,59 @@
+# TODO-2721：PR 关闭后删掉只属于该 PR 的 Actions 缓存。
+#
+# GitHub 的缓存是**按 ref 分桶**的：`refs/pull/<N>/merge` 上存的缓存和
+# `refs/heads/develop` 上同 key 的缓存是两条独立记录，一起算进仓库那 10 GB 配额。
+# 正常情况下 PR run 会命中 base 分支的缓存、不新存；但仓库一旦超配额、develop 那条
+# 被 LRU 驱逐，下一个 PR run 就会 miss 并在**自己的 PR 桶**里存一份 —— 于是出现
+# 「同一个 key 两条 1.8 GB 记录」，配额越紧越容易复制，是个正反馈。
+#
+# PR 合并/关闭后那些桶永远不会再被读到，但 GitHub 只在「7 天无访问」后才回收。
+# 这一步把它们立刻删掉，把配额还给 develop。
+#
+# 本 workflow **不发布任何东西**：只稀疏检出 base 分支上的 tool/cleanup_pr_ci.sh，
+# 无构建、无 release，只调 Actions API 取消 run 与删缓存。
+name: Cleanup PR caches
+
+# pull_request, same-repo PRs only (2026-09-30). #1829 moved this to
+# pull_request_target so fork PRs (79%; their pull_request token is read-only) get
+# the base repo's token -- but pull_request_target takes the workflow definition
+# from the DEFAULT branch, main, which lags develop and is not synced by agents, and
+# main's copy only knew `pull_request`: from then on the job never ran for anyone.
+# Merged PRs of any origin are now cleaned on the develop push instead
+# (merged-pr-cleanup.yml; merging IS a push, which runs develop's own file with a
+# writable token). This workflow keeps same-repo PRs closed without merging.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: cache-cleanup-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    # A fork PR's token here is read-only: every cancel / delete would 403.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The script from the base branch, not the closed PR's merge ref (which may
+      # be gone once the PR is closed).
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          sparse-checkout: tool/cleanup_pr_ci.sh
+          sparse-checkout-cone-mode: false
+      # Cancels first, then deletes the PR ref's caches (tool/cleanup_pr_ci.sh).
+      - name: Cancel this PR's leftover CI and delete its caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          SKIP_WORKFLOW_PATHS: .github/workflows/cache-cleanup.yml
+        run: bash tool/cleanup_pr_ci.sh

@@ -1,0 +1,963 @@
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:fushi/src/settings/settings_context.dart';
+
+enum SettingsDestinationId {
+  appearance,
+  // 「悬浮球」一级分类：应用内 / 应用外开关与各场景按钮的唯一入口
+  // （settings_schema_floating_ball.dart）。此前散在查词页与阅读页两处。
+  floatingBall,
+  profiles,
+  reading,
+  // 「漫画」一级分类：漫画阅读器的观看偏好（方向/缩放/翻页）+ 漫画 OCR。原先
+  // OCR 组寄生在 reading 末尾、观看偏好则完全不在设置里；漫画与 EPUB 阅读没有
+  // 任何共享设置项，故拆成独立大类（见 settings_schema_manga.dart）。
+  manga,
+  lookup,
+  cardCreation,
+  // 「模型」一级分类（2026-10-13 用户拍板）：LLM / OCR / 语音转录 / 语音合成 / 模型
+  // 文件的唯一的家。此前 OCR 寄生在漫画、模型文件在存储、LLM（原「AI」）在连接组，
+  // 视频图形字幕却和漫画共用同一份 OCR 配置，用户找不到。原 `ai` 分类降为本页的
+  // 「LLM」子页，枚举值保留（模块门控与入口可见性判据仍按它问）。
+  models,
+  video,
+  mediaTracking,
+  // 「下载」一级分类：torrent / qBittorrent 后端配置从下载页齿轮抬进设置主页
+  // （可达 + 可搜）。位置紧随视频/听，在同步备份之前。
+  downloads,
+  // 「在线服务」一级分类：第三方 API / 索引器 / 媒体服务器的凭据与端点
+  // （Jimaku、OpenSubtitles、Torznab、内置索引器、发现来源、Jellyfin/Emby、AniDB、
+  // TMDB、Dandanplay 服务器）唯一的家。此前按「服务于哪个媒介」散在视频/下载两
+  // 页，同一组件甚至双挂载；用户配完一处不知道另一处还有（BUG-1712 的真根因）。
+  // 本机后端（qBittorrent）、云盘备份后端、Anki/Yomitan 是各自域的核心，不归此。
+  services,
+  // 「游戏」一级分类（审计 K/Phase 3.12）：游戏库 / 捕获工作台 / 兼容性诊断此前
+  // 完全没有 settings destination，页面与其中配置项不可搜。与 games 顶层 tab
+  // 同门控（仅 Windows，galgame hook 平台边界）。
+  game,
+  // 「AI」一级分类：用户自配的大模型提供商（端点/凭据/模型/协议）与「哪个功能用
+  // 哪家」的映射。归在 services 模块下（同 Jimaku / OpenSubtitles / Torznab 一类
+  // 第三方在线服务），见 module_registry.dart。
+  ai,
+  syncBackup,
+  // 「存储」一级分类：磁盘占用总览（书/词典单条删除）+ 可选模块（OCR 模型 /
+  // Anime4K 着色器删除恢复）+ 随包组件展示（构建函数在 settings_schema_storage.dart）。
+  storage,
+  system,
+  // Fushi P2P 互联（设备直连 + 本机作为服务器）；从 syncBackup 拆出的
+  // 独立一级分类（构建函数在 sync_settings_schema.dart 同库，共享私有状态）。
+  interconnect,
+  // Synthetic destination for the reader quick-settings dialog; its own id so
+  // it never collides with the real reading destination (HBK-AUDIT-131).
+  readerQuickSettings,
+  // Synthetic destination for the pushed app-icon sub-page
+  // (MiscellaneousSettingsPage)；own id so the shell no longer borrows
+  // `appearance` for content that isn't the appearance destination.
+  appIcon,
+  // Synthetic destination for the in-video quick-settings sheet; its own id so
+  // it never collides with the real video destination（与 readerQuickSettings
+  // 同款约定）。
+  videoQuickSettings,
+  // Synthetic destination for the pushed shortcut-settings page
+  // (ShortcutSettingsPage)；own id so the shell no longer borrows `system` for
+  // content that isn't the system destination（与 appIcon 同款约定）。
+  shortcuts,
+}
+
+/// 书内快捷面板的分组维度，与全局 [SettingsDestinationId] 正交。
+/// 一个设置项可以同时出现在全局某 destination 和书内某 [ReaderGroup]。
+///
+/// TODO-802/774：原「外观」组（appearance）已删——字体/行高/缩进早已并入
+/// [layout]（TODO-774），最后只剩主题选择器，亦并入 [layout]（主题改的也是阅读
+/// 显示），外观组整个不再存在。
+enum ReaderGroup { layout, behavior, lookup, audiobook }
+
+/// 描述某个 [SettingsItem] 在书内快捷面板里的放置位置。
+/// 为 null 表示该项不出现在书内面板（仅全局可见）。
+class ReaderPlacement {
+  const ReaderPlacement({required this.group, required this.order});
+
+  final ReaderGroup group;
+
+  /// 在所属 [group] 内的升序排序键（仅组内有效，可有间隔）。
+  final int order;
+}
+
+/// 视频快捷设置面板的分组维度，与全局 [SettingsDestinationId] 正交；与
+/// [ReaderGroup] 同款设计。取值对齐 video_quick_settings_sheet 的现有大分类
+/// （playback/audio/subtitle/shaders/mpv/danmaku/controls），阶段 B 重写该
+/// 面板时按此投影 schema。
+enum VideoGroup { playback, audio, subtitle, shaders, mpv, danmaku, controls }
+
+/// 描述某个 [SettingsItem] 在视频快捷面板里的放置位置。
+/// 为 null 表示该项不出现在视频面板（仅全局可见）。
+class VideoPlacement {
+  const VideoPlacement({
+    required this.group,
+    required this.order,
+    this.section,
+  });
+
+  final VideoGroup group;
+
+  /// 在所属 [group] 内的升序排序键（仅组内有效，可有间隔）。
+  final int order;
+
+  /// 组内小节标题（如 mpv 组的「画质 / 画面几何 / 色彩均衡」）。投影时相邻同名
+  /// 条目并入同一个带标题 [SettingsSection]；null = 无题小节（相邻 null 合并）。
+  final String? section;
+}
+
+typedef SettingsVisibility = bool Function(SettingsContext context);
+
+/// 渲染时求值的副标题。返回 null = 用静态 [SettingsItem.subtitle]。
+///
+/// 与 [SettingsItem.titleBuilder] 同一条纪律：schema 树按 locale 缓存、构造期求值，
+/// 任何运行期状态都不许插进 `subtitle` 字面量（守卫见 settings_schema_cache_test 的
+/// 「静态文案逐字不变」）。副标题要随运行期状态变，只能走这个闭包。
+typedef SettingsSubtitleBuilder = String? Function(SettingsContext context);
+typedef SettingsItemAction = FutureOr<void> Function(SettingsContext context);
+typedef SettingsItemBuilder = Widget Function(SettingsContext context);
+
+/// 一个 custom item 渲染成**多行**：返回的每个 widget 在所属分组里各占一行
+/// （MD3 各是一张分段卡、Apple 行间画 inset 分隔线），见 [SettingsCustomItem.rows]。
+typedef SettingsItemRowsBuilder =
+    List<Widget> Function(SettingsContext context);
+typedef SettingsValueGetter<T extends Object> =
+    T Function(SettingsContext context);
+typedef SettingsValueChanged<T extends Object> =
+    FutureOr<void> Function(SettingsContext context, T value);
+typedef SettingsSwitchGetter = bool Function(SettingsContext context);
+typedef SettingsSwitchChanged =
+    FutureOr<void> Function(SettingsContext context, bool value);
+typedef SettingsDoubleFormatter = String Function(double value);
+
+class SettingsDestination {
+  const SettingsDestination({
+    required this.id,
+    required this.title,
+    required this.icon,
+    required this.sections,
+    this.summary,
+    this.visible,
+    this.body,
+    this.bodyBeforeSections = false,
+    this.bodySearchEntries = const <SettingsBodySearchEntry>[],
+    this.bodyFillsViewport = false,
+  });
+
+  final SettingsDestinationId id;
+  final String title;
+  final IconData icon;
+  final String? summary;
+  final SettingsVisibility? visible;
+  final List<SettingsSection> sections;
+
+  /// 可选的「整页正文」逃生口：非空时，渲染器在渲染完 [sections] 后把
+  /// `body(context)` 接在同一个滚动容器里。用于把原本藏在子级菜单（独立路由
+  /// 页）的复杂正文——Anki 设置、Profile 管理——直接平铺进本 destination 详情页，
+  /// 消掉一层多余跳转。返回的 widget 必须自带 [AdaptiveSettingsSection] 布局且
+  /// **不得**自带脚手架/独立滚动（外层渲染器已提供滚动与内边距）。
+  final SettingsItemBuilder? body;
+
+  /// Allows an existing grouped form to precede navigation without nesting its
+  /// surfaces inside a synthetic schema row.
+  final bool bodyBeforeSections;
+
+  /// 自绘正文的搜索元数据。索引器沿子页路径递归收集；声明 hasRevealTarget 的
+  /// 行使用真实 SettingsSearchTarget 定位，其余兼容条目只导航到所在页。
+  final List<SettingsBodySearchEntry> bodySearchEntries;
+
+  /// 正文自己管滚动、要占满详情视口（吸顶的工具区 / 两栏左侧导航 / 粘性分组
+  /// 标题都依赖这一点——装进外层 SingleChildScrollView 就只能整页一起滚）。
+  ///
+  /// 只对**推入的独立详情页**（[buildDetailPage]）且没有 schema [sections] 的
+  /// destination 生效：此时渲染器保留页头与水平内边距，把 [body] 直接放进剩余
+  /// 视口，不再套外层滚动容器。嵌进父级可滚动宿主（shrinkWrap）的场合仍按旧
+  /// 契约平铺，因为那里本来就没有可占满的视口。
+  final bool bodyFillsViewport;
+
+  /// [bodyFillsViewport] 真正生效的判据（三个渲染器共用，免得各写一份）。
+  bool fillsViewport(SettingsContext context) =>
+      bodyFillsViewport && body != null && visibleSections(context).isEmpty;
+
+  bool isVisible(SettingsContext context) => visible?.call(context) ?? true;
+
+  List<SettingsSection> visibleSections(SettingsContext context) {
+    return sections
+        .where((SettingsSection section) => section.isVisible(context))
+        .map((SettingsSection section) => section.visibleCopy(context))
+        .where((SettingsSection section) => section.items.isNotEmpty)
+        .toList(growable: false);
+  }
+}
+
+/// [SettingsDestination.bodySearchEntries] 的一条：body 逃生口正文里某个设置行
+/// 的搜索元数据（标题用与正文行一致的 i18n 文案；[subtitle] 参与元数据打分）。
+/// [visible] 为 null 表示恒可搜；否则与渲染同款谓词求值，平台/状态下不显示的
+/// 行不会进搜索索引。
+class SettingsBodySearchEntry {
+  const SettingsBodySearchEntry({
+    required this.id,
+    required this.title,
+    this.subtitle,
+    this.visible,
+    this.hasRevealTarget = false,
+  });
+
+  /// 全局唯一 id（如 `card_creation.anki.deck`），与真实正文挂点使用相同身份。
+  final String id;
+  final String title;
+  final String? subtitle;
+  final SettingsVisibility? visible;
+
+  /// True only when the real body row is wrapped in SettingsSearchTarget.
+  final bool hasRevealTarget;
+
+  bool isVisible(SettingsContext context) => visible?.call(context) ?? true;
+}
+
+/// 测试钩子：为 true 时，渲染器忽略每个 section 的 [SettingsSection.collapsedByDefault]，
+/// 把所有可折叠 section 一律按展开渲染。默认折叠会把折叠 section 的行移出 widget 树，
+/// 而 `settings_schema_coverage_test` 以 Tab 焦点遍历逐行驱动——够不到的行会被静默跳过、
+/// 削弱这道覆盖守卫。凡「枚举/驱动全部设置行」的测试须在 setUp 里置 true、tearDown 复位。
+bool debugSettingsForceExpandAllSections = false;
+
+/// Core controls remain visible; secondary groups explicitly opt into folding.
+enum SettingsSectionPresentation { alwaysExpanded, expanded, collapsed }
+
+class SettingsSection {
+  const SettingsSection({
+    required this.items,
+    this.id,
+    this.title,
+    this.footer,
+    this.visible,
+    bool collapsedByDefault = false,
+    SettingsSectionPresentation? presentation,
+    this.summaryBuilder,
+    this.liveListenable,
+  }) : presentation =
+           presentation ??
+           (collapsedByDefault
+               ? SettingsSectionPresentation.collapsed
+               : SettingsSectionPresentation.alwaysExpanded),
+       _unfiltered = null;
+
+  /// [visibleCopy] 的产物：记住过滤前的分组，[liveListenable] 触发时据此重新
+  /// 求值行级可见性（被过滤掉的行要能重新出现）。
+  const SettingsSection._filtered({
+    required this.items,
+    required this.presentation,
+    required SettingsSection unfiltered,
+    this.id,
+    this.title,
+    this.footer,
+    this.visible,
+    this.summaryBuilder,
+    this.liveListenable,
+  }) : _unfiltered = unfiltered;
+
+  /// Stable identity independent of translated titles or visible row positions.
+  final String? id;
+  final SettingsSectionPresentation presentation;
+  final SettingsSubtitleBuilder? summaryBuilder;
+
+  final String? title;
+  final String? footer;
+  final SettingsVisibility? visible;
+  final List<SettingsItem> items;
+
+  /// 本分组的行（标题 / 副标题 / 值 / 行级可见性）读的**外部事件源**——不是设置
+  /// 偏好、不经 `SettingsContext.refresh` 变化的运行期状态（错误 / 调试日志条数、
+  /// galgame hook 异步报上来的准入、推荐包下载阶段……）。渲染层订阅它，变化时
+  /// **只重建本分组**（并按 [visibleCopy] 重算行级可见性）。
+  ///
+  /// 此前这类状态由设置宿主页整页 setState 刷新：调试日志开着时每条 debugPrint
+  /// 都把整页设置行重建一遍，日志一刷屏设置页就逐帧掉帧。
+  ///
+  /// 限制：只能增删本分组里的行，分组本身至少要有一行恒可见（整组的出现 /
+  /// 消失仍由宿主重建决定）。
+  final Listenable? Function(SettingsContext context)? liveListenable;
+
+  final SettingsSection? _unfiltered;
+
+  /// 旧调用点的兼容读取；新代码显式使用 presentation。折叠仅影响展示，
+  /// 搜索可临时展开，业务配置值不受影响。
+  bool get collapsedByDefault =>
+      presentation == SettingsSectionPresentation.collapsed;
+
+  bool isVisible(SettingsContext context) => visible?.call(context) ?? true;
+
+  SettingsSection visibleCopy(SettingsContext context) {
+    final SettingsSection source = _unfiltered ?? this;
+    return SettingsSection._filtered(
+      unfiltered: source,
+      id:
+          source.id ??
+          (source.items.isEmpty ? null : 'section.${source.items.first.id}'),
+      title: source.title,
+      footer: source.footer,
+      visible: source.visible,
+      presentation: source.presentation,
+      summaryBuilder: source.summaryBuilder,
+      liveListenable: source.liveListenable,
+      items: source.items
+          .where((SettingsItem item) => item.isVisible(context))
+          .toList(growable: false),
+    );
+  }
+}
+
+sealed class SettingsItem {
+  const SettingsItem({
+    required this.id,
+    required this.title,
+    this.titleBuilder,
+    this.subtitle,
+    this.subtitleBuilder,
+    this.icon,
+    this.visible,
+    this.reader,
+    this.video,
+  });
+
+  final String id;
+
+  /// 静态标题。schema 树按 locale 缓存（见 settings_schema.dart 的
+  /// `_SettingsSchemaCache`），故本字段在**构造期**求值一次——它只能是 i18n 常量，
+  /// 不得插值任何运行期状态。标题要随状态变（计数、当前值），用 [titleBuilder]。
+  final String title;
+
+  /// 渲染时求值的标题；非空时覆盖 [title]。
+  ///
+  /// 存在的理由：`title` 是这个数据结构里唯一「只能构造期求值」的字段，而
+  /// `value` / `visible` / `onChanged` 全是渲染时求值的闭包。诊断分区那三行
+  /// （错误日志 / 崩溃转储 / 调试日志）需要在标题里带实时条数，此前只能靠
+  /// 「每次 build 重建整棵 schema」来刷新——这正是全量重建的成因之一，而且顺带让
+  /// 崩溃转储行每帧做一次同步目录扫描。补上这个闭包后标题与其它字段对称，动态
+  /// 标题在渲染时算、缓存树保持纯净。
+  ///
+  /// 目前只有 [SettingsNavigationItem] 透传；其它 item 类型需要时照此加
+  /// `super.titleBuilder` 即可。
+  final SettingsValueGetter<String>? titleBuilder;
+
+  final String? subtitle;
+
+  /// 渲染时求值的副标题；返回非 null 时覆盖 [subtitle]。见 [SettingsSubtitleBuilder]。
+  ///
+  /// 目前只有 [SettingsSwitchItem] / [SettingsActionItem] 透传（游戏内查词要按 hook
+  /// 报上来的准入状态说明为什么开关被灰了，并把游戏 exe 摘要摆出来）；其它 item
+  /// 类型需要时照此加 `super.subtitleBuilder`。
+  final SettingsSubtitleBuilder? subtitleBuilder;
+
+  final IconData? icon;
+  final SettingsVisibility? visible;
+
+  /// 书内快捷面板放置；null = 仅全局可见。
+  final ReaderPlacement? reader;
+
+  /// 视频快捷面板放置；null = 不出现在视频面板。
+  final VideoPlacement? video;
+
+  bool isVisible(SettingsContext context) => visible?.call(context) ?? true;
+
+  /// 渲染 / 搜索展示用的标题：有 [titleBuilder] 就用它，否则用静态 [title]。
+  String resolveTitle(SettingsContext context) =>
+      titleBuilder?.call(context) ?? title;
+
+  /// 渲染 / 搜索展示用的副标题：有 [subtitleBuilder] 且它给了值就用它，否则用静态
+  /// [subtitle]。
+  String? resolveSubtitle(SettingsContext context) =>
+      subtitleBuilder?.call(context) ?? subtitle;
+}
+
+class SettingsNavigationItem extends SettingsItem {
+  const SettingsNavigationItem({
+    required super.id,
+    required super.title,
+    super.titleBuilder,
+    this.builder,
+    this.onTap,
+    this.child,
+    this.showIcon = false,
+    super.subtitle,
+    super.subtitleBuilder,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  }) : assert(builder != null || onTap != null || child != null);
+
+  final WidgetBuilder? builder;
+  final SettingsItemAction? onTap;
+
+  /// 子 schema 页：点本行推一个与顶层分类同一套详情壳的 [SettingsDestination]
+  /// （`SettingsDetailPage.subPage`）。与 [builder] / [SettingsDestination.body]
+  /// 逃生口的区别：子页的行是真正的 schema item——进设置搜索索引（命中后先进父页
+  /// 再推子页定位）、进焦点覆盖遍历，不需要 `bodySearchEntries` 手工登记。
+  ///
+  /// 子页共用父分类的 [SettingsDestination.id]（枚举不为子页扩容）；它靠本闭包而非
+  /// id 取新鲜树，所以闭包必须是零参、构造期只读 i18n 常量（与顶层分类同一条
+  /// `settings_schema_cache_test` 纪律）。
+  final SettingsDestination Function()? child;
+  final bool showIcon;
+}
+
+/// 只读状态行：图标 + 标题 + 状态文本 + 可选一个行尾动作按钮。
+///
+/// 存在的理由：设置页里「当前账号 / 服务在跑在哪个端口 / 此项已挪到别处」这类
+/// 指路与状态行此前只能用 [SettingsCustomItem] 手拼 `AdaptiveSettingsRow`——四处
+/// 各写一份、且默认进不了搜索。收成一等 item 后渲染、搜索、焦点遍历都走框架。
+/// 状态文本随运行期变化时用 [subtitleBuilder]；无动作时整行不可点。
+class SettingsStatusItem extends SettingsItem {
+  const SettingsStatusItem({
+    required super.id,
+    required super.title,
+    super.titleBuilder,
+    super.subtitle,
+    super.subtitleBuilder,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+    this.actionLabel,
+    this.onAction,
+    this.actionVisible,
+  }) : assert(
+         (actionLabel == null) == (onAction == null),
+         'actionLabel 与 onAction 必须同时给或同时不给',
+       ),
+       assert(
+         actionVisible == null || onAction != null,
+         'actionVisible 只对带动作的状态行有意义',
+       );
+
+  /// 行尾动作按钮文案；null = 无按钮。
+  final String? actionLabel;
+  final SettingsItemAction? onAction;
+
+  /// 渲染时求值的动作可见性；返回 false 时本行按纯状态行渲染（无按钮、不进焦点）。
+  /// null = 有动作就恒显示。用于「只在某状态下才有意义」的动作（如空 key 才给
+  /// 「生成密钥」）。
+  final SettingsVisibility? actionVisible;
+
+  /// 当前上下文下实际生效的动作；[actionVisible] 判否时为 null。
+  SettingsItemAction? resolveAction(SettingsContext context) =>
+      (actionVisible?.call(context) ?? true) ? onAction : null;
+}
+
+class SettingsActionItem extends SettingsItem {
+  const SettingsActionItem({
+    required super.id,
+    required super.title,
+    required this.onTap,
+    this.destructive = false,
+    this.cli,
+    super.subtitle,
+    super.subtitleBuilder,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  });
+
+  final SettingsItemAction onTap;
+
+  /// true = 不可撤销的危险动作（清空 / 删除 / 重置），渲染成 error 色调的
+  /// 危险操作行（settings_kit 的 SettingsDangerRow）。只影响外观，确认框仍由
+  /// [onTap] 自己负责。
+  final bool destructive;
+
+  /// 控制通道（`fushi_cli config run`）上怎么执行这个动作。[onTap] 常带确认框 /
+  /// 选择器 / 文件选择器，CLI 不能去弹主窗口对话框，所以每个动作都要声明：
+  /// 直接跑 onTap（无交互）、带参数的入口，或「只是打开界面，用别的命令」。
+  /// 守卫：`test/settings/settings_cli_action_coverage_test.dart`。
+  final SettingsCliAction? cli;
+}
+
+/// 控制通道动作 / 列表操作的一个参数（CLI：`--arg name=value`，单参数可用
+/// `--value`）。
+class SettingsCliParam {
+  const SettingsCliParam(
+    this.name, {
+    required this.help,
+    this.required = true,
+    this.path = false,
+    this.secret = false,
+  });
+
+  final String name;
+
+  /// 给 CLI 用户看的一句说明（含写法）。
+  final String help;
+  final bool required;
+
+  /// 本机路径：CLI 侧转绝对路径，app 侧要求绝对路径。
+  final bool path;
+
+  /// 凭据（密码 / token / API key）：只收 CLI 的 `--secret-stdin` /
+  /// `--secret-from-env`，不收命令行明文。
+  final bool secret;
+}
+
+/// 控制通道执行体：[args] 已按 [SettingsCliAction.params] 校验过必填项；返回值
+/// （可 JSON 编码）进应答。参数不合法时抛 [ArgumentError] / [FormatException]
+/// （控制通道映射成 400）。
+typedef SettingsCliRun =
+    Future<Object?> Function(SettingsContext context, Map<String, String> args);
+
+/// [SettingsActionItem.cli]：动作在控制通道上的执行方式。
+class SettingsCliAction {
+  /// 带参数的无交互入口（把 [SettingsActionItem.onTap] 里对话框收集的值改成
+  /// 参数传入）。[confirm] = 破坏性，CLI 必须带 `--yes`。
+  const SettingsCliAction({
+    required SettingsCliRun this.run,
+    this.params = const <SettingsCliParam>[],
+    this.confirm = false,
+    this.offPageRunnable = false,
+  }) : unsupportedHint = null,
+       sameAsTap = false;
+
+  /// [SettingsActionItem.onTap] 本身没有任何对话框 / 选择器：CLI 直接调它。
+  const SettingsCliAction.tap({
+    this.confirm = false,
+    this.offPageRunnable = false,
+  }) : run = null,
+       params = const <SettingsCliParam>[],
+       unsupportedHint = null,
+       sameAsTap = true;
+
+  /// 这个动作只是打开页面 / 外部界面，没有能在这里完成的业务；[hint] 指向
+  /// 完成同一件事的 CLI 命令（或说明为何只能在界面里做）。
+  const SettingsCliAction.unsupported(String hint)
+    : run = null,
+      params = const <SettingsCliParam>[],
+      confirm = false,
+      offPageRunnable = false,
+      unsupportedHint = hint,
+      sameAsTap = false;
+
+  final SettingsCliRun? run;
+  final List<SettingsCliParam> params;
+  final bool confirm;
+  final bool sameAsTap;
+  final String? unsupportedHint;
+
+  /// 行只在某个页面里可见，但动作写的是全局偏好、离开页面执行同样有效：控制
+  /// 通道不按行可见性拒绝（同 [SettingsCliValue.offPageWritable]）。
+  final bool offPageRunnable;
+}
+
+/// [SettingsCustomItem.cliValue]：自绘行在控制通道上的单值读写（颜色、多行
+/// 文本、可序列化的布局 JSON…），`fushi_cli config get/set` 直接可用。
+class SettingsCliValue {
+  const SettingsCliValue({
+    required this.read,
+    required this.write,
+    this.help,
+    this.options,
+    this.offPageWritable = false,
+  });
+
+  /// 行本身只在某个页面里可见（如只在播放页快捷面板出现），但值是全局偏好、
+  /// 离开那个页面写入同样有效（下次进入生效）：控制通道不按行可见性拒绝。
+  final bool offPageWritable;
+
+  /// 当前值的文本形式（与 [write] 收的写法同形）。
+  final String Function(SettingsContext context) read;
+
+  /// 写入；写法不合法时抛 [ArgumentError] / [FormatException]（→ 400）。
+  final Future<void> Function(SettingsContext context, String raw) write;
+
+  /// 写法说明（如 `#AARRGGBB 或 theme`）。
+  final String? help;
+
+  /// 可选值（有固定取值集时）。
+  final List<String> Function(SettingsContext context)? options;
+}
+
+/// [SettingsCustomItem.cliList]：可增删的记录列表在控制通道上的操作
+/// （`fushi_cli config items ls|add|set|rm <key>`）。每条记录必须带 `id` 字段。
+class SettingsCliList {
+  const SettingsCliList({
+    required this.list,
+    this.add,
+    this.update,
+    this.remove,
+    this.fields = const <SettingsCliParam>[],
+    this.offPageWritable = false,
+  });
+
+  /// 同 [SettingsCliValue.offPageWritable]。
+  final bool offPageWritable;
+
+  final Future<List<Map<String, Object?>>> Function(SettingsContext context)
+  list;
+
+  /// 新增一条；返回新记录（含 id）。
+  final Future<Object?> Function(
+    SettingsContext context,
+    Map<String, String> fields,
+  )?
+  add;
+
+  /// 改一条（只改给出的字段）。
+  final Future<Object?> Function(
+    SettingsContext context,
+    String id,
+    Map<String, String> fields,
+  )?
+  update;
+
+  final Future<void> Function(SettingsContext context, String id)? remove;
+
+  /// add / update 收的字段说明。
+  final List<SettingsCliParam> fields;
+}
+
+class SettingsSwitchItem extends SettingsItem {
+  const SettingsSwitchItem({
+    required super.id,
+    required super.title,
+    required this.value,
+    required this.onChanged,
+    super.subtitle,
+    super.subtitleBuilder,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+    this.defaultValue,
+    this.enabled,
+  });
+
+  final SettingsSwitchGetter value;
+  final SettingsSwitchChanged onChanged;
+
+  /// 渲染时求值的可交互性；null / 返回 true = 可操作，false = 置灰禁用（值照旧显示）。
+  ///
+  /// 只用于「这个偏好在当前**设置组合**下不生效」（例如翻页动画只在翻页模式生效），
+  /// 说明原因走 [subtitleBuilder]。**不要**拿运行期能力（本局游戏用不了等）禁用开关——
+  /// 那是用户意图与会话能力两件正交的事（见 settings_schema_game.dart 的说明）。
+  final SettingsSwitchGetter? enabled;
+
+  bool isEnabled(SettingsContext context) => enabled?.call(context) ?? true;
+
+  /// 出厂默认值；非 null 时渲染层在值偏离默认时标「已改过」并提供单项恢复默认
+  /// （见 settings_kit 的 settingsResetSpecFor）。只是 UI 元数据，与持久化无关——
+  /// 必须与读取端（AppModel getter 的 defaultValue）保持一致，守卫见
+  /// test/settings/settings_default_values_test.dart。
+  final bool? defaultValue;
+}
+
+class SettingsSegmentOption<T extends Object> {
+  const SettingsSegmentOption({
+    required this.value,
+    required this.label,
+    this.icon,
+    this.tooltip,
+  });
+
+  final T value;
+  final String label;
+  final IconData? icon;
+  final String? tooltip;
+}
+
+class SettingsSegmentedItem<T extends Object> extends SettingsItem {
+  const SettingsSegmentedItem({
+    required super.id,
+    required super.title,
+    required this.options,
+    required this.selected,
+    required this.onChanged,
+    super.subtitle,
+    super.subtitleBuilder,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+    this.controlBelow = true,
+    this.dropdown = false,
+    this.defaultValue,
+    this.enabled,
+    this.optionsBuilder,
+  });
+
+  /// 出厂默认选项；语义同 [SettingsSwitchItem.defaultValue]。
+  final T? defaultValue;
+
+  /// 可交互性；语义同 [SettingsSwitchItem.enabled]（false = 整条分段置灰）。
+  final SettingsSwitchGetter? enabled;
+
+  bool isEnabled(SettingsContext context) => enabled?.call(context) ?? true;
+
+  /// 全部可能的选项（静态值域）：恢复默认的标签格式化按它查。
+  final List<SettingsSegmentOption<T>> options;
+
+  /// 渲染时求值的**此刻可选**选项；null = 恒为 [options]。用于值域随设置组合变化的
+  /// 行（启动页只能从已开启的模块里选）。渲染、设置搜索、ctl 一律读 [optionsFor]。
+  final List<SettingsSegmentOption<T>> Function(SettingsContext context)?
+  optionsBuilder;
+
+  List<SettingsSegmentOption<T>> optionsFor(SettingsContext context) =>
+      optionsBuilder?.call(context) ?? options;
+
+  final SettingsValueGetter<T> selected;
+  final SettingsValueChanged<T> onChanged;
+  final bool controlBelow;
+
+  /// true = 渲染成下拉单选（AdaptiveSettingsPickerRow）而非分段条。用于标签长 /
+  /// 选项多、分段条在窄 pane 只能横向滚动裁断的行（TODO-209 沉浸模式四态、mpv
+  /// 解码/几何/声道等）；数据模型不变，仅换行控件。
+  final bool dropdown;
+
+  /// 渲染器持有的是 `SettingsSegmentedItem<Object>`，静态读 [onChanged]（实际签名
+  /// `(ctx, T)`）会因函数参数逆变抛 `_TypeError`——故在真实 [T] 上下文里转回再调。
+  FutureOr<void> dispatchChange(SettingsContext context, Object value) =>
+      onChanged(context, value as T);
+}
+
+class SettingsSliderItem extends SettingsItem {
+  const SettingsSliderItem({
+    required super.id,
+    required super.title,
+    required this.value,
+    required this.onChanged,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+    this.min = 0,
+    this.max = 1,
+    this.divisions,
+    this.label,
+    this.onChangeEnd,
+    this.step,
+    this.titleReadout = false,
+    this.commitOnRelease = false,
+    this.defaultValue,
+  }) : assert(
+         !commitOnRelease || onChangeEnd == null,
+         'commitOnRelease 滑条松手统一走 onChanged 提交，不得再声明 onChangeEnd',
+       );
+
+  final double Function(SettingsContext context) value;
+  final double min;
+  final double max;
+  final int? divisions;
+  final SettingsDoubleFormatter? label;
+  final SettingsValueChanged<double> onChanged;
+  final SettingsValueChanged<double>? onChangeEnd;
+
+  /// 键盘 / 手柄左右键单按步进（覆盖默认的「一档 divisions」步进）。
+  /// 用于拖动档位（细）与按键步进（粗）需要解耦的滑条。
+  final double? step;
+
+  /// 为 true 时渲染器在标题后追加实时读数 `(label(value))`，如「音量 (95%)」。
+  /// [title] 本身保持裸标题不变（焦点遍历 / 覆盖测试以裸标题为身份 key）。
+  final bool titleReadout;
+
+  /// 为 true 时拖动只更新渲染层本地预览值（跟手 + 读数实时），松手才把最终值经
+  /// [onChanged] 提交一次。用于写穿成本高（BUG-963：播放页逐 tick 写穿触发全页
+  /// rebuild 掉帧）且拖动过程无实时预览意义的滑条；键盘/手柄步进仍每按即提交。
+  /// 与 [onChangeEnd] 互斥（松手提交统一走 [onChanged]）。
+  final bool commitOnRelease;
+
+  /// 出厂默认值；语义同 [SettingsSwitchItem.defaultValue]。
+  final double? defaultValue;
+}
+
+class SettingsStepperItem extends SettingsItem {
+  const SettingsStepperItem({
+    required super.id,
+    required super.title,
+    required this.value,
+    required this.step,
+    required this.min,
+    required this.max,
+    required this.format,
+    required this.onChanged,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+    this.defaultValue,
+  });
+
+  /// 出厂默认值；语义同 [SettingsSwitchItem.defaultValue]。
+  final double? defaultValue;
+
+  final double Function(SettingsContext context) value;
+  final double step;
+  final double min;
+  final double max;
+  final SettingsDoubleFormatter format;
+  final SettingsValueChanged<double> onChanged;
+}
+
+/// 一等文本输入项：字符串值经 getter/setter 闭包同步读写。渲染复用
+/// settings_schema_fields 的 [SettingsSecretField] 内部（防抖/提交语义一致），
+/// 由共享 SettingsSchemaItem 分发，Material/Cupertino 同路径。
+class SettingsTextItem extends SettingsItem {
+  const SettingsTextItem({
+    required super.id,
+    required super.title,
+    required this.value,
+    required this.onChanged,
+    this.secret = false,
+    this.debounce = const Duration(milliseconds: 500),
+    this.resetValue,
+    this.placeholder,
+    this.keyboardType,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  });
+
+  final SettingsValueGetter<String> value;
+  final SettingsValueChanged<String> onChanged;
+
+  /// true = 敏感值：明文遮蔽渲染 + 行尾眼睛按钮切换显隐（API key 等）。
+  final bool secret;
+
+  /// 击键到写穿的防抖间隔；[Duration.zero] = 每次击键立即写。提交（回车）恒立即写。
+  final Duration debounce;
+
+  /// 非 null 时行尾提供重置按钮，点击把该值写回并回填输入框。
+  final SettingsValueGetter<String>? resetValue;
+
+  /// 输入框占位提示；null = 不显示。
+  final String? placeholder;
+
+  /// null 时按 [secret] 取 visiblePassword / text。
+  final TextInputType? keyboardType;
+}
+
+/// 一等数字输入项：文本框输入 int/double，镜像 [SettingsNumberField] 行为
+/// （逐击键解析写穿 + 重置按钮），另支持可选 min/max 夹取；解析失败不写。
+class SettingsNumberItem extends SettingsItem {
+  const SettingsNumberItem({
+    required super.id,
+    required super.title,
+    required this.value,
+    required this.onChanged,
+    this.resetValue,
+    this.integer = false,
+    this.min,
+    this.max,
+    this.suffixText,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  });
+
+  final num Function(SettingsContext context) value;
+  final SettingsValueChanged<num> onChanged;
+
+  /// 非 null 时行尾提供重置按钮，点击把该值写回并回填输入框。
+  final num Function(SettingsContext context)? resetValue;
+
+  /// true = 整数输入（int 解析），false = 小数（double 解析）。
+  final bool integer;
+
+  /// 写穿前的夹取边界；null = 不限。
+  final num? min;
+  final num? max;
+
+  /// 输入框尾缀单位文字（如 ms / px）。
+  final String? suffixText;
+}
+
+class SettingsCustomItem extends SettingsItem {
+  const SettingsCustomItem({
+    required super.id,
+    required this.builder,
+    super.title = '',
+    this.searchTitle,
+    this.searchKeywords,
+    this.reset,
+    this.cliValue,
+    this.cliList,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  }) : rowsBuilder = null;
+
+  /// 可增删的记录列表（自定义站点、仓库地址…）：schema 的 item 树表达不了「条数
+  /// 随数据变」，但每条记录仍该是分组里的一行。[rowsBuilder] 返回的每个 widget
+  /// 由 schema 渲染器拆成分组里的独立行（与同组的声明式行同一分段 / 分隔线规则），
+  /// 记录变化后调用 `SettingsContext.refresh` 重建。不认识多行的宿主（快捷设置
+  /// 面板等）走 [builder]，退化成一列竖排的行。
+  SettingsCustomItem.rows({
+    required super.id,
+    required SettingsItemRowsBuilder this.rowsBuilder,
+    super.title = '',
+    this.searchTitle,
+    this.searchKeywords,
+    this.cliValue,
+    this.cliList,
+    super.subtitle,
+    super.icon,
+    super.visible,
+    super.reader,
+    super.video,
+  }) : reset = null,
+       builder = ((SettingsContext context) => Column(
+         mainAxisSize: MainAxisSize.min,
+         crossAxisAlignment: CrossAxisAlignment.stretch,
+         children: rowsBuilder(context),
+       ));
+
+  final SettingsItemBuilder builder;
+
+  /// 非空 = 多行 custom item（见 [SettingsCustomItem.rows]）。
+  final SettingsItemRowsBuilder? rowsBuilder;
+
+  /// 搜索元数据 opt-in：custom 行的 [title] 通常为空（正文由 [builder] 自绘），
+  /// 默认不可搜。声明本字段后该行以此标题进入设置搜索（展平/打分/结果展示均用它，
+  /// 见 settingsItemSearchTitle）；不影响渲染。
+  final String? searchTitle;
+
+  /// 自绘正文里的子项名（渲染时求值）：搜其中任何一个都命中本行，结果行露出
+  /// 命中的那个词（与分段控件的选项标签同一套，见 settings_search 的
+  /// `_optionLabelsOf`）。只在声明了 [searchTitle] 时生效。
+  final SettingsValueGetter<List<String>>? searchKeywords;
+
+  /// 自绘行的「恢复默认」元数据：声明后该行参与详情页的「恢复本页默认」
+  /// （settings_kit 的 settingsResetSpecFor），与声明了 defaultValue 的开关 /
+  /// 滑杆同一套判据。
+  final SettingsCustomReset? reset;
+
+  /// 控制通道上的单值读写（见 [SettingsCliValue]）；与 [cliList] 二选一。
+  final SettingsCliValue? cliValue;
+
+  /// 控制通道上的记录列表操作（见 [SettingsCliList]）。
+  final SettingsCliList? cliList;
+}
+
+/// [SettingsCustomItem.reset]：自绘行改没改过默认值、怎么恢复、恢复确认框里
+/// 当前值 / 默认值怎么写。
+class SettingsCustomReset {
+  const SettingsCustomReset({
+    required this.isModified,
+    required this.reset,
+    required this.currentLabel,
+    required this.defaultLabel,
+  });
+
+  final bool Function(SettingsContext context) isModified;
+  final Future<void> Function(SettingsContext context) reset;
+  final String Function(SettingsContext context) currentLabel;
+  final String Function(SettingsContext context) defaultLabel;
+}

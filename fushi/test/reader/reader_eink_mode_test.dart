@@ -1,0 +1,145 @@
+import 'dart:io';
+
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi/src/models/theme_notifier.dart';
+import 'package:fushi/src/profile/profile_keys.dart';
+import 'package:fushi/src/reader/reader_content_styles.dart';
+import 'package:fushi/src/reader/reader_settings.dart';
+
+import '../helpers/source_guard.dart';
+
+/// 墨水屏模式（eink_mode）守卫：
+///  1. 阅读器 CSS 生成器的 eink 分支——纯黑白正文、线式高亮（一律直线条）、关过渡、
+///     `--fushi-reader-eink-mode: 1`（连续模式跟随滚动瞬时化读它）；关掉时逐项
+///     不出现（零行为变化）。
+///  2. buildEinkColorScheme——纯黑白 ColorScheme（手工构造，不走 fromSeed），
+///     surfaceTint/shadow 透明（e-ink 不能有 elevation 灰阶）。
+///  3. eink_mode 必须在 Profile 快照黑名单里（设备属性，切 Profile 不回滚）。
+Future<ReaderSettings> _defaultSettings() async {
+  final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+  addTearDown(db.close);
+  final ReaderSettings settings = ReaderSettings(db);
+  await settings.refreshFromDb();
+  return settings;
+}
+
+void main() {
+  group('ReaderContentStyles.css eink branch', () {
+    test('einkMode=true (light) forces pure black-on-white body', () async {
+      final ReaderSettings settings = await _defaultSettings();
+      final String css = ReaderContentStyles.css(
+        settings: settings,
+        einkMode: true,
+      );
+      expect(css, contains('--fushi-reader-eink-mode: 1'));
+      expect(css, contains('background: #fff !important'));
+      expect(css, contains('color: #000 !important'));
+      // 关过渡：书籍自带动画一并压掉。
+      expect(css, contains('transition: none !important'));
+      expect(css, contains('animation: none !important'));
+      // 线式高亮：查词=粗实线、sasayaki=细实线、搜索=双线。
+      expect(css, contains('text-decoration-style: solid'));
+      expect(css, contains('text-decoration-style: double'));
+      expect(css, contains('text-decoration-line: underline'));
+      // sasayaki 跟读线必须是直线条，不得回退成虚线：上游 HSA 的墨水屏跟读高亮
+      // 是 overlay 画的 1.5px 实心线，虚线的每段短划在慢刷新屏上都是独立黑白
+      // 跳变，既更脏也更难一眼定位当前句。
+      expect(css, isNot(contains('text-decoration-style: dashed')));
+    });
+
+    test('einkMode=true honours einkDark (white-on-black)', () async {
+      final ReaderSettings settings = await _defaultSettings();
+      final String css = ReaderContentStyles.css(
+        settings: settings,
+        einkMode: true,
+        einkDark: true,
+      );
+      expect(css, contains('background: #000 !important'));
+      expect(css, contains('color: #fff !important'));
+      expect(css, contains('--fushi-reader-eink-mode: 1'));
+    });
+
+    test('einkMode=true overrides themed colors even for preset themes',
+        () async {
+      final ReaderSettings settings = await _defaultSettings();
+      final String css = ReaderContentStyles.css(
+        settings: settings,
+        themeOverride: 'ecru-theme',
+        einkMode: true,
+      );
+      // ecru 的手调底色被 eink 压掉。
+      expect(css, isNot(contains('#f7f6eb')));
+      expect(css, contains('background: #fff !important'));
+    });
+
+    test('einkMode=false (default) leaves normal output untouched', () async {
+      final ReaderSettings settings = await _defaultSettings();
+      final String css = ReaderContentStyles.css(settings: settings);
+      expect(css, isNot(contains('--fushi-reader-eink-mode')));
+      // 线式高亮整套只属于 eink 分支，非 eink 输出里一条都不该有。
+      expect(css, isNot(contains('text-decoration-style')));
+      // sasayaki 仍是色块填充（背景变量非 transparent）。
+      expect(css, contains('--fushi-sentence-audio-background-color: rgba'));
+    });
+  });
+
+  group('buildEinkColorScheme', () {
+    test('light = black on white, no tint/shadow', () {
+      final ColorScheme cs = buildEinkColorScheme(Brightness.light);
+      expect(cs.surface, Colors.white);
+      expect(cs.onSurface, Colors.black);
+      expect(cs.primary, Colors.black);
+      expect(cs.onPrimary, Colors.white);
+      expect(cs.outline, Colors.black);
+      expect(cs.surfaceContainerLow, Colors.white);
+      expect(cs.surfaceContainerHighest, Colors.white);
+      expect(cs.surfaceTint, Colors.transparent);
+      expect(cs.shadow, Colors.transparent);
+    });
+
+    test('dark = white on black', () {
+      final ColorScheme cs = buildEinkColorScheme(Brightness.dark);
+      expect(cs.surface, Colors.black);
+      expect(cs.onSurface, Colors.white);
+      expect(cs.primary, Colors.white);
+      expect(cs.onPrimary, Colors.black);
+      expect(cs.outline, Colors.white);
+      expect(cs.surfaceTint, Colors.transparent);
+    });
+  });
+
+  group('live re-injection (BUG-2329)', () {
+    test('appearance.eink_mode onChanged notifies the open reader', () {
+      // einkMode 是 ReaderContentStyles.css 的入参：开着书切换必须走
+      // notifyReaderSettingsChanged（→ onSettingsChangedLive → _applyStylesLive）
+      // 重注入正文 CSS，只 refresh() 设置页会让正文退出重进才变黑白。
+      // 注释掩掉再切：注释里提到调用名不算数；切片以「本项 id → 下一项 id」为界，
+      // 不钉相邻项的类型，schema 重排 / 中间插项都不会让断言漂到别的 handler 上。
+      final String schema = maskComments(
+        File('lib/src/settings/settings_schema_appearance.dart')
+            .readAsStringSync(),
+      );
+      final int id = schema.indexOf("id: 'appearance.eink_mode'");
+      expect(id, isNonNegative);
+      final int next = schema.indexOf("id: '", id + 5);
+      final String item =
+          next == -1 ? schema.substring(id) : schema.substring(id, next);
+      expect(item, contains('setEinkMode(value)'));
+      expect(item, contains('notifyReaderSettingsChanged(settingsContext)'),
+          reason: 'eink toggle must re-inject reader CSS live, not only '
+              'refresh the settings sheet');
+      expect(item, isNot(contains('settingsContext.refresh()')),
+          reason: 'notifyReaderSettingsChanged already refreshes the sheet');
+    });
+  });
+
+  group('profile snapshot exclusion', () {
+    test('eink_mode is app-global (excluded from per-profile snapshot)', () {
+      expect(ProfileKeys.isExcludedPref('eink_mode'), isTrue,
+          reason: 'eink_mode 描述物理屏幕，切 Profile 不得把整个 app 颜色翻转回去');
+    });
+  });
+}

@@ -1,0 +1,437 @@
+import 'dart:io';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/media/source_library/source_library_row.dart';
+import 'package:fushi_engine/media/video/metadata/video_metadata_models.dart';
+import 'package:fushi_engine/media/video/metadata/video_scrape_operation_gate.dart';
+import 'package:fushi_engine/media/video/metadata/video_source_metadata_indexer.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:path/path.dart' as p;
+
+/// 用**当前平台**的分隔符拼一条绝对路径。
+///
+/// [classifyLocalVideoExtra] 的目录名判据走 `p.split`（平台上下文）。原来这条用例
+/// 硬编码 `D:\Shows\...`：Windows 上 `p.split` 认得反斜杠、目录段能切出来所以全绿；
+/// Linux CI 上反斜杠只是普通字符，整串被当成**一个**路径段，`Trailers` / `迷你动画`
+/// 这类目录判据一条都命不中，stem 又变成 `d:\shows\title\trailers\official`，
+/// `trailer` 后面跟着 `s` 连兜底正则也不匹配 → 全部返回 null。典型的「本机 Windows
+/// 绿、CI 必红」。判据本身按平台分是对的（本地扫描拿到的就是平台原生路径），所以
+/// 修的是用例的平台假设，不是生产代码。
+String _nativePath(List<String> segments) => p.joinAll(<String>[
+      if (Platform.isWindows) r'D:\' else '/',
+      ...segments,
+    ]);
+
+Future<({File nfo, int sourceId})> _createMovieFixture(
+  FushiDatabase db,
+  Directory root,
+) async {
+  final File video = File(p.join(root.path, 'Movie.mkv'));
+  await video.writeAsBytes(const <int>[0]);
+  final int sourceId = await db.insertMediaSource(
+    MediaSourcesCompanion.insert(
+      label: 'Movie source',
+      mediaKind: 'video',
+      rootPath: root.path,
+      createdAt: 1,
+    ),
+  );
+  await db.upsertVideoBook(VideoBooksCompanion(
+    bookUid: const Value<String>('movie-book'),
+    title: const Value<String>('Movie'),
+    videoPath: Value<String>(video.path),
+    sourceId: Value<int?>(sourceId),
+  ));
+  return (nfo: File(p.setExtension(video.path, '.nfo')), sourceId: sourceId);
+}
+
+void main() {
+  test('maintenance lease blocks direct metadata backfill before it writes work',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    addTearDown(db.close);
+    final Directory root = await Directory.systemTemp.createTemp(
+      'video_indexer_gate_',
+    );
+    addTearDown(() => root.delete(recursive: true));
+    final ({File nfo, int sourceId}) fixture =
+        await _createMovieFixture(db, root);
+    final SourceLibraryRow source =
+        (await db.getMediaSourceById(fixture.sourceId))!;
+    final VideoScrapeOperationLease lease =
+        VideoScrapeOperationGate.tryEnterMaintenance()!;
+    addTearDown(lease.release);
+
+    await VideoSourceMetadataIndexer(db).index(source);
+
+    expect(await db.getAllVideoMetadataWorks(), isEmpty);
+  });
+
+  test('Kodi local extra names are classified without matching normal episodes',
+      () {
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Shows', 'Title', 'Trailers', 'official.mkv']),
+      )?.kind,
+      VideoMetadataExtraKind.trailer,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>[
+          'Shows',
+          'Title',
+          'Behind The Scenes',
+          'making-of.mkv',
+        ]),
+      )?.kind,
+      VideoMetadataExtraKind.behindTheScenes,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Movies', 'Film-trailer.mp4']),
+      )?.kind,
+      VideoMetadataExtraKind.trailer,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Shows', 'Title', 'NCOP2.mkv']),
+      )?.kind,
+      VideoMetadataExtraKind.clip,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Shows', 'Title', 'Title NCED.mkv']),
+      )?.kind,
+      VideoMetadataExtraKind.clip,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>[
+          'Shows',
+          'Title',
+          'PV',
+          '[Group][Title][PV][01].mkv',
+        ]),
+      )?.kind,
+      VideoMetadataExtraKind.clip,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>[
+          'Shows',
+          'Title',
+          'NCOP&NCED',
+          '[Group][Title][NCOP].mkv',
+        ]),
+      )?.kind,
+      VideoMetadataExtraKind.clip,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>[
+          'Shows',
+          'Title',
+          'menu',
+          '[Group][Title][01].mkv',
+        ]),
+      )?.kind,
+      VideoMetadataExtraKind.extra,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Shows', 'Title', '迷你动画', 'short-01.mkv']),
+      )?.kind,
+      VideoMetadataExtraKind.short,
+    );
+    expect(
+      classifyLocalVideoExtra(
+        _nativePath(<String>['Shows', 'Title', 'Title.S01E01.mkv']),
+      ),
+      isNull,
+    );
+  });
+
+  test('legacy-only NFO stays local while preserving cross-reference ids',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    final Directory root =
+        await Directory.systemTemp.createTemp('video-metadata-legacy-nfo-');
+    addTearDown(() async {
+      await db.close();
+      if (await root.exists()) await root.delete(recursive: true);
+    });
+    final fixture = await _createMovieFixture(db, root);
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>Legacy NFO Movie</title>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+  <uniqueid type="bangumi" default="false">200</uniqueid>
+  <uniqueid type="anilist" default="false">300</uniqueid>
+</movie>
+''');
+
+    await VideoSourceMetadataIndexer(db).index(
+      (await db.getMediaSourceById(fixture.sourceId))!,
+    );
+
+    final VideoMetadataWorkRow work =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(work.title, 'Legacy NFO Movie');
+    final List<VideoMetadataProviderIdentityRow> identities =
+        await db.getVideoMetadataProviderIdentities(workId: work.id);
+    expect(
+      identities
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}')
+          .toSet(),
+      <String>{'tmdb:100:false', 'bangumi:200:false', 'anilist:300:false'},
+    );
+    final VideoScrapeMetaRow? legacy =
+        await db.getVideoScrapeMeta('movie-book');
+    expect(legacy?.source, VideoMetadataProviderKind.local.name);
+    expect(legacy?.detailUrl, isNull);
+  });
+
+  test('rescan without NFO preserves pre-AniDB metadata and cross references',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    final Directory root =
+        await Directory.systemTemp.createTemp('video-metadata-legacy-rescan-');
+    addTearDown(() async {
+      await db.close();
+      if (await root.exists()) await root.delete(recursive: true);
+    });
+    final fixture = await _createMovieFixture(db, root);
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>Preserved Legacy Movie</title>
+  <plot>Legacy metadata must survive indexing.</plot>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+  <uniqueid type="bangumi" default="false">200</uniqueid>
+</movie>
+''');
+    final VideoSourceMetadataIndexer indexer = VideoSourceMetadataIndexer(db);
+    final source = (await db.getMediaSourceById(fixture.sourceId))!;
+
+    await indexer.index(source);
+    final VideoMetadataWorkRow before =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    await fixture.nfo.delete();
+    await indexer.index(source);
+
+    final VideoMetadataWorkRow after =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(after.id, before.id);
+    expect(after.title, 'Preserved Legacy Movie');
+    expect(after.overview, 'Legacy metadata must survive indexing.');
+    expect(
+      (await db.getVideoMetadataProviderIdentities(workId: after.id))
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}')
+          .toSet(),
+      <String>{'tmdb:100:false', 'bangumi:200:false'},
+    );
+  });
+
+  test('rescan keeps existing AniDB canonical identity over a legacy NFO',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    final Directory root =
+        await Directory.systemTemp.createTemp('video-metadata-anidb-nfo-');
+    addTearDown(() async {
+      await db.close();
+      if (await root.exists()) await root.delete(recursive: true);
+    });
+    final fixture = await _createMovieFixture(db, root);
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>AniDB Canonical Movie</title>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+  <uniqueid type="anidb" default="false">42</uniqueid>
+</movie>
+''');
+    final VideoSourceMetadataIndexer indexer = VideoSourceMetadataIndexer(db);
+    final source = (await db.getMediaSourceById(fixture.sourceId))!;
+
+    await indexer.index(source);
+    final VideoMetadataWorkRow canonical =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(canonical.title, 'AniDB Canonical Movie');
+    expect(
+      (await db.getVideoMetadataProviderIdentities(workId: canonical.id))
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}')
+          .toSet(),
+      <String>{'anidb:42:true', 'tmdb:100:false'},
+      reason: 'AniDB is canonical even when the NFO marks TMDB as default',
+    );
+
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>Legacy Override Must Not Win</title>
+  <uniqueid type="tmdb" default="true">999</uniqueid>
+  <uniqueid type="bangumi" default="false">888</uniqueid>
+</movie>
+''');
+    await indexer.index(source);
+
+    final VideoMetadataWorkRow rescanned =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(rescanned.id, canonical.id);
+    expect(rescanned.title, 'AniDB Canonical Movie');
+    expect(
+      (await db.getVideoMetadataProviderIdentities(workId: rescanned.id))
+          .map((VideoMetadataProviderIdentityRow row) =>
+              '${row.provider}:${row.externalId}:${row.isPrimary}')
+          .toSet(),
+      <String>{'anidb:42:true', 'tmdb:100:false'},
+    );
+    expect(
+      (await db.getVideoScrapeMeta('movie-book'))?.source,
+      VideoMetadataProviderKind.anidb.name,
+    );
+  });
+
+  test('existing source is backfilled into one idempotent provisional work',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    final Directory root =
+        await Directory.systemTemp.createTemp('video-metadata-backfill-');
+    addTearDown(() async {
+      await db.close();
+      if (await root.exists()) await root.delete(recursive: true);
+    });
+    final Directory show = Directory(p.join(root.path, 'Himouto'));
+    await show.create(recursive: true);
+    final int sourceId = await db.insertMediaSource(
+      MediaSourcesCompanion.insert(
+        label: 'Existing source',
+        mediaKind: 'video',
+        rootPath: root.path,
+        createdAt: 1,
+      ),
+    );
+    for (final int episode in <int>[8, 9]) {
+      final File video = File(p.join(
+        show.path,
+        '[Kamigami] Himouto! Umaru-chan - ${episode.toString().padLeft(2, '0')}'
+        ' [1920x1080].mkv',
+      ));
+      await video.writeAsBytes(const <int>[0]);
+      await db.upsertVideoBook(VideoBooksCompanion(
+        bookUid: Value<String>('himouto-$episode'),
+        title: Value<String>(p.basenameWithoutExtension(video.path)),
+        videoPath: Value<String>(video.path),
+        sourceId: Value<int?>(sourceId),
+      ));
+    }
+    final File ncop = File(p.join(show.path, 'Himouto NCOP.mkv'));
+    await ncop.writeAsBytes(const <int>[0]);
+    await db.upsertVideoBook(VideoBooksCompanion(
+      bookUid: const Value<String>('himouto-ncop'),
+      title: const Value<String>('Himouto NCOP'),
+      videoPath: Value<String>(ncop.path),
+      sourceId: Value<int?>(sourceId),
+    ));
+    await db.upsertVideoMetadataWork(
+      VideoMetadataWorksCompanion.insert(
+        bookUid: const Value<String?>('himouto-ncop'),
+        mediaType: 'movie',
+        title: 'Himouto NCOP',
+        updatedAt: 1,
+      ),
+    );
+    final int collectionId = await db.createMediaCollection(
+      'Himouto! Umaru-chan',
+      collectionType: 'playlist',
+    );
+    await db.addToCollection(collectionId, MediaKind.video, 'himouto-8');
+    await db.addToCollection(collectionId, MediaKind.video, 'himouto-9');
+    final source = (await db.getMediaSourceById(sourceId))!;
+    final VideoSourceMetadataIndexer indexer = VideoSourceMetadataIndexer(db);
+
+    expect(await indexer.index(source), isTrue);
+    final VideoMetadataWorkRow first =
+        (await db.getVideoMetadataWorkByCollection(collectionId))!;
+    expect(first.title, 'Himouto! Umaru-chan');
+    expect(first.mediaType, 'tv');
+    expect(await db.getVideoMetadataSeasons(first.id), hasLength(1));
+    expect(
+      await db.getVideoMetadataProviderIdentities(workId: first.id),
+      isEmpty,
+    );
+    final CollectionScrapeMetaRow? provisional =
+        await db.getCollectionScrapeMeta(collectionId);
+    expect(provisional?.source, VideoMetadataProviderKind.local.name);
+    expect(provisional?.detailUrl, isNull);
+    expect(await db.getVideoMetadataWorkByBook('himouto-ncop'), isNull,
+        reason: '历史误建的 NCOP 独立作品应清理，但 VideoBook 仍保留');
+    expect(await db.getVideoBookByBookUid('himouto-ncop'), isNotNull);
+    final List<VideoMetadataExtraRow> extras =
+        await db.getVideoMetadataExtras(first.id);
+    expect(extras.single.bookUid, 'himouto-ncop');
+    expect(extras.single.kind, 'clip');
+
+    // 启动回填每次都会跑：什么都没变时必须零写入（不重写作品、不重插特典），
+    // 调用方据返回值决定要不要整页刷新视频库。
+    expect(await indexer.index(source), isFalse);
+    final VideoMetadataWorkRow second =
+        (await db.getVideoMetadataWorkByCollection(collectionId))!;
+    expect(second.id, first.id);
+    expect(second.updatedAt, first.updatedAt);
+    expect(await db.getVideoMetadataSeasons(first.id), hasLength(1));
+    expect(
+      (await db.getVideoMetadataExtras(first.id)).single.updatedAt,
+      extras.single.updatedAt,
+    );
+  });
+
+  test('unchanged NFO is not re-applied on every launch; an edited one is',
+      () async {
+    final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+    final Directory root =
+        await Directory.systemTemp.createTemp('video-metadata-nfo-mtime-');
+    addTearDown(() async {
+      await db.close();
+      if (await root.exists()) await root.delete(recursive: true);
+    });
+    final fixture = await _createMovieFixture(db, root);
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>First NFO Title</title>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+</movie>
+''');
+    final VideoSourceMetadataIndexer indexer = VideoSourceMetadataIndexer(db);
+    final source = (await db.getMediaSourceById(fixture.sourceId))!;
+
+    expect(await indexer.index(source), isTrue);
+    final VideoMetadataWorkRow applied =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(applied.title, 'First NFO Title');
+
+    // NFO 没动：只 stat，不解析、不重写。
+    expect(await indexer.index(source), isFalse);
+    expect(
+      (await db.getVideoMetadataWorkByBook('movie-book'))!.updatedAt,
+      applied.updatedAt,
+    );
+
+    // 用户改了 NFO（晚于作品行上次落库）：重新吃进去。作品行时刻钉到过去，
+    // 免得文件系统 mtime 粒度让「刚写」与「刚落库」撞在同一刻。
+    await db.setVideoMetadataWorkUpdatedAt(applied.id, 1);
+    await fixture.nfo.writeAsString('''
+<movie>
+  <title>Edited NFO Title</title>
+  <uniqueid type="tmdb" default="true">100</uniqueid>
+</movie>
+''');
+    expect(await indexer.index(source), isTrue);
+    final VideoMetadataWorkRow edited =
+        (await db.getVideoMetadataWorkByBook('movie-book'))!;
+    expect(edited.id, applied.id);
+    expect(edited.title, 'Edited NFO Title');
+  });
+}

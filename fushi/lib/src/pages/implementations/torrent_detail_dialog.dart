@@ -1,0 +1,1018 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi_engine/media/torrent/anime_download_config.dart';
+import 'package:fushi_engine/media/torrent/embedded_torrent_backend.dart';
+import 'package:fushi_engine/media/torrent/torrent_network_diagnosis.dart';
+import 'package:fushi/src/media/torrent/anime_download_plan.dart';
+import 'package:fushi_engine/media/torrent/torrent_backend.dart';
+import 'package:fushi_engine/media/torrent/torrent_task_display.dart';
+import 'package:fushi_engine/media/video/download/video_download_pipeline_service.dart';
+import 'package:fushi/src/media/torrent/torrent_network_issue_banner.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/pages/implementations/download_actions.dart';
+import 'package:fushi/utils.dart';
+
+/// TODO-2482：下载任务详情对话框（qb/hayase 式四 tab：总览 / 文件 /
+/// 节点 / Tracker）。入口 = 下载任务行点击。
+///
+/// 数据面走 [TorrentDetailBackend] 可选能力接口：`backend is` 探测 +
+/// [TorrentDetailBackend.detailAvailable] 运行时能力位双重把关（内置引擎
+/// 随包 DLL 过旧时类型探测过了符号也缺）；缺能力的 tab 显示「当前后端
+/// 不支持」而不是空白。文件列表是 [TorrentBackend] 基础能力，不受降级
+/// 影响；文件优先级下拉只在详情能力可用时出现。
+///
+/// 轮询：对话框自持一个后端实例（qb = 独立 http 客户端；内置 = 常驻
+/// session 的短命视图，close 不连累会话），每 2s 刷当前 tab 需要的数据，
+/// 切 tab 立即补一轮 —— 不给不可见的 tab 白拉数据。
+class TorrentTaskDetailDialog extends ConsumerStatefulWidget {
+  TorrentTaskDetailDialog({
+    required AnimeDownloadPlan plan,
+    super.key,
+    this.networkIssue,
+    @visibleForTesting this.backendOverride,
+  })  : torrentId = plan.id,
+        title = plan.seriesTitle,
+        torrentTitle = plan.torrentTitle,
+        initialSnapshot = null,
+        initialFiles = null,
+        liveDataAbsence = VideoDownloadLiveDataAbsence.none,
+        resolveBackendFromAppModel = true;
+
+  /// Durable download jobs use the same real backend detail surface without
+  /// manufacturing a legacy [AnimeDownloadPlan].
+  const TorrentTaskDetailDialog.task({
+    required this.torrentId,
+    required this.title,
+    required this.torrentTitle,
+    required this.backendOverride,
+    required this.initialSnapshot,
+    required this.initialFiles,
+    required this.liveDataAbsence,
+    this.networkIssue,
+    super.key,
+  }) : resolveBackendFromAppModel = false;
+
+  final String torrentId;
+  final String title;
+  final String torrentTitle;
+
+  /// 仅测试用：注入假后端，跳过 AppModel 的真实后端工厂（widget 测试
+  /// 不必拉起整个应用模型）。注入的后端由**调用方**负责 close。
+  final TorrentBackend? backendOverride;
+  final TorrentSnapshot? initialSnapshot;
+  final List<TorrentFileEntry>? initialFiles;
+
+  /// 没有实时数据时的**定性结论**（由管线服务给出，UI 不再自己猜）。
+  final VideoDownloadLiveDataAbsence liveDataAbsence;
+
+  /// Legacy plan dialogs may resolve the currently configured backend. Durable
+  /// job dialogs must never do that because their persisted backend identity
+  /// can refer to another qBittorrent instance.
+  final bool resolveBackendFromAppModel;
+
+  /// BUG-2950：内置引擎会话级网络诊断（通常是 `AppModel.torrentNetworkIssue`）。
+  /// 只在本任务走内置引擎时展示在「网络」区顶部；null = 不展示。
+  final ValueListenable<TorrentNetworkIssue>? networkIssue;
+
+  @override
+  ConsumerState<TorrentTaskDetailDialog> createState() =>
+      _TorrentTaskDetailDialogState();
+}
+
+class _TorrentTaskDetailDialogState
+    extends ConsumerState<TorrentTaskDetailDialog>
+    with SingleTickerProviderStateMixin {
+  static const Duration _pollInterval = Duration(seconds: 2);
+
+  late final TabController _tabController;
+  TorrentBackend? _backend;
+
+  /// 详情能力：类型探测 + 运行时能力位（见类 doc）。
+  bool _detailCapable = false;
+
+  /// 后端是否归本状态所有（注入的测试后端不 close）。
+  bool _ownsBackend = true;
+  Timer? _timer;
+  bool _snapshotRefreshing = false;
+  bool _snapshotRefreshPending = false;
+  final Set<int> _refreshingTabs = <int>{};
+  final Set<int> _pendingTabRefreshes = <int>{};
+
+  /// 四路会「转圈等结果」的数据统一走 [_LoadState]（BUG-1532 / BUG-1535）：
+  /// 加载中 / 失败 / 后端答「没有」三态由同一个状态模型和同一条渲染路径
+  /// （[_buildMissingData]）决定，不再是「只有 Trackers 记得写失败态，其余
+  /// 三个 tab 在后端持续报错时永久转圈」。
+  _LoadState<TorrentSnapshot> _snapshot =
+      const _LoadState<TorrentSnapshot>.initial();
+  _LoadState<List<TorrentPeerDetail>> _peers =
+      const _LoadState<List<TorrentPeerDetail>>.initial();
+  _LoadState<List<TorrentTrackerDetail>> _trackers =
+      const _LoadState<List<TorrentTrackerDetail>>.initial();
+  _LoadState<List<TorrentFileEntry>> _files =
+      const _LoadState<List<TorrentFileEntry>>.initial();
+
+  /// 总览的装饰行（会话状态 / piece 图）：没有也只是少几行，不参与
+  /// loading 判定，故不进 [_LoadState]。
+  TorrentSessionStatusInfo? _sessionStatus;
+  TorrentPieceStates? _pieces;
+  List<TorrentFilePriority>? _filePriorities;
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 4, vsync: this);
+    // 切 tab 立即补一轮该 tab 的数据（等下一个 2s tick 会显得迟钝）。
+    _tabController.addListener(() {
+      if (!_tabController.indexIsChanging) {
+        unawaited(_refresh());
+      }
+    });
+    final TorrentSnapshot? initialSnapshot = widget.initialSnapshot;
+    if (initialSnapshot != null) {
+      _snapshot = _snapshot.withData(initialSnapshot);
+    }
+    final List<TorrentFileEntry>? initialFiles = widget.initialFiles;
+    if (initialFiles != null) _files = _files.withData(initialFiles);
+    final TorrentBackend? override = widget.backendOverride;
+    if (override != null) {
+      _backend = override;
+      _ownsBackend = false;
+      _detailCapable =
+          override is TorrentDetailBackend && override.detailAvailable;
+    } else if (widget.resolveBackendFromAppModel) {
+      final AppModel appModel = ref.read(appProvider);
+      if (torrentBackendReady(appModel)) {
+        final TorrentBackend backend = appModel.createTorrentBackend(
+          effectiveTorrentConfig(appModel.qbConnectionConfig),
+        );
+        _backend = backend;
+        _detailCapable =
+            backend is TorrentDetailBackend && backend.detailAvailable;
+      }
+    }
+    unawaited(_refresh());
+    _timer = Timer.periodic(_pollInterval, (_) => unawaited(_refresh()));
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _tabController.dispose();
+    if (_ownsBackend) _backend?.close();
+    super.dispose();
+  }
+
+  /// 刷一轮：任务快照与当前 tab 各走自己的请求通道。
+  ///
+  /// qBittorrent WebUI 的 Tracker 面板直接按 hash 请求
+  /// `/api/v2/torrents/trackers`；它不会等待 peers 或 torrent 列表请求完成。
+  /// 这里保持相同的独立性，避免任一慢请求把另一个 tab 永久挡在 loading。
+  Future<void> _refresh() async {
+    final TorrentBackend? backend = _backend;
+    if (backend == null || !mounted) return;
+    final int tab = _tabController.index;
+    await Future.wait<void>(<Future<void>>[
+      _refreshSnapshot(backend),
+      _refreshTab(backend, tab),
+    ]);
+  }
+
+  Future<void> _refreshSnapshot(TorrentBackend backend) async {
+    if (!mounted) return;
+    if (_snapshotRefreshing) {
+      _snapshotRefreshPending = true;
+      return;
+    }
+    _snapshotRefreshing = true;
+    try {
+      final String wantedHash = widget.torrentId.toLowerCase();
+      final List<TorrentSnapshot> torrents = await backend.listTorrents();
+      TorrentSnapshot? snapshot;
+      for (final TorrentSnapshot t in torrents) {
+        if (t.hash.toLowerCase() == wantedHash) {
+          snapshot = t;
+          break;
+        }
+      }
+      if (!mounted) return;
+      setState(() {
+        _snapshot = snapshot == null
+            ? _snapshot.withAbsent()
+            : _snapshot.withData(snapshot);
+      });
+    } on Object catch (error, stack) {
+      ErrorLogService.instance.log(
+        'TorrentTaskDetailDialog.refreshSnapshot',
+        error,
+        stack,
+      );
+      // 后端持续报错时总览必须给出失败态：只记日志会让「已尝试」永远为
+      // false，总览退化成永久转圈（BUG-1532）。
+      if (mounted) setState(() => _snapshot = _snapshot.withFailure());
+    } finally {
+      _snapshotRefreshing = false;
+      final bool rerun = _snapshotRefreshPending;
+      _snapshotRefreshPending = false;
+      if (mounted && rerun) {
+        unawaited(_refreshSnapshot(backend));
+      }
+    }
+  }
+
+  Future<void> _refreshTab(TorrentBackend backend, int tab) async {
+    if (!mounted) return;
+    if (_refreshingTabs.contains(tab)) {
+      _pendingTabRefreshes.add(tab);
+      return;
+    }
+    _refreshingTabs.add(tab);
+    final TorrentDetailBackend? detail =
+        _detailCapable && backend is TorrentDetailBackend ? backend : null;
+    try {
+      switch (tab) {
+        case 0:
+          // 详情能力缺失时这两项本就没有来源，UI 走「当前后端不支持」，
+          // 不能记成失败态。
+          if (detail == null) return;
+          final TorrentSessionStatusInfo? sessionStatus =
+              await detail.sessionStatus();
+          final TorrentPieceStates? pieces =
+              await detail.pieceStates(widget.torrentId);
+          if (!mounted) return;
+          setState(() {
+            if (sessionStatus != null) _sessionStatus = sessionStatus;
+            if (pieces != null) _pieces = pieces;
+          });
+        case 1:
+          final List<TorrentFileEntry> files =
+              await backend.listFiles(widget.torrentId);
+          final List<TorrentFilePriority>? priorities =
+              await detail?.filePriorities(widget.torrentId);
+          if (!mounted) return;
+          setState(() {
+            _files = _files.withData(files);
+            if (priorities != null) _filePriorities = priorities;
+          });
+        case 2:
+          if (detail == null) return;
+          final List<TorrentPeerDetail>? peers =
+              await detail.listPeers(widget.torrentId);
+          if (!mounted) return;
+          // null = 后端明确答不上来（同 Trackers），是失败而不是「还在加载」。
+          setState(() {
+            _peers =
+                peers == null ? _peers.withFailure() : _peers.withData(peers);
+          });
+        case 3:
+          if (detail == null) return;
+          final List<TorrentTrackerDetail>? trackers =
+              await detail.listTrackers(widget.torrentId);
+          if (!mounted) return;
+          setState(() {
+            _trackers = trackers == null
+                ? _trackers.withFailure()
+                : _trackers.withData(trackers);
+          });
+      }
+    } on Object catch (error, stack) {
+      ErrorLogService.instance.log(
+        'TorrentTaskDetailDialog.refreshTab.$tab',
+        error,
+        stack,
+      );
+      if (!mounted) return;
+      setState(() => _markTabFailed(tab));
+    } finally {
+      _refreshingTabs.remove(tab);
+      final bool rerun = _pendingTabRefreshes.remove(tab);
+      // 用户可能在等待期间切走了：只给仍然可见的 tab 补跑，遵守类头
+      // 「不给不可见的 tab 白拉数据」。切回来时 TabController 监听器和 2s
+      // 轮询都会重新拉。
+      if (mounted && rerun && _tabController.index == tab) {
+        unawaited(_refreshTab(backend, tab));
+      }
+    }
+  }
+
+  /// 请求抛异常时把该 tab 的数据标成失败：四个 tab 共用一条写入路径，
+  /// 避免再出现「某个 tab 忘了写失败态 → 永久转圈」（BUG-1535）。
+  /// 已有的旧数据由 [_LoadState.withFailure] 保留，2s 轮询偶发一次失败
+  /// 不会把已渲染的列表闪成失败态再闪回来。
+  void _markTabFailed(int tab) {
+    switch (tab) {
+      case 1:
+        _files = _files.withFailure();
+      case 2:
+        _peers = _peers.withFailure();
+      case 3:
+        _trackers = _trackers.withFailure();
+      // 总览的快照走独立的 [_refreshSnapshot] 通道（自带失败态）；本 tab
+      // 这一路只拉会话状态 / piece 图这类装饰行，失败沿用上一次的值。
+    }
+  }
+
+  Future<void> _changeFilePriority(
+    int fileIndex,
+    TorrentFilePriority priority,
+  ) async {
+    final TorrentBackend? backend = _backend;
+    if (backend is! TorrentDetailBackend || !_detailCapable) return;
+    await backend.setFilePriority(widget.torrentId, fileIndex, priority);
+    await _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ThemeData theme = Theme.of(context);
+    return FushiDialogFrame(
+      maxWidth: 720,
+      maxHeightFactor: 0.86,
+      scrollable: false,
+      padding: const EdgeInsets.fromLTRB(24, 20, 24, 12),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          // M3E 对话框头：饼干形图标徽标 + Emphasized 标题（Apple 下徽标退化成
+          // 单色图标，见 FushiDialogHeroIcon）。
+          Row(
+            children: <Widget>[
+              const FushiDialogHeroIcon(
+                icon: FushiIcons.downloading,
+                tone: FushiHeroTone.primary,
+                size: 48,
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    Text(
+                      widget.title,
+                      style: context.fushiType.titleLargeEmphasized,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      widget.torrentTitle,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          FushiTabBar(
+            controller: _tabController,
+            tabs: <Widget>[
+              Tab(text: t.download_detail_tab_overview),
+              Tab(text: t.download_detail_tab_files),
+              Tab(text: t.download_detail_tab_peers),
+              Tab(text: t.download_detail_tab_trackers),
+            ],
+          ),
+          Flexible(
+            child: TabBarView(
+              controller: _tabController,
+              children: <Widget>[
+                _buildOverviewTab(theme),
+                _buildFilesTab(theme),
+                _buildPeersTab(theme),
+                _buildTrackersTab(theme),
+              ],
+            ),
+          ),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FushiTextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text(t.dialog_cancel),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 缺详情能力时各 tab 的占位（「当前后端不支持」，绝不空白）。
+  Widget _buildUnsupported(ThemeData theme) {
+    return _buildEmptyNote(theme, _backendUnavailableMessage);
+  }
+
+  String get _backendUnavailableMessage => switch (widget.liveDataAbsence) {
+        // 排队等槽位是正常状态，不能报成故障（用户报障：「明明只是因为其他
+        // 东西在下载」）。
+        VideoDownloadLiveDataAbsence.notHandedOff =>
+          t.download_detail_task_queued,
+        VideoDownloadLiveDataAbsence.missingFromBackend =>
+          t.download_detail_task_missing,
+        VideoDownloadLiveDataAbsence.backendOffline =>
+          t.download_detail_backend_offline,
+        VideoDownloadLiveDataAbsence.none =>
+          !widget.resolveBackendFromAppModel && _backend == null
+              ? t.download_detail_backend_offline
+              : t.download_detail_backend_unsupported,
+      };
+
+  /// 四路数据共用的「没有数据时显示什么」——**唯一**会显示转圈的路径：
+  /// 后端整体不可用 → 说明后端；还没有过任何结果 → 转圈；最近一次尝试
+  /// 失败 → 明确失败态；后端答「没有」→ [absentMessage]（不给就按失败处理，
+  /// 因为除快照外的三路成功时必定返回非 null 列表）。
+  ///
+  /// 只要 [_LoadState.attempted] 为真就不可能再回到转圈，这是「离线/持续
+  /// 报错不再永久 loading」在四个 tab 上同时成立的结构保证。
+  Widget _buildMissingData(
+    ThemeData theme,
+    _LoadState<Object> state, {
+    String? absentMessage,
+  }) {
+    if (_backend == null) {
+      return _buildEmptyNote(theme, _backendUnavailableMessage);
+    }
+    if (!state.attempted) {
+      return const FushiLoadingView();
+    }
+    if (state.failed || absentMessage == null) {
+      return _buildEmptyNote(theme, t.error_load_failed);
+    }
+    return _buildEmptyNote(theme, absentMessage);
+  }
+
+  Widget _buildEmptyNote(ThemeData theme, String text) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: FushiPlaceholderMessage(
+          key: const Key('torrent-detail-empty-note'),
+          icon: FushiIcons.info,
+          iconSize: 36,
+          message: text,
+          messageStyle: theme.textTheme.bodyMedium
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ),
+    );
+  }
+
+  /// 「标签: 值」一行（总览区的单元）。
+  Widget _statRow(ThemeData theme, String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Expanded(
+            flex: 1,
+            child: Text(
+              label,
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            flex: 2,
+            child: Text(
+              value,
+              textAlign: TextAlign.end,
+              softWrap: true,
+              style: theme.textTheme.bodySmall,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 「已连接 (swarm 总量)」合成：`5 (32)`；无数据的段各自省略。
+  static String _peerCountText(int connected, int swarm) {
+    if (connected < 0 && swarm < 0) return '—';
+    final String head = connected >= 0 ? '$connected' : '—';
+    return swarm >= 0 ? '$head ($swarm)' : head;
+  }
+
+  String _statusLabelFor(TorrentSnapshot snapshot) {
+    return switch (torrentDisplayStatusFor(snapshot.state)) {
+      TorrentDisplayStatus.downloading => t.download_task_status_downloading,
+      TorrentDisplayStatus.seeding => t.download_task_status_seeding,
+      TorrentDisplayStatus.completed => t.download_task_status_completed,
+      TorrentDisplayStatus.paused => t.download_task_status_paused,
+      TorrentDisplayStatus.queued => t.download_task_status_queued,
+      TorrentDisplayStatus.stalled => t.download_task_status_stalled,
+      TorrentDisplayStatus.checking => t.download_task_status_checking,
+      TorrentDisplayStatus.fetchingMetadata => t.download_task_status_metadata,
+      TorrentDisplayStatus.moving => t.download_task_status_moving,
+      TorrentDisplayStatus.error => t.download_task_status_error,
+      TorrentDisplayStatus.unknown => snapshot.state,
+    };
+  }
+
+  Widget _buildOverviewTab(ThemeData theme) {
+    final TorrentSnapshot? snapshot = _snapshot.value;
+    if (snapshot == null) {
+      return _buildMissingData(
+        theme,
+        _snapshot,
+        absentMessage: t.download_detail_task_gone,
+      );
+    }
+    final String? eta = formatTorrentEta(
+      amountLeft: snapshot.amountLeft,
+      downRateBps: snapshot.downRateBps,
+    );
+    final String? ratio = formatShareRatio(
+      uploadedBytes: snapshot.uploadedBytes,
+      downloadedBytes: snapshot.downloadedBytes,
+    );
+    final TorrentSessionStatusInfo? session = _sessionStatus;
+    final TorrentPieceStates? pieces = _pieces;
+    return ListView(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: FushiLinearProgressIndicator(
+                value: snapshot.progress.clamp(0.0, 1.0),
+                minHeight: 6,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              '${(snapshot.progress * 100).toStringAsFixed(1)}% · '
+              '${_statusLabelFor(snapshot)}',
+              style: theme.textTheme.bodySmall,
+            ),
+          ],
+        ),
+        if (pieces != null && pieces.numPieces > 0) ...<Widget>[
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 10,
+            child: CustomPaint(
+              painter: TorrentPieceBarPainter(
+                states: pieces.states,
+                haveColor: theme.colorScheme.primary,
+                downloadingColor: theme.colorScheme.tertiary,
+                missingColor: FushiDesignTokens.of(context).surfaces.overlay,
+              ),
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '${t.download_detail_pieces_label}: '
+            '${pieces.haveCount}/${pieces.numPieces}',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ],
+        const SizedBox(height: 12),
+        Text(
+          t.download_detail_section_task,
+          style: theme.textTheme.titleSmall,
+        ),
+        const SizedBox(height: 4),
+        _statRow(
+          theme,
+          t.download_detail_hash_label,
+          snapshot.hash.trim().isEmpty ? '—' : snapshot.hash,
+        ),
+        _statRow(
+          theme,
+          t.download_detail_raw_state_label,
+          snapshot.state,
+        ),
+        if (snapshot.totalSizeBytes >= 0)
+          _statRow(
+            theme,
+            t.download_detail_total_size_label,
+            FushiByteFormat.bytes(snapshot.totalSizeBytes),
+          ),
+        if (snapshot.amountLeft >= 0)
+          _statRow(
+            theme,
+            t.download_detail_remaining_label,
+            FushiByteFormat.bytes(snapshot.amountLeft),
+          ),
+        if (snapshot.savePath.trim().isNotEmpty)
+          _statRow(
+            theme,
+            t.download_detail_save_path_label,
+            snapshot.savePath,
+          ),
+        if (snapshot.contentPath.trim().isNotEmpty)
+          _statRow(
+            theme,
+            t.download_detail_content_path_label,
+            snapshot.contentPath,
+          ),
+        const SizedBox(height: 12),
+        Text(t.download_detail_section_transfer,
+            style: theme.textTheme.titleSmall),
+        const SizedBox(height: 4),
+        _statRow(
+          theme,
+          '↓ / ↑',
+          '${FushiByteFormat.speed(snapshot.downRateBps.toDouble())} / '
+              '${FushiByteFormat.speed(snapshot.upRateBps.toDouble())}',
+        ),
+        _statRow(
+          theme,
+          '↓ ${FushiByteFormat.bytes(snapshot.downloadedBytes)}',
+          '↑ ${FushiByteFormat.bytes(snapshot.uploadedBytes)}',
+        ),
+        if (eta != null) _statRow(theme, t.download_task_eta, eta),
+        if (ratio != null) _statRow(theme, t.download_task_ratio, ratio),
+        _statRow(
+          theme,
+          t.download_detail_seeds_label,
+          _peerCountText(snapshot.numSeeds, snapshot.swarmSeeds),
+        ),
+        _statRow(
+          theme,
+          t.download_detail_leechers_label,
+          _peerCountText(snapshot.numLeechs, snapshot.swarmLeechs),
+        ),
+        _statRow(
+          theme,
+          t.download_detail_connections_label,
+          snapshot.numConnections >= 0
+              ? '${snapshot.numConnections}'
+              : '${snapshot.numPeers}',
+        ),
+        if (snapshot.activeDurationSeconds >= 0)
+          _statRow(
+            theme,
+            t.download_detail_time_active,
+            formatCompactDuration(
+              Duration(seconds: snapshot.activeDurationSeconds),
+            ),
+          ),
+        if (snapshot.seedingDurationSeconds > 0)
+          _statRow(
+            theme,
+            t.download_detail_time_seeding,
+            formatCompactDuration(
+              Duration(seconds: snapshot.seedingDurationSeconds),
+            ),
+          ),
+        const SizedBox(height: 12),
+        Text(t.download_detail_section_network,
+            style: theme.textTheme.titleSmall),
+        const SizedBox(height: 4),
+        ..._buildNetworkRows(theme, session),
+      ],
+    );
+  }
+
+  /// 总览的「网络」区行集（协议状态；缺能力时单行提示）。
+  List<Widget> _buildNetworkRows(
+    ThemeData theme,
+    TorrentSessionStatusInfo? session,
+  ) {
+    if (!_detailCapable) {
+      return <Widget>[
+        Text(
+          _backendUnavailableMessage,
+          style: theme.textTheme.bodySmall
+              ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        ),
+      ];
+    }
+    if (session == null) {
+      return <Widget>[Text('…', style: theme.textTheme.bodySmall)];
+    }
+    final ValueListenable<TorrentNetworkIssue>? networkIssue =
+        widget.networkIssue;
+    return <Widget>[
+      // BUG-2950：诊断是内置引擎会话级的结论，qBittorrent 任务不套用。
+      if (networkIssue != null && _backend is EmbeddedTorrentBackend)
+        ValueListenableBuilder<TorrentNetworkIssue>(
+          valueListenable: networkIssue,
+          builder: (BuildContext context, TorrentNetworkIssue issue, _) =>
+              TorrentNetworkIssueBanner(
+            issue: issue,
+            margin: const EdgeInsets.only(bottom: 8),
+          ),
+        ),
+      if (session.dhtEnabled != null)
+        _statRow(
+          theme,
+          'DHT',
+          session.dhtEnabled!
+              ? (session.dhtNodes >= 0
+                  ? '${t.download_detail_dht_nodes}: ${session.dhtNodes}'
+                  : '✓')
+              : '✗',
+        ),
+      if (session.lsdEnabled != null)
+        _statRow(theme, 'LSD', session.lsdEnabled! ? '✓' : '✗'),
+      if (session.pexEnabled != null)
+        _statRow(theme, 'PEX', session.pexEnabled! ? '✓' : '✗'),
+      if (session.listenPort > 0)
+        _statRow(
+          theme,
+          t.download_detail_listen_port,
+          '${session.listenPort}',
+        ),
+      if (session.downRateBps >= 0 || session.upRateBps >= 0)
+        _statRow(
+          theme,
+          t.download_detail_session_rates,
+          '↓ ${FushiByteFormat.speed(session.downRateBps.toDouble())} · '
+          '↑ ${FushiByteFormat.speed(session.upRateBps.toDouble())}',
+        ),
+      for (final TorrentPortMappingInfo mapping in session.portMappings)
+        _statRow(
+          theme,
+          '${t.download_detail_port_mapping} '
+          '(${mapping.transport}'
+          '${mapping.protocol.isEmpty ? '' : '/${mapping.protocol}'})',
+          mapping.ok ? '✓ ${mapping.externalPort}' : '✗ ${mapping.error}',
+        ),
+    ];
+  }
+
+  String _priorityLabel(TorrentFilePriority priority) {
+    return switch (priority) {
+      TorrentFilePriority.skip => t.download_detail_priority_skip,
+      TorrentFilePriority.normal => t.download_detail_priority_normal,
+      TorrentFilePriority.high => t.download_detail_priority_high,
+    };
+  }
+
+  Widget _buildFilesTab(ThemeData theme) {
+    final List<TorrentFileEntry>? files = _files.value;
+    if (files == null) {
+      return _buildMissingData(theme, _files);
+    }
+    if (files.isEmpty) {
+      return _buildEmptyNote(theme, t.download_task_status_metadata);
+    }
+    final List<TorrentFilePriority>? priorities = _filePriorities;
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: files.length,
+      itemBuilder: (BuildContext context, int index) {
+        final TorrentFileEntry file = files[index];
+        final TorrentFilePriority? priority = (priorities != null &&
+                file.index >= 0 &&
+                file.index < priorities.length)
+            ? priorities[file.index]
+            : null;
+        return FushiListItem(
+          density: FushiListDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          titleMaxLines: 2,
+          title: Text(file.name),
+          subtitle: Row(
+            children: <Widget>[
+              Expanded(
+                child: FushiLinearProgressIndicator(
+                  value: file.progress.clamp(0.0, 1.0),
+                  minHeight: 4,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                '${(file.progress * 100).toStringAsFixed(0)}% · '
+                '${FushiByteFormat.bytes(file.size)}',
+                style: theme.textTheme.bodySmall,
+              ),
+            ],
+          ),
+          trailing: priority == null
+              ? null
+              : FushiDropdownButton<TorrentFilePriority>(
+                  value: priority,
+                  isDense: true,
+                  underline: const SizedBox.shrink(),
+                  style: theme.textTheme.bodySmall
+                      ?.copyWith(color: theme.colorScheme.onSurface),
+                  items: <DropdownMenuItem<TorrentFilePriority>>[
+                    for (final TorrentFilePriority p
+                        in TorrentFilePriority.values)
+                      DropdownMenuItem<TorrentFilePriority>(
+                        value: p,
+                        child: Text(_priorityLabel(p)),
+                      ),
+                  ],
+                  onChanged: (TorrentFilePriority? next) {
+                    if (next != null && next != priority) {
+                      unawaited(_changeFilePriority(file.index, next));
+                    }
+                  },
+                ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPeersTab(ThemeData theme) {
+    if (!_detailCapable) return _buildUnsupported(theme);
+    final List<TorrentPeerDetail>? peers = _peers.value;
+    if (peers == null) {
+      return _buildMissingData(theme, _peers);
+    }
+    if (peers.isEmpty) {
+      return _buildEmptyNote(theme, t.download_detail_no_peers);
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: peers.length,
+      itemBuilder: (BuildContext context, int index) {
+        final TorrentPeerDetail peer = peers[index];
+        return FushiListItem(
+          density: FushiListDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          title: Text('${peer.address}:${peer.port}'),
+          subtitle: Text(
+            <String>[
+              if (peer.client.isNotEmpty) peer.client,
+              '${(peer.progress * 100).toStringAsFixed(0)}%',
+              if (peer.flags.isNotEmpty) peer.flags,
+            ].join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          trailing: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: <Widget>[
+              Text(
+                '↓ ${FushiByteFormat.speed(peer.downSpeedBps.toDouble())} '
+                '↑ ${FushiByteFormat.speed(peer.upSpeedBps.toDouble())}',
+                style: theme.textTheme.bodySmall,
+              ),
+              Text(
+                '↓ ${FushiByteFormat.bytes(peer.downloadedBytes)} '
+                '↑ ${FushiByteFormat.bytes(peer.uploadedBytes)}',
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _trackerStatusLabel(TorrentTrackerStatus status) {
+    return switch (status) {
+      TorrentTrackerStatus.working => t.download_detail_tracker_working,
+      TorrentTrackerStatus.updating => t.download_detail_tracker_updating,
+      TorrentTrackerStatus.notContacted =>
+        t.download_detail_tracker_not_contacted,
+      TorrentTrackerStatus.notWorking => t.download_detail_tracker_not_working,
+      TorrentTrackerStatus.disabled => t.download_detail_tracker_disabled,
+    };
+  }
+
+  Widget _buildTrackersTab(ThemeData theme) {
+    if (!_detailCapable) return _buildUnsupported(theme);
+    final List<TorrentTrackerDetail>? trackers = _trackers.value;
+    if (trackers == null) {
+      return _buildMissingData(theme, _trackers);
+    }
+    if (trackers.isEmpty) {
+      return _buildEmptyNote(theme, t.download_detail_no_trackers);
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: trackers.length,
+      itemBuilder: (BuildContext context, int index) {
+        final TorrentTrackerDetail tracker = trackers[index];
+        final bool failing = tracker.status == TorrentTrackerStatus.notWorking;
+        return FushiListItem(
+          density: FushiListDensity.compact,
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          titleMaxLines: 2,
+          title: Text(tracker.url),
+          subtitle: Text(
+            <String>[
+              _trackerStatusLabel(tracker.status),
+              if (tracker.message.isNotEmpty) tracker.message,
+            ].join(' · '),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: failing
+                ? theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.error)
+                : null,
+          ),
+          trailing: Text(
+            '${t.download_detail_seeds_label} '
+            '${tracker.seeds >= 0 ? tracker.seeds : '—'} · '
+            '${t.download_detail_leechers_label} '
+            '${tracker.leeches >= 0 ? tracker.leeches : '—'}',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// 一路异步数据的加载状态（BUG-1532 / BUG-1535 的统一状态模型）。
+///
+/// 三条互斥解读，四个 tab 共用：
+/// * `!attempted` —— 还没有过任何结果 → 转圈；
+/// * `attempted && failed` —— 最近一次尝试抛异常 / 后端明确答不上来 → 失败态；
+/// * `attempted && !failed && value == null` —— 后端答「确实没有」→ 空态。
+///
+/// [withFailure] 刻意**保留**上一次成功的 [value]：2s 轮询里偶发一次失败不该
+/// 把已经渲染出来的列表闪成失败态再闪回来。
+@immutable
+class _LoadState<T extends Object> {
+  const _LoadState.initial()
+      : value = null,
+        attempted = false,
+        failed = false;
+
+  const _LoadState._(
+    this.value, {
+    required this.attempted,
+    required this.failed,
+  });
+
+  final T? value;
+  final bool attempted;
+  final bool failed;
+
+  _LoadState<T> withData(T value) =>
+      _LoadState<T>._(value, attempted: true, failed: false);
+
+  /// 请求成功但后端里确实没有这项（例如任务已从后端消失）：清空旧值，
+  /// 让总览如实说「任务已不在后端」而不是继续展示过期快照。
+  _LoadState<T> withAbsent() =>
+      _LoadState<T>._(null, attempted: true, failed: false);
+
+  _LoadState<T> withFailure() =>
+      _LoadState<T>._(value, attempted: true, failed: true);
+}
+
+/// piece 位图条：按可用宽度把 piece 折进桶里，桶色 = 缺→有 的插值
+/// （下载中的 piece 记半权重）。公开类以便测试直接构造。
+class TorrentPieceBarPainter extends CustomPainter {
+  TorrentPieceBarPainter({
+    required this.states,
+    required this.haveColor,
+    required this.downloadingColor,
+    required this.missingColor,
+  });
+
+  /// 0 = 缺、1 = 下载中、2 = 已持有（[TorrentPieceStates.states] 同值域）。
+  final List<int> states;
+  final Color haveColor;
+  final Color downloadingColor;
+  final Color missingColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (states.isEmpty || size.width <= 0) return;
+    // 每桶至少 2 逻辑像素，桶数不超过 piece 数。
+    final int buckets = (size.width ~/ 2).clamp(1, states.length);
+    final double bucketWidth = size.width / buckets;
+    final Paint paint = Paint();
+    for (int b = 0; b < buckets; b++) {
+      final int start = (b * states.length) ~/ buckets;
+      int end = ((b + 1) * states.length) ~/ buckets;
+      if (end <= start) end = start + 1;
+      double weight = 0;
+      bool downloading = false;
+      for (int i = start; i < end && i < states.length; i++) {
+        if (states[i] == 2) {
+          weight += 1;
+        } else if (states[i] == 1) {
+          weight += 0.5;
+          downloading = true;
+        }
+      }
+      final double fraction = weight / (end - start);
+      final Color base =
+          downloading && fraction < 1 ? downloadingColor : haveColor;
+      paint.color = Color.lerp(missingColor, base, fraction) ?? missingColor;
+      canvas.drawRect(
+        Rect.fromLTWH(b * bucketWidth, 0, bucketWidth + 0.5, size.height),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(TorrentPieceBarPainter oldDelegate) =>
+      oldDelegate.states != states ||
+      oldDelegate.haveColor != haveColor ||
+      oldDelegate.downloadingColor != downloadingColor ||
+      oldDelegate.missingColor != missingColor;
+}

@@ -1,0 +1,342 @@
+import 'dart:io';
+
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/src/models/preferences_repository.dart';
+import 'package:fushi/src/pages/implementations/home_dictionary_page.dart';
+import 'package:fushi/src/pages/implementations/home_page.dart';
+import 'package:fushi/src/platform/platform_providers.dart';
+import 'package:fushi/src/sync/desktop_lookup_service.dart';
+import 'package:fushi/src/utils/adaptive/adaptive_navigation.dart';
+import 'package:fushi/src/utils/misc/update_checker.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+import '../helpers/test_platform_services.dart';
+
+/// 用户报告：底栏点「查词」进不了输入状态——搜索框既不聚焦（键盘不弹），上一次的
+/// 查询词还留在框里，得先手动点 × 再点框。
+///
+/// 判据落在**导航点击**这条路径上（[_HomePageState._selectTabFromNav]）：从导航点
+/// 「查词」是「我要查个新词」这一条意图，故发一条 `clearQuery: true` 的
+/// [DictionaryFocusRequest]，查词页消费后清空+聚焦。这里挂真的 [HomePage] 底栏，
+/// 用真实点击驱动，断言两件事：
+/// - 从别的 tab 点进查词：搜索框直接拿到焦点（焦点即是键盘弹起的前提）；
+/// - **已经在查词 tab 上再点一次**：残留的查询被清掉，焦点仍在搜索框。
+///   这正是用户截图里的场景（查词 tab 已高亮、框里留着上次的词）。
+class _NavTapAppModel extends AppModel {
+  _NavTapAppModel(this._dir) : super(testPlatformServices());
+
+  final Directory _dir;
+
+  @override
+  PackageInfo get packageInfo => PackageInfo(
+    appName: 'Fushi',
+    packageName: 'app.hibiki.reader',
+    version: '1.0.0',
+    buildNumber: '1',
+  );
+
+  @override
+  Directory get appDirectory => _dir;
+
+  @override
+  Directory get temporaryDirectory => _dir;
+
+  @override
+  Directory get dictionaryResourceDirectory => _dir;
+
+  @override
+  bool get isDatabaseOpen => true;
+
+  @override
+  bool get isFirstTimeSetup => false;
+
+  @override
+  bool get onboardingCompleted => true;
+
+  @override
+  List<DictionarySearchResult> get dictionaryHistory =>
+      <DictionarySearchResult>[];
+
+  @override
+  List<Dictionary> get dictionaries => <Dictionary>[
+    Dictionary(name: 'Test', formatKey: 'test', order: 0),
+  ];
+
+  @override
+  int get maximumTerms => 10;
+
+  @override
+  void addToSearchHistory({
+    required String historyKey,
+    required String searchTerm,
+  }) {}
+
+  @override
+  void addToDictionaryHistory({required DictionarySearchResult result}) {}
+
+  @override
+  Future<DictionarySearchResult> searchDictionary({
+    required String searchTerm,
+    required bool searchWithWildcards,
+    int? overrideMaximumTerms,
+    bool useCache = true,
+    bool allowRemoteLookup = true,
+  }) async => DictionarySearchResult(searchTerm: searchTerm);
+}
+
+const ValueKey<String> _searchFieldKey = ValueKey<String>(
+  'home_dictionary_search_field',
+);
+
+Future<void> _pumpHome(WidgetTester tester) async {
+  final FushiDatabase db = FushiDatabase.forTesting(NativeDatabase.memory());
+  addTearDown(db.close);
+  final PreferencesRepository prefsRepo = PreferencesRepository(db);
+  await prefsRepo.loadFromDb();
+  final Directory tmpDir = Directory.systemTemp.createTempSync(
+    'fushi_dict_nav_tap_',
+  );
+  addTearDown(() {
+    try {
+      tmpDir.deleteSync(recursive: true);
+    } catch (_) {}
+  });
+
+  final _NavTapAppModel appModel = _NavTapAppModel(tmpDir)
+    ..wireLocalAudioForTesting(prefsRepo: prefsRepo, databaseDirectory: tmpDir)
+    ..wireDatabaseForTesting(db);
+
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+    const MethodChannel('window_manager'),
+    (MethodCall call) {
+      if (call.method == 'isFocused') return Future<bool>.value(true);
+      return Future<void>.value();
+    },
+  );
+
+  await tester.pumpWidget(
+    ProviderScope(
+      overrides: <Override>[
+        appProvider.overrideWith((ref) => appModel),
+        platformServicesProvider.overrideWithValue(testPlatformServices()),
+      ],
+      child: TranslationProvider(
+        child: MaterialApp(
+          navigatorKey: appModel.navigatorKey,
+          home: const HomePage(),
+        ),
+      ),
+    ),
+  );
+  await tester.pump();
+  await tester.pump();
+}
+
+/// 有界推帧：整页 HomePage 挂着持续动画与周期定时器，`pumpAndSettle` 永远等不到
+/// 静止（与 home_hidden_tab_select_behavior_test 同因）。
+Future<void> _settle(WidgetTester tester) async {
+  for (int i = 0; i < 15; i++) {
+    await tester.pump(const Duration(milliseconds: 50));
+  }
+}
+
+Future<void> _unmount(WidgetTester tester) async {
+  await tester.pumpWidget(const SizedBox.shrink());
+  await tester.pump(Duration.zero);
+  await tester.pump(const Duration(milliseconds: 10));
+}
+
+/// 点底栏上的一个 destination（按可见 label 定位）。MD3 悬浮底栏里「查词」
+/// 是胶囊右侧的 FAB（只有 tooltip），放不下的目的地在「更多」菜单里。
+Future<void> _tapNav(WidgetTester tester, String label) async {
+  final Finder nav = find.byKey(fushiMaterialNavKey);
+  // hitTestable：悬浮底栏常驻一枚透明 + IgnorePointer 的「最小化小胶囊」，里面是
+  // 当前项的标签与 tooltip（当前是查词时就是「查词」），点它会穿透到下面的目的地；
+  // 下面 tooltip 分支同理。
+  final Finder text = find
+      .descendant(of: nav, matching: find.text(label))
+      .hitTestable();
+  if (text.evaluate().isNotEmpty) {
+    expect(text, findsOneWidget, reason: '底栏上应有「$label」这个 destination');
+    await tester.tap(text);
+    await _settle(tester);
+    return;
+  }
+  final Finder tip = find
+      .descendant(of: nav, matching: find.byTooltip(label))
+      .hitTestable();
+  if (tip.evaluate().isNotEmpty) {
+    await tester.tap(tip.first);
+    await _settle(tester);
+    return;
+  }
+  // 分页滑动底栏（2026-10-16 起出厂默认）：查词并进胶囊、可能在别的页，
+  // 像用户一样在底栏上左滑翻页直到它露出来（别页的格不接指针）。
+  final Finder more = find.descendant(of: nav, matching: find.text('More'));
+  if (more.evaluate().isEmpty) {
+    // 按本仓 Tooltip（material_ui）的 message 认格：flutter_test 的 byTooltip
+    // 只认 SDK 旧 Material 的 Tooltip 类型，在这里恒为空。
+    final Finder cellTip = find
+        .descendant(
+          of: nav,
+          matching: find.byWidgetPredicate(
+            (Widget w) => w is Tooltip && w.message == label,
+          ),
+        )
+        .hitTestable();
+    for (int page = 0; page < 4 && cellTip.evaluate().isEmpty; page++) {
+      // 从底栏一格的高度横滑（nav 的几何中心不一定落在格子行上）。
+      final Finder cell = find
+          .descendant(of: nav, matching: find.byType(Tooltip))
+          .hitTestable()
+          .first;
+      final double y = tester.getCenter(cell).dy;
+      final double x = tester.getCenter(nav).dx;
+      await tester.dragFrom(Offset(x + 100, y), const Offset(-200, 0));
+      await _settle(tester);
+    }
+    expect(cellTip, findsWidgets, reason: '分页底栏翻页后应能看到「$label」');
+    await tester.tap(cellTip.first);
+    await _settle(tester);
+    return;
+  }
+  expect(more, findsOneWidget, reason: '底栏上应有「$label」或「更多」');
+  await tester.tap(more);
+  await _settle(tester);
+  await tester.tap(find.text(label).last);
+  await _settle(tester);
+}
+
+/// 搜索框当前的焦点节点。
+///
+/// **不按具体控件类型取**：这条用例钉的是「焦点在搜索框上」，与搜索框内部用
+/// 哪个 Material 控件渲染无关。原先写 `tester.widget<SearchBar>(...)`，#1406 把
+/// FushiSearchField 从 MD3 SearchBar 换成 TextField 之后当场
+/// `type 'TextField' is not a subtype of type 'SearchBar'`——把类型改成 TextField
+/// 只是把同一个坑往后挪一次。任何文本输入控件底下都有 EditableText，取它的
+/// focusNode 才是真正与实现无关的判据。
+/// 搜索框当前的文本。理由同 [_searchFocusNode]：不绑具体控件类型。
+String _searchText(WidgetTester tester) => tester
+    .widget<EditableText>(
+      find.descendant(
+        of: find.byKey(_searchFieldKey),
+        matching: find.byType(EditableText),
+      ),
+    )
+    .controller
+    .text;
+
+FocusNode _searchFocusNode(WidgetTester tester) => tester
+    .widget<EditableText>(
+      find.descendant(
+        of: find.byKey(_searchFieldKey),
+        matching: find.byType(EditableText),
+      ),
+    )
+    .focusNode;
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    LocaleSettings.setLocale(AppLocale.en);
+    UpdateChecker.disableAutoCheckForTesting = true;
+    DesktopLookupService.instance.debugReset();
+  });
+
+  tearDown(() {
+    UpdateChecker.disableAutoCheckForTesting = false;
+    DesktopLookupService.instance.debugReset();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(const MethodChannel('window_manager'), null);
+  });
+
+  testWidgets('底栏点「查词」：搜索框直接聚焦（键盘随焦点弹起）', (WidgetTester tester) async {
+    // compact 宽度才走底栏布局（≥600 是侧栏 rail）。
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await _pumpHome(tester);
+    expect(
+      find.byType(HomeDictionaryPage),
+      findsNothing,
+      reason: '起点是首页，查词页尚未挂载。',
+    );
+
+    await _tapNav(tester, t.nav_lookup);
+
+    expect(find.byType(HomeDictionaryPage), findsOneWidget);
+    expect(
+      _searchFocusNode(tester).hasFocus,
+      isTrue,
+      reason: '点导航进查词 = 要查新词；焦点必须已经在搜索框上，键盘才会弹。',
+    );
+    await _unmount(tester);
+  });
+
+  testWidgets('已在查词 tab 再点一次「查词」：清空残留查询并重新聚焦', (WidgetTester tester) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await _pumpHome(tester);
+    await _tapNav(tester, t.nav_lookup);
+    expect(find.byType(HomeDictionaryPage), findsOneWidget);
+
+    // 用户上一次查的词还留在框里（截图里的「おばさん」）。
+    await tester.enterText(find.byKey(_searchFieldKey), 'おばさん');
+    await _settle(tester);
+    expect(_searchText(tester), 'おばさん');
+
+    // 查词 tab 已是当前 tab，再点一次底栏的「查词」。
+    await _tapNav(tester, t.nav_lookup);
+
+    expect(_searchText(tester), isEmpty, reason: '再点一次 = 重新开始查；残留的查询必须被清掉。');
+    expect(
+      _searchFocusNode(tester).hasFocus,
+      isTrue,
+      reason: '清空之后焦点仍要留在搜索框上，用户直接就能打字。',
+    );
+    await _unmount(tester);
+  });
+
+  testWidgets('BUG-2687 已在查词 tab、键盘已收起：再点「查词」重新弹起键盘', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(400, 900);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.reset);
+
+    await _pumpHome(tester);
+    await _tapNav(tester, t.nav_lookup);
+    await tester.enterText(find.byKey(_searchFieldKey), 'おばさん');
+    await _settle(tester);
+    expect(tester.testTextInput.isVisible, isTrue, reason: '前提：键盘已弹起。');
+
+    // 用户收起了键盘（提交收键盘 / 系统返回键）——焦点仍留在搜索框上。
+    await SystemChannels.textInput.invokeMethod<void>('TextInput.hide');
+    await tester.pump();
+    expect(tester.testTextInput.isVisible, isFalse);
+    expect(_searchFocusNode(tester).hasFocus, isTrue);
+
+    await _tapNav(tester, t.nav_lookup);
+
+    expect(_searchText(tester), isEmpty);
+    expect(_searchFocusNode(tester).hasFocus, isTrue);
+    expect(
+      tester.testTextInput.isVisible,
+      isTrue,
+      reason: '焦点本来就在框里时 requestFocus 是空操作；点「查词」必须显式把键盘要回来。',
+    );
+    await _unmount(tester);
+  });
+}

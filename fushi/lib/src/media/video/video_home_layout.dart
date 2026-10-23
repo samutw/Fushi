@@ -1,0 +1,424 @@
+import 'package:fushi/src/media/collections/collection_continue.dart';
+import 'package:fushi/src/media/video/cover_ui/cover_aspect_probe.dart';
+
+/// 视频首页（hayase 式改版，TODO-2486）的布局与筛选纯函数。
+///
+/// 页面几何真相源：横滚行与媒体库墙的卡片**高度统一、宽度随封面朝向**——
+/// 竖版 2:3、横版 16:9。朝向判定与 PortraitCoverImage / LandscapeCoverImage
+/// 共用同一阈值 [kCoverLandscapeAspectThreshold]（TODO-2426 真相源），不另造。
+/// 全部无副作用，单测在 `test/media/video/video_home_layout_test.dart`。
+enum VideoCardOrientation {
+  /// 竖版卡（2:3 海报）。朝向未知（无封面 / 首帧未解码 / 远端）默认此值。
+  portrait,
+
+  /// 横版卡（16:9 截帧 / backdrop）。
+  landscape,
+}
+
+/// 竖版卡封面宽高比（主库墙沿用 Kazumi 式 2:3 海报）。
+const double kVideoPortraitCardAspect = 2 / 3;
+
+/// 横版卡封面宽高比（16:9 截帧/backdrop）。
+const double kVideoLandscapeCardAspect = 16 / 9;
+
+/// 「最近添加」行/角标的入库时间窗。
+const Duration kVideoRecentlyAddedWindow = Duration(days: 14);
+
+/// 由封面固有宽高比判定卡片朝向。
+///
+/// [aspect] 为 null（首帧未解码 / 无封面 / 远端未知）时**默认竖卡**（拍板：
+/// 朝向未知时默认竖卡），阈值走 [kCoverLandscapeAspectThreshold]（≥1.2 算横图），
+/// 绝不另写一份。
+VideoCardOrientation videoCardOrientationForAspect(double? aspect) {
+  if (aspect == null) return VideoCardOrientation.portrait;
+  return aspect >= kCoverLandscapeAspectThreshold
+      ? VideoCardOrientation.landscape
+      : VideoCardOrientation.portrait;
+}
+
+/// 统一封面高下的卡宽：竖卡 2:3、横卡 16:9，高度同源故底边天然对齐。
+double videoCardWidthForOrientation({
+  required VideoCardOrientation orientation,
+  required double coverHeight,
+}) =>
+    coverHeight *
+    (orientation == VideoCardOrientation.landscape
+        ? kVideoLandscapeCardAspect
+        : kVideoPortraitCardAspect);
+
+/// 库墙的封面高：以「竖卡目标宽」换算（竖卡 2:3 → 高 = 宽 × 3/2），
+/// 墙内竖卡与旧网格卡同宽感受、横卡只在宽度上伸展。
+double videoCoverHeightForPortraitWidth(double portraitCardWidth) =>
+    portraitCardWidth * 3 / 2;
+
+/// 首页横滚行里横卡宽相对竖卡目标宽的上限倍数。
+const double kVideoRowLandscapeWidthFactor = 1.5;
+
+/// 首页横滚行（继续观看 / 下一集 / 最近添加）的统一封面高。
+///
+/// 行内竖横混排、封面底边靠**统一高度**对齐，所以高一变两种卡一起变；换句话说
+/// 「竖卡够大」与「横卡不过宽」在同一个高度上互斥，必须挑一边当基准。沿用库墙
+/// 口径 [videoCoverHeightForPortraitWidth] 是挑了竖卡：横卡宽随之等于竖卡目标宽
+/// × 3/2 × 16/9 = **8/3 倍**，桌面 ~235 的卡宽算出 626 宽的横卡，一屏只剩 3 张
+/// （用户实报「动画缩略图太大」）；手机上单张横卡甚至比屏幕还宽。
+///
+/// 横滚行是墙内容的快捷镜像、以扫读为主，这里改挑横卡当基准：横卡宽封顶在竖卡
+/// 目标宽的 [kVideoRowLandscapeWidthFactor] 倍，竖卡按同高换宽自然跟着收。倍数
+/// 随断点的卡宽等比缩放，不另立一把绝对像素尺子（[allVideoThumbnailTargetWidthForWidth]
+/// 是「全部视频」等宽网格的口径，那里没有竖卡要对齐）。库墙不受影响。
+double videoRowCoverHeightForPortraitWidth(double portraitCardWidth) =>
+    portraitCardWidth *
+    kVideoRowLandscapeWidthFactor /
+    kVideoLandscapeCardAspect;
+
+/// “全部视频”16:9 缩略图网格的目标卡宽。
+///
+/// 该分区展示的是可直接播放的单个视频文件，不沿用系列墙的 2:3 海报目标宽：
+/// 横卡若按 210px 书架卡宽排，会在桌面缩得过小；若沿用混排墙的“竖卡高换横卡宽”，
+/// 又会膨胀到 600px 左右并在 [Wrap] 行尾留下大洞。这里按内容宽度给等宽网格一个
+/// 稳定目标，配合 `unifiedShelfCardLayout` 等分整行。
+double allVideoThumbnailTargetWidthForWidth(double width) {
+  if (width >= 1600) return 320;
+  if (width >= 1280) return 300;
+  if (width >= 960) return 280;
+  if (width >= 600) return 240;
+  return 150;
+}
+
+/// 全宽 hero 轮播高度：宽屏压成 21:9 影院比例，夹在 [220, 420] 之间——手机竖屏
+/// 不至于占满半屏，桌面超宽不至于无限长高。
+double videoHeroHeightForWidth(double width) =>
+    (width * 9 / 21).clamp(220.0, 420.0);
+
+/// 视频库搜索行的单行排版下限（2026-10 体验优化）：宽度低于此值时搜索框独占
+/// 一行、年份 / 看完状态 chip 落到第二行可横滑。宽度取 LayoutBuilder 的逻辑
+/// 像素，界面缩放已折算在内。
+const double kVideoSearchBarInlineMinWidth = 600;
+
+/// 「全部视频」列表行的紧凑断点（2026-10 体验优化）：低于此宽度行封面缩小，
+/// 给标题与操作按钮留出空间。
+const double kVideoListRowCompactWidth = 420;
+
+/// 「全部视频」列表行的封面槽宽：常规 164，窄于 [kVideoListRowCompactWidth]
+/// 时收到 112（行高固定 96 不变，只让出横向空间）。
+double videoListRowCoverWidth(double rowWidth) =>
+    rowWidth < kVideoListRowCompactWidth ? 112 : 164;
+
+/// 发现页详情 hero 的窄屏断点：低于此宽度按单栏紧凑排版。
+const double kVideoDiscoveryCompactWidth = 700;
+
+/// 发现页详情 hero 高度（BUG-2431）。
+///
+/// 与 [videoHeroHeightForWidth] 那个**故意**压 21:9 的轮播不同，这里铺的是刮削
+/// 来的整张 16:9 backdrop，且由 LandscapeCoverImage 走 `BoxFit.cover` 填满容器：
+/// 高度只要与图片比例脱钩，图就被上下裁掉主体。旧实现写死 430/460，1920 宽下图
+/// 需要 1080 高，等于砍掉六成画面（人物头顶和身体被切）。
+///
+/// 所以高度直接从宽度按 16:9 派生，只在两端设夹子：
+/// - 下限保住 hero 内标题/评分/按钮/状态流程那一列的排版高度，窄屏宁可裁图也不让
+///   文字溢出；
+/// - 上限是视口高度，hero 不吃满一屏以上，下方总留出可继续滚动的提示。
+double videoDiscoveryHeroHeightForViewport(double width, double height) {
+  final double minHeight = width < kVideoDiscoveryCompactWidth ? 460.0 : 430.0;
+  final double maxHeight = height > minHeight ? height : minHeight;
+  return (width * 9 / 16).clamp(minHeight, maxHeight);
+}
+
+/// 刮削 airDate（TMDB `YYYY-MM-DD` 或裸年份 `YYYY`）→ 年份；解析不出返回
+/// null（归「未知」桶，条目在年份筛选下不消失）。
+int? videoAirYear(String? airDate) {
+  if (airDate == null) return null;
+  final RegExpMatch? m = RegExp(r'^(\d{4})').firstMatch(airDate.trim());
+  if (m == null) return null;
+  final int year = int.parse(m.group(1)!);
+  // 1900 以前当脏数据，不当有效年份。
+  return year >= 1900 ? year : null;
+}
+
+/// airDate 月份 → 季度序号（1=冬 1-3 月、2=春 4-6、3=夏 7-9、4=秋 10-12，
+/// 对齐番剧季度习惯）；无月份信息返回 null（hero 只显年份）。
+int? videoAirSeasonQuarter(String? airDate) {
+  if (airDate == null) return null;
+  final RegExpMatch? m = RegExp(r'^\d{4}-(\d{2})').firstMatch(airDate.trim());
+  if (m == null) return null;
+  final int month = int.parse(m.group(1)!);
+  if (month < 1 || month > 12) return null;
+  return (month - 1) ~/ 3 + 1;
+}
+
+/// 年份筛选三态：全部 / 指定年份 / 未知（无刮削资料）。
+///
+/// 数据结构消掉特例：`year == null && unknownOnly == false` 即「全部」，
+/// 不需要独立的 all 标志位。
+class VideoYearFilter {
+  const VideoYearFilter.all() : year = null, unknownOnly = false;
+
+  const VideoYearFilter.unknown() : year = null, unknownOnly = true;
+
+  const VideoYearFilter.year(int this.year) : unknownOnly = false;
+
+  /// 指定年份；null = 全部或未知（看 [unknownOnly]）。
+  final int? year;
+
+  /// 只看「无刮削年份」的条目。
+  final bool unknownOnly;
+
+  bool get isAll => year == null && !unknownOnly;
+
+  /// [entryYear] = 条目刮削年份（无资料 = null）。
+  bool matches(int? entryYear) {
+    if (isAll) return true;
+    if (unknownOnly) return entryYear == null;
+    return entryYear == year;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      other is VideoYearFilter &&
+      other.year == year &&
+      other.unknownOnly == unknownOnly;
+
+  @override
+  int get hashCode => Object.hash(year, unknownOnly);
+}
+
+/// 看完状态筛选档位。
+enum VideoWatchStatusFilter { all, unwatched, watching, completed }
+
+/// 系列归属筛选档位（「全部视频」平铺视图）。
+///
+/// 「全部视频」逐条平铺整库，系列的每一集都在里面；用户要的是「只看还没归进
+/// 系列的散片」。这是条目在**系列视图里的折叠形态**这一维度上的筛选，与刮削
+/// 资格无关（BUG-1839：系列与全部视频的区别只是折叠方式）。
+enum VideoSeriesFilter { all, inSeries, standalone }
+
+/// 偏好值 → 系列归属档位；空值 / 脏值退回默认的 [VideoSeriesFilter.standalone]
+/// （BUG-2835：合集成员在系列页折成卡，「全部视频」默认只看散片）。
+VideoSeriesFilter videoSeriesFilterFromName(String name) =>
+    VideoSeriesFilter.values.asNameMap()[name] ?? kDefaultVideoSeriesFilter;
+
+/// 「全部视频」系列归属的分区默认档（BUG-2835：默认只看散片）。库页筛选按钮的
+/// 圆点与生效 chip 只认**偏离**这一档的选择，chip 的 ✕ 也复位回这一档。
+const VideoSeriesFilter kDefaultVideoSeriesFilter =
+    VideoSeriesFilter.standalone;
+
+/// 「全部视频」媒体类型筛选档位（BUG-2835）：纯音频（专辑曲目等）与视频分开看。
+enum VideoMediaTypeFilter { all, video, audio }
+
+/// 「全部视频」正片 / 特典筛选档位（BUG-2835）：特典 = NCOP/NCED/PV/花絮等本地
+/// 附件，判据与系列页排除特典同源。
+enum VideoExtrasFilter { all, main, extras }
+
+/// 条目级媒体类型判定（本地即筛）。
+bool matchesVideoMediaType({
+  required VideoMediaTypeFilter filter,
+  required bool isAudio,
+}) => switch (filter) {
+  VideoMediaTypeFilter.all => true,
+  VideoMediaTypeFilter.video => !isAudio,
+  VideoMediaTypeFilter.audio => isAudio,
+};
+
+/// 条目级正片 / 特典判定（本地即筛）。
+bool matchesVideoExtras({
+  required VideoExtrasFilter filter,
+  required bool isExtra,
+}) => switch (filter) {
+  VideoExtrasFilter.all => true,
+  VideoExtrasFilter.main => !isExtra,
+  VideoExtrasFilter.extras => isExtra,
+};
+
+/// 条目级来源判定：[sourceFilter] 为 null = 不限；否则只留该来源的条目
+/// （无来源的手动导入条目、远端占位都不属于任何来源）。
+bool matchesVideoSource({required int? sourceFilter, required int? sourceId}) =>
+    sourceFilter == null || sourceFilter == sourceId;
+
+/// A series member's playback facts in the collection's stable episode order.
+class VideoSeriesPlaybackState {
+  const VideoSeriesPlaybackState({
+    required this.lastWatchedAtMs,
+    required this.positionMs,
+    required this.completed,
+    this.durationMs,
+  });
+
+  final int lastWatchedAtMs;
+  final int positionMs;
+  final bool completed;
+
+  /// 片长毫秒（播放器记下的 / host 下发的）；null = 不知道。只用来分辨「已打勾的
+  /// 集正在重看」（BUG-3491，见 [CollectionMemberProgress.isRewatching]）。
+  final int? durationMs;
+
+  /// 换成合集续播的共享输入，锚点判据只走 [latestPlayedMemberIndex] 一处。
+  CollectionMemberProgress get progress => CollectionMemberProgress(
+    positionMs: positionMs,
+    completed: completed,
+    lastPlayedAt: lastWatchedAtMs,
+    durationMs: durationMs,
+  );
+}
+
+/// 成员的有效「最近观看时刻」（epoch 毫秒，0 = 没看过）。纯函数。
+///
+/// 两个来源取较大者：
+/// * [statsWatchedAtMs] —— 本机播放统计（`VideoWatchStatistics.lastModified`），
+///   只有本机真播放过才有行；
+/// * [lastPlayedAt] —— 行级 `VideoBooks.lastPlayedAt`，本机播放与远端进度回灌
+///   （互联子端上报 / sync sweep，用对端时刻）都写它。
+///
+/// BUG-1731：合集续播锚点此前只认统计行——子端在手机上看完后续集数只回灌行级
+/// `lastPlayedAt`、不产生 host 本机统计行，锚点仍钉在 host 最后本机播放的那集。
+/// 回落行级时刻后与 hero 的 collection_continue（只读 `lastPlayedAt`）口径一致；
+/// 本机播放时两来源同时写、时刻近似相等，max 不改变已有本机行为。
+int effectiveWatchedAtMs({
+  required int statsWatchedAtMs,
+  required int? lastPlayedAt,
+}) {
+  final int rowAt = lastPlayedAt ?? 0;
+  return statsWatchedAtMs >= rowAt ? statsWatchedAtMs : rowAt;
+}
+
+/// Returns the episode the user actually played most recently.
+///
+/// This deliberately does not mean "the furthest episode". A user may go back
+/// to episode 3 after reaching episode 12; Continue Watching must resume 3.
+/// Legacy rows without a watch timestamp fall back to the last traced member in
+/// stable episode order.
+///
+/// 判据委托 [latestPlayedMemberIndex]（与详情大卡 [continueMemberIndex] 同一
+/// 实现，BUG-3370）：只打开过、进度 0 的那集也是锚点。
+int? latestPlayedSeriesIndex(List<VideoSeriesPlaybackState> members) =>
+    latestPlayedMemberIndex(<CollectionMemberProgress>[
+      for (final VideoSeriesPlaybackState member in members) member.progress,
+    ]);
+
+/// 「下一集」行的目标集（Next-Up）：
+///
+/// * 锚点（[latestPlayedSeriesIndex]）**已开始看**（看完或有进度）→ 紧接的下一集；
+///   没有下一集 → null；
+/// * 锚点**只打开过**（有时刻、进度 0、未完成）→ 停在它自己——它就是还没看的
+///   下一集。此前一律取锚点 +1：看完第 7 集自动连播第 8 集几秒退出，「下一集」
+///   跳到第 9 集，第 8 集在首页无入口（BUG-3370）。
+int? nextEpisodeAfterLatestPlayed(List<VideoSeriesPlaybackState> members) {
+  final int? current = latestPlayedSeriesIndex(members);
+  if (current == null) return null;
+  if (!members[current].progress.hasStarted) return current;
+  if (current + 1 >= members.length) return null;
+  return current + 1;
+}
+
+/// 「继续观看」行的合集目标集（Next-Up 语义，与 hero 大卡的
+/// [continueMemberIndex] 同一锚点、给同一答案）：
+///
+/// * 最近实际播放的那集**没看完**（有进度，或只打开过、进度 0）→ 停在它；
+/// * 它**已看完** → 紧接的下一集（整部看完、没有下一集 → null，不再占继续行）；
+///   已打勾但**重看到一半**退出不算看完，停在它（BUG-3491）；
+/// * 整部合集没有任何播放痕迹 → null。
+///
+/// 「只打开过」也进本行（BUG-3370）：用户确实打开过这部合集，此前按「进度为 0」
+/// 整部丢掉，只碰过第 1 集几秒的合集在首页彻底消失，大卡却显示「继续看 第1集」。
+int? continueWatchingSeriesIndex(List<VideoSeriesPlaybackState> members) {
+  final int? current = latestPlayedSeriesIndex(members);
+  if (current == null) return null;
+  if (!members[current].progress.isFinished) return current;
+  return current + 1 < members.length ? current + 1 : null;
+}
+
+/// 条目级看完状态判定（本地即筛）：
+/// * completed —— `completedAt` 非空；
+/// * watching —— 未完成但有播放痕迹（`lastPositionMs > 0`）；
+/// * unwatched —— 两者皆无。
+bool matchesVideoWatchStatus({
+  required VideoWatchStatusFilter filter,
+  required bool completed,
+  required int lastPositionMs,
+}) {
+  switch (filter) {
+    case VideoWatchStatusFilter.all:
+      return true;
+    case VideoWatchStatusFilter.completed:
+      return completed;
+    case VideoWatchStatusFilter.watching:
+      return !completed && lastPositionMs > 0;
+    case VideoWatchStatusFilter.unwatched:
+      return !completed && lastPositionMs <= 0;
+  }
+}
+
+/// 条目级系列归属判定（本地即筛）。
+///
+/// [inSeries] = 该条目在系列视图里会被折进一张合集卡（有主合集归属、且那个合集
+/// 真的存在）。归属指向已删除合集的孤儿条目在系列页本来就是散卡，这里同样按
+/// 「不在系列里」算——判据与 `_groupVideos` 的折叠判据同源，不许分叉。
+bool matchesVideoSeriesFilter({
+  required VideoSeriesFilter filter,
+  required bool inSeries,
+}) {
+  switch (filter) {
+    case VideoSeriesFilter.all:
+      return true;
+    case VideoSeriesFilter.inSeries:
+      return inSeries;
+    case VideoSeriesFilter.standalone:
+      return !inSeries;
+  }
+}
+
+/// 「最近添加」窗口判定：入库时刻在 [now] 往前 [kVideoRecentlyAddedWindow] 内。
+/// [importedAt] 毫秒时刻；null / 非正值（远端占位无入库时刻）不算。
+bool isVideoRecentlyAdded({required int? importedAt, required DateTime now}) {
+  if (importedAt == null || importedAt <= 0) return false;
+  final DateTime at = DateTime.fromMillisecondsSinceEpoch(importedAt);
+  return !at.isAfter(now) && now.difference(at) <= kVideoRecentlyAddedWindow;
+}
+
+/// hero 轮播候选单元的选取输入。
+///
+/// [unit] 是调用方的单元载荷——合集**或**散装单视频（v68 起：hero 不再是
+/// 合集专属粒度。用户最后看的是散装条目时，合集门槛会让置顶不是它，见
+/// PR#712 跟进）。本函数只看三个排序事实，对单元种类无感知。
+class VideoHeroCandidate<T> {
+  const VideoHeroCandidate({
+    required this.unit,
+    this.lastWatchedAt,
+    this.latestImportedAt = 0,
+    this.hasUnfinishedTrace = false,
+  });
+
+  final T unit;
+
+  /// 单元最近观看时刻（合集取成员 max；无痕迹 = null）。
+  final DateTime? lastWatchedAt;
+
+  /// 单元最近入库时刻毫秒（合集取成员 max；回落排序用）。
+  final int latestImportedAt;
+
+  /// 有观看痕迹且未看完（=「在看」；合集 = 有痕迹且未整套看完）。
+  final bool hasUnfinishedTrace;
+}
+
+/// hero 轮播内容选取：最近在看的前 [limit] 个单元（合集与散装混排，同一
+/// 「最近观看倒序」——置顶恒为用户最后在看的那个东西）；一个在看的都没有时
+/// 回落「最近添加」（按最近入库时刻倒序）。返回单元有序列表。
+List<T> selectVideoHeroUnits<T>(
+  List<VideoHeroCandidate<T>> candidates, {
+  int limit = 5,
+}) {
+  final List<VideoHeroCandidate<T>> watching =
+      <VideoHeroCandidate<T>>[
+        for (final VideoHeroCandidate<T> c in candidates)
+          if (c.hasUnfinishedTrace && c.lastWatchedAt != null) c,
+      ]..sort(
+        (VideoHeroCandidate<T> a, VideoHeroCandidate<T> b) =>
+            b.lastWatchedAt!.compareTo(a.lastWatchedAt!),
+      );
+  final List<VideoHeroCandidate<T>> pool = watching.isNotEmpty
+      ? watching
+      : (List<VideoHeroCandidate<T>>.of(candidates)..sort(
+          (VideoHeroCandidate<T> a, VideoHeroCandidate<T> b) =>
+              b.latestImportedAt.compareTo(a.latestImportedAt),
+        ));
+  return <T>[for (final VideoHeroCandidate<T> c in pool.take(limit)) c.unit];
+}

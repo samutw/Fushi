@@ -1,0 +1,365 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:audio_session/audio_session.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:multi_value_listenable_builder/multi_value_listenable_builder.dart';
+import 'package:fushi/creator.dart';
+import 'package:fushi/models.dart';
+import 'package:fushi/utils.dart';
+
+/// Base class for audio creator fields (term audio and sentence audio).
+/// Contains all shared audio-player logic so concrete subclasses only need
+/// to supply identity values (key, label, icon, localised label).
+abstract class BaseAudioField extends AudioExportField {
+  /// Initialise this field with the predetermined and hardset values.
+  BaseAudioField({
+    required super.uniqueKey,
+    required super.label,
+    required super.description,
+    required super.icon,
+  });
+
+  AudioPlayer _audioPlayer = AudioPlayer();
+
+  final ValueNotifier<Duration> _positionNotifier =
+      ValueNotifier<Duration>(Duration.zero);
+  final ValueNotifier<Duration?> _durationNotifier =
+      ValueNotifier<Duration>(Duration.zero);
+  final ValueNotifier<PlayerState?> _playerStateNotifier =
+      ValueNotifier<PlayerState?>(null);
+
+  int _audioLoadGeneration = 0;
+  Future<void> _audioLoadQueue = Future<void>.value();
+  final List<StreamSubscription<dynamic>> _audioSubscriptions = [];
+  StreamSubscription<void>? _noisySub;
+
+  /// Build the audio player.
+  Widget buildAudioPlayer() {
+    return SizedBox(
+      height: 48,
+      child: Row(
+        children: [
+          buildPlayButton(),
+          buildDurationAndPosition(),
+          buildSlider(),
+        ],
+      ),
+    );
+  }
+
+  /// Build the disabled audio player.
+  Widget buildDisabledPlayer(BuildContext context) {
+    return SizedBox(
+      height: 48,
+      child: IgnorePointer(
+        child: Opacity(
+          opacity: 0.5,
+          child: Row(
+            children: [
+              SizedBox.square(
+                dimension: 48,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: adaptiveIndicator(
+                    context: context,
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+              Text(
+                '--:-- / --:--',
+                style: context.fushiType.labelLarge.tabular,
+              ),
+              Expanded(
+                child: adaptiveSlider(
+                  context: context,
+                  value: 0,
+                  thumbColor: Theme.of(context).colorScheme.onSurfaceVariant,
+                  onChanged: (value) {},
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void setAudioFile({
+    required AppModel appModel,
+    required CreatorModel creatorModel,
+    required File file,
+    String? searchTermUsed,
+  }) {
+    unawaited(initialiseAudio(file));
+    super.setAudioFile(
+      appModel: appModel,
+      creatorModel: creatorModel,
+      file: file,
+    );
+  }
+
+  /// Set up audio for new file.
+  Future<void> initialiseAudio(File file) {
+    final int generation = ++_audioLoadGeneration;
+    _audioLoadQueue = _audioLoadQueue.catchError((Object e) {
+      debugPrint('[creator-audio] previous load failed: $e');
+    }).then((_) => _replaceAudioPlayer(file, generation));
+    return _audioLoadQueue;
+  }
+
+  Future<void> _replaceAudioPlayer(File file, int generation) async {
+    for (final subscription in _audioSubscriptions) {
+      await subscription.cancel();
+    }
+    _audioSubscriptions.clear();
+
+    final AudioPlayer oldPlayer = _audioPlayer;
+    await oldPlayer.stop();
+    await oldPlayer.dispose();
+
+    final AudioPlayer newPlayer = AudioPlayer();
+    if (generation != _audioLoadGeneration) {
+      await newPlayer.dispose();
+      return;
+    }
+
+    _audioPlayer = newPlayer;
+    await newPlayer.setFilePath(file.path);
+    if (generation != _audioLoadGeneration) {
+      if (identical(_audioPlayer, newPlayer)) {
+        _audioPlayer = AudioPlayer();
+      }
+      await newPlayer.dispose();
+      return;
+    }
+
+    await newPlayer.pause();
+    _positionNotifier.value = newPlayer.position;
+    _durationNotifier.value = newPlayer.duration ?? Duration.zero;
+    _audioSubscriptions.addAll([
+      newPlayer.durationStream.listen((duration) {
+        _durationNotifier.value = duration;
+      }),
+      newPlayer.positionStream.listen((position) {
+        _positionNotifier.value = position;
+      }),
+      newPlayer.playerStateStream.listen((playerState) {
+        _playerStateNotifier.value = playerState;
+      }),
+    ]);
+  }
+
+  Future<void> _disposeAudioPlayer() async {
+    _noisySub?.cancel();
+    _noisySub = null;
+    for (final subscription in _audioSubscriptions) {
+      await subscription.cancel();
+    }
+    _audioSubscriptions.clear();
+
+    final AudioPlayer oldPlayer = _audioPlayer;
+    _audioPlayer = AudioPlayer();
+    await oldPlayer.stop();
+    await oldPlayer.dispose();
+  }
+
+  /// Clears this field's data. The state refresh afterwards is not performed
+  /// here and should be performed by the invocation of the clear field button.
+  @override
+  void clearFieldState({
+    required CreatorModel creatorModel,
+  }) {
+    unawaited(_audioPlayer.stop());
+    super.clearFieldState(creatorModel: creatorModel);
+  }
+
+  /// Build the play/pause button.
+  Widget buildPlayButton() {
+    return MultiValueListenableBuilder(
+      valueListenables: [
+        _playerStateNotifier,
+      ],
+      builder: (context, values, _) {
+        PlayerState? playerState = values.elementAt(0);
+
+        IconData iconData = FushiIcons.play;
+
+        if (playerState == null ||
+            playerState.processingState == ProcessingState.completed) {
+          iconData = FushiIcons.play;
+        } else if (playerState.playing) {
+          iconData = FushiIcons.pause;
+        } else {
+          iconData = FushiIcons.play;
+        }
+
+        // M3E：播放键是 tonal 色块圆钮，与时长 / 进度条同一行。
+        return FushiIconButtonControl.filledTonal(
+          icon: FushiIcon(iconData, size: 24),
+          tooltip: playerState?.playing == true ? t.pause : t.play,
+          onPressed: () async {
+            AudioSession? session;
+            if (supportsNativeAudio) {
+              session = await AudioSession.instance;
+              await session.configure(
+                const AudioSessionConfiguration(
+                  avAudioSessionCategory: AVAudioSessionCategory.playback,
+                  avAudioSessionCategoryOptions:
+                      AVAudioSessionCategoryOptions.duckOthers,
+                  avAudioSessionMode: AVAudioSessionMode.defaultMode,
+                  avAudioSessionRouteSharingPolicy:
+                      AVAudioSessionRouteSharingPolicy.defaultPolicy,
+                  avAudioSessionSetActiveOptions:
+                      AVAudioSessionSetActiveOptions.none,
+                  androidAudioAttributes: AndroidAudioAttributes(
+                    contentType: AndroidAudioContentType.music,
+                    usage: AndroidAudioUsage.media,
+                  ),
+                  androidAudioFocusGainType:
+                      AndroidAudioFocusGainType.gainTransientMayDuck,
+                  androidWillPauseWhenDucked: true,
+                ),
+              );
+
+              _noisySub?.cancel();
+              _noisySub =
+                  session.becomingNoisyEventStream.listen((event) async {
+                await _audioPlayer.pause();
+                session?.setActive(false);
+              });
+            }
+
+            if (playerState == null ||
+                playerState.processingState == ProcessingState.completed) {
+              await _audioPlayer.seek(Duration.zero);
+
+              session?.setActive(true);
+              await _audioPlayer.play();
+              session?.setActive(false);
+            } else if (playerState.playing) {
+              await _audioPlayer.pause();
+              session?.setActive(false);
+            } else {
+              session?.setActive(true);
+              await _audioPlayer.play();
+              session?.setActive(false);
+            }
+          },
+        );
+      },
+    );
+  }
+
+  /// Build the player duration label.
+  Widget buildDurationAndPosition() {
+    return MultiValueListenableBuilder(
+      valueListenables: [
+        _durationNotifier,
+        _positionNotifier,
+        _playerStateNotifier,
+      ],
+      builder: (context, values, _) {
+        Duration duration = values.elementAt(0);
+        Duration position = values.elementAt(1);
+        PlayerState? playerState = values.elementAt(2);
+
+        if (duration == Duration.zero) {
+          return const SizedBox.shrink();
+        }
+
+        String getPositionText() {
+          if (playerState == null ||
+              playerState.processingState == ProcessingState.completed) {
+            position = Duration.zero;
+          }
+
+          return FushiTimeFormat.getVideoDurationText(position).trim();
+        }
+
+        String getDurationText() {
+          return FushiTimeFormat.getVideoDurationText(duration).trim();
+        }
+
+        return Text(
+          '${getPositionText()} / ${getDurationText()}',
+          // 逐秒变化的时长用等宽数字，宽度不跳。
+          style: context.fushiType.labelLarge.tabular,
+        );
+      },
+    );
+  }
+
+  /// Build the duration slider.
+  Widget buildSlider() {
+    return MultiValueListenableBuilder(
+      valueListenables: [
+        _durationNotifier,
+        _positionNotifier,
+        _playerStateNotifier,
+      ],
+      builder: (context, values, _) {
+        Duration duration = values.elementAt(0);
+        Duration position = values.elementAt(1);
+        PlayerState? playerState = values.elementAt(2);
+
+        double sliderValue = position.inMilliseconds.toDouble();
+        double max = duration.inMilliseconds.toDouble();
+
+        if (playerState == null ||
+            playerState.processingState == ProcessingState.completed) {
+          sliderValue = 0;
+        }
+
+        return Expanded(
+          child: gamepadSeekableSlider(
+              value: sliderValue <= max ? sliderValue : 0.0,
+              max: max,
+              step: 5000, // gamepad D-pad Left/Right = seek ±5s
+              onChanged: (progress) {
+                _audioPlayer.seek(Duration(milliseconds: progress.floor()));
+              }),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget buildTopWidget({
+    required BuildContext context,
+    required WidgetRef ref,
+    required AppModel appModel,
+    required CreatorModel creatorModel,
+    required Orientation orientation,
+  }) {
+    if (isSearching) {
+      return buildDisabledPlayer(context);
+    }
+
+    if (!showWidget) {
+      if (orientation == Orientation.landscape) {
+        return const SizedBox(height: 24);
+      } else {
+        return const SizedBox.shrink();
+      }
+    }
+
+    return buildAudioPlayer();
+  }
+
+  // Executed on close of the creator screen.
+  @override
+  void onCreatorClose() {
+    _audioLoadGeneration++;
+    _audioLoadQueue = _audioLoadQueue.catchError((Object e) {
+      debugPrint('[creator-audio] pending load failed on close: $e');
+    }).then((_) => _disposeAudioPlayer());
+    unawaited(_audioLoadQueue);
+  }
+}

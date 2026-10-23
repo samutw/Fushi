@@ -1,0 +1,1132 @@
+/// TODO-767 / BUG-417: orchestrator book + video progress live two-way full sweep test.
+/// Root cause: interconnect manual-full-sync previously sent book progress only via
+/// SyncManager WebDAV file box (progress_*.json); host never applied it into its own
+/// reader_positions DB. Video progress only synced on-demand. This test verifies the
+/// live host-apply + bidirectional + full-sweep fix with a real server/host/client/local.
+library;
+
+import 'dart:io';
+
+import 'package:drift/drift.dart' hide isNull, isNotNull;
+import 'package:drift/native.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi_engine/sync/local_library_host_service.dart';
+import 'package:fushi/src/sync/interconnect_book_progress_sync.dart';
+import 'package:fushi/src/sync/interconnect_playback_position_sync.dart';
+import 'package:fushi/src/sync/interconnect_sync_backend.dart';
+import 'package:fushi_engine/sync/fushi_library_host_service.dart';
+import 'package:fushi_engine/sync/fushi_sync_server.dart';
+import 'package:fushi_engine/sync/sync_asset_package_service.dart';
+import 'package:fushi/src/sync/sync_backend.dart';
+import 'package:fushi/src/sync/sync_orchestrator.dart';
+import 'package:fushi/src/sync/sync_repository.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:path/path.dart' as p;
+
+FushiDatabase _memDb() =>
+    FushiDatabase.forTesting(DatabaseConnection(NativeDatabase.memory()));
+
+Future<void> _seedBook(FushiDatabase db, String title) =>
+    db.insertEpubBook(EpubBooksCompanion.insert(
+      bookKey: title,
+      title: title,
+      epubPath: '/tmp/$title.epub',
+      extractDir: '/tmp/$title',
+      chapterCount: 1,
+      chaptersJson: '["ch1"]',
+      importedAt: DateTime.now().millisecondsSinceEpoch,
+    ));
+
+Future<void> _seedPosition(
+  FushiDatabase db,
+  String bookKey, {
+  required int section,
+  required int norm,
+  required int charOffset,
+  required int updatedAt,
+}) async {
+  // v82：reader_positions 键 = epub_books.uid；wire 面貌仍是 bookKey，本地
+  // 造数经 resolveEpubBookUid 换算（书必须已 _seedBook）。
+  final String bookUid = (await db.resolveEpubBookUid(bookKey))!;
+  await db.upsertReaderPosition(ReaderPositionsCompanion(
+    bookUid: Value(bookUid),
+    sectionIndex: Value(section),
+    normCharOffset: Value(norm),
+    charOffset: Value(charOffset),
+    updatedAt: Value(updatedAt),
+  ));
+}
+
+/// BUG-2506：种「上次两端达成一致的位置基线」（互联 live 进度三方判定的第三方）。
+Future<void> _seedBaseline(
+  FushiDatabase db,
+  String bookKey, {
+  required int section,
+  required int norm,
+}) =>
+    db.setSyncBaseline(
+      bookKey,
+      kInterconnectBookProgressDimension,
+      BookProgressBaseline(sectionIndex: section, normCharOffset: norm)
+          .encode(),
+    );
+
+/// bookKey → uid 换算后的本地读取口（断言侧同样只认本地 uid 键）。
+Future<ReaderPositionRow?> _positionOf(FushiDatabase db, String bookKey) async {
+  final String? uid = await db.resolveEpubBookUid(bookKey);
+  if (uid == null) return null;
+  return db.getReaderPosition(uid);
+}
+
+Future<void> _seedHostVideo(
+  FushiDatabase db,
+  Directory dir,
+  String uid,
+  String title,
+) async {
+  // 视频进度 PUT 端点要求该视频文件在 host 真实存在（防路径穿越/任意 id 写脏）。
+  final File videoFile = File(p.join(dir.path, '$title.mp4'))
+    ..writeAsBytesSync(<int>[0, 1, 2, 3]);
+  await db.upsertVideoBook(VideoBooksCompanion.insert(
+    bookUid: uid,
+    title: title,
+    videoPath: videoFile.path,
+  ));
+}
+
+/// 在 host DB 种一本可经 live-sync 列出的有声书：Audiobooks 行 + SrtBooks 行齐备
+/// （host listAudiobooks 要求两表同源，缺一不列出，见 LocalLibraryHostService）。
+Future<void> _seedHostAudiobook(FushiDatabase db, String bookKey) async {
+  await db.upsertAudiobook(AudiobooksCompanion.insert(
+    bookKey: bookKey,
+    alignmentFormat: 'srt',
+    alignmentPath: '/tmp/$bookKey.srt',
+  ));
+  await db.upsertSrtBook(SrtBooksCompanion.insert(
+    uid: 'srt-$bookKey',
+    title: bookKey,
+    bookKey: Value(bookKey),
+    srtPath: '/tmp/$bookKey.srt',
+    importedAt: 0,
+  ));
+}
+
+Future<InterconnectSyncBackend> _buildClientBackend({
+  required String base,
+  required String token,
+}) async {
+  final FushiDatabase db = _memDb();
+  final SyncRepository repo = SyncRepository(db);
+  await repo.setFushiClientUrls(<FushiClientUrl>[
+    FushiClientUrl(url: base, enabled: true),
+  ]);
+  await repo.setFushiClientToken(token);
+  final InterconnectSyncBackend backend =
+      InterconnectSyncBackend.withProbe((String u, String t) async => true);
+  await backend.restoreAuth(repo);
+  await backend.authenticate(repo: repo);
+  return backend;
+}
+
+SyncOrchestrator _orchestrator({
+  required FushiDatabase db,
+  required SyncBackend backend,
+  required Directory tmp,
+}) =>
+    SyncOrchestrator(
+      db: db,
+      backend: backend,
+      dictionaryResourceRoot: tmp,
+      audioDatabaseRoot: tmp,
+      tempDir: tmp,
+      syncStats: false,
+      syncAudioBookPosition: false,
+      syncContent: false,
+      syncAudioBookFiles: false,
+      syncDictionary: false,
+    );
+
+void main() {
+  late Directory work;
+  late FushiSyncServer server;
+  late FushiDatabase hostDb;
+  late String base;
+  const String token = 'orch-live-progress-token';
+
+  setUp(() async {
+    work = await Directory.systemTemp.createTemp('orch_live_progress_');
+    hostDb = _memDb();
+    final LocalLibraryHostService libSvc = LocalLibraryHostService(
+      db: hostDb,
+      dictionaryResourceRoot: Directory(work.path),
+      packages: SyncAssetPackageService(db: hostDb),
+      refreshDictionaryCache: () async {},
+      runExclusive: (Future<void> Function() body) => body(),
+    );
+    server = FushiSyncServer(
+      syncDataDir: p.join(work.path, 'server_data'),
+      port: 0,
+      token: token,
+      allowLan: false,
+      libraryService: libSvc,
+    );
+    await server.start();
+    base = 'http://127.0.0.1:${server.port}';
+  });
+
+  tearDown(() async {
+    await server.stop();
+    await hostDb.close();
+    if (work.existsSync()) await work.delete(recursive: true);
+  });
+
+  group('book progress full sweep', () {
+    test('local has progress, host none -> push to host DB (host-apply)',
+        () async {
+      // host 也有这本书（真实互联场景：syncContent 已把内容推成 host 书，或两端
+      // 各自有同名书）——putBookProgress 的书存在性闸门要求 host 书库先有该书。
+      await _seedBook(hostDb, 'BookA');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookA');
+      await _seedPosition(localDb, 'BookA',
+          section: 4, norm: 4200, charOffset: 88, updatedAt: 2000);
+
+      final Directory tmp = Directory(p.join(work.path, 't1'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+
+      final ReaderPositionRow? hostRow = await _positionOf(hostDb, 'BookA');
+      expect(hostRow, isNotNull);
+      expect(hostRow!.sectionIndex, 4);
+      expect(hostRow.normCharOffset, 4200);
+      expect(hostRow.updatedAt, 2000);
+    });
+
+    test(
+        'host moved off the agreed baseline, local unchanged -> apply to local',
+        () async {
+      // v82：host 位置行必须 JOIN 到 host epub_books（uid 键），无书行的进度
+      // 不再可见——host 有进度必有书，先种书。
+      await _seedBook(hostDb, 'BookB');
+      await _seedPosition(hostDb, 'BookB',
+          section: 9, norm: 9000, charOffset: 90, updatedAt: 5000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookB');
+      await _seedPosition(localDb, 'BookB',
+          section: 1, norm: 100, charOffset: 1, updatedAt: 1000);
+      // BUG-2506：三方判定——本端仍停在上次一致的位置，只有 host 动了。
+      await _seedBaseline(localDb, 'BookB', section: 1, norm: 100);
+
+      final Directory tmp = Directory(p.join(work.path, 't2'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncBookProgressLiveForTest(SyncRunReport(), backend);
+
+      final ReaderPositionRow? localRow = await _positionOf(localDb, 'BookB');
+      expect(localRow!.sectionIndex, 9);
+      expect(localRow.updatedAt, 5000);
+    });
+
+    test('local moved off the agreed baseline, host unchanged -> push to host',
+        () async {
+      await _seedBook(hostDb, 'BookC');
+      await _seedPosition(hostDb, 'BookC',
+          section: 1, norm: 10, charOffset: 1, updatedAt: 1000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookC');
+      await _seedPosition(localDb, 'BookC',
+          section: 7, norm: 7000, charOffset: 70, updatedAt: 9000);
+      // BUG-2506：host 仍停在上次一致的位置，只有本端动了。
+      await _seedBaseline(localDb, 'BookC', section: 1, norm: 10);
+
+      final Directory tmp = Directory(p.join(work.path, 't3'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncBookProgressLiveForTest(SyncRunReport(), backend);
+
+      final ReaderPositionRow? localRow = await _positionOf(localDb, 'BookC');
+      expect(localRow!.sectionIndex, 7);
+      final ReaderPositionRow? hostRow = await _positionOf(hostDb, 'BookC');
+      expect(hostRow!.sectionIndex, 7);
+      expect(hostRow.updatedAt, 9000);
+    });
+
+    test(
+        'BUG-2506: both sides moved off the baseline -> conflict reported, '
+        'neither side overwritten', () async {
+      await _seedBook(hostDb, 'BookFork');
+      await _seedPosition(hostDb, 'BookFork',
+          section: 9, norm: 9000, charOffset: 90, updatedAt: 5000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookFork');
+      await _seedPosition(localDb, 'BookFork',
+          section: 3, norm: 300, charOffset: 3, updatedAt: 1000);
+      // 上次一致在 (1,100)；之后 host 读到 (9,9000)，本端读到 (3,300)——真分叉。
+      await _seedBaseline(localDb, 'BookFork', section: 1, norm: 100);
+
+      final Directory tmp = Directory(p.join(work.path, 'tfork'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+
+      // 旧实现（纯 LWW）在这里把本端 (3,300) 盖成 host 的 (9,9000)——用户报的
+      // 「无论服务端快还是慢，客户端都被覆盖」。现在：谁都不动，报冲突交用户。
+      expect(report.conflicts, hasLength(1));
+      expect(report.conflicts.single.assetKey, 'BookFork');
+      expect(report.conflicts.single.dimension,
+          kInterconnectBookProgressDimension);
+      expect(report.conflicts.single.localVersion, 1000);
+      expect(report.conflicts.single.remoteVersion, 5000);
+      final ReaderPositionRow? localRow =
+          await _positionOf(localDb, 'BookFork');
+      expect(localRow!.sectionIndex, 3);
+      expect(localRow.normCharOffset, 300);
+      final ReaderPositionRow? hostRow = await _positionOf(hostDb, 'BookFork');
+      expect(hostRow!.sectionIndex, 9);
+      expect(report.localBookProgressPulled, 0);
+    });
+
+    test(
+        'BUG-2506: no baseline yet and both sides differ -> conflict, '
+        'not silent newer-wins', () async {
+      await _seedBook(hostDb, 'BookNoBase');
+      await _seedPosition(hostDb, 'BookNoBase',
+          section: 9, norm: 9000, charOffset: 90, updatedAt: 5000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookNoBase');
+      await _seedPosition(localDb, 'BookNoBase',
+          section: 1, norm: 100, charOffset: 1, updatedAt: 1000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tnb'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+
+      expect(report.conflicts.map((SyncConflict c) => c.assetKey),
+          <String>['BookNoBase']);
+      final ReaderPositionRow? localRow =
+          await _positionOf(localDb, 'BookNoBase');
+      expect(localRow!.sectionIndex, 1, reason: '无基线不能猜谁动了，本端不被盖');
+    });
+
+    test(
+        'BUG-2506: host merely reopened the book (timestamp bumped, position '
+        'unchanged) while local read on -> local wins, no conflict', () async {
+      await _seedBook(hostDb, 'BookReopen');
+      // host 位置仍在基线 (1,100)，但时间戳比本端新（重开书刷新了 updatedAt）。
+      await _seedPosition(hostDb, 'BookReopen',
+          section: 1, norm: 100, charOffset: 1, updatedAt: 9_999_999);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookReopen');
+      await _seedPosition(localDb, 'BookReopen',
+          section: 5, norm: 500, charOffset: 50, updatedAt: 2000);
+      await _seedBaseline(localDb, 'BookReopen', section: 1, norm: 100);
+
+      final Directory tmp = Directory(p.join(work.path, 'tro'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+      expect(report.conflicts, isEmpty, reason: 'host 只是重开过书、位置没动，不是分叉');
+
+      // 旧 LWW 在这里让 host 的「重开」胜出，把本端读到的 (5,500) 盖回 (1,100)。
+      final ReaderPositionRow? hostRow =
+          await _positionOf(hostDb, 'BookReopen');
+      expect(hostRow!.sectionIndex, 5);
+      expect(hostRow.normCharOffset, 500);
+      // host 端仍是防御性「取较新」：推上去的时间戳必须严格新于 host 的旧戳，
+      // 否则 PUT 被 host 静默丢弃、每轮都推每轮都丢。
+      expect(hostRow.updatedAt, greaterThan(9_999_999));
+      final ReaderPositionRow? localRow =
+          await _positionOf(localDb, 'BookReopen');
+      expect(localRow!.sectionIndex, 5);
+      expect(localRow.updatedAt, hostRow.updatedAt,
+          reason: '两端在这一刻真正对齐（同位置同时刻）');
+      // 基线推进到新的一致位置。
+      expect(
+        BookProgressBaseline.decode(await localDb.getSyncBaseline(
+            'BookReopen', kInterconnectBookProgressDimension)),
+        isA<BookProgressBaseline>()
+            .having((b) => b.sectionIndex, 'section', 5)
+            .having((b) => b.normCharOffset, 'norm', 500),
+      );
+    });
+
+    test(
+        'BUG-2506: same position, different timestamps -> aligned, baseline '
+        'recorded, no conflict', () async {
+      await _seedBook(hostDb, 'BookSame');
+      await _seedPosition(hostDb, 'BookSame',
+          section: 2, norm: 200, charOffset: 20, updatedAt: 7000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookSame');
+      await _seedPosition(localDb, 'BookSame',
+          section: 2, norm: 200, charOffset: -1, updatedAt: 1000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tsame'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+      expect(report.conflicts, isEmpty);
+      final ReaderPositionRow? localRow =
+          await _positionOf(localDb, 'BookSame');
+      expect(localRow!.updatedAt, 7000);
+      expect(localRow.charOffset, 20, reason: '较新者带来精确锚');
+      expect(
+        await localDb.getSyncBaseline(
+            'BookSame', kInterconnectBookProgressDimension),
+        BookProgressBaseline(sectionIndex: 2, normCharOffset: 200).encode(),
+      );
+    });
+  });
+
+  group('book progress pull flags shelf refresh (BUG-686)', () {
+    // Root cause: a host-newer book-progress pull upserts reader_positions but
+    // sets no report counter, so [SyncRunReport.needsLocalLibraryRefresh] stays
+    // false → refreshAfterSyncRun early-returns → the cached fushiBooksProvider
+    // keeps the pre-sync progress bar → the user sees "book progress not synced"
+    // even though it landed in the DB. The audiobook resume path re-reads its
+    // pref at play time, so it looked like it synced — hence the asymmetry.
+    test('host-newer pull sets localBookProgressPulled + needsRefresh',
+        () async {
+      // v82：host 进度必须挂在 host epub_books.uid 上，先种书。
+      await _seedBook(hostDb, 'BookRefresh');
+      await _seedPosition(hostDb, 'BookRefresh',
+          section: 9, norm: 9000, charOffset: 90, updatedAt: 5000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookRefresh');
+      await _seedPosition(localDb, 'BookRefresh',
+          section: 1, norm: 100, charOffset: 1, updatedAt: 1000);
+      // BUG-2506：三方判定——本端停在基线，只有 host 动了 → 拉取。
+      await _seedBaseline(localDb, 'BookRefresh', section: 1, norm: 100);
+
+      final Directory tmp = Directory(p.join(work.path, 'tbr'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+
+      // Progress actually landed locally...
+      final ReaderPositionRow? localRow =
+          await _positionOf(localDb, 'BookRefresh');
+      expect(localRow!.sectionIndex, 9);
+      // ...and the run flags the shelf for a refresh so it becomes visible.
+      expect(report.localBookProgressPulled, 1,
+          reason: 'host-newer pull must count as a local progress change');
+      expect(report.needsLocalLibraryRefresh, isTrue,
+          reason: 'a progress-only pull must still refresh the shelf');
+    });
+
+    test('push-only (local newer) does not flag a shelf refresh', () async {
+      await _seedBook(hostDb, 'BookPushOnly');
+      await _seedPosition(hostDb, 'BookPushOnly',
+          section: 1, norm: 10, charOffset: 1, updatedAt: 1000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedBook(localDb, 'BookPushOnly');
+      await _seedPosition(localDb, 'BookPushOnly',
+          section: 7, norm: 7000, charOffset: 70, updatedAt: 9000);
+      // BUG-2506：host 停在基线，只有本端动了 → 纯推送。
+      await _seedBaseline(localDb, 'BookPushOnly', section: 1, norm: 10);
+
+      final Directory tmp = Directory(p.join(work.path, 'tbp'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncBookProgressLiveForTest(report, backend);
+
+      // Local was already newest → nothing pulled → no needless shelf refresh.
+      expect(report.localBookProgressPulled, 0,
+          reason: 'a pure push must not mark the local shelf dirty');
+      expect(report.needsLocalLibraryRefresh, isFalse);
+    });
+  });
+
+  group('video progress full sweep', () {
+    test('local has lastPositionMs, host none -> push to host video prefs',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/v1', 'V1');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.upsertVideoBook(VideoBooksCompanion.insert(
+        bookUid: 'video/v1',
+        title: 'V1',
+        videoPath: '/tmp/v1.mp4',
+        lastPositionMs: const Value(600000),
+      ));
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/v1'), 3000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tv1'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      final int hostPos = await hostDb.getPrefTyped<int>(
+          videoRemotePositionPrefKey('video/v1'), 0);
+      expect(hostPos, 600000);
+      final int hostAt = await hostDb.getPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/v1'), 0);
+      expect(hostAt, 3000);
+    });
+
+    test('host newer video progress -> apply to local lastPositionMs',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/v2', 'V2');
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/v2'), 1200000);
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/v2'), 8000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.upsertVideoBook(VideoBooksCompanion.insert(
+        bookUid: 'video/v2',
+        title: 'V2',
+        videoPath: '/tmp/v2.mp4',
+        lastPositionMs: const Value(100000),
+      ));
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/v2'), 2000);
+      // BUG-3367：上次两端对齐在本机这个位置，之后只有 host 动了。
+      await localDb.setSyncBaseline(
+          'video/v2', kInterconnectVideoPositionDimension, 100000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tv2'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      final VideoBookRow? row = await localDb.getVideoBookByBookUid('video/v2');
+      expect(row!.lastPositionMs, 1200000);
+    });
+
+    test('streamed video (prefs only, no local VideoBooks row) pushes to host',
+        () async {
+      // client 流式看远端视频：本地无 VideoBooks 行，只有 resume 路径写的
+      // video_remote_position_<uid> + _at_<uid> prefs（断点①回归）。
+      await _seedHostVideo(hostDb, work, 'video/stream', 'Stream');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/stream'), 720000);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/stream'), 5000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tvs'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      final int hostPos = await hostDb.getPrefTyped<int>(
+          videoRemotePositionPrefKey('video/stream'), 0);
+      expect(hostPos, 720000,
+          reason: 'streamed video progress must enter host via full sweep');
+      // 写回不得为流式视频强建 VideoBooks 行（避免污染书架）。
+      final VideoBookRow? localRow =
+          await localDb.getVideoBookByBookUid('video/stream');
+      expect(localRow, isNull,
+          reason: 'sweep must not create a VideoBooks row for streamed video');
+    });
+
+    test('streamed video receives newer host progress into prefs (no row)',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/stream2', 'Stream2');
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/stream2'), 990000);
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/stream2'), 9000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/stream2'), 100000);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/stream2'), 2000);
+      await localDb.setSyncBaseline(
+          'video/stream2', kInterconnectVideoPositionDimension, 100000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tvs2'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      final int localPos = await localDb.getPrefTyped<int>(
+          videoRemotePositionPrefKey('video/stream2'), 0);
+      expect(localPos, 990000,
+          reason: 'host-newer streamed progress must write back to prefs');
+      final int localAt = await localDb.getPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/stream2'), 0);
+      expect(localAt, 9000);
+      final VideoBookRow? localRow =
+          await localDb.getVideoBookByBookUid('video/stream2');
+      expect(localRow, isNull);
+    });
+  });
+
+  group('audiobook delay sweep (互联完整支持批次)', () {
+    test('本地带戳调轴 push 到 host；host 带戳调轴 pull 回本地；清单内联字段可用', () async {
+      await _seedHostAudiobook(hostDb, 'abk-push');
+      await _seedHostAudiobook(hostDb, 'abk-pull');
+      // host 侧 abk-pull 有带戳调轴（host 本机 updateDelayMs 盖戳的效果）。
+      await hostDb.setPrefTyped<int>(audiobookDelayPrefKey('abk-pull'), 800);
+      await hostDb.setPrefTyped<int>(audiobookDelayAtPrefKey('abk-pull'), 9000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      // 两本都进 sweep 基底（有听书位置 prefs）。
+      for (final String key in <String>['abk-push', 'abk-pull']) {
+        await localDb.setPrefTyped<int>(audiobookPositionPrefKey(key), 1000);
+        await localDb.setPrefTyped<int>(audiobookPositionAtPrefKey(key), 500);
+      }
+      // 本地 abk-push 有带戳调轴。
+      await localDb.setPrefTyped<int>(audiobookDelayPrefKey('abk-push'), -700);
+      await localDb.setPrefTyped<int>(
+          audiobookDelayAtPrefKey('abk-push'), 8000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tabd'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      // 清单内联字段（免逐本 GET 的前提）先行断言。
+      final RemoteAudiobookInfo pullInfo =
+          (await backend.listRemoteAudiobooks())
+              .firstWhere((RemoteAudiobookInfo i) => i.identity == 'abk-pull');
+      expect(pullInfo.delayMs, 800);
+      expect(pullInfo.delayUpdatedAtMs, 9000);
+
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      await orch.syncAudiobookProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await hostDb.getPrefTyped<int>(audiobookDelayPrefKey('abk-push'), 0),
+          -700,
+          reason: '本地较新调轴须收敛到 host');
+      expect(
+          await hostDb.getPrefTyped<int>(
+              audiobookDelayAtPrefKey('abk-push'), 0),
+          8000);
+      expect(
+          await localDb.getPrefTyped<int>(audiobookDelayPrefKey('abk-pull'), 0),
+          800,
+          reason: 'host 较新调轴须回灌本地');
+      expect(
+          await localDb.getPrefTyped<int>(
+              audiobookDelayAtPrefKey('abk-pull'), 0),
+          9000);
+    });
+  });
+
+  group('standalone SRT audiobook sweep (BUG-1637)', () {
+    test('纯 SRT 有声书（bookKey 空、身份=uid）的听书进度进 sweep 交集并双向同步', () async {
+      // host：只有 standalone SrtBooks 行（无 Audiobooks 行、bookKey 空）。
+      await hostDb.upsertSrtBook(SrtBooksCompanion.insert(
+        uid: 'srt-uid-1',
+        title: 'Standalone SRT',
+        srtPath: '/tmp/standalone.srt',
+        importedAt: 0,
+      ));
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      // 本地听过：进度 prefs 按 uid 键（standalone 的 identity）。
+      await localDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('srt-uid-1'), 123000);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('srt-uid-1'), 7000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tsrt'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncAudiobookProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await hostDb.getPrefTyped<int>(
+              audiobookPositionPrefKey('srt-uid-1'), 0),
+          123000,
+          reason: '此前 hostKeys 用裸 bookKey（standalone 恒空串）建交集，'
+              '纯 SRT 的进度永远不同步；必须用 identity（bookKey ?? uid）');
+      expect(
+          await hostDb.getPrefTyped<int>(
+              audiobookPositionAtPrefKey('srt-uid-1'), 0),
+          7000);
+    });
+  });
+
+  group('video delay full sweep (BUG-1620)', () {
+    test(
+        'local stamped delay newer -> push to host (prefs + row write-through)',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/d1', 'D1');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      // 本地看过该视频（有断点 prefs 即进 sweep 基底）+ 带戳调轴。
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/d1'), 60000);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/d1'), 1000);
+      await localDb.setPrefTyped<int>(
+          videoRemoteDelayPrefKey('video/d1'), -1500);
+      await localDb.setPrefTyped<int>(
+          videoRemoteDelayAtPrefKey('video/d1'), 5000);
+
+      final Directory tmp = Directory(p.join(work.path, 'td1'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await hostDb.getPrefTyped<int>(
+              videoRemoteDelayPrefKey('video/d1'), 0),
+          -1500,
+          reason: '离线时段调的轴须在全量同步收敛到 host');
+      expect(
+          await hostDb.getPrefTyped<int>(
+              videoRemoteDelayAtPrefKey('video/d1'), 0),
+          5000);
+      // host 端写穿行值：host 本机播放（读 row.delayMs）跟随。
+      expect((await hostDb.getVideoBookByBookUid('video/d1'))!.delayMs, -1500);
+    });
+
+    test('host stamped delay newer -> pull into local prefs (+ row if exists)',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/d2', 'D2');
+      // host 上有人带戳调过轴（如 host 本机播放镜像盖戳）。
+      await hostDb.setPrefTyped<int>(videoRemoteDelayPrefKey('video/d2'), 800);
+      await hostDb.setPrefTyped<int>(
+          videoRemoteDelayAtPrefKey('video/d2'), 9000);
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      // 本地书架也有该视频（下载过），行值应被写穿。
+      await localDb.upsertVideoBook(VideoBooksCompanion.insert(
+        bookUid: 'video/d2',
+        title: 'D2',
+        videoPath: '/tmp/d2.mp4',
+      ));
+
+      final Directory tmp = Directory(p.join(work.path, 'td2'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncVideoProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await localDb.getPrefTyped<int>(
+              videoRemoteDelayPrefKey('video/d2'), 0),
+          800,
+          reason: 'host 的带戳调轴须回灌本地');
+      expect(
+          await localDb.getPrefTyped<int>(
+              videoRemoteDelayAtPrefKey('video/d2'), 0),
+          9000,
+          reason: '时间戳用对端的（不冒充 now），与进度写回同纪律');
+      expect((await localDb.getVideoBookByBookUid('video/d2'))!.delayMs, 800);
+    });
+  });
+
+  group('audiobook progress full sweep (BUG-471)', () {
+    test('local has audiobook position, host none -> push to host prefs',
+        () async {
+      await _seedHostAudiobook(hostDb, 'AB1');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(audiobookPositionPrefKey('AB1'), 480000);
+      await localDb.setPrefTyped<int>(audiobookPositionAtPrefKey('AB1'), 3000);
+
+      final Directory tmp = Directory(p.join(work.path, 'ta1'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncAudiobookProgressLiveForTest(report, backend);
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+
+      expect(await hostDb.getPrefTyped<int>(audiobookPositionPrefKey('AB1'), 0),
+          480000);
+      expect(
+          await hostDb.getPrefTyped<int>(audiobookPositionAtPrefKey('AB1'), 0),
+          3000);
+    });
+
+    test('host newer audiobook progress -> apply to local prefs', () async {
+      await _seedHostAudiobook(hostDb, 'AB2');
+      await hostDb.setPrefTyped<int>(audiobookPositionPrefKey('AB2'), 990000);
+      await hostDb.setPrefTyped<int>(audiobookPositionAtPrefKey('AB2'), 8000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(audiobookPositionPrefKey('AB2'), 100000);
+      await localDb.setPrefTyped<int>(audiobookPositionAtPrefKey('AB2'), 2000);
+      await localDb.setSyncBaseline(
+          'AB2', kInterconnectAudiobookPositionDimension, 100000);
+
+      final Directory tmp = Directory(p.join(work.path, 'ta2'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncAudiobookProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await localDb.getPrefTyped<int>(audiobookPositionPrefKey('AB2'), 0),
+          990000);
+      expect(
+          await localDb.getPrefTyped<int>(audiobookPositionAtPrefKey('AB2'), 0),
+          8000);
+    });
+
+    test('local newer not rolled back by host old', () async {
+      await _seedHostAudiobook(hostDb, 'AB3');
+      await hostDb.setPrefTyped<int>(audiobookPositionPrefKey('AB3'), 1000);
+      await hostDb.setPrefTyped<int>(audiobookPositionAtPrefKey('AB3'), 1000);
+
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(audiobookPositionPrefKey('AB3'), 700000);
+      await localDb.setPrefTyped<int>(audiobookPositionAtPrefKey('AB3'), 9000);
+      await localDb.setSyncBaseline(
+          'AB3', kInterconnectAudiobookPositionDimension, 1000);
+
+      final Directory tmp = Directory(p.join(work.path, 'ta3'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      await orch.syncAudiobookProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await localDb.getPrefTyped<int>(audiobookPositionPrefKey('AB3'), 0),
+          700000);
+      expect(await hostDb.getPrefTyped<int>(audiobookPositionPrefKey('AB3'), 0),
+          700000,
+          reason: 'local newer must propagate to host');
+      expect(
+          await hostDb.getPrefTyped<int>(audiobookPositionAtPrefKey('AB3'), 0),
+          9000);
+    });
+
+    test('local has audiobook but host does not -> skip (no error)', () async {
+      // host 没有这本有声书：listAudiobooks 不含它 → 跳过，不报错。
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('AB_local_only'), 60000);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('AB_local_only'), 4000);
+
+      final Directory tmp = Directory(p.join(work.path, 'ta4'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncAudiobookProgressLiveForTest(report, backend);
+      expect(report.errors, isEmpty);
+      // host 无该有声书 → 不写脏 prefs。
+      expect(
+          await hostDb.getPrefTyped<int>(
+              audiobookPositionPrefKey('AB_local_only'), 0),
+          0);
+    });
+  });
+
+  // BUG-3367：两端在上次同步后都看 / 听过同一条目 → 报冲突、两端都不动；此前是纯
+  // 「取较新时间戳」LWW，晚同步的一端被静默盖掉。
+  group('playback position fork is a conflict, not a silent overwrite', () {
+    test('video: both moved off the baseline -> conflict, neither side written',
+        () async {
+      await _seedHostVideo(hostDb, work, 'video/fork', 'Fork Episode');
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/fork'), 300000);
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/fork'), 9000);
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.upsertVideoBook(VideoBooksCompanion.insert(
+        bookUid: 'video/fork',
+        title: 'Fork Episode',
+        videoPath: '/tmp/fork.mp4',
+        lastPositionMs: const Value(800000),
+      ));
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/fork'), 5000);
+      await localDb.setSyncBaseline(
+          'video/fork', kInterconnectVideoPositionDimension, 100000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tvf'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncVideoProgressLiveForTest(report, backend);
+
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+      expect(report.conflicts, hasLength(1));
+      final SyncConflict c = report.conflicts.single;
+      expect(c.assetKey, 'video/fork');
+      expect(c.dimension, kInterconnectVideoPositionDimension);
+      expect(c.title, 'Fork Episode');
+      expect(
+          (await localDb.getVideoBookByBookUid('video/fork'))!.lastPositionMs,
+          800000,
+          reason: 'host 时间戳更新也不能盖掉本机的新进度');
+      expect(
+          await hostDb.getPrefTyped<int>(
+              videoRemotePositionPrefKey('video/fork'), 0),
+          300000,
+          reason: '冲突时也不能把本机进度推上 host');
+    });
+
+    // 升级前从没记过基线：无基线时退回旧 LWW 一次并记下基线，不能把每条只有一端
+    // 动过的条目都弹成冲突。
+    test(
+        'video: no baseline and positions differ -> legacy LWW once '
+        '(newer host wins), baseline recorded, no conflict', () async {
+      await _seedHostVideo(hostDb, work, 'video/nobase', 'NoBase');
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/nobase'), 300000);
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/nobase'), 9000);
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/nobase'), 800000);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/nobase'), 5000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tvn'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncVideoProgressLiveForTest(report, backend);
+
+      expect(report.errors, isEmpty, reason: '${report.errors}');
+      expect(report.conflicts, isEmpty);
+      expect(
+          await localDb.getPrefTyped<int>(
+              videoRemotePositionPrefKey('video/nobase'), 0),
+          300000);
+      expect(
+          await localDb.getSyncBaseline(
+              'video/nobase', kInterconnectVideoPositionDimension),
+          300000);
+    });
+
+    test(
+        'video: same position, different stamps -> aligned + baseline, '
+        'no conflict', () async {
+      await _seedHostVideo(hostDb, work, 'video/same', 'Same');
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/same'), 420000);
+      await hostDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/same'), 9000);
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionPrefKey('video/same'), 420000);
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/same'), 5000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tvsm'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncVideoProgressLiveForTest(report, backend);
+
+      expect(report.conflicts, isEmpty);
+      expect(
+          await localDb.getPrefTyped<int>(
+              videoRemotePositionAtPrefKey('video/same'), 0),
+          9000);
+      expect(
+          await localDb.getSyncBaseline(
+              'video/same', kInterconnectVideoPositionDimension),
+          420000);
+    });
+
+    test('audiobook: both moved off the baseline -> conflict', () async {
+      await _seedHostAudiobook(hostDb, 'ABFork');
+      await hostDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('ABFork'), 200000);
+      await hostDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('ABFork'), 9000);
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('ABFork'), 700000);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('ABFork'), 5000);
+      await localDb.setSyncBaseline(
+          'ABFork', kInterconnectAudiobookPositionDimension, 50000);
+
+      final Directory tmp = Directory(p.join(work.path, 'taf'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      final SyncRunReport report = SyncRunReport();
+      await orch.syncAudiobookProgressLiveForTest(report, backend);
+
+      expect(report.conflicts, hasLength(1));
+      expect(report.conflicts.single.dimension,
+          kInterconnectAudiobookPositionDimension);
+      expect(
+          await localDb.getPrefTyped<int>(
+              audiobookPositionPrefKey('ABFork'), 0),
+          700000);
+      expect(
+          await hostDb.getPrefTyped<int>(audiobookPositionPrefKey('ABFork'), 0),
+          200000);
+    });
+
+    test('push records the agreed position as the new baseline', () async {
+      await _seedHostAudiobook(hostDb, 'ABBase');
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('ABBase'), 480000);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('ABBase'), 3000);
+
+      final Directory tmp = Directory(p.join(work.path, 'tab'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+      await orch.syncAudiobookProgressLiveForTest(SyncRunReport(), backend);
+
+      expect(
+          await localDb.getSyncBaseline(
+              'ABBase', kInterconnectAudiobookPositionDimension),
+          480000);
+    });
+  });
+
+  group('full run() syncs book + video progress together', () {
+    test('interconnect run() runs book + video progress live sweep', () async {
+      final FushiDatabase localDb = _memDb();
+      addTearDown(localDb.close);
+      await _seedHostVideo(hostDb, work, 'video/run', 'VRun');
+      await _seedBook(hostDb, 'BookRun');
+      await _seedBook(localDb, 'BookRun');
+      await _seedHostAudiobook(hostDb, 'ABRun');
+      await localDb.setPrefTyped<int>(
+          audiobookPositionPrefKey('ABRun'), 360000);
+      await localDb.setPrefTyped<int>(
+          audiobookPositionAtPrefKey('ABRun'), 4000);
+      await _seedPosition(localDb, 'BookRun',
+          section: 3, norm: 3000, charOffset: 33, updatedAt: 4000);
+      await localDb.upsertVideoBook(VideoBooksCompanion.insert(
+        bookUid: 'video/run',
+        title: 'VRun',
+        videoPath: '/tmp/vrun.mp4',
+        lastPositionMs: const Value(450000),
+      ));
+      await localDb.setPrefTyped<int>(
+          videoRemotePositionAtPrefKey('video/run'), 4000);
+
+      final Directory tmp = Directory(p.join(work.path, 'trun'))..createSync();
+      final InterconnectSyncBackend backend =
+          await _buildClientBackend(base: base, token: token);
+      final SyncOrchestrator orch =
+          _orchestrator(db: localDb, backend: backend, tmp: tmp);
+
+      final SyncRunReport report = await orch.run();
+      expect(report.errors, isEmpty,
+          reason: 'run() full sweep no errors: ${report.errors}');
+
+      final ReaderPositionRow? hostBook = await _positionOf(hostDb, 'BookRun');
+      expect(hostBook, isNotNull);
+      expect(hostBook!.sectionIndex, 3);
+
+      final int hostVidPos = await hostDb.getPrefTyped<int>(
+          videoRemotePositionPrefKey('video/run'), 0);
+      expect(hostVidPos, 450000);
+
+      final int hostAbPos =
+          await hostDb.getPrefTyped<int>(audiobookPositionPrefKey('ABRun'), 0);
+      expect(hostAbPos, 360000,
+          reason: 'run() full sweep must also push audiobook progress to host');
+    });
+  });
+}

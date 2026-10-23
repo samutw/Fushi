@@ -1,0 +1,1587 @@
+/// [MangaOcrService] 真实实现：模型清单/下载管理 + 后台 isolate 整卷 OCR +
+/// EP 策略接线。
+///
+/// ## isolate 结构（设计决策）
+///
+/// `flutter_onnxruntime` 是 MethodChannel 插件（native 侧注册在 root engine）。
+/// 整卷任务把**全部 Dart 侧重活**（图片解码、预处理像素循环、解码记账）
+/// 放进 `Isolate.spawn` 的后台 isolate，靠
+/// `BackgroundIsolateBinaryMessenger.ensureInitialized(RootIsolateToken)`
+/// 让插件的 MethodChannel 调用从后台 isolate 直达 root engine 的 platform
+/// 线程——ORT native 推理本就跑在 platform/native 线程，UI isolate 全程零负担。
+/// 取消经 control SendPort 送进 isolate 置位 [OcrCancelToken]，页/块边界停。
+///
+/// 阅读器「边看边 OCR」走**常驻页级会话**（[IsolateMangaOcrPageSessionRunner]）：
+/// 同一套 isolate 结构，但 ORT 会话只建一次、串行处理逐页请求，直到显式关闭——
+/// 几百 MB 模型的初始化不再每页付一次。两条路径共用 [_openIsolateOcrEngine]。
+/// 字幕位图（已裁好的文字图）也走页级会话（[MangaOcrTextImageSession]），与页请求
+/// 同一条串行队列，但跳过检测器、补检与逐页缓存；`textImagesOnly` 会话干脆不建
+/// 检测器。
+///
+/// ## 可测缝
+///
+/// - 模型目录、下载器、清单、任务 runner 全部构造注入；测试用临时目录 +
+///   本地 HttpServer + 进程内 fake runner，不下载真模型、不跑真 ORT。
+/// - EP 接线是纯函数组合（[resolveOcrPlatform] + [selectOcrExecutionProviders]）。
+library;
+
+import 'dart:async';
+import 'dart:developer' as developer;
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
+
+import 'package:fushi_engine/ocr/ctc_column_ocr_recognizer.dart';
+import 'package:fushi_engine/ocr/manga_ocr_local_model.dart';
+import 'package:fushi_engine/ocr/manga_ocr_folder_job.dart';
+import 'package:fushi_engine/ocr/manga_ocr_model_downloader.dart';
+import 'package:fushi_engine/ocr/manga_ocr_model_fingerprint.dart' as model_fp;
+import 'package:fushi_engine/ocr/manga_ocr_model_manifest.dart';
+import 'package:fushi_engine/ocr/manga_ocr_pipeline.dart';
+import 'package:fushi_engine/ocr/manga_ocr_service.dart';
+import 'package:fushi_engine/ocr/ocr_inference.dart';
+import 'package:fushi_engine/ocr/ocr_host_bindings.dart';
+import 'package:fushi_engine/ocr/ocr_types.dart';
+import 'package:fushi_engine/ocr/page_text_sweep.dart';
+import 'package:fushi_engine/ocr/ppocr_line_detector.dart';
+import 'package:fushi_engine/ocr/ppocr_line_recognizer.dart';
+import 'package:fushi_engine/ocr/routing_ocr_recognizer.dart';
+import 'package:fushi_engine/ocr/text_detector.dart';
+import 'package:fushi_engine/utils/misc/directory_bytes.dart';
+
+/// 纯函数：`Platform.operatingSystem` 字符串 → [OcrPlatform]。
+/// 未知平台（fuchsia 等）落 linux 档（纯 CPU），不会选到不存在的 EP。
+OcrPlatform resolveOcrPlatform(String operatingSystem) {
+  switch (operatingSystem) {
+    case 'windows':
+      return OcrPlatform.windows;
+    case 'macos':
+      return OcrPlatform.macos;
+    case 'ios':
+      return OcrPlatform.ios;
+    case 'android':
+      return OcrPlatform.android;
+    case 'linux':
+    default:
+      return OcrPlatform.linux;
+  }
+}
+
+/// 模型文件的绝对路径（isolate 参数，字段全 String 可跨 isolate 发送）。
+///
+/// 块识别主路径目前只有逐列 CTC：[ctcRecPath] 必须非空，空的路径组合在 isolate
+/// 里建会话时直接 [StateError]（2026-10 删除 Baberu 后不再有非 CTC 的块识别器）。
+class MangaOcrModelPaths {
+  const MangaOcrModelPaths({
+    required this.detectorPath,
+    this.ppDetPath = '',
+    this.ppRecPath = '',
+    this.ppRecDictPath = '',
+    this.ctcRecPath = '',
+  });
+
+  final String detectorPath;
+
+  /// 逐列 CTC 的列识别 rec（漫画微调的 PP-OCRv6）；空 = 不是 CTC 模型。
+  final String ctcRecPath;
+
+  /// 横排行路径：PP-OCRv6 small det / rec / rec 字典（`inference.yml`）。
+  final String ppDetPath;
+  final String ppRecPath;
+  final String ppRecDictPath;
+}
+
+/// 整卷任务请求。
+class MangaOcrVolumeJobRequest {
+  const MangaOcrVolumeJobRequest({
+    required this.imageDirPath,
+    required this.modelPaths,
+    this.volumeTitle,
+    this.engineSignature,
+    this.startPage = 0,
+  });
+
+  final String imageDirPath;
+  final MangaOcrModelPaths modelPaths;
+
+  /// 展示用卷名（manga.json 结构本身无标题字段，仅透传给未来 UI/日志）。
+  final String? volumeTitle;
+  final String? engineSignature;
+
+  /// 处理起点页号（语义见 [MangaOcrService.ocrFolder]）。
+  final int startPage;
+}
+
+/// 一次在跑的整卷任务句柄。
+abstract interface class MangaOcrVolumeJob {
+  /// 完成时给出 manga.json 绝对路径；取消以 [OcrCancelledException] 失败。
+  Future<String> get result;
+
+  /// 请求取消（页/块边界生效，幂等）。
+  void cancel();
+
+  /// 读者翻到了 [pageIndex]：下一页先跑它，再从它往后接着跑（页边界生效）。
+  void focus(int pageIndex);
+}
+
+/// 整卷任务 runner 接口（生产 = isolate；测试 = 进程内 fake）。
+abstract interface class MangaOcrVolumeJobRunner {
+  /// [onAcceleration] 在会话建成后回报本次真正生效的执行后端与降级原因；
+  /// 会话建立和运行时设备降级都会回报（BUG-1163）。
+  /// [onProgress] 的 `pageIndex` 是刚完成那页的真实页号（任务按
+  /// [MangaOcrVolumeJobRequest.startPage] 旋转处理）。
+  MangaOcrVolumeJob start(
+    MangaOcrVolumeJobRequest request, {
+    required void Function(int pagesDone, int pagesTotal, int pageIndex)
+    onProgress,
+    void Function(MangaOcrAcceleration acceleration)? onAcceleration,
+  });
+}
+
+/// 页级会话请求。
+class MangaOcrPageSessionRequest {
+  const MangaOcrPageSessionRequest({
+    required this.imageDirPath,
+    required this.modelPaths,
+    required this.engineSignature,
+    this.textImagesOnly = false,
+  });
+
+  final String imageDirPath;
+  final MangaOcrModelPaths modelPaths;
+
+  /// 逐页缓存子目录名。由服务在主 isolate 按已安装模型解析一次后传入，会话
+  /// isolate 不再自行重算——保证与 [MangaOcrPageService.resolvePageCacheDirPath]
+  /// 同源，读缓存与写缓存永远是同一个目录。
+  final String engineSignature;
+
+  /// 只做文字图识别（见 [MangaOcrPageService.openPageSession]）：会话不建漫画
+  /// 检测器与补检，页请求以 [StateError] 失败。
+  final bool textImagesOnly;
+}
+
+/// 页级会话 runner 接口（生产 = 常驻 isolate；测试 = 进程内 fake）。
+abstract interface class MangaOcrPageSessionRunner {
+  /// 立即返回会话句柄；推理会话在后台建立，建成前到达的页请求排队。
+  /// [onAcceleration] 在会话建成后回报一次（BUG-1163）。
+  MangaOcrPageSession open(
+    MangaOcrPageSessionRequest request, {
+    void Function(MangaOcrAcceleration acceleration)? onAcceleration,
+  });
+}
+
+// ── isolate 消息协议（Isolate.spawn 同代码库，可直接发送实例） ────────────
+
+class _JobControlPortMessage {
+  const _JobControlPortMessage(this.controlPort);
+  final SendPort controlPort;
+}
+
+class _JobProgressMessage {
+  const _JobProgressMessage(this.pagesDone, this.pagesTotal, this.pageIndex);
+  final int pagesDone;
+  final int pagesTotal;
+  final int pageIndex;
+}
+
+class _JobAccelerationMessage {
+  const _JobAccelerationMessage(this.acceleration);
+  final MangaOcrAcceleration acceleration;
+}
+
+class _JobDoneMessage {
+  const _JobDoneMessage(this.mangaJsonPath);
+  final String mangaJsonPath;
+}
+
+class _JobCancelledMessage {
+  const _JobCancelledMessage();
+}
+
+class _JobErrorMessage {
+  const _JobErrorMessage(this.message, this.stackTrace);
+  final String message;
+  final String stackTrace;
+}
+
+/// isolate 收到即置位取消令牌的控制消息。
+const String _kJobCancelMessage = 'cancel';
+
+/// 主 isolate → 整卷 isolate：读者翻到了这一页（[MangaOcrPageFocus]）。
+class _JobFocusMessage {
+  const _JobFocusMessage(this.pageIndex);
+  final int pageIndex;
+}
+
+class _JobIsolateArgs {
+  const _JobIsolateArgs({
+    required this.events,
+    required this.factoryBuilder,
+    required this.bootstrap,
+    required this.bootstrapArg,
+    required this.imageDirPath,
+    required this.modelPaths,
+    required this.engineSignature,
+    required this.startPage,
+  });
+
+  final SendPort events;
+
+  /// 顶层函数：在 isolate 里构造会话工厂（宿主装配，见 ocr_host_bindings.dart）。
+  final OcrSessionFactory Function() factoryBuilder;
+
+  /// 顶层函数：isolate 引导（Flutter app 用它接 MethodChannel；服务端 null）。
+  final OcrIsolateBootstrap? bootstrap;
+  final Object? bootstrapArg;
+  final String imageDirPath;
+  final MangaOcrModelPaths modelPaths;
+  final String? engineSignature;
+  final int startPage;
+}
+
+/// 请求 ORT 之前就能定下的 EP 决策：三个会话各请求哪些 provider，以及此刻**已经
+/// 能断定**的降级说明。
+///
+/// 做成一个对象、并且只经 [toAcceleration] 出口产出 [MangaOcrAcceleration]，是
+/// 为了让「决策」与「可观测性」不可分割。`_openIsolateOcrEngine` 跑在
+/// `Isolate.spawn` 里、直连真 ORT，单测够不到它；早先那版把降级说明散成 isolate
+/// 里的两句 `recordUnavailable(...)`，删掉这两句测试全绿——降级从此静默，没人
+/// 会发现（BUG-2050 审查 M5）。现在 provider 列表和降级说明装在同一个对象里，
+/// isolate 拿了列表就必然带着说明，想丢只能改这个可单测的类。
+class OcrAccelerationPlan {
+  const OcrAccelerationPlan({
+    required this.detectionProviders,
+    required this.recognitionProviders,
+    required this.degradeReasons,
+    this.intraOpNumThreads,
+  });
+
+  /// Windows runs five serial CPU sessions. Giving every session a full-core
+  /// pool oversubscribes the machine while the other sessions spin idle.
+  final int? intraOpNumThreads;
+
+  Future<OcrSession> createSession(
+    OcrSessionFactory factory,
+    String modelPath, {
+    required List<OcrExecutionProvider> providers,
+    void Function(OcrProviderResolution resolution)? onProviderResolved,
+  }) => factory.createSession(
+    modelPath,
+    providers: providers,
+    onProviderResolved: onProviderResolved,
+    intraOpNumThreads: intraOpNumThreads,
+  );
+
+  /// 检测会话要提交给 ORT 的 provider 列表（末位永远是 CPU）。
+  final List<OcrExecutionProvider> detectionProviders;
+
+  /// 识别会话要提交给 ORT 的 provider 列表。
+  final List<OcrExecutionProvider> recognitionProviders;
+
+  /// 请求前就能断定的降级说明（探测失败 / 想要的 EP 没编进运行时）。
+  final List<String> degradeReasons;
+
+  /// 合并「请求前」与「建会话时」两批降级说明，产出上报 UI 的加速状态。
+  ///
+  /// [runtimeDegradeReasons] 是 `createOcrSessionWithProviderFallback` 真回退时
+  /// 记下的那批；[degradeReasons] 无条件排在它前面（时间顺序）。
+  MangaOcrAcceleration toAcceleration({
+    required OcrExecutionProvider detection,
+    required OcrExecutionProvider recognition,
+    List<String> runtimeDegradeReasons = const <String>[],
+  }) {
+    return MangaOcrAcceleration(
+      detection: detection,
+      recognition: recognition,
+      degradeReasons: List<String>.unmodifiable(<String>[
+        ...degradeReasons,
+        ...runtimeDegradeReasons,
+      ]),
+    );
+  }
+}
+
+/// 由平台偏好与本机真实可用的加速 EP 推出 [OcrAccelerationPlan]（纯函数）。
+///
+/// [probeError] 非 null 表示 `availableAcceleratedProviders()` 自己抛了——那本身
+/// 就是一条降级（有 N 卡也会退到 CPU），不许静默（BUG-1163）。
+///
+/// 「平台想要加速 EP，但运行时里一个都没编译进来」也记一条：BUG-2050 修好之后
+/// 这条路径不再产生 session 创建失败，可观测性不能跟着一起消失——原先用户至少
+/// 还能从 `detector: directml -> cpu (INVALID_PROVIDER)` 看出来。
+///
+/// 反过来，平台**本来就该走纯 CPU**（偏好表为空：Windows 见 BUG-2050、Apple 见
+/// BUG-1613、linux/android 同档）不是降级，一条都不记——否则 Windows 每卷都会
+/// 弹一条用户永远消不掉的黄条。
+OcrAccelerationPlan planOcrAcceleration({
+  required OcrPlatform platform,
+  required Set<OcrExecutionProvider> availableProviders,
+  Object? probeError,
+  int processorCount = 2,
+}) {
+  final List<String> reasons = <String>[];
+  if (probeError != null) {
+    reasons.add('accelerated provider probe failed: $probeError');
+  }
+  final Map<String, OcrModelKind> roles = <String, OcrModelKind>{
+    'detector': OcrModelKind.detection,
+    'recognition': OcrModelKind.recognition,
+  };
+  final Map<OcrModelKind, List<OcrExecutionProvider>> chosen =
+      <OcrModelKind, List<OcrExecutionProvider>>{};
+  for (final MapEntry<String, OcrModelKind> role in roles.entries) {
+    final List<OcrExecutionProvider> providers = selectOcrExecutionProviders(
+      kind: role.value,
+      platform: platform,
+      availableProviders: availableProviders,
+    );
+    chosen[role.value] = providers;
+    if (providers.first != OcrExecutionProvider.cpu) continue;
+    final List<OcrExecutionProvider> wanted = acceleratedProviderPreference(
+      kind: role.value,
+      platform: platform,
+    );
+    if (wanted.isEmpty) continue;
+    final String names = wanted
+        .map((OcrExecutionProvider p) => p.name)
+        .join('/');
+    reasons.add('${role.key}: $names not built into this ONNX Runtime -> cpu');
+  }
+  return OcrAccelerationPlan(
+    detectionProviders: chosen[OcrModelKind.detection]!,
+    recognitionProviders: chosen[OcrModelKind.recognition]!,
+    degradeReasons: List<String>.unmodifiable(reasons),
+    intraOpNumThreads: ocrIntraOpNumThreads(
+      platform: platform,
+      processorCount: processorCount,
+    ),
+  );
+}
+
+/// 一个 OCR 任务的 CPU 会话开几个线程；null = 交给 ORT 默认（吃满物理核）。
+///
+/// Windows 钉 2：2026-09-26 实测 N=2 与 N=4 在噪声内持平、N≥8 明显变慢
+/// （docs/reviews/2026-09-23-manga-ocr-options.md）。跨书并行任务的上限
+/// （`mangaOcrMaxParallelTasks`）由这个数推导，两处必须读同一个函数。
+int? ocrIntraOpNumThreads({
+  required OcrPlatform platform,
+  required int processorCount,
+}) => platform == OcrPlatform.windows ? processorCount.clamp(1, 2) : null;
+
+/// isolate 内已建好的一套推理对象（检测 + 块识别器（逐列 CTC）+
+/// PP-OCRv6 行 det/rec + 路由识别器）。
+///
+/// 字段在 [_openIsolateOcrEngine] 里**边建边赋值**：建到一半抛异常时，已建好的
+/// 会话仍挂在这里，由调用方 finally 里的 [close] 逐个释放，不会泄漏。
+class _IsolateOcrEngine {
+  TextDetector? detector;
+  PpOcrLineDetector? lineDetector;
+  PpOcrLineRecognizer? lineRecognizer;
+
+  /// 逐列 CTC 的列识别 rec（与 [lineRecognizer] 是同一个对象时只关一次）。
+  PpOcrLineRecognizer? columnRecognizer;
+  OcrRecognizer? recognizer;
+
+  /// 补检（检测器弱候选复核，仅逐列 CTC 模式）：只引用 [lineDetector] /
+  /// [columnRecognizer] 的会话，不另持有会话，关闭时置空即可。
+  OcrPageTextSweeper? sweeper;
+
+  /// 逐个关闭（幂等、吞单个关闭错误）：建到一半时 [recognizer] 还是 null，只关
+  /// 它会漏掉已建好的会话，所以每个持有会话的对象各关各的。
+  Future<void> close() async {
+    final TextDetector? detector = this.detector;
+    final PpOcrLineDetector? lineDetector = this.lineDetector;
+    final PpOcrLineRecognizer? lineRecognizer = this.lineRecognizer;
+    final PpOcrLineRecognizer? columnRecognizer = this.columnRecognizer;
+    this.detector = null;
+    this.lineDetector = null;
+    this.lineRecognizer = null;
+    this.columnRecognizer = null;
+    recognizer = null;
+    sweeper = null;
+    try {
+      await detector?.close();
+    } catch (_) {}
+    try {
+      await lineDetector?.close();
+    } catch (_) {}
+    try {
+      await lineRecognizer?.close();
+    } catch (_) {}
+    if (!identical(columnRecognizer, lineRecognizer)) {
+      try {
+        await columnRecognizer?.close();
+      } catch (_) {}
+    }
+  }
+}
+
+/// isolate 内共用：宿主引导 → EP 探测/选择 → 建全部 ORT 会话 → 组装路由识别器。
+///
+/// 整卷任务与页级会话走同一份实现，EP 降级记录（BUG-1163）只有这一个出口：
+/// [onAcceleration] 收到的值只能经 `plan.toAcceleration` 产出。
+///
+/// [textImagesOnly] 为真时（字幕位图会话）不建漫画检测器与补检：文字图本身就是
+/// 一个块，只用得到路由识别器；[_IsolateOcrEngine.detector] 留 null。
+Future<void> _openIsolateOcrEngine(
+  _IsolateOcrEngine engine, {
+  required OcrSessionFactory Function() factoryBuilder,
+  required OcrIsolateBootstrap? bootstrap,
+  required Object? bootstrapArg,
+  required MangaOcrModelPaths modelPaths,
+  required void Function(MangaOcrAcceleration acceleration) onAcceleration,
+  bool textImagesOnly = false,
+}) async {
+  // 宿主引导（app：BackgroundIsolateBinaryMessenger.ensureInitialized(token)；
+  // 服务端：null）。没装引导而宿主又需要它时，第一次 ORT 调用会以
+  // 「No implementation found」告终——那是宿主装配的错，不是这里的。
+  bootstrap?.call(bootstrapArg);
+  final OcrSessionFactory factory = factoryBuilder();
+  Set<OcrExecutionProvider> availableProviders = const <OcrExecutionProvider>{};
+  Object? probeError;
+  try {
+    availableProviders = await factory.availableAcceleratedProviders();
+  } catch (error) {
+    // BUG-1163：探测失败也是降级（有 N 卡也会退到 CPU），
+    // 必须留痕，不能 catch (_) 吞掉。
+    availableProviders = const <OcrExecutionProvider>{};
+    probeError = error;
+    developer.log(
+      'manga OCR accelerated provider probe failed; assuming CPU only',
+      name: kOcrLogName,
+      error: error,
+    );
+  }
+  final OcrPlatform platform = resolveOcrPlatform(Platform.operatingSystem);
+  final OcrAccelerationPlan plan = planOcrAcceleration(
+    platform: platform,
+    availableProviders: availableProviders,
+    probeError: probeError,
+    processorCount: Platform.numberOfProcessors,
+  );
+  final List<OcrExecutionProvider> detectionProviders = plan.detectionProviders;
+  final List<OcrExecutionProvider> recognitionProviders =
+      plan.recognitionProviders;
+
+  OcrExecutionProvider detectionEffective = detectionProviders.first;
+  OcrExecutionProvider recognitionEffective = recognitionProviders.first;
+  // 建会话过程中才知道的降级（BUG-1163）；请求前就能断定的那批由 [plan] 带着，
+  // 在 `plan.toAcceleration` 里与这批合并——本 isolate 没法把它漏掉。
+  final List<String> runtimeDegradeReasons = <String>[];
+  void record(String role, OcrProviderResolution resolution) {
+    if (!resolution.didFallBack) return;
+    runtimeDegradeReasons.add(
+      '$role: ${resolution.requested.first.name} -> '
+      '${resolution.effective.name} (${resolution.fallbackReason})',
+    );
+  }
+
+  if (!textImagesOnly) {
+    engine.detector = TextDetector(
+      await plan.createSession(
+        factory,
+        modelPaths.detectorPath,
+        providers: detectionProviders,
+        onProviderResolved: (OcrProviderResolution resolution) {
+          detectionEffective = resolution.effective;
+          record('detector', resolution);
+        },
+      ),
+    );
+  }
+
+  // PP-OCRv6 det 与字典：横排行路径要用，逐列 CTC 的列检测也用同一个会话，所以
+  // 按需建一次、两处共用。
+  PpOcrLineDetector? sharedLineDetector;
+  Future<PpOcrLineDetector> openLineDetector() async =>
+      sharedLineDetector ??= engine.lineDetector = PpOcrLineDetector(
+        await plan.createSession(
+          factory,
+          modelPaths.ppDetPath,
+          providers: recognitionProviders,
+          onProviderResolved: (OcrProviderResolution resolution) =>
+              record('line detector', resolution),
+        ),
+      );
+  List<String>? sharedVocab;
+  Future<List<String>> ppVocab() async => sharedVocab ??= buildPpOcrCtcVocab(
+    parsePpOcrCharacterDict(
+      await File(modelPaths.ppRecDictPath).readAsString(),
+    ),
+  );
+
+  if (modelPaths.ctcRecPath.isEmpty) {
+    throw StateError(
+      'manga OCR model paths name no block recognizer '
+      '(expected a CTC column rec)',
+    );
+  }
+  // 逐列 CTC：整块交它的块逐列读（漫画微调的 PP-OCRv6 rec），每列的文本与列框
+  // 直接交回，不再按字格估算切分。
+  final PpOcrLineRecognizer columns = engine.columnRecognizer =
+      PpOcrLineRecognizer(
+        await plan.createSession(
+          factory,
+          modelPaths.ctcRecPath,
+          providers: recognitionProviders,
+          onProviderResolved: (OcrProviderResolution resolution) {
+            recognitionEffective = resolution.effective;
+            record('recognition ctc columns', resolution);
+          },
+        ),
+        vocab: await ppVocab(),
+      );
+  final OcrRecognizer primary = CtcColumnOcrRecognizer(
+    lineDetector: await openLineDetector(),
+    lineRecognizer: columns,
+  );
+  // 横排行路径：PP-OCRv6 small det/rec 与块识别器同一组 provider（都是识别侧）；
+  // 建会话时的降级同样经 record 留痕。
+  final PpOcrLineDetector lineDetector = await openLineDetector();
+  // 横排行：逐列 CTC 的漫画 rec 与横排行共用同一个模型文件时直接复用那个会话。
+  final PpOcrLineRecognizer lineRecognizer = engine.lineRecognizer =
+      modelPaths.ppRecPath == modelPaths.ctcRecPath
+      ? columns
+      : PpOcrLineRecognizer(
+          await plan.createSession(
+            factory,
+            modelPaths.ppRecPath,
+            providers: recognitionProviders,
+            onProviderResolved: (OcrProviderResolution resolution) =>
+                record('line recognizer', resolution),
+          ),
+          vocab: await ppVocab(),
+        );
+  engine.recognizer = RoutingOcrRecognizer(
+    mangaOcr: primary,
+    lineDetector: lineDetector,
+    lineRecognizer: lineRecognizer,
+  );
+  // 补检用逐列 CTC 的漫画 rec：补回的块靠识别置信度把关，只有漫画 CTC 权重对装饰字
+  // 读得可靠（用户真实页的「オキテ」，通用 PP rec 以高置信度读成「才半元」）。
+  // 文字图会话没有检测器候选可复核，不建。
+  if (!textImagesOnly) {
+    engine.sweeper = PpOcrPageTextSweeper(
+      lineDetector: lineDetector,
+      lineRecognizer: columns,
+    );
+  }
+  final MangaOcrAcceleration acceleration = plan.toAcceleration(
+    detection: detectionEffective,
+    recognition: recognitionEffective,
+    runtimeDegradeReasons: runtimeDegradeReasons,
+  );
+  developer.log('manga OCR acceleration: $acceleration', name: kOcrLogName);
+  onAcceleration(acceleration);
+}
+
+/// isolate 入口：建推理会话 → 跑目录任务 → 回发事件。
+Future<void> _volumeJobIsolateMain(_JobIsolateArgs args) async {
+  final ReceivePort control = ReceivePort();
+  final OcrCancelToken cancelToken = OcrCancelToken();
+  final _IsolateOcrEngine engine = _IsolateOcrEngine();
+  int? pendingFocus;
+  control.listen((Object? message) {
+    if (message == _kJobCancelMessage) {
+      cancelToken.cancel();
+    } else if (message is _JobFocusMessage) {
+      pendingFocus = message.pageIndex;
+    }
+  });
+  args.events.send(_JobControlPortMessage(control.sendPort));
+
+  try {
+    await _openIsolateOcrEngine(
+      engine,
+      factoryBuilder: args.factoryBuilder,
+      bootstrap: args.bootstrap,
+      bootstrapArg: args.bootstrapArg,
+      modelPaths: args.modelPaths,
+      onAcceleration: (MangaOcrAcceleration acceleration) =>
+          args.events.send(_JobAccelerationMessage(acceleration)),
+    );
+
+    // 缓存目录带上本机已安装模型的内容指纹：上游换模型后旧页缓存自然失效，
+    // 不会与新模型的结果混进同一卷（BUG-1173）。指纹按 (size, mtime) 记忆化，
+    // 常态只做几次 stat。
+    // 块识别器只剩逐列 CTC（[_openIsolateOcrEngine] 已拒绝没有 CTC rec 的路径）。
+    const MangaOcrLocalModel jobModel = MangaOcrLocalModel.mangaCtc;
+    final String engineSignature =
+        args.engineSignature ??
+        await model_fp.resolveLocalMangaOcrEngineSignature(
+          Directory(p.dirname(args.modelPaths.detectorPath)),
+          manifest: jobModel.manifest,
+          baseSignature: jobModel.cacheSignature,
+        );
+    final String mangaJsonPath = await runMangaOcrFolderJob(
+      imageDirPath: args.imageDirPath,
+      detector: engine.detector!,
+      recognizer: engine.recognizer!,
+      sweeper: engine.sweeper,
+      engineSignature: engineSignature,
+      startPage: args.startPage,
+      cancelToken: cancelToken,
+      onProgress: (int done, int total, int pageIndex) {
+        args.events.send(_JobProgressMessage(done, total, pageIndex));
+      },
+      takeFocus: () {
+        final int? focus = pendingFocus;
+        pendingFocus = null;
+        return focus;
+      },
+    );
+    args.events.send(_JobDoneMessage(mangaJsonPath));
+  } on OcrCancelledException {
+    args.events.send(const _JobCancelledMessage());
+  } catch (e, stack) {
+    args.events.send(
+      cancelToken.isCancelled
+          ? const _JobCancelledMessage()
+          : _JobErrorMessage('$e', '$stack'),
+    );
+  } finally {
+    control.close();
+    await engine.close();
+  }
+}
+
+// ── 页级会话 isolate 消息协议 ─────────────────────────────────────────────
+
+/// 主 isolate → 会话 isolate 的请求：两种请求进同一条串行队列（同一套 ORT 会话
+/// 不能并发跑），[id] 共用一个编号空间，用于回发配对。
+sealed class _SessionRequestMessage {
+  const _SessionRequestMessage(this.id);
+  final int id;
+}
+
+/// 识别一页（落逐页缓存）。
+class _PageRequestMessage extends _SessionRequestMessage {
+  const _PageRequestMessage(super.id, this.relativeUrl);
+  final String relativeUrl;
+}
+
+/// 识别一张已裁好的文字图（[MangaOcrTextImageSession]）。像素走
+/// [TransferableTypedData]：跨 isolate 移交所有权，不再整块复制。
+class _TextImageRequestMessage extends _SessionRequestMessage {
+  const _TextImageRequestMessage(
+    super.id,
+    this.pixels,
+    this.width,
+    this.height,
+  );
+  final TransferableTypedData pixels;
+  final int width;
+  final int height;
+}
+
+/// 会话 isolate → 主 isolate：该页缓存已写好。
+class _PageDoneMessage {
+  const _PageDoneMessage(this.id, this.cacheDirPath);
+  final int id;
+  final String cacheDirPath;
+}
+
+/// 会话 isolate → 主 isolate：该文字图的整块识别结果。
+class _TextImageDoneMessage {
+  const _TextImageDoneMessage(this.id, this.recognition);
+  final int id;
+  final OcrRecognition recognition;
+}
+
+/// 会话 isolate → 主 isolate：该请求（页或文字图）失败（会话本身仍可继续
+/// 处理后续请求）。
+class _PageErrorMessage {
+  const _PageErrorMessage(this.id, this.message, this.stackTrace);
+  final int id;
+  final String message;
+  final String stackTrace;
+}
+
+/// 会话 isolate → 主 isolate：建推理会话失败，会话整体不可用。
+class _PageSessionFailedMessage {
+  const _PageSessionFailedMessage(this.message, this.stackTrace);
+  final String message;
+  final String stackTrace;
+}
+
+/// 关闭会话的控制消息：置位取消令牌 → 关 ORT 会话 → isolate 退出。
+const String _kPageSessionCloseMessage = 'close';
+
+class _PageSessionIsolateArgs {
+  const _PageSessionIsolateArgs({
+    required this.events,
+    required this.factoryBuilder,
+    required this.bootstrap,
+    required this.bootstrapArg,
+    required this.imageDirPath,
+    required this.modelPaths,
+    required this.engineSignature,
+    required this.textImagesOnly,
+  });
+
+  final SendPort events;
+  final OcrSessionFactory Function() factoryBuilder;
+  final OcrIsolateBootstrap? bootstrap;
+  final Object? bootstrapArg;
+  final String imageDirPath;
+  final MangaOcrModelPaths modelPaths;
+  final String engineSignature;
+  final bool textImagesOnly;
+}
+
+/// 文字图会话上来了页请求时的错误文案（主 isolate 侧直接拒，isolate 侧兜底）。
+const String _kTextImagesOnlyPageError =
+    'manga OCR page session was opened with textImagesOnly; '
+    'ocrPage needs the manga detector, which this session did not load';
+
+/// 会话 isolate 内：一张文字图整块交路由识别器。
+///
+/// 整图就是一个块：路由识别器按宽≥高走 PP 行检测 + 逐行识别，竖排占多数时整块
+/// 交块识别器——与漫画页里的一个块同一条路径，只是省掉了检测器与补检。
+Future<OcrRecognition> _recognizeIsolateTextImage(
+  _IsolateOcrEngine engine,
+  _TextImageRequestMessage request,
+) async {
+  final OcrRecognizer? recognizer = engine.recognizer;
+  if (recognizer is! OrientedOcrRecognizer) {
+    throw StateError('manga OCR recognizer is not an OrientedOcrRecognizer');
+  }
+  final ByteBuffer pixels = request.pixels.materialize();
+  final img.Image image = img.Image.fromBytes(
+    width: request.width,
+    height: request.height,
+    bytes: pixels,
+    numChannels: 4,
+  );
+  final List<OcrRecognition> results = await recognizer
+      .recognizeOriented(image, <OcrRect>[
+        OcrRect(
+          left: 0,
+          top: 0,
+          right: request.width.toDouble(),
+          bottom: request.height.toDouble(),
+        ),
+      ]);
+  return results.single;
+}
+
+/// 页级会话 isolate 入口：推理会话只建一次，之后串行处理请求（页 / 文字图）
+/// 直到收到关闭。
+Future<void> _pageSessionIsolateMain(_PageSessionIsolateArgs args) async {
+  final ReceivePort control = ReceivePort();
+  final OcrCancelToken cancelToken = OcrCancelToken();
+  final _IsolateOcrEngine engine = _IsolateOcrEngine();
+  final List<_SessionRequestMessage> queue = <_SessionRequestMessage>[];
+  bool closing = false;
+  Completer<void>? wake;
+  control.listen((Object? message) {
+    if (message is _SessionRequestMessage) {
+      queue.add(message);
+    } else if (message == _kPageSessionCloseMessage) {
+      closing = true;
+      // 在跑页在页/块边界停下；已完成页的缓存保留。
+      cancelToken.cancel();
+    }
+    final Completer<void>? pending = wake;
+    wake = null;
+    pending?.complete();
+  });
+  args.events.send(_JobControlPortMessage(control.sendPort));
+
+  try {
+    await _openIsolateOcrEngine(
+      engine,
+      factoryBuilder: args.factoryBuilder,
+      bootstrap: args.bootstrap,
+      bootstrapArg: args.bootstrapArg,
+      modelPaths: args.modelPaths,
+      onAcceleration: (MangaOcrAcceleration acceleration) =>
+          args.events.send(_JobAccelerationMessage(acceleration)),
+      textImagesOnly: args.textImagesOnly,
+    );
+    while (!closing) {
+      if (queue.isEmpty) {
+        final Completer<void> next = Completer<void>();
+        wake = next;
+        await next.future;
+        continue;
+      }
+      final _SessionRequestMessage request = queue.removeAt(0);
+      try {
+        switch (request) {
+          case _PageRequestMessage():
+            final TextDetector? detector = engine.detector;
+            if (detector == null) {
+              throw StateError(_kTextImagesOnlyPageError);
+            }
+            final String cacheDirPath = await runMangaOcrFolderJob(
+              imageDirPath: args.imageDirPath,
+              relativeUrls: <String>[request.relativeUrl],
+              detector: detector,
+              recognizer: engine.recognizer!,
+              sweeper: engine.sweeper,
+              engineSignature: args.engineSignature,
+              cancelToken: cancelToken,
+            );
+            args.events.send(_PageDoneMessage(request.id, cacheDirPath));
+          case _TextImageRequestMessage():
+            // 与页请求同一取消语义：关闭后不再开跑新的识别。
+            cancelToken.throwIfCancelled();
+            final OcrRecognition recognition = await _recognizeIsolateTextImage(
+              engine,
+              request,
+            );
+            args.events.send(_TextImageDoneMessage(request.id, recognition));
+        }
+      } catch (e, stack) {
+        args.events.send(_PageErrorMessage(request.id, '$e', '$stack'));
+      }
+    }
+  } catch (e, stack) {
+    args.events.send(_PageSessionFailedMessage('$e', '$stack'));
+  } finally {
+    control.close();
+    await engine.close();
+  }
+  // 返回即 isolate 退出；主 isolate 经 onExit 得知资源已释放。
+}
+
+/// 生产页级会话 runner：常驻 [Isolate.spawn] 后台 isolate。
+class IsolateMangaOcrPageSessionRunner implements MangaOcrPageSessionRunner {
+  const IsolateMangaOcrPageSessionRunner();
+
+  @override
+  MangaOcrPageSession open(
+    MangaOcrPageSessionRequest request, {
+    void Function(MangaOcrAcceleration acceleration)? onAcceleration,
+  }) {
+    final OcrSessionFactory Function()? factoryBuilder =
+        ocrSessionFactoryBuilder;
+    if (factoryBuilder == null) {
+      throw StateError(
+        'ocrSessionFactoryBuilder not installed: the host process must assign '
+        'fushi_engine ocr_host_bindings before opening a manga OCR page session',
+      );
+    }
+    final _IsolatePageSession session = _IsolatePageSession(
+      onAcceleration,
+      textImagesOnly: request.textImagesOnly,
+    );
+    session.spawn(request, factoryBuilder);
+    return session;
+  }
+}
+
+class _IsolatePageSession
+    implements MangaOcrPageSession, MangaOcrTextImageSession {
+  _IsolatePageSession(this._onAcceleration, {required this.textImagesOnly});
+
+  final void Function(MangaOcrAcceleration acceleration)? _onAcceleration;
+
+  /// 只做文字图：页请求在本侧直接以 [StateError] 失败，不进 isolate。
+  final bool textImagesOnly;
+  final ReceivePort _events = ReceivePort();
+
+  /// 两种请求各自的挂起表；编号共用 [_nextId]，回发消息按编号找得到唯一一项。
+  final Map<int, Completer<String>> _pendingPages = <int, Completer<String>>{};
+  final Map<int, Completer<OcrRecognition>> _pendingTextImages =
+      <int, Completer<OcrRecognition>>{};
+
+  /// 控制端口到达前发出的请求（isolate 尚在启动）。
+  final List<_SessionRequestMessage> _unsent = <_SessionRequestMessage>[];
+  final Completer<void> _exited = Completer<void>();
+  SendPort? _control;
+  int _nextId = 0;
+  bool _closed = false;
+  Object? _failure;
+  StackTrace? _failureStack;
+
+  void spawn(
+    MangaOcrPageSessionRequest request,
+    OcrSessionFactory Function() factoryBuilder,
+  ) {
+    _events.listen(_onMessage);
+    unawaited(() async {
+      try {
+        await Isolate.spawn<_PageSessionIsolateArgs>(
+          _pageSessionIsolateMain,
+          _PageSessionIsolateArgs(
+            events: _events.sendPort,
+            factoryBuilder: factoryBuilder,
+            bootstrap: ocrIsolateBootstrap,
+            bootstrapArg: ocrIsolateBootstrapArg,
+            imageDirPath: request.imageDirPath,
+            modelPaths: request.modelPaths,
+            engineSignature: request.engineSignature,
+            textImagesOnly: request.textImagesOnly,
+          ),
+          onError: _events.sendPort,
+          // 退出时向事件端口发 null：挂起请求失败、close() 完成。
+          onExit: _events.sendPort,
+          debugName: 'manga_ocr_page_session',
+        );
+      } catch (e, stack) {
+        _fail(StateError('failed to spawn OCR isolate: $e'), stack);
+        _onExited();
+      }
+    }());
+  }
+
+  /// 会话已不可用（已关闭 / 建会话失败）时的失败 Future；可用时 null。
+  Future<T>? _rejection<T>() {
+    if (_closed) {
+      return Future<T>.error(StateError('manga OCR page session is closed'));
+    }
+    final Object? failure = _failure;
+    if (failure != null) {
+      return Future<T>.error(failure, _failureStack);
+    }
+    return null;
+  }
+
+  /// 控制端口到手前先攒着（isolate 尚在启动），到手后按序补发。
+  void _send(_SessionRequestMessage message) {
+    final SendPort? control = _control;
+    if (control == null) {
+      _unsent.add(message);
+    } else {
+      control.send(message);
+    }
+  }
+
+  @override
+  Future<String> ocrPage(String relativeUrl) {
+    final Future<String>? rejected = _rejection<String>();
+    if (rejected != null) return rejected;
+    if (textImagesOnly) {
+      return Future<String>.error(StateError(_kTextImagesOnlyPageError));
+    }
+    final int id = _nextId++;
+    final Completer<String> completer = Completer<String>();
+    _pendingPages[id] = completer;
+    _send(_PageRequestMessage(id, relativeUrl));
+    return completer.future;
+  }
+
+  @override
+  Future<OcrRecognition> recognizeTextImage(
+    Uint8List rgba, {
+    required int width,
+    required int height,
+  }) {
+    if (width <= 0 || height <= 0) {
+      throw ArgumentError(
+        'text image size must be positive, got ${width}x$height',
+      );
+    }
+    if (rgba.length != width * height * 4) {
+      throw ArgumentError.value(
+        rgba.length,
+        'rgba',
+        'expected width * height * 4 = ${width * height * 4} bytes '
+            'for ${width}x$height',
+      );
+    }
+    final Future<OcrRecognition>? rejected = _rejection<OcrRecognition>();
+    if (rejected != null) return rejected;
+    final int id = _nextId++;
+    final Completer<OcrRecognition> completer = Completer<OcrRecognition>();
+    _pendingTextImages[id] = completer;
+    _send(
+      _TextImageRequestMessage(
+        id,
+        TransferableTypedData.fromList(<TypedData>[rgba]),
+        width,
+        height,
+      ),
+    );
+    return completer.future;
+  }
+
+  @override
+  Future<void> close() {
+    if (!_closed) {
+      _closed = true;
+      _unsent.clear();
+      _failPending(
+        StateError('manga OCR page session is closed'),
+        StackTrace.current,
+      );
+      _control?.send(_kPageSessionCloseMessage);
+    }
+    return _exited.future;
+  }
+
+  void _onMessage(Object? message) {
+    if (message is _JobControlPortMessage) {
+      _control = message.controlPort;
+      if (_closed) {
+        message.controlPort.send(_kPageSessionCloseMessage);
+        return;
+      }
+      for (final _SessionRequestMessage request in _unsent) {
+        message.controlPort.send(request);
+      }
+      _unsent.clear();
+      return;
+    }
+    if (message is _JobAccelerationMessage) {
+      if (!_closed) _onAcceleration?.call(message.acceleration);
+      return;
+    }
+    if (message is _PageDoneMessage) {
+      final Completer<String>? completer = _pendingPages.remove(message.id);
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(message.cacheDirPath);
+      }
+      return;
+    }
+    if (message is _TextImageDoneMessage) {
+      final Completer<OcrRecognition>? completer = _pendingTextImages.remove(
+        message.id,
+      );
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(message.recognition);
+      }
+      return;
+    }
+    if (message is _PageErrorMessage) {
+      final StackTrace stack = StackTrace.fromString(message.stackTrace);
+      final Completer<String>? page = _pendingPages.remove(message.id);
+      if (page != null && !page.isCompleted) {
+        page.completeError(
+          StateError('manga OCR page failed: ${message.message}'),
+          stack,
+        );
+      }
+      final Completer<OcrRecognition>? textImage = _pendingTextImages.remove(
+        message.id,
+      );
+      if (textImage != null && !textImage.isCompleted) {
+        textImage.completeError(
+          StateError('manga OCR text image failed: ${message.message}'),
+          stack,
+        );
+      }
+      return;
+    }
+    if (message is _PageSessionFailedMessage) {
+      _fail(
+        StateError('manga OCR page session failed: ${message.message}'),
+        StackTrace.fromString(message.stackTrace),
+      );
+      return;
+    }
+    if (message is List<Object?> && message.length == 2) {
+      // Isolate.spawn onError 的未捕获错误通道（[error, stackTrace] 字符串对）。
+      _fail(
+        StateError('manga OCR page session crashed: ${message[0]}'),
+        StackTrace.fromString('${message[1]}'),
+      );
+      return;
+    }
+    if (message == null) {
+      // onExit：isolate 已退出，推理会话已释放（或随 isolate 一起销毁）。
+      _fail(
+        StateError('manga OCR page session isolate exited'),
+        StackTrace.current,
+      );
+      _onExited();
+    }
+  }
+
+  /// 会话整体不可用：记下首个失败原因，挂起与后续请求都以它失败。
+  void _fail(Object error, StackTrace stack) {
+    if (_failure == null && !_closed) {
+      _failure = error;
+      _failureStack = stack;
+    }
+    _unsent.clear();
+    _failPending(error, stack);
+  }
+
+  void _failPending(Object error, StackTrace stack) {
+    final List<Completer<String>> pages = _pendingPages.values.toList();
+    final List<Completer<OcrRecognition>> textImages = _pendingTextImages.values
+        .toList();
+    _pendingPages.clear();
+    _pendingTextImages.clear();
+    for (final Completer<String> completer in pages) {
+      if (!completer.isCompleted) completer.completeError(error, stack);
+    }
+    for (final Completer<OcrRecognition> completer in textImages) {
+      if (!completer.isCompleted) completer.completeError(error, stack);
+    }
+  }
+
+  void _onExited() {
+    _events.close();
+    if (!_exited.isCompleted) _exited.complete();
+  }
+}
+
+/// 生产 runner：整卷任务下放 [Isolate.spawn] 后台 isolate。
+class IsolateMangaOcrVolumeJobRunner implements MangaOcrVolumeJobRunner {
+  const IsolateMangaOcrVolumeJobRunner();
+
+  @override
+  MangaOcrVolumeJob start(
+    MangaOcrVolumeJobRequest request, {
+    required void Function(int pagesDone, int pagesTotal, int pageIndex)
+    onProgress,
+    void Function(MangaOcrAcceleration acceleration)? onAcceleration,
+  }) {
+    final OcrSessionFactory Function()? factoryBuilder =
+        ocrSessionFactoryBuilder;
+    if (factoryBuilder == null) {
+      throw StateError(
+        'ocrSessionFactoryBuilder not installed: the host process must assign '
+        'fushi_engine ocr_host_bindings before running a manga OCR volume job',
+      );
+    }
+    final _IsolateVolumeJob job = _IsolateVolumeJob(onProgress, onAcceleration);
+    job.spawn(request, factoryBuilder);
+    return job;
+  }
+}
+
+class _IsolateVolumeJob implements MangaOcrVolumeJob {
+  _IsolateVolumeJob(this._onProgress, this._onAcceleration);
+
+  final void Function(int pagesDone, int pagesTotal, int pageIndex) _onProgress;
+  final void Function(MangaOcrAcceleration acceleration)? _onAcceleration;
+  final Completer<String> _completer = Completer<String>();
+  final ReceivePort _events = ReceivePort();
+  SendPort? _control;
+  bool _cancelRequested = false;
+
+  /// 控制端口到手前收到的焦点页（isolate 还在起），到手后补发。
+  int? _pendingFocus;
+
+  @override
+  Future<String> get result => _completer.future;
+
+  void spawn(
+    MangaOcrVolumeJobRequest request,
+    OcrSessionFactory Function() factoryBuilder,
+  ) {
+    _events.listen(_onMessage);
+    unawaited(() async {
+      try {
+        await Isolate.spawn<_JobIsolateArgs>(
+          _volumeJobIsolateMain,
+          _JobIsolateArgs(
+            events: _events.sendPort,
+            factoryBuilder: factoryBuilder,
+            bootstrap: ocrIsolateBootstrap,
+            bootstrapArg: ocrIsolateBootstrapArg,
+            imageDirPath: request.imageDirPath,
+            modelPaths: request.modelPaths,
+            engineSignature: request.engineSignature,
+            startPage: request.startPage,
+          ),
+          onError: _events.sendPort,
+          debugName: 'manga_ocr_volume_job',
+        );
+      } catch (e, stack) {
+        _finishError(StateError('failed to spawn OCR isolate: $e'), stack);
+      }
+    }());
+  }
+
+  void _onMessage(Object? message) {
+    if (message is _JobControlPortMessage) {
+      _control = message.controlPort;
+      if (_cancelRequested) {
+        message.controlPort.send(_kJobCancelMessage);
+      }
+      final int? focus = _pendingFocus;
+      _pendingFocus = null;
+      if (focus != null) message.controlPort.send(_JobFocusMessage(focus));
+      return;
+    }
+    if (message is _JobAccelerationMessage) {
+      if (!_completer.isCompleted) {
+        _onAcceleration?.call(message.acceleration);
+      }
+      return;
+    }
+    if (message is _JobProgressMessage) {
+      if (!_completer.isCompleted) {
+        _onProgress(message.pagesDone, message.pagesTotal, message.pageIndex);
+      }
+      return;
+    }
+    if (message is _JobDoneMessage) {
+      if (!_completer.isCompleted) {
+        _completer.complete(message.mangaJsonPath);
+      }
+      _events.close();
+      return;
+    }
+    if (message is _JobCancelledMessage) {
+      _finishError(const OcrCancelledException(), StackTrace.current);
+      return;
+    }
+    if (message is _JobErrorMessage) {
+      _finishError(
+        StateError('manga OCR job failed: ${message.message}'),
+        StackTrace.fromString(message.stackTrace),
+      );
+      return;
+    }
+    if (message is List<Object?> && message.length == 2) {
+      // Isolate.spawn onError 的未捕获错误通道（[error, stackTrace] 字符串对）。
+      _finishError(
+        StateError('manga OCR isolate crashed: ${message[0]}'),
+        StackTrace.fromString('${message[1]}'),
+      );
+    }
+  }
+
+  void _finishError(Object error, StackTrace stack) {
+    if (!_completer.isCompleted) {
+      _completer.completeError(error, stack);
+    }
+    _events.close();
+  }
+
+  @override
+  void cancel() {
+    _cancelRequested = true;
+    _control?.send(_kJobCancelMessage);
+  }
+
+  @override
+  void focus(int pageIndex) {
+    final SendPort? control = _control;
+    if (control == null) {
+      _pendingFocus = pageIndex;
+    } else {
+      control.send(_JobFocusMessage(pageIndex));
+    }
+  }
+}
+
+/// [MangaOcrService] 真实实现。
+class MangaOcrServiceImpl
+    implements MangaOcrService, MangaOcrFocusableService, MangaOcrPageService {
+  MangaOcrServiceImpl({
+    Future<Directory> Function()? modelsDirProvider,
+    MangaOcrModelDownloader? downloader,
+    List<MangaOcrModelFile>? manifest,
+    MangaOcrVolumeJobRunner? jobRunner,
+    MangaOcrPageSessionRunner? pageSessionRunner,
+    bool Function()? platformSupport,
+    this.localModel = kDefaultMangaOcrLocalModel,
+  }) : _modelsDirProvider = modelsDirProvider ?? localModel.modelsDirectory,
+       _downloader = downloader ?? MangaOcrModelDownloader(),
+       _manifest = manifest ?? localModel.manifest,
+       _jobRunner = jobRunner ?? const IsolateMangaOcrVolumeJobRunner(),
+       _pageSessionRunner =
+           pageSessionRunner ?? const IsolateMangaOcrPageSessionRunner(),
+       _platformSupport = platformSupport ?? defaultPlatformSupport;
+
+  final Future<Directory> Function() _modelsDirProvider;
+  final MangaOcrModelDownloader _downloader;
+  final List<MangaOcrModelFile> _manifest;
+  final MangaOcrVolumeJobRunner _jobRunner;
+  final MangaOcrPageSessionRunner _pageSessionRunner;
+  final bool Function() _platformSupport;
+  final MangaOcrLocalModel localModel;
+
+  /// 默认模型目录：`<appSupport>/ocr_models/manga`（经 [AppPaths] 数据根
+  /// 单一入口，不硬编码平台路径）。指纹层与本类共用同一个解析函数。
+  static Future<Directory> defaultMangaOcrModelsDir() =>
+      model_fp.defaultMangaOcrModelsDir();
+
+  /// 整卷本地 OCR 的平台闸门 = **本机确有 ORT native**（[isLocalOnnxRuntimeAvailable]），
+  /// 不再维护第二份平台白名单。
+  ///
+  /// 白名单存在的那段时间里，这一个布尔位承担了两个**互不相同**的语义——「本机能
+  /// 不能跑本地 ONNX 推理」和「整卷这种重活允不允许」。设置页的模型区（下载 / 删除 /
+  /// 占用）和框选识别只需要前者，却被后者连坐关掉：安卓因此陷入「点框选识别 → 提示
+  /// 去设置下载模型 → 设置里根本没有下载按钮」的死循环，已下一半的几百 MB 既下不完
+  /// 也删不掉（BUG-1780）。一个概念一个真相源，这类特殊情况才不会再长出来。
+  ///
+  /// macOS 是 2026-08 随 flutter_onnxruntime fork 重新接上 Apple native 后开的：
+  /// 它就是桌面，和 Windows / Linux 同一档重活预算。
+  ///
+  /// iOS 一并开——整卷是重活，但 iPhone/iPad 上既没有外部 mokuro CLI 也没有桌面
+  /// 可用，不开就等于「iOS 永远没有本地整卷 OCR」。
+  ///
+  /// **Android 于 2026-08-23 开启**（BUG-1780，用户明确要求）：它此前不开的理由
+  /// 不是技术阻塞——ORT native 一直正常注册，执行提供者也早有明确定义
+  /// （[selectOcrExecutionProviders] 对 android 返回纯 CPU）——而是低端机的重活
+  /// 预算顾虑。那是「慢」，与下面 A13 的量级同档；做成硬闸门等于替用户做了决定，
+  /// 还顺手废掉了本该可用的模型管理和框选识别。
+  ///
+  /// 说清楚一件事，免得下一个人误读：框选识别的闸门（`isLocalRescanSupported`）
+  /// 一直是 ORT 可用性、在安卓一直为真，但**这不等于它在安卓跑过**——模型下载
+  /// 入口被这同一个位连坐关掉，门开着而门后没路。所以本次是 Android 上第一次
+  /// 真正执行 ORT，与 BUG-1613 里 Apple CoreML「分支存在但从未被执行」同形，
+  /// 别把「闸门为真」当成「已验证」。
+  ///
+  /// **真机实测（2026-08-14，`integration_test/manga_ocr_volume_e2e_itest.dart`，
+  /// 4 块竖排气泡的 1200×1700 页，识别逐字 100% 正确）**：
+  ///
+  /// | 设备 | 每页 | 构成 |
+  /// |---|---|---|
+  /// | macOS 26.6（M 系列） | 2.7s | 检测 148ms + 识别 4 块 |
+  /// | iPhone SE 2（A13, iOS 26.6） | 13.9s | 检测 381ms + 识别 4 块 |
+  ///
+  /// A13 是当前最低档的在役 iPhone；识别耗时**随页内文字块数线性增长**，真实漫画
+  /// 一页 10~15 块，A13 上折合约 35~50s/页。也就是说整卷在老机型上是「挂着跑几
+  /// 小时」的量级——能用，但别当交互操作。新机型（A17/A18）大致快 3~4 倍。
+  /// 用户不接受这个量级时，向导里的「已配对主机代跑」和 Google Lens 仍在。
+  static bool defaultPlatformSupport() => isLocalOnnxRuntimeAvailable;
+
+  @override
+  bool get isSupportedPlatform => _platformSupport();
+
+  /// 清单是否齐全（只 stat 清单里那几个文件，不遍历目录）。
+  ///
+  /// 与 [modelStatus] 分开：跑 OCR 的热路径只需要这个答案，而占用统计要递归遍历
+  /// 整个模型目录——把两者绑在一起等于让每次开跑都白扫一遍磁盘。
+  Future<bool> _manifestComplete() async {
+    final Directory dir = await _modelsDirProvider();
+    return _manifest.every(
+      (MangaOcrModelFile model) =>
+          isMangaOcrModelFileReady(File(p.join(dir.path, model.fileName))),
+    );
+  }
+
+  @override
+  Future<MangaOcrModelStatus> modelStatus() async {
+    final Directory dir = await _modelsDirProvider();
+    bool detectorReady = true;
+    bool recognizerReady = true;
+    int totalBytes = 0;
+    int obtainedBytes = 0;
+    for (final MangaOcrModelFile model in _manifest) {
+      totalBytes += model.expectedBytes;
+      final File file = File(p.join(dir.path, model.fileName));
+      if (isMangaOcrModelFileReady(file)) {
+        obtainedBytes += file.lengthSync();
+        continue;
+      }
+      // 未就绪的文件若留着 `.part`，那些字节下次点下载会被 Range 续上，必须
+      // 算进「已下多少」——否则用户看到的进度会在每次重进设置页时归零。
+      final File part = File('${file.path}.part');
+      if (part.existsSync()) {
+        obtainedBytes += part.lengthSync();
+      }
+      if (model.role == MangaOcrModelRole.detector) {
+        detectorReady = false;
+      } else {
+        recognizerReady = false;
+      }
+    }
+    return MangaOcrModelStatus(
+      detectorReady: detectorReady,
+      recognizerReady: recognizerReady,
+      // 占用按目录实际大小，不按清单累加：`.part` 残留与遗留旧档同样占磁盘，
+      // 用户看到的数字必须能被「删除」兑现（BUG-1732）。
+      diskBytes: await measureDirectoryBytes(dir),
+      totalBytes: totalBytes,
+      obtainedBytes: obtainedBytes,
+    );
+  }
+
+  @override
+  Stream<MangaOcrDownloadEvent> downloadModels() async* {
+    final Directory dir = await _modelsDirProvider();
+    // 已就绪的文件下载器会跳过（仍发一条满额进度）。
+    yield* _downloader.downloadAll(files: _manifest, targetDir: dir);
+  }
+
+  @override
+  Future<int> deleteModels() async {
+    final Directory dir = await _modelsDirProvider();
+    if (!await dir.exists()) {
+      return 0;
+    }
+    // 先量后删：删完再量只会得到 0，用户就永远拿不到「到底释放了多少」。
+    final int freed = await measureDirectoryBytes(dir);
+    await dir.delete(recursive: true);
+    return freed;
+  }
+
+  Future<MangaOcrModelPaths> _resolveModelPaths() async {
+    final Directory dir = await _modelsDirProvider();
+    String pathOf(MangaOcrModelRole role, String suffix) {
+      final MangaOcrModelFile model = _manifest.firstWhere(
+        (MangaOcrModelFile m) => m.role == role && m.fileName.endsWith(suffix),
+        orElse: () =>
+            throw StateError('manifest missing $role file with suffix $suffix'),
+      );
+      return p.join(dir.path, model.fileName);
+    }
+
+    switch (localModel) {
+      case MangaOcrLocalModel.mangaCtc:
+        final String ctcRecPath = pathOf(
+          MangaOcrModelRole.recognizer,
+          kMangaCtcRecFileName,
+        );
+        return MangaOcrModelPaths(
+          detectorPath: pathOf(MangaOcrModelRole.detector, '.onnx'),
+          ppDetPath: pathOf(MangaOcrModelRole.recognizer, kPpOcrDetFileName),
+          ppRecPath: ctcRecPath,
+          ppRecDictPath: pathOf(
+            MangaOcrModelRole.recognizer,
+            kPpOcrRecDictFileName,
+          ),
+          ctcRecPath: ctcRecPath,
+        );
+    }
+  }
+
+  /// 跑本地 OCR 前的共同闸门：平台支持 + 模型齐全，返回各模型文件的绝对路径。
+  Future<MangaOcrModelPaths> _checkedModelPaths() async {
+    if (!isSupportedPlatform) {
+      throw StateError(
+        'manga OCR is not supported on ${Platform.operatingSystem}',
+      );
+    }
+    // 只问「齐不齐」，不量「占多少」：占用统计要递归遍历整个模型目录，
+    // 那是设置页展示的开销，没有理由压在每次开跑 OCR 的路径上。
+    if (!await _manifestComplete()) {
+      throw StateError('manga OCR models are not downloaded');
+    }
+    return _resolveModelPaths();
+  }
+
+  /// 页级缓存签名的**唯一**来源：按本服务的模型目录与清单解析已安装模型指纹
+  /// （BUG-1173）。[resolvePageCacheDirPath] 与 [openPageSession] 都经这里，
+  /// 会话 isolate 直接用传进去的签名，不再按 detectorPath 重算——注入自定义
+  /// 模型目录时读写缓存也不会分叉到两个目录。
+  Future<String> _pageEngineSignature() async =>
+      model_fp.resolveLocalMangaOcrEngineSignature(
+        await _modelsDirProvider(),
+        manifest: _manifest,
+        baseSignature: localModel.cacheSignature,
+      );
+
+  static String _pageCacheDirPath(String imageDirPath, String signature) =>
+      p.join(
+        imageDirPath,
+        kMangaOcrOutDirName,
+        kMangaOcrPagesCacheDirName,
+        signature,
+      );
+
+  @override
+  Future<String> resolvePageCacheDirPath({
+    required String imageDirPath,
+  }) async => _pageCacheDirPath(imageDirPath, await _pageEngineSignature());
+
+  @override
+  Future<MangaOcrPageSession> openPageSession({
+    required String imageDirPath,
+    void Function(MangaOcrAcceleration acceleration)? onAcceleration,
+    bool textImagesOnly = false,
+  }) async {
+    final MangaOcrModelPaths modelPaths = await _checkedModelPaths();
+    final String signature = await _pageEngineSignature();
+    return _pageSessionRunner.open(
+      MangaOcrPageSessionRequest(
+        imageDirPath: imageDirPath,
+        modelPaths: modelPaths,
+        engineSignature: signature,
+        textImagesOnly: textImagesOnly,
+      ),
+      onAcceleration: onAcceleration,
+    );
+  }
+
+  @override
+  Stream<MangaOcrVolumeEvent> ocrFolder({
+    required String imageDirPath,
+    String? volumeTitle,
+    int startPage = 0,
+    MangaOcrPageFocus? focus,
+  }) {
+    final StreamController<MangaOcrVolumeEvent> controller =
+        StreamController<MangaOcrVolumeEvent>();
+    MangaOcrVolumeJob? job;
+    bool cancelled = false;
+    int lastTotal = 0;
+    MangaOcrAcceleration? acceleration;
+    void forwardFocus(int pageIndex) => job?.focus(pageIndex);
+
+    controller.onListen = () {
+      unawaited(() async {
+        try {
+          final MangaOcrModelPaths modelPaths = await _checkedModelPaths();
+          final String engineSignature = await _pageEngineSignature();
+          if (cancelled) {
+            // 订阅在模型检查期间已被取消：任务根本不启动。
+            return;
+          }
+          job = _jobRunner.start(
+            MangaOcrVolumeJobRequest(
+              imageDirPath: imageDirPath,
+              modelPaths: modelPaths,
+              volumeTitle: volumeTitle,
+              engineSignature: engineSignature,
+              startPage: startPage,
+            ),
+            onProgress: (int done, int total, int pageIndex) {
+              lastTotal = total;
+              if (!controller.isClosed) {
+                controller.add(
+                  MangaOcrVolumeEvent.page(
+                    pagesDone: done,
+                    pagesTotal: total,
+                    pageIndex: pageIndex,
+                    acceleration: acceleration,
+                  ),
+                );
+              }
+            },
+            onAcceleration: (MangaOcrAcceleration resolved) {
+              acceleration = resolved;
+            },
+          );
+          if (focus != null) {
+            // 模型检查期间读者已翻过页：先补一次，之后每次翻页实时转发。
+            final int? pending = focus.take();
+            if (pending != null) job!.focus(pending);
+            focus.addListener(forwardFocus);
+          }
+          final String mangaJsonPath = await job!.result;
+          if (!controller.isClosed) {
+            controller.add(
+              MangaOcrVolumeEvent.finished(
+                pagesTotal: lastTotal,
+                mangaJsonPath: mangaJsonPath,
+                acceleration: acceleration,
+              ),
+            );
+          }
+        } on OcrCancelledException {
+          // 取消订阅即请求中止：静默收流，不当错误。
+        } catch (e, stack) {
+          if (!controller.isClosed) {
+            controller.addError(e, stack);
+          }
+        } finally {
+          focus?.removeListener(forwardFocus);
+          if (!controller.isClosed) {
+            await controller.close();
+          }
+        }
+      }());
+    };
+    controller.onCancel = () {
+      cancelled = true;
+      focus?.removeListener(forwardFocus);
+      job?.cancel();
+    };
+    return controller.stream;
+  }
+}

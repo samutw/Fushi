@@ -1,0 +1,263 @@
+/// 下载模式资源候选的「版本」聚类（纯函数，参照 RSS-Subtitle-Manager 的
+/// Nyaa 版本选择器）：几十条发布流水账 → 少数几张「发布组 › 清晰度」版本卡。
+///
+/// 订阅模式已有按订阅生效单位的聚合（`groupVideoSubscriptionCandidates`，
+/// BUG-1590）；本模块服务**下载模式**：用户最终要挑的是一条具体发布，聚类只
+/// 负责把「哪个组哪个清晰度」这层决策折起来，选组后再展开挑集。
+library;
+
+import 'package:fushi_engine/media/torrent/video_resource_provider.dart';
+import 'package:fushi_engine/media/video/download/subscription_release_scope.dart';
+
+/// 从发布标题解析集号（`S01E05` / `Title - 05 [1080p]` 两种主流形态）。
+/// 认不出返回 null。纯函数（原居 acquisition dialogs，聚类需要后下沉到此，
+/// dialogs 侧 re-export 保源兼容）。
+final RegExp _seasonEpisodePattern = RegExp(
+  r'\bS(\d{1,3})[ ._-]*E(\d{1,4})(?:v\d+)?\b',
+  caseSensitive: false,
+);
+// 右边界只认开括号与串尾，所以集号写在块**内部**的 `[4th - 14][总第80]` 这一族
+// 在这里解不出集号（`14` 后面跟的是 `]`）。**刻意不在 BUG-2146 里放宽**：这个
+// 函数用 firstMatch，放宽右边界会让更靠左的位置抢答 ——
+// `[Anime Time - 2] Show - 05` 解成 2、`[Title [Vol.1 - 2] - 05]` 解成 2、
+// 合集 `[01 - 12]` 从 null 变成 12、`（1979 - 2005）` 解成 2005。后果是版本卡的
+// 集号标签与「从第 N 集之后」订阅起点被填错值（比原先的空更糟）。
+// 要真修得先用 isLikelyBatchVideoRelease 排掉区间形态、并约束命中位置不落在开头的
+// 发布组标签里，那是独立于本 bug 的改动。见 BUG-2146 的「已知剩余缺口」。
+final RegExp _animeEpisodePattern = RegExp(
+  r'(?:^|\s)-\s*(\d{1,4})(?:v\d+)?(?=\s*(?:\[|\(|$))',
+  caseSensitive: false,
+);
+
+int? episodeNumberFromReleaseTitle(String title) {
+  final RegExpMatch? seasonEpisode = _seasonEpisodePattern.firstMatch(title);
+  if (seasonEpisode != null) return int.tryParse(seasonEpisode.group(2)!);
+  final RegExpMatch? anime = _animeEpisodePattern.firstMatch(title);
+  return anime == null ? null : int.tryParse(anime.group(1)!);
+}
+
+/// 标题开头的发布组标签（`[SubsPlease] xxx` → `SubsPlease`）。
+/// candidate.releaseGroup 缺失时的回退；CRC/分辨率不算组名。
+String? releaseGroupTagFromTitle(String title) {
+  final RegExpMatch? match = RegExp(
+    r'^\s*[\[【]([^\]】]{2,30})[\]】]',
+  ).firstMatch(title);
+  if (match == null) return null;
+  final String tag = match.group(1)!.trim();
+  if (tag.isEmpty) return null;
+  if (RegExp(r'^[0-9a-fA-F]{8}$').hasMatch(tag)) return null;
+  if (RegExp(r'^\d{3,4}[pP]$').hasMatch(tag)) return null;
+  return tag;
+}
+
+String? _releaseGroupOf(VideoResourceCandidate candidate) {
+  final String structured = candidate.releaseGroup?.trim() ?? '';
+  if (structured.isNotEmpty) return structured;
+  return releaseGroupTagFromTitle(candidate.title);
+}
+
+/// 没有发布组字段时，用「只抹掉集号」的标题模板识别同一逐集发布系列。
+///
+/// 不能退成统一空串：那会把不同季、不同编码版本全部混成一组；也不能全部拆成
+/// 单条：综合索引器虽然常缺发布组字段，但同一发布者的逐集标题通常仍有稳定模板。
+/// 只有真的识别到集号才生成模板；电影/合集等没有逐集身份的候选仍保持单条。
+String _unknownReleaseFamilyKey(VideoResourceCandidate candidate) {
+  String title = candidate.title.trim().toLowerCase();
+  bool replacedEpisode = false;
+  title = title.replaceAllMapped(_seasonEpisodePattern, (Match match) {
+    replacedEpisode = true;
+    return 's${match.group(1)}e#';
+  });
+  title = title.replaceAllMapped(_animeEpisodePattern, (Match match) {
+    replacedEpisode = true;
+    return ' - #';
+  });
+  if (!replacedEpisode) return 'single:${candidate.identityKey}';
+  // 每集不同的 CRC 不属于发布系列身份；其它编码、音轨、来源等技术标记保留，
+  // 因而 MULTi x264-AMBER 与普通 H264 不会因为同季同清晰度而误合并。
+  title = title.replaceAll(RegExp(r'[\[\(][0-9a-f]{8}[\]\)]'), '');
+  title = title.replaceAll(RegExp(r'\s+'), ' ').trim();
+  return 'template:$title';
+}
+
+/// 标题里的清晰度（candidate.resolution 缺失时的回退）。
+String? resolutionFromTitle(String title) => RegExp(
+  r'\b(2160|1440|1080|720|576|480)[pP]\b',
+).firstMatch(title)?.group(0)?.toLowerCase();
+
+/// 这条发布是不是整季合集（batch）。
+///
+/// 判据本身在引擎侧 [looksLikeBatchVideoRelease] 一处：订阅创建端、订阅检查端
+/// 与这里的版本卡必须给出同一个答案，否则就会重演「UI 认它是单集、服务端认它是
+/// 合集」这种两端打架的空订阅（BUG-2619）。这里只保留本层的名字。
+bool isLikelyBatchVideoRelease(String title) =>
+    looksLikeBatchVideoRelease(title);
+
+/// 一张资源「版本卡」：同来源实例、同发布组、同清晰度、同 trusted 的发布集合。
+class VideoResourceVersionGroup {
+  VideoResourceVersionGroup._({required this.key, required this.members});
+
+  final String key;
+
+  /// 集号升序（认不出的殿后），同集按发布时间降序。
+  final List<VideoResourceCandidate> members;
+
+  String get providerId => members.first.providerId;
+  bool get trusted => members.first.trusted;
+
+  String? get releaseGroup => _releaseGroupOf(members.first);
+
+  String? get resolution =>
+      members.first.resolution ?? resolutionFromTitle(members.first.title);
+
+  /// 卡标题的组成部分（缺段跳过）：组名、清晰度、来源。
+  List<String> get labelParts => <String>[
+    if (releaseGroup != null) releaseGroup!,
+    if (resolution != null) resolution!,
+    providerId,
+  ];
+
+  Set<int> get episodes => <int>{
+    for (final VideoResourceCandidate member in members)
+      if (episodeNumberFromReleaseTitle(member.title) != null)
+        episodeNumberFromReleaseTitle(member.title)!,
+  };
+
+  int get batchCount => members
+      .where(
+        (VideoResourceCandidate member) =>
+            isLikelyBatchVideoRelease(member.title),
+      )
+      .length;
+
+  DateTime? get latestPublishedAt {
+    DateTime? latest;
+    for (final VideoResourceCandidate member in members) {
+      final DateTime? at = member.publishedAt;
+      if (at != null && (latest == null || at.isAfter(latest))) latest = at;
+    }
+    return latest;
+  }
+
+  int get bestSeeders => members.fold(
+    0,
+    (int best, VideoResourceCandidate member) =>
+        member.seeders > best ? member.seeders : best,
+  );
+
+  /// 代表条：做种最多 → 最新 → 标题（全序，渲染稳定）。
+  VideoResourceCandidate get representative {
+    final List<VideoResourceCandidate> sorted = List<VideoResourceCandidate>.of(
+      members,
+    )..sort(_bySeedersDesc);
+    return sorted.first;
+  }
+}
+
+int _bySeedersDesc(VideoResourceCandidate a, VideoResourceCandidate b) {
+  final int bySeeders = b.seeders.compareTo(a.seeders);
+  if (bySeeders != 0) return bySeeders;
+  final DateTime? pa = a.publishedAt;
+  final DateTime? pb = b.publishedAt;
+  if (pa != null && pb != null) {
+    final int byDate = pb.compareTo(pa);
+    if (byDate != 0) return byDate;
+  } else if (pa != pb) {
+    return pa == null ? 1 : -1;
+  }
+  return a.title.compareTo(b.title);
+}
+
+String _groupKeyOf(VideoResourceCandidate candidate) {
+  final String? releaseGroup = _releaseGroupOf(candidate);
+  return <String>[
+    candidate.providerId,
+    candidate.providerInstanceId,
+    // 发布组缺失时仍允许按稳定的逐集标题模板聚合，但不能退成统一空串。
+    releaseGroup?.toLowerCase() ?? _unknownReleaseFamilyKey(candidate),
+    (candidate.resolution ?? resolutionFromTitle(candidate.title) ?? '')
+        .toLowerCase(),
+    candidate.trusted ? 'trusted' : '',
+  ].join('\u001f');
+}
+
+int _byEpisodeAsc(VideoResourceCandidate a, VideoResourceCandidate b) {
+  final int episodeA = episodeNumberFromReleaseTitle(a.title) ?? (1 << 30);
+  final int episodeB = episodeNumberFromReleaseTitle(b.title) ?? (1 << 30);
+  if (episodeA != episodeB) return episodeA.compareTo(episodeB);
+  return _bySeedersDesc(a, b);
+}
+
+/// 聚类 + 排序。组间：**输入相关度次序**（组内最靠前那条的名次）→ 最高做种数降序
+/// → 最新发布降序 → key（稳定）。
+///
+/// 相关度必须是主键，不能上来就按做种数排：`VideoResourceRegistry` 在返回前专门跑过
+/// `rankVideoResourcesByRelevance`（按季号/标题贴合度），它存在的全部理由就是
+/// 「Nyaa 只做模糊词匹配，搜 "xxx 2" 会被做种更多的 S1/S3 压在前面」。组间再按做种数
+/// 重排等于把那个已修的 bug 原样放回主路径——用户搜第二季，第一季的版本卡回到第一位。
+/// 做种数退为**同等相关度内**的次级信号。
+List<VideoResourceVersionGroup> buildVideoResourceVersionGroups(
+  Iterable<VideoResourceCandidate> candidates,
+) {
+  final Map<String, List<VideoResourceCandidate>> byKey =
+      <String, List<VideoResourceCandidate>>{};
+  // 输入次序 = 上游给的相关度名次；记下每组里最靠前的那个名次。
+  final Map<String, int> bestRank = <String, int>{};
+  int rank = 0;
+  for (final VideoResourceCandidate candidate in candidates) {
+    final String key = _groupKeyOf(candidate);
+    byKey.putIfAbsent(key, () => <VideoResourceCandidate>[]).add(candidate);
+    final int? seen = bestRank[key];
+    if (seen == null || rank < seen) bestRank[key] = rank;
+    rank++;
+  }
+  final List<VideoResourceVersionGroup> groups = <VideoResourceVersionGroup>[
+    for (final MapEntry<String, List<VideoResourceCandidate>> entry
+        in byKey.entries)
+      VideoResourceVersionGroup._(
+        key: entry.key,
+        members: List<VideoResourceCandidate>.unmodifiable(
+          entry.value..sort(_byEpisodeAsc),
+        ),
+      ),
+  ];
+  groups.sort((VideoResourceVersionGroup a, VideoResourceVersionGroup b) {
+    final int byRank = (bestRank[a.key] ?? 1 << 30).compareTo(
+      bestRank[b.key] ?? 1 << 30,
+    );
+    if (byRank != 0) return byRank;
+    final int bySeeders = b.bestSeeders.compareTo(a.bestSeeders);
+    if (bySeeders != 0) return bySeeders;
+    final DateTime? pa = a.latestPublishedAt;
+    final DateTime? pb = b.latestPublishedAt;
+    if (pa != null && pb != null) {
+      final int byDate = pb.compareTo(pa);
+      if (byDate != 0) return byDate;
+    } else if (pa != pb) {
+      return pa == null ? 1 : -1;
+    }
+    return a.key.compareTo(b.key);
+  });
+  return List<VideoResourceVersionGroup>.unmodifiable(groups);
+}
+
+/// 从版本卡解析「用户要的那一集」：
+/// - [episode] 非空：集号精确命中 → 该发布（同集多条取代表序最优）；否则 null；
+/// - [episode] 为空：组里恰 1 条 → 它；否则 null（UI 展开手选）。
+VideoResourceCandidate? pickResourceVersionCandidate(
+  VideoResourceVersionGroup group, {
+  int? episode,
+}) {
+  if (episode != null) {
+    final List<VideoResourceCandidate> hits =
+        group.members
+            .where(
+              (VideoResourceCandidate member) =>
+                  episodeNumberFromReleaseTitle(member.title) == episode,
+            )
+            .toList()
+          ..sort(_bySeedersDesc);
+    return hits.isEmpty ? null : hits.first;
+  }
+  return group.members.length == 1 ? group.members.single : null;
+}

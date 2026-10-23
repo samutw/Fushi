@@ -1,0 +1,241 @@
+import 'dart:io';
+
+import 'package:path/path.dart' as p;
+
+import 'package:fushi_engine/media/audiobook/text_to_epub.dart';
+
+/// 一个待导入路径的**载体身份**：它到底是哪种东西，因而该交给哪个 importer。
+///
+/// 此前这个判断只活在 `BookImportDialog._importEpubOnly` 的函数体末尾——用户从
+/// 漫画库进来时「这是漫画」本来是已知的，却在入口被丢掉，一路走到导入执行阶段
+/// 再靠扩展名 + 真读包嗅回来。载体身份提到入口后，漫画和书籍各自有独立入口与
+/// 对话框，`isImageArchive` 那次真实 IO 只在**扩展名确实二义**时才发生。
+enum ImportCarrier {
+  /// 页图**目录**（一个漫画文件夹）。走 `MangaModule.importImageFolder`。
+  mangaFolder,
+
+  /// **装着整卷载体文件的目录**：目录自身没有页图，但直接子层放着一批
+  /// `.epub` / `.cbz` / `.zip` / `.mokuro`（每个文件一卷）。走
+  /// `MangaModule.importBatchFolder`，逐卷导成独立的一本。
+  ///
+  /// 为什么必须是独立的载体身份（BUG-1649）：此前「目录」只有 [mangaFolder]
+  /// 一种解释，用户在漫画框选一个装着 20 卷 EPUB 的文件夹，会被当成页图目录，
+  /// 扫不到任何图片扩展名的文件，报 `Manga image folder has no pages`——那句话
+  /// 描述的是判定结果，而不是用户做错了什么。目录里装什么是**数据的形状**，
+  /// 不是错误情况，缺的是枚举成员，不是一个更好的错误提示。
+  mangaBatchFolder,
+
+  /// mokuro v0.2+ 的 `.mokuro` OCR 结果文件（+ 同级图片）。
+  /// 走 `MangaModule.importMokuro`。
+  ///
+  /// 也可能是一个**目录**：直接子层恰好一个 `.mokuro`（BUG-2785）。消费方须经
+  /// `MangaModule.directorySingleMokuroPath` 换成那个文件再导入。
+  mangaMokuro,
+
+  /// 图片压缩包：`.cbz` / `.cbr` / `.rar` / `.cb7`，或真读包确认装的是
+  /// 页图的 `.zip` / `.epub`。
+  /// 走 `MangaModule.importArchive`。
+  mangaArchive,
+
+  /// PDF。走 `PdfImporter`（真渲染，不经 TextToEpub 文本转换）。
+  pdf,
+
+  /// EPUB。走 `EpubImporter.importFromPath`。
+  epub,
+
+  /// 可转成 EPUB 的纯文本类（txt/md/html/…），以及不认识的扩展名。
+  /// 走 `TextToEpub.convert` + `EpubImporter.import`。
+  text;
+
+  /// 是否属漫画域（四种漫画载体的统称）。书籍侧入口只关心这一个问题。
+  bool get isManga =>
+      this == ImportCarrier.mangaFolder ||
+      this == ImportCarrier.mangaBatchFolder ||
+      this == ImportCarrier.mangaMokuro ||
+      this == ImportCarrier.mangaArchive;
+
+  /// 能不能在漫画库里成为一本漫画。= [isManga] + [ImportCarrier.pdf]。
+  ///
+  /// 为什么不是把 pdf 塞进 [isManga]：两个入口问的**不是同一个问题**。
+  /// - 书籍框问 [isManga]：「这东西该不该被转交给漫画流程？」PDF 的答案是**否**
+  ///   ——它在书籍框里有自己的正经去向（[ImportCarrier.pdf] → `PdfImporter`，
+  ///   落成一本 PDF 书进 PDF 阅读器）。把 pdf 并进 isManga，从书架选一份 PDF
+  ///   就会弹「这是漫画」并被转走，那是把一个正确行为改坏。
+  /// - 漫画框问本判据：「这东西能不能变成一本漫画？」PDF 的答案是**能**——逐页
+  ///   栅格化即页图，转化引擎（`book_format_rebuild.dart`）本来就在做这件事。
+  ///
+  /// 此前漫画框直接问 isManga，于是「PDF 能不能变成漫画」这个问题从来没被问过，
+  /// 漫画框选不中 PDF、硬塞进去也被当成「不支持的格式」挡回（用户实报）。
+  bool get isMangaCapable => isManga || this == ImportCarrier.pdf;
+}
+
+/// 单个文件可以承载「一整卷漫画」的扩展名（带点，小写）。
+///
+/// 这是**唯一真相源**：漫画框的文件选择器白名单、目录批量导入的候选枚举、
+/// 以及 [classifyImportCarrier] 的目录分支都从这里取。三处各自手抄的话，
+/// 「选得中但导不了」或「批量漏掉某种卷」这类漂移迟早出现。
+///
+/// `.zip` / `.epub` 在列是因为它们与词典包 / 普通电子书同形——光看扩展名分不出，
+/// 真定性仍由 [classifyImportCarrier] 的 `isImageArchive` 开包完成。
+///
+/// `.pdf` 在列是因为一卷扫描版漫画常常就是一份 PDF：逐页栅格化即页图。它的载体
+/// 身份仍是 [ImportCarrier.pdf]（书籍框据此走 `PdfImporter`），漫画侧的「能不能
+/// 变成漫画」由 [ImportCarrier.isMangaCapable] 单独回答，两边不打架。
+const Set<String> kMangaCarrierFileExtensions = <String>{
+  '.mokuro',
+  '.cbz',
+  '.cbr',
+  '.rar',
+  '.cb7',
+  '.zip',
+  '.epub',
+  '.pdf',
+};
+
+/// 判定 [path] 的载体身份。
+///
+/// 文件系统判据由调用方注入（与 `classifyDroppedFiles` 同款设计），本函数自身
+/// 不碰 IO，故可在纯 Dart 测试里穷举各分支：
+///
+/// - [isDirectory]：目录判定。**必须最先问**——目录没有扩展名，而目录名带点时
+///   `p.extension` 还会误取出一个假扩展名，落到任何按扩展名分派的分支都会失败。
+/// - [isImageArchive]：真读包判定，只在扩展名二义（`.zip` / `.epub`）时才被调用。
+///   `.zip` 同时是 Yomitan 词典包扩展名，`.epub` 也可能是扫描版漫画——光看扩展名
+///   分不出，必须开包看里面装的是不是页图。
+/// - [directoryHasPageImages]：目录里有没有页图，判据必须与真正执行导入的枚举
+///   同源（`enumerateMangaPages`），否则会出现「判定说是页图目录、导入却扫不到页」。
+/// - [directoryCarrierFileCount]：目录**直接子层**里有几个 [kMangaCarrierFileExtensions]
+///   文件。只看扩展名（便宜），真定性推迟到逐卷导入时——那时反正要开包。
+/// - [directoryMokuroFileCount]：目录**直接子层**里有几个 `.mokuro`。
+ImportCarrier classifyImportCarrier(
+  String path, {
+  required bool Function(String path) isDirectory,
+  required bool Function(String path) isImageArchive,
+  required bool Function(String path) directoryHasPageImages,
+  required int Function(String path) directoryCarrierFileCount,
+  required int Function(String path) directoryMokuroFileCount,
+}) {
+  if (isDirectory(path)) {
+    // `.mokuro` 先于页图（BUG-2785）：mokuro 的标准产物就是「`卷.mokuro` + 同名页图
+    // 子目录」，用户选的恰是装着这两样的文件夹。页图判据会递归压平进子目录、先把它
+    // 认成页图目录，于是 OCR 结果被静默丢掉、导成一本没字的漫画。`.mokuro` 是这个
+    // 目录里**信息量最大**的东西，它在就按它导：一个 = 这一卷（调用方把路径换成那个
+    // 文件），多个 = 一批卷（逐卷各带各的 OCR）。
+    final int mokuroCount = directoryMokuroFileCount(path);
+    if (mokuroCount == 1) return ImportCarrier.mangaMokuro;
+    if (mokuroCount > 1) return ImportCarrier.mangaBatchFolder;
+    // 页图优先：有页图就是一卷页图目录，与改动前的行为逐字节一致。目录里
+    // 同时躺着页图和整卷文件时，页图这条解释更贴近用户点「选文件夹」的意图。
+    if (directoryHasPageImages(path)) return ImportCarrier.mangaFolder;
+    if (directoryCarrierFileCount(path) > 0) {
+      return ImportCarrier.mangaBatchFolder;
+    }
+    // 空目录 / 既无页图也无整卷文件：仍按页图目录走，让导入器抛那句
+    // 「没有页」——这里没有比它更准确的话可说。
+    return ImportCarrier.mangaFolder;
+  }
+
+  final String ext = p.extension(path).toLowerCase();
+
+  // PDF 必须在下面的文本分支之前早退——否则 PDF 二进制会被当文本转成乱码 EPUB。
+  if (ext == '.pdf') return ImportCarrier.pdf;
+
+  // .mokuro 同理：它的 JSON 内容会被文本分支当纯文本吞掉。
+  if (ext == '.mokuro') return ImportCarrier.mangaMokuro;
+
+  if (<String>{'.cbz', '.cbr', '.rar', '.cb7'}.contains(ext)) {
+    return ImportCarrier.mangaArchive;
+  }
+  if (_ambiguousArchiveExtensions.contains(ext) && isImageArchive(path)) {
+    return ImportCarrier.mangaArchive;
+  }
+
+  // 非 epub/zip 的一切（含无扩展名文件）都尝试按文本转 EPUB——保持既有兜底语义。
+  if (TextToEpub.isSupported(path) || (ext != '.epub' && ext != '.zip')) {
+    return ImportCarrier.text;
+  }
+  return ImportCarrier.epub;
+}
+
+/// 需要真读包才能定性的容器扩展名（带点，小写）。
+const Set<String> _ambiguousArchiveExtensions = <String>{'.zip', '.epub'};
+
+/// 按路径记住一次载体身份的小盒子。
+///
+/// 为什么需要它：`.zip` / `.epub` 的定性要 [classifyImportCarrier] **真开包**
+/// （`isImageArchive` → 全量同步解压），那是导入对话框里唯一一处重量级同步 IO。
+/// 而一次导入里同一个路径会被问到不止一次：选中时的漫画闸门、`_doImport` 的兜底
+/// 闸门、以及真正分派时。每问一次就整包解压一次。有声书对齐路径（EPUB+字幕）尤其
+/// 亏——它根本不进按载体分派那一步，前面那几次开包纯属白开，而分家之前它一次都不开。
+///
+/// 载体身份本来就是路径的函数（这正是 [ImportCarrier] 的立意：身份在**选中那一刻**
+/// 定死，而不是一路嗅到导入执行阶段），所以按路径记住即可。换路径自动失效——key 变了
+/// 就重算，因此不会把上一个文件的判定张冠李戴到下一个文件上。
+///
+/// **不是**靠跳过判据来省 IO：判据一字未动，词典包一票否决照常生效（见
+/// `MangaArchiveImporter.looksLikeImageArchive`）。省掉的只是**重复**问同一个问题。
+class ImportCarrierResolver {
+  ImportCarrierResolver({
+    required this.isDirectory,
+    required this.isImageArchive,
+    required this.directoryHasPageImages,
+    required this.directoryCarrierFileCount,
+    required this.directoryMokuroFileCount,
+  });
+
+  final bool Function(String path) isDirectory;
+  final bool Function(String path) isImageArchive;
+  final bool Function(String path) directoryHasPageImages;
+  final int Function(String path) directoryCarrierFileCount;
+  final int Function(String path) directoryMokuroFileCount;
+
+  String? _cachedKey;
+  ImportCarrier? _cachedCarrier;
+
+  /// 记忆键：路径 + 内容指纹（mtime + 字节数）。
+  ///
+  /// 只用路径当键是不够的——判定本身要**真开包读内容**（`isImageArchive` 要开 zip 看
+  /// 里面有没有页图，目录分支还要数文件），结论随内容变。可达的翻车路径全程在既有 UI 上：
+  /// 用户选了一个还在下载中、中央目录尚未落盘的 `.cbz` → 判成非漫画 → 弹一条
+  /// 「不支持的格式」toast 并 return（**对话框不关、resolver 不销毁**）→ 下载完成后
+  /// 在同一个对话框里重选同一路径 → 单槽命中，`isImageArchive` 根本不再被调用 →
+  /// 返回过期判定 → 继续被拒，只能关掉重开。反向同样成立（已判成漫画包的路径在外部
+  /// 被换成词典 zip，会按漫画收下）。
+  ///
+  /// stat 失败（文件不在了 / 无权限）时键退化成纯路径 + 一个哨兵，宁可多判一次。
+  String _memoKey(String path) {
+    try {
+      final FileStat stat = FileStat.statSync(path);
+      if (stat.type == FileSystemEntityType.notFound) return '$path ?';
+      return '$path ${stat.modified.microsecondsSinceEpoch} '
+          '${stat.size}';
+    } catch (_) {
+      return '$path ?';
+    }
+  }
+
+  /// 判定 [path] 的载体身份；同一个 [path] 且内容未变时连续问只算一次真判定。
+  ImportCarrier resolve(String path) {
+    final String key = _memoKey(path);
+    final ImportCarrier? cached = _cachedCarrier;
+    if (cached != null && _cachedKey == key) return cached;
+    final ImportCarrier carrier = classifyImportCarrier(
+      path,
+      isDirectory: isDirectory,
+      isImageArchive: isImageArchive,
+      directoryHasPageImages: directoryHasPageImages,
+      directoryCarrierFileCount: directoryCarrierFileCount,
+      directoryMokuroFileCount: directoryMokuroFileCount,
+    );
+    _cachedKey = key;
+    _cachedCarrier = carrier;
+    return carrier;
+  }
+
+  /// 丢弃记忆。键已经带内容指纹，正常不需要调它；留给「内容没变但判据本身变了」
+  /// 这种场景（例如用户在对话框里改了受理规则）。
+  void invalidate() {
+    _cachedKey = null;
+    _cachedCarrier = null;
+  }
+}

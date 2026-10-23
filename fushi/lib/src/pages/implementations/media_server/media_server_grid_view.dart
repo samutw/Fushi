@@ -1,0 +1,556 @@
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter/rendering.dart' show SliverConstraints;
+import 'package:fushi/src/focus/fushi_focus_controller.dart';
+import 'package:fushi/src/media/video/media_server/media_server_browser.dart';
+import 'package:fushi/src/pages/implementations/media_server/media_server_routes.dart';
+import 'package:fushi/src/pages/implementations/media_server/media_server_session.dart';
+import 'package:fushi/src/pages/implementations/media_server/media_server_widgets.dart';
+import 'package:fushi/src/utils/components/fushi_m3e_feedback.dart';
+import 'package:fushi/src/utils/components/fushi_search.dart';
+import 'package:fushi/src/utils/components/fushi_staggered_entrance.dart';
+import 'package:fushi/src/utils/components/glass/fushi_icon.dart';
+import 'package:fushi/src/utils/fushi_icons.dart';
+import 'package:fushi/utils.dart';
+
+/// 库 / 文件夹 / BoxSet 的分页网格；搜索框非空时改走 [MediaServerBrowser.search]
+/// （同样分页），排序只对浏览生效。
+///
+/// 翻页**只认** [MediaServerPage.nextStartIndex]：实现侧滤掉非视频域类型后一页的
+/// `items.length` 可能小于服务器实际返回的行数，自己拿 `startIndex + items.length`
+/// 会把下一页前几条重复取回来（契约文档 + `media_server_grid_view_test`）。
+class MediaServerGridView extends StatefulWidget {
+  const MediaServerGridView({
+    required this.session,
+    required this.parentId,
+    required this.title,
+    this.library,
+    this.initialQuery,
+    super.key,
+  });
+
+  final MediaServerSession session;
+
+  /// 媒体库 / 文件夹 / BoxSet id；null = 服务器根。
+  final String? parentId;
+  final String title;
+
+  /// 从媒体库进来时的库（[parentId] == 库 id）。有它且服务器支持
+  /// [MediaServerLibraryItems] 时，默认按库类型列作品（剧 / 电影），页头可切回
+  /// 按文件夹浏览（BUG-3198）。
+  final MediaServerLibrary? library;
+
+  /// 进来时搜索框里已有的关键词（从「搜索所有服务器」的某台「查看全部」进来）。
+  final String? initialQuery;
+
+  @override
+  State<MediaServerGridView> createState() => _MediaServerGridViewState();
+}
+
+class _MediaServerGridViewState extends State<MediaServerGridView> {
+  static const Duration _searchDebounce = Duration(milliseconds: 350);
+
+  final TextEditingController _searchController = TextEditingController();
+  late final FocusNode _searchFocusNode = FocusNode(
+    debugLabel: 'media-server-grid-search-${widget.session.serverId}',
+  );
+  final ScrollController _scrollController = ScrollController();
+
+  Timer? _debounce;
+
+  /// 每次重置分页（换排序 / 换搜索词 / 重试）都 +1；旧请求回来时与它比对，过期就丢。
+  int _generation = 0;
+
+  /// 每次第一页落地 +1：进场窗口的 replayKey。换排序 / 换搜索词 / 重试后的新
+  /// 一屏重新错峰淡入；追加页不动它（滚出来的卡瞬间出现）。
+  int _listEpoch = 0;
+  MediaServerSort _sort = MediaServerSort.name;
+  List<MediaServerItem> _items = const <MediaServerItem>[];
+  int _nextStartIndex = 0;
+  bool _hasMore = false;
+  bool _loading = true;
+  bool _loadingMore = false;
+
+  /// 首页失败（整页错误 + 重试）与追加页失败（保留已有条目 + 底部重试）分开记。
+  Object? _firstPageError;
+  bool _loadMoreFailed = false;
+
+  MediaServerBrowser get _browser => widget.session.browser;
+
+  /// 按文件夹浏览（列库的直接子级）而不是按库类型列作品。
+  bool _folderView = false;
+
+  /// 这一页能在「作品 / 文件夹」两种浏览间切换：从媒体库进来、服务器支持、
+  /// 库有单一作品类型（混合库本来就按文件夹浏览）。
+  bool get _canToggleFolderView {
+    final MediaServerLibrary? library = widget.library;
+    return library != null &&
+        library.kind != MediaServerLibraryKind.mixed &&
+        _browser is MediaServerLibraryItems;
+  }
+
+  void _toggleFolderView() {
+    setState(() => _folderView = !_folderView);
+    unawaited(_reload());
+  }
+
+  String get _query => _searchController.text.trim();
+
+  bool get _searchMode => _query.isNotEmpty;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController.text = widget.initialQuery ?? '';
+    _scrollController.addListener(_onScroll);
+    unawaited(_reload());
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _scrollController
+      ..removeListener(_onScroll)
+      ..dispose();
+    _searchFocusNode.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_scrollController.hasClients) return;
+    if (_scrollController.position.extentAfter < 600) {
+      unawaited(_loadMore());
+    }
+  }
+
+  /// 一页落地后主动补拉：视口没铺满不会有滚动事件；而 `_items` 为空时根本没挂
+  /// `CustomScrollView`（`hasClients == false`），[_onScroll] 会直接 return——搜索
+  /// 把关后首页可以是「0 条命中但 hasMore」（BUG-2608 的第三种形状），这时要绕过
+  /// 滚动控制器直接续扫，否则用户永远停在「无结果」。
+  void _fillViewportAfterPage() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (_scrollController.hasClients) {
+        _onScroll();
+      } else if (_hasMore) {
+        unawaited(_loadMore());
+      }
+    });
+  }
+
+  Future<MediaServerPage> _fetch(int startIndex) {
+    if (_searchMode) {
+      return _browser.search(_query, startIndex: startIndex);
+    }
+    final MediaServerBrowser browser = _browser;
+    final MediaServerLibrary? library = widget.library;
+    if (library != null && !_folderView && browser is MediaServerLibraryItems) {
+      return (browser as MediaServerLibraryItems).listLibraryItems(
+        library: library,
+        startIndex: startIndex,
+        sort: _sort,
+      );
+    }
+    return browser.listChildren(
+      parentId: widget.parentId,
+      startIndex: startIndex,
+      sort: _sort,
+    );
+  }
+
+  /// 重置分页并拉第一页。
+  Future<void> _reload() async {
+    final int generation = ++_generation;
+    // 换排序 / 换搜索词是一份新清单：滚回顶部，否则旧偏移落在新清单尾部会立刻
+    // 触发一次追加拉取，第一屏看到的是第二页。
+    if (_scrollController.hasClients) _scrollController.jumpTo(0);
+    setState(() {
+      _loading = true;
+      _loadingMore = false;
+      _loadMoreFailed = false;
+      _firstPageError = null;
+      _items = const <MediaServerItem>[];
+      _nextStartIndex = 0;
+      _hasMore = false;
+    });
+    try {
+      final MediaServerPage page = await _fetch(0);
+      if (!mounted || generation != _generation) return;
+      setState(() {
+        _items = List<MediaServerItem>.unmodifiable(page.items);
+        _nextStartIndex = page.nextStartIndex;
+        _hasMore = page.hasMore;
+        _loading = false;
+        _listEpoch += 1;
+      });
+      // 首页没铺满视口时不会有滚动事件，主动再问一页（大字体 / 高窗口）。
+      _fillViewportAfterPage();
+    } catch (e) {
+      if (!mounted || generation != _generation) return;
+      setState(() {
+        _firstPageError = e;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _loadMore() async {
+    if (_loading || _loadingMore || !_hasMore || _loadMoreFailed) return;
+    final int generation = _generation;
+    setState(() => _loadingMore = true);
+    try {
+      final MediaServerPage page = await _fetch(_nextStartIndex);
+      if (!mounted || generation != _generation) return;
+      // 进度守卫：服务器某页回 0 行且 nextStartIndex 没前进，而 totalCount 仍说
+      // 有更多——下面的主动补拉会无限续请求，这里把它当作到尾。
+      final bool advanced = page.nextStartIndex > _nextStartIndex;
+      setState(() {
+        _items = List<MediaServerItem>.unmodifiable(<MediaServerItem>[
+          ..._items,
+          ...page.items,
+        ]);
+        _nextStartIndex = page.nextStartIndex;
+        _hasMore = page.hasMore && advanced;
+        _loadingMore = false;
+      });
+      // 追加页也可能没铺满视口（搜索把关后一页可以只剩几条甚至 0 条，BUG-2608；
+      // 浏览滤掉非视频域类型也一样），没有滚动事件就得主动再问一页。
+      _fillViewportAfterPage();
+    } catch (e) {
+      if (!mounted || generation != _generation) return;
+      debugPrint('[media-server] load more failed: $e');
+      setState(() {
+        _loadingMore = false;
+        _loadMoreFailed = true;
+      });
+    }
+  }
+
+  void _retryLoadMore() {
+    setState(() => _loadMoreFailed = false);
+    unawaited(_loadMore());
+  }
+
+  void _scheduleSearch(String _) {
+    _debounce?.cancel();
+    // 输入一变就作废在途响应：等防抖到期再作废会让旧词的结果闪现一帧。
+    _generation += 1;
+    _debounce = Timer(_searchDebounce, () => unawaited(_reload()));
+  }
+
+  void _submitSearch(String _) {
+    _debounce?.cancel();
+    unawaited(_reload());
+  }
+
+  void _clearSearch() {
+    _debounce?.cancel();
+    _searchController.clear();
+    unawaited(_reload());
+  }
+
+  void _changeSort(MediaServerSort? value) {
+    if (value == null || value == _sort) return;
+    setState(() => _sort = value);
+    unawaited(_reload());
+  }
+
+  String _sortLabel(MediaServerSort sort) => switch (sort) {
+    MediaServerSort.name => t.media_server_sort_name,
+    MediaServerSort.dateAdded => t.media_server_sort_date_added,
+    MediaServerSort.premiereDate => t.video_discovery_sort_release,
+    MediaServerSort.communityRating => t.video_discovery_sort_rating,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    // 本视图是嵌套 Navigator 里的一条路由：页面外壳自带 Scaffold（Material 祖先）
+    // 与 M3E 悬浮页头。搜索 / 排序行挂在页头底部，与标题胶囊一起随滚动收起、
+    // 往回滚弹出（与库页工具行同一口径）。
+    return MediaServerPageFrame(
+      header: FushiPageHeader(
+        title: widget.title,
+        compact: true,
+        leading: BackButton(onPressed: () => Navigator.of(context).maybePop()),
+        actions: <Widget>[
+          if (_canToggleFolderView)
+            FushiIconButton(
+              key: const ValueKey<String>('media-server-grid-folder-view'),
+              icon: _folderView ? FushiIcons.gridView : FushiIcons.folder,
+              tooltip: _folderView
+                  ? t.media_server_browse_by_title
+                  : t.media_server_browse_by_folder,
+              focusId: FushiFocusId(
+                '${widget.session.serverId}-grid-folder-view',
+              ),
+              selected: _folderView,
+              onTap: _toggleFolderView,
+            ),
+        ],
+        bottom: _buildControls(),
+      ),
+      // 页头（含搜索 / 排序行）叠在正文上：网格把让位加成顶部内边距，空态 /
+      // 错误整体让开。
+      body: MediaServerBodyInset(
+        builder: (BuildContext context, double top) => _buildBody(top),
+      ),
+    );
+  }
+
+  Widget _buildControls() {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    final String prefix = widget.session.serverId;
+    // 2026-10 体验优化：窄于 480 时排序收成图标菜单。写死 180 宽的下拉在
+    // 手机竖屏上把搜索框挤到不足一半。
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints box) {
+        final bool compactSort = box.maxWidth < 480;
+        // M3E 搜索胶囊。防抖仍由本页自己做（[_scheduleSearch] 一输入就作废在途
+        // 响应），所以这里 debounce 为零、只借它的 IME 组字门与同值去重。
+        final Widget search = FushiSearchBar(
+          fieldKey: const ValueKey<String>('media-server-grid-search'),
+          clearButtonKey: const ValueKey<String>(
+            'media-server-grid-search-clear',
+          ),
+          focusId: FushiFocusId('$prefix-grid-search'),
+          controller: _searchController,
+          focusNode: _searchFocusNode,
+          hintText: t.media_server_search_hint,
+          onQueryChanged: _scheduleSearch,
+          onSubmitted: _submitSearch,
+          onClear: _clearSearch,
+        );
+        // 与库页工具行（LibraryToolbar）同一形态：宽屏搜索框限宽 240–460 靠左、
+        // 排序贴右；窄屏搜索撑满、排序收成图标菜单。
+        // 结构恒定（宽窄只换约束值），跨断点缩放窗口时搜索框不重挂、不丢焦点。
+        final double searchMax = box.maxWidth >= 640
+            ? (box.maxWidth * 0.36).clamp(240.0, 460.0)
+            : double.infinity;
+        return Row(
+          children: <Widget>[
+            Expanded(
+              child: Align(
+                alignment: AlignmentDirectional.centerStart,
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(maxWidth: searchMax),
+                  child: search,
+                ),
+              ),
+            ),
+            SizedBox(width: tokens.spacing.gap),
+            // 搜索走服务器的相关度序，排序只对浏览生效；搜索态禁用而不是藏起来。
+            // 下拉里是 DropdownMenu（InputDecorator），在 Row 里必须给定宽。
+            if (compactSort)
+              _buildCompactSortButton()
+            else
+              SizedBox(
+                width: 180,
+                child: FushiDropdown<MediaServerSort>(
+                  inline: true,
+                  key: const ValueKey<String>('media-server-grid-sort'),
+                  options: MediaServerSort.values,
+                  initialOption: _sort,
+                  generateLabel: _sortLabel,
+                  onChanged: _changeSort,
+                  enabled: !_searchMode,
+                  focusId: FushiFocusId('$prefix-grid-sort'),
+                ),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 窄屏的排序入口：图标菜单，当前项打勾。搜索态同样禁用。
+  Widget _buildCompactSortButton() {
+    return FushiPopupMenuButton<MediaServerSort>(
+      key: const ValueKey<String>('media-server-grid-sort-compact'),
+      tooltip: t.sort_by,
+      enabled: !_searchMode,
+      icon: const FushiIcon(FushiIcons.sort),
+      initialValue: _sort,
+      onSelected: _changeSort,
+      itemBuilder: (BuildContext context) => <PopupMenuEntry<MediaServerSort>>[
+        for (final MediaServerSort sort in MediaServerSort.values)
+          CheckedPopupMenuItem<MediaServerSort>(
+            value: sort,
+            checked: sort == _sort,
+            child: Text(_sortLabel(sort)),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildBody(double top) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    if (_loading && _items.isEmpty) return _buildSkeleton(tokens, top);
+    if (_firstPageError != null && _items.isEmpty) {
+      return Padding(
+        padding: EdgeInsets.only(top: top),
+        child: FushiPlaceholderMessage(
+          icon: FushiIcons.cloudOff,
+          tone: FushiPlaceholderTone.error,
+          message: t.media_server_items_load_failed,
+          detail: '$_firstPageError',
+          action: FushiFilledButton.icon(
+            key: const ValueKey<String>('media-server-grid-retry'),
+            onPressed: () => unawaited(_reload()),
+            icon: const FushiIcon(FushiIcons.refresh),
+            label: Text(t.retry),
+          ),
+        ),
+      );
+    }
+    if (_items.isEmpty && (_hasMore || _loadingMore)) {
+      // 首页 0 条但服务器还有后续页（搜索把关后常见）：续扫期间显示骨架而不是
+      // 先闪一下「无结果」。
+      return _buildSkeleton(tokens, top);
+    }
+    if (_items.isEmpty) {
+      return Padding(
+        padding: EdgeInsets.only(top: top),
+        child: FushiPlaceholderMessage(
+          icon: _searchMode ? FushiIcons.searchOff : FushiIcons.collection,
+          message: _searchMode
+              ? t.video_discovery_empty
+              : t.media_server_items_empty,
+        ),
+      );
+    }
+    final String prefix = widget.session.serverId;
+    // 2026-10 动效重做：首屏卡片错峰淡入；翻页补进来的卡在窗口外，瞬间出现。
+    return FushiEntranceScope(
+      replayKey: _listEpoch,
+      child: CustomScrollView(
+        key: PageStorageKey<String>(
+          '$prefix-grid-${widget.parentId ?? 'root'}',
+        ),
+        controller: _scrollController,
+        slivers: <Widget>[
+          _posterGrid(tokens, top, (int _) => _cardDelegate(context, prefix)),
+          if (_loadingMore)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: EdgeInsets.all(tokens.spacing.card),
+                child: const FushiLoadingView(compact: true),
+              ),
+            )
+          else if (_loadMoreFailed)
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: EdgeInsets.all(tokens.spacing.card),
+                child: Center(
+                  child: FushiTextButton.icon(
+                    key: const ValueKey<String>('media-server-grid-retry-more'),
+                    onPressed: _retryLoadMore,
+                    icon: const FushiIcon(FushiIcons.refresh),
+                    label: Text(t.retry),
+                  ),
+                ),
+              ),
+            )
+          else
+            SliverToBoxAdapter(child: SizedBox(height: tokens.spacing.section)),
+        ],
+      ),
+    );
+  }
+
+  /// 海报网格 sliver：真实网格与加载骨架共用同一套列数 / 行高算法，骨架换成
+  /// 数据时版面不跳。[delegateFor] 拿到本次布局的列数。
+  Widget _posterGrid(
+    FushiDesignTokens tokens,
+    double top,
+    SliverChildDelegate Function(int columns) delegateFor,
+  ) {
+    final double gap = tokens.spacing.card;
+    return SliverPadding(
+      // 顶部先让开叠在上面的页头（[top]，内容滚到胶囊底下），再留出悬停抬升的
+      // 余量：第一排卡放大 5% 时不被页头 / 视口上沿裁掉。
+      padding: EdgeInsets.fromLTRB(
+        tokens.spacing.page,
+        top + tokens.spacing.gap / 2,
+        tokens.spacing.page,
+        0,
+      ),
+      sliver: SliverLayoutBuilder(
+        builder: (BuildContext context, SliverConstraints constraints) {
+          // 行高按「实际列宽 × 3/2（2:3 海报）+ 文字块」精确给：发现页那种
+          // `childAspectRatio: 0.50` 是把文字区按列宽的一半留，桌面 210 列宽下
+          // 文字块只要 ~60，卡片底部空出一截（像素预览实测）。列数与
+          // [SliverGridDelegateWithMaxCrossAxisExtent] 同一算法（ceil）。
+          // 封面即卡片没有卡底：列间 / 行间都用卡片级间距，标题与下一排
+          // 封面之间留得开。
+          final double maxExtent = readerShelfGridExtentForWidth(
+            MediaQuery.sizeOf(context).width,
+          );
+          final double width = constraints.crossAxisExtent;
+          final int columns = ((width + gap) / (maxExtent + gap))
+              .ceil()
+              .clamp(1, 1 << 16)
+              .toInt();
+          final double cardWidth = (width - gap * (columns - 1)) / columns;
+          return SliverGrid(
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: columns,
+              mainAxisSpacing: gap + tokens.spacing.gap / 2,
+              crossAxisSpacing: gap,
+              mainAxisExtent:
+                  cardWidth * 3 / 2 + mediaServerCardTextBlock(context),
+            ),
+            delegate: delegateFor(columns),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 加载骨架：与真实网格同几何的三排海报卡块（有界闪光）。不挂本页滚动控制器
+  /// ——那是真实网格的，骨架只是占位。
+  Widget _buildSkeleton(FushiDesignTokens tokens, double top) {
+    return FushiSkeletonShimmer(
+      child: CustomScrollView(
+        key: const ValueKey<String>('media-server-grid-skeleton'),
+        physics: const NeverScrollableScrollPhysics(),
+        slivers: <Widget>[
+          _posterGrid(
+            tokens,
+            top,
+            (int columns) => SliverChildBuilderDelegate(
+              (BuildContext context, int index) =>
+                  const MediaServerPosterSkeleton(),
+              childCount: columns * 3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  SliverChildBuilderDelegate _cardDelegate(
+    BuildContext context,
+    String prefix,
+  ) => SliverChildBuilderDelegate(
+    fushiStaggeredItemBuilder((BuildContext context, int index) {
+      final MediaServerItem item = _items[index];
+      return MediaServerItemCard(
+        key: ValueKey<String>('media-server-grid-card-${item.id}'),
+        browser: _browser,
+        item: item,
+        focusId: FushiFocusId('$prefix-grid-card-${item.id}'),
+        onTap: () => openMediaServerItem(
+          context,
+          widget.session,
+          item,
+          siblings: _items,
+        ),
+        onLongPress: () =>
+            openMediaServerItemDetail(context, widget.session, item),
+      );
+    }),
+    childCount: _items.length,
+  );
+}

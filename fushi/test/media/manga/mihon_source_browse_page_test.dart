@@ -1,0 +1,483 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:drift/drift.dart' show Value;
+import 'package:drift/native.dart';
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_test/flutter_test.dart';
+import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/media/manga/manga_global_search_page.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_manager.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_models.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_runtime.dart';
+import 'package:fushi/src/media/manga/mihon/mihon_source_browse_page.dart';
+import 'package:fushi_core/fushi_core.dart';
+
+void main() {
+  test('source image queue starts only four cover fetches at a time', () async {
+    final MihonSourceImageLoadQueue queue = MihonSourceImageLoadQueue(
+      maxConcurrent: 4,
+    );
+    final List<Completer<void>> gates = List<Completer<void>>.generate(
+      10,
+      (_) => Completer<void>(),
+    );
+    int active = 0;
+    int maximumActive = 0;
+    int started = 0;
+    final List<Future<void>> tasks = <Future<void>>[
+      for (int index = 0; index < gates.length; index++)
+        queue.run<void>(() async {
+          started++;
+          active++;
+          if (active > maximumActive) maximumActive = active;
+          await gates[index].future;
+          active--;
+        }),
+    ];
+
+    await Future<void>.delayed(Duration.zero);
+    expect(started, 4);
+    expect(queue.active, 4);
+    expect(queue.pending, 6);
+
+    gates.first.complete();
+    await Future<void>.delayed(Duration.zero);
+    expect(started, 5);
+    expect(maximumActive, 4);
+
+    for (final Completer<void> gate in gates.skip(1)) {
+      gate.complete();
+    }
+    await Future.wait<void>(tasks);
+    expect(maximumActive, 4);
+    expect(queue.active, 0);
+    expect(queue.pending, 0);
+  });
+
+  late Directory root;
+  late FushiDatabase database;
+  late _BrowseRuntime runtime;
+  late MihonManager manager;
+
+  setUp(() async {
+    root = await Directory.systemTemp.createTemp('fushi-mihon-browse-');
+    database = FushiDatabase.forTesting(NativeDatabase.memory());
+    runtime = _BrowseRuntime();
+
+    await database.upsertMangaExtension(
+      MangaExtensionsCompanion.insert(
+        packageName: 'org.example.fixture',
+        name: 'Raw Otaku fixture',
+        versionCode: 1,
+        versionName: '1.0.0',
+        libVersion: '1.6',
+        language: 'en',
+        apkPath: 'extensions/org.example.fixture.ext',
+        apkSha256: 'fixture-apk-sha',
+        signerSha256: 'fixture-signer-sha',
+        installedAt: 1,
+      ),
+    );
+    await database.replaceMangaOnlineSources(
+      'org.example.fixture',
+      <MangaOnlineSourcesCompanion>[
+        MangaOnlineSourcesCompanion.insert(
+          extensionPackage: 'org.example.fixture',
+          sourceId: '9223372036854775807',
+          name: 'Raw Otaku',
+          language: 'en',
+        ),
+      ],
+    );
+
+    manager = MihonManager(
+      database: database,
+      rootDirectory: root,
+      runtime: runtime,
+    );
+    await manager.initialise();
+  });
+
+  tearDown(() async {
+    manager.dispose();
+    await database.close();
+    if (await root.exists()) await root.delete(recursive: true);
+  });
+
+  testWidgets(
+    'opening a manga while its large chapter list resolves does not trip layout',
+    (WidgetTester tester) async {
+      await tester.binding.setSurfaceSize(const Size(2048, 1055));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: ThemeData.light(useMaterial3: true),
+          home: MihonSourceBrowsePage(
+            manager: manager,
+            target: MihonInstalledTarget(manager.sources.single),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      expect(find.text('Raw Otaku fixture'), findsOneWidget);
+      await tester.tap(find.text('Raw Otaku fixture'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(tester.takeException(), isNull);
+      expect(find.text('Chapter 1'), findsOneWidget);
+      expect(find.text('Add to manga shelf'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'a failed detail load surfaces the real cause and can be retried',
+    (WidgetTester tester) async {
+      // 原本这里只会渲染一行光秃的异常文本，既没重试也拿不到
+      // 堆栈（BUG-1767）。这条用例盯住三件事：原因可见、诊断入口存在、
+      // 重试真的会重新发请求并恢复正常页面。
+      await tester.binding.setSurfaceSize(const Size(1400, 1000));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      runtime.detailsFailure = const MihonRuntimeException(
+        'RUNTIME_FAILURE',
+        'Mihon invoke/getDetailsManga failed: '
+            'NoClassDefFoundError: kotlin.LazyKt',
+        details: 'java.lang.NoClassDefFoundError\n\tat fixture.Stack',
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: ThemeData.light(useMaterial3: true),
+          home: MihonSourceBrowsePage(
+            manager: manager,
+            target: MihonInstalledTarget(manager.sources.single),
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+      await tester.tap(find.text('Raw Otaku fixture'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(tester.takeException(), isNull);
+      expect(runtime.detailsCalls, 1);
+      expect(find.text('Could not load this manga.'), findsOneWidget);
+      expect(
+        find.textContaining('NoClassDefFoundError: kotlin.LazyKt'),
+        findsOneWidget,
+      );
+
+      // 诊断对话框里必须能拿到原生堆栈和失败阶段。
+      await tester.tap(
+        // 详情页已并入共享的 MangaSeriesPage（书架和源浏览共用一页），诊断入口
+        // 随之改名。**盯的行为一条没变**：原因可见、堆栈与阶段进可复制对话框、
+        // 重试真的重新发请求（BUG-1767）。
+        find.byKey(const ValueKey<String>('manga_series_error_details')),
+      );
+      await tester.pumpAndSettle();
+      expect(find.textContaining('stage: details'), findsOneWidget);
+      expect(find.textContaining('at fixture.Stack'), findsOneWidget);
+      await tester.tap(find.text('CLOSE'));
+      await tester.pumpAndSettle();
+
+      runtime.detailsFailure = null;
+      await tester.tap(find.text('Retry'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 50));
+
+      expect(runtime.detailsCalls, 2);
+      expect(find.text('Could not load this manga.'), findsNothing);
+      expect(find.text('Chapter 1'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'wrapped detail challenge verifies explicitly then retries details',
+    (WidgetTester tester) async {
+      runtime.detailsFailure = MihonCloudflareChallengeException(
+        Uri.parse('https://fixture.invalid/challenge'),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MihonMangaDetailPage(
+            manager: manager,
+            sourceContext: await manager.contextForSource(
+              manager.sources.single,
+            ),
+            manga: _BrowseRuntime.manga,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(runtime.solved, isEmpty);
+      expect(find.text(t.manga_source_cloudflare_verify_title), findsOneWidget);
+      await tester.tap(find.text(t.manga_source_cloudflare_verify_title));
+      await tester.pumpAndSettle();
+      expect(
+        runtime.solved.single,
+        Uri.parse('https://fixture.invalid/challenge'),
+      );
+      expect(runtime.detailsCalls, 2);
+      expect(find.text('Chapter 1'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'global search leaves challenge idle until user verifies and retries source',
+    (WidgetTester tester) async {
+      runtime.searchFailure = MihonCloudflareChallengeException(
+        Uri.parse('https://fixture.invalid/search'),
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MangaGlobalSearchPage(
+            mihonManager: manager,
+            mihonSources: manager.sources,
+            initialQuery: 'fixture',
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(runtime.solved, isEmpty);
+      expect(runtime.searchCalls, 1);
+      await tester.tap(find.text(t.manga_source_cloudflare_verify_title));
+      await tester.pumpAndSettle();
+      expect(
+        runtime.solved.single,
+        Uri.parse('https://fixture.invalid/search'),
+      );
+      expect(runtime.searchCalls, 2);
+      expect(find.text(t.manga_source_cloudflare_verify_title), findsNothing);
+    },
+  );
+
+  testWidgets('a stale initial response cannot replace a newer search result', (
+    WidgetTester tester,
+  ) async {
+    runtime.popularGate = Completer<MihonMangaPage>();
+    runtime.searchGate = Completer<MihonMangaPage>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MihonSourceBrowsePage(
+          manager: manager,
+          target: MihonInstalledTarget(manager.sources.single),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.enterText(find.byType(TextField), 'new query');
+    await tester.testTextInput.receiveAction(TextInputAction.search);
+    await tester.pump();
+    runtime.searchGate!.complete(
+      const MihonMangaPage(
+        items: <MihonManga>[
+          MihonManga(url: '/manga/new', title: 'New search result'),
+        ],
+        hasNextPage: false,
+      ),
+    );
+    await tester.pump();
+    expect(find.text('New search result'), findsOneWidget);
+
+    runtime.popularGate!.complete(
+      const MihonMangaPage(
+        items: <MihonManga>[
+          MihonManga(url: '/manga/old', title: 'Stale popular result'),
+        ],
+        hasNextPage: false,
+      ),
+    );
+    await tester.pump();
+    expect(find.text('New search result'), findsOneWidget);
+    expect(find.text('Stale popular result'), findsNothing);
+  });
+
+  testWidgets('a duplicate-only next page terminates pagination', (
+    WidgetTester tester,
+  ) async {
+    runtime.popularPages = <int, MihonMangaPage>{
+      1: const MihonMangaPage(
+        items: <MihonManga>[_BrowseRuntime.manga],
+        hasNextPage: true,
+      ),
+      2: const MihonMangaPage(
+        items: <MihonManga>[_BrowseRuntime.manga],
+        hasNextPage: true,
+      ),
+    };
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MihonSourceBrowsePage(
+          manager: manager,
+          target: MihonInstalledTarget(manager.sources.single),
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('Raw Otaku fixture'), findsOneWidget);
+
+    // M3E：「加载更多」改成 filledTonal 图标按钮（FushiIcons.add），按它的稳定
+    // key 定位，不绑定具体图标码点。
+    final Finder loadMore = find.byKey(
+      const ValueKey<String>('mihon_browse_more'),
+    );
+    await tester.tap(loadMore);
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.text('Raw Otaku fixture'), findsOneWidget);
+    expect(loadMore, findsNothing);
+  });
+
+  testWidgets(
+    'open on website joins the source baseUrl with the manga url when the '
+    'runtime cannot ask the extension',
+    (WidgetTester tester) async {
+      // 运行时是纯 Fake（没有 MihonWebUrlRuntime 能力）→ 走 baseUrl + url 兜底。
+      await database.replaceMangaOnlineSources(
+        'org.example.fixture',
+        <MangaOnlineSourcesCompanion>[
+          MangaOnlineSourcesCompanion.insert(
+            extensionPackage: 'org.example.fixture',
+            sourceId: '9223372036854775807',
+            name: 'Raw Otaku',
+            language: 'en',
+            baseUrl: const Value('https://fixture.invalid'),
+          ),
+        ],
+      );
+      await manager.reload();
+      final List<Uri> launched = <Uri>[];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: MihonMangaDetailPage(
+            manager: manager,
+            sourceContext: await manager.contextForSource(
+              manager.sources.single,
+            ),
+            manga: _BrowseRuntime.manga,
+            openExternal: (Uri url) async => launched.add(url),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      // M3E 详情骨架：「在网站打开」在 hero 的「⋯」菜单里。
+      await tester.tap(find.byKey(const ValueKey<String>('online_work_more')));
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey<String>('manga_series_open_website')),
+      );
+      await tester.pumpAndSettle();
+      expect(launched, <Uri>[Uri.parse('https://fixture.invalid/manga/fixture')]);
+      expect(tester.takeException(), isNull);
+    },
+  );
+}
+
+class _BrowseRuntime extends Fake
+    implements MihonRuntime, ChallengeMihonRuntime {
+  final List<Uri> solved = <Uri>[];
+  Exception? searchFailure;
+  int searchCalls = 0;
+
+  @override
+  Future<void> solveCloudflare(Uri uri, {String? userAgent}) async {
+    solved.add(uri);
+    detailsFailure = null;
+    searchFailure = null;
+  }
+
+  static const MihonManga manga = MihonManga(
+    url: '/manga/fixture',
+    title: 'Raw Otaku fixture',
+  );
+  Completer<MihonMangaPage>? popularGate;
+  Completer<MihonMangaPage>? searchGate;
+  Map<int, MihonMangaPage>? popularPages;
+
+  /// 非空时 [getDetails] 抛它，用来驱动详情页的失败态。
+  Exception? detailsFailure;
+  int detailsCalls = 0;
+
+  @override
+  Future<List<MihonFilter>> getFilters(
+    MihonExtensionRef extension,
+    MihonSource source, {
+    List<MihonPreference> preferences = const <MihonPreference>[],
+  }) async => const <MihonFilter>[];
+
+  @override
+  Future<MihonMangaPage> getPopular(
+    MihonExtensionRef extension,
+    MihonSource source, {
+    required int page,
+    List<MihonPreference> preferences = const <MihonPreference>[],
+  }) async => popularGate != null
+      ? popularGate!.future
+      : popularPages?[page] ??
+            const MihonMangaPage(
+              items: <MihonManga>[manga],
+              hasNextPage: false,
+            );
+
+  @override
+  Future<MihonMangaPage> search(
+    MihonExtensionRef extension,
+    MihonSource source, {
+    required int page,
+    required String query,
+    List<MihonFilter> filters = const <MihonFilter>[],
+    List<MihonPreference> preferences = const <MihonPreference>[],
+  }) async {
+    searchCalls++;
+    if (searchFailure != null) throw searchFailure!;
+    return searchGate?.future ??
+        const MihonMangaPage(items: <MihonManga>[], hasNextPage: false);
+  }
+
+  @override
+  Future<MihonManga> getDetails(
+    MihonExtensionRef extension,
+    MihonSource source,
+    MihonManga manga, {
+    List<MihonPreference> preferences = const <MihonPreference>[],
+  }) async {
+    detailsCalls++;
+    final Exception? failure = detailsFailure;
+    if (failure != null) throw failure;
+    return const MihonManga(
+      url: '/manga/fixture',
+      title: 'Raw Otaku fixture',
+      author: 'Fixture author',
+      description: 'Fixture description',
+      initialized: true,
+    );
+  }
+
+  @override
+  Future<List<MihonChapter>> getChapters(
+    MihonExtensionRef extension,
+    MihonSource source,
+    MihonManga manga, {
+    List<MihonPreference> preferences = const <MihonPreference>[],
+  }) async => List<MihonChapter>.generate(
+    486,
+    (int index) => MihonChapter(
+      url: '/chapter/${index + 1}',
+      name: 'Chapter ${index + 1}',
+      uploadedAt: index,
+      number: index + 1,
+    ),
+    growable: false,
+  );
+
+  @override
+  Future<void> dispose() async {}
+}

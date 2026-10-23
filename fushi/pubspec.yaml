@@ -1,0 +1,278 @@
+name: fushi
+resolution: workspace
+description: A focused Japanese EPUB reader with popup dictionary and Anki integration.
+publish_to: 'none'
+version: 3.0.1+1356
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+  flutter: "^3.47.0"
+
+dependencies:
+  # 语音识别生成字幕：算法层已抽成独立仓库（hajisensai/fushi-subtitles，GPL-3.0），本仓只留
+  # Flutter 插件后端（`src/onnx/onnx_inference_ort.dart`）与 UI。漫画 OCR 也经
+  # `src/ocr/ocr_inference.dart` 复用同一套 ONNX 抽象，所以 fushi_asr_core 不只服务 ASR。
+  #
+  # 钉 sha 而不是分支：转录产物的字节级一致要能复现，跟着分支飘会让「同一版
+  # Fushi 转出来的字幕不一样」这种事无从追查。
+  fushi_asr_core:
+    git:
+      url: https://github.com/hajisensai/fushi-subtitles.git
+      path: packages/asr_core
+      ref: 0c5878a856be72c7439f166a3144c0c4c6a998a7
+  # 字幕重定时（拿 ASR 转录当参照修好已有字幕的时间轴）。与 fushi_asr_core 同仓同 sha。
+  #
+  # 只依赖 fushi_asr_core，**不含** ONNX 后端：算法那半边住在 fushi_asr 包里的话会
+  # 拖上 fushi_asr_onnx_ffi（archive ^4），而本仓钉 archive ^3.6.1，引进来等于强制一次
+  # archive 4 迁移。上游 PR #7 因此把它拆成了这个零重依赖的包。
+  fushi_asr_subtitles:
+    git:
+      url: https://github.com/hajisensai/fushi-subtitles.git
+      path: packages/asr_subtitles
+      ref: 0c5878a856be72c7439f166a3144c0c4c6a998a7
+  archive: ^3.6.1
+  async_zip: ^0.1.0
+  basic_utils: ^5.7.0
+  audio_service: ^0.18.9
+  audio_session: ^0.1.13
+  cached_network_image: ^3.4.1
+  carousel_slider: ^4.2.1
+  change_notifier_builder: ^1.1.2
+  characters: ^1.3.0
+  clipboard: ^0.1.3
+  collection:
+  cupertino_icons: ^1.0.8
+  # Flutter 3.47 起 Material / Cupertino 拆成独立 pub 包；本仓已迁移
+  # （tool/migrate_design_widgets.sh）。lib/ 下禁止再 import
+  # package:flutter/material.dart / cupertino.dart（守卫
+  # test/build/design_widgets_import_guard_test.dart）。
+  cupertino_ui: ^1.1.3
+  material_ui: ^1.7.0
+  liquid_glass_widgets: ^1.8.1
+  crop_image: ^1.0.4
+  desktop_drop: ^0.5.0
+  device_info_plus: ^9.0.0
+  dio: ^5.1.1
+  # 2.x 起依赖 material_ui：其 ColorScheme 与本仓迁移后的 ColorScheme 同一类型。
+  dynamic_color: ^2.1.0
+  external_app_launcher: ^4.0.3
+  external_path: ^2.2.0
+  # 分段条溢出滚动的渐隐边缘（vendored，见 dependency_overrides）。
+  fading_edge_scrollview: ^3.0.0
+  file_picker: ^8.0.0
+  float_column: ^4.0.3
+  # Cross-platform game controllers (GameInput / GameController / evdev).
+  # BUILD PREREQ: the Windows backend (gamepads_windows) #includes <GameInput.h>,
+  # which ships only in Windows SDK >= 10.0.26100 — every Windows build
+  # machine/CI must have that SDK installed. (Android is overridden to a no-op
+  # below; see dependency_overrides.)
+  gamepads: ^0.1.10+2
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  fushi_core:
+    path: ../packages/fushi_core
+  fushi_dictionary:
+    path: ../packages/fushi_dictionary
+  fushi_cli:
+    path: ../packages/fushi_cli
+  fushi_engine:
+    path: ../packages/fushi_engine
+  fushi_anki:
+    path: ../packages/fushi_anki
+  fushi_srs:
+    path: ../packages/fushi_srs
+  fushi_audio:
+    path: ../packages/fushi_audio
+  fushi_platform:
+    path: ../packages/fushi_platform
+  fushi_torrent:
+    path: ../packages/fushi_torrent
+  google_sign_in: ^6.2.2
+  extension_google_sign_in_as_googleapis_auth: ^2.0.12
+  googleapis: ^13.2.0
+  googleapis_auth: ^1.6.0
+  flutter_archive: ^5.0.0
+  flutter_cache_manager: ^3.3.0
+  flutter_charset_detector: ^1.0.2
+  flutter_colorpicker: ^1.1.0
+  flutter_markdown: ^0.6.18
+  flutter_exit_app: ^1.0.5
+  flutter_html: ^3.0.0
+  flutter_inappwebview: ^6.1.5
+  # Linux WebView 后端（WPE WebKit）。6.1.5 的 flutter_inappwebview 不 endorse
+  # Linux，必须由 app 直接依赖实现包才会注册；vendored 原因见该包 pubspec 顶部。
+  flutter_inappwebview_linux:
+    path: ../packages/flutter_inappwebview_linux
+  flutter_logs: ^2.1.11
+  # v101 统一更新提醒的系统通知后端。选 20.x 而不是 22.x：22 起要求
+  # `sdk: ^3.10.0`，会把本包的 SDK 下界从 3.8 顶上去；20.1.0 的
+  # environment 与本仓一致，且 android/ios/macos/linux/windows 五端都有实现
+  # （Windows 走 flutter_local_notifications_windows 的 WinRT toast）。
+  flutter_local_notifications: ^20.1.0
+  flutter_riverpod: ^2.3.6
+  # WebRTC 游戏串流（Windows 主机；五端都可当接收端）。
+  # 钉精确版本，不用 caret：WGC 客户区采集的入口只在
+  # ci/patches/hosted/flutter_webrtc-1.6.2+hotfix.3/ 那份补丁里，而补丁目录按
+  # 精确版本命名、apply-patches.sh 对目标缺失只打一行 WARNING 不判红。约束一旦
+  # 漂到 1.6.3 就是「编译照过、运行时零帧」。升版本时同步改补丁目录名。
+  flutter_webrtc: 1.6.2+hotfix.3
+  flutter_staggered_grid_view: ^0.7.0
+  fluttertoast: ^8.2.1
+  drift: ">=2.33.0 <2.34.0"
+  sqlite3_flutter_libs: ^0.5.28
+  sqlite3: ">=3.4.0 <4.0.0"
+  ffi: ^2.1.3
+  gap: ^3.0.1
+  http: ^1.2.0
+  html: ^0.15.2
+  html_unescape: ^2.0.0
+  youtube_explode_dart: ^2.3.6
+  image: ^4.3.0
+  image_picker: ^0.8.7
+  intl: ^0.20.2
+  json_annotation: ^4.8.1
+  json_serializable: ^6.6.1
+  just_audio: ^0.9.31
+  just_audio_media_kit: ^2.1.0
+  # media_kit_libs_windows_audio 移除：与视频用的 media_kit_libs_video 抢同名 libmpv
+  # 归档(同下载路径不同 MD5)，video libs 是 audio 超集，统一提供 libmpv。
+  kana_kit: ^2.0.0
+  macos_ui: ^2.2.2
+  material_color_utilities: ^0.13.0
+  marquee: ^2.2.3
+  multi_value_listenable_builder: ^0.0.2
+  network_to_file_image: ^4.0.1
+  package_info_plus: ^4.0.2
+  path: ^1.8.2
+  path_provider: ^2.0.13
+  permission_handler: ^10.2.0
+  # PDF 阅读器（Phase 0 spike）：PDFium 底层、字符级文本矩形供点选查词。
+  # 五平台 + native-assets/build-hook 下载 PDFium。见 docs/specs/pdf-reader-lookup。
+  # 钉 2.4.5：>=2.4.6 经 pdfrx_engine 拉 image ^4.8.0 → 要 archive ^4.0.7 / xml ^7.0.1，
+  # 与本仓 archive ^3.6.1 / xml ^6.3.0 冲突（升 archive/xml 主版本代价大，Phase 0 先钉）。
+  pdfrx: 2.4.5
+  progress_indicators: ^1.0.0
+  recase: ^4.1.0
+  receive_intent:
+    git:
+      url: https://github.com/arianneorpilla/receive_intent
+      ref: 3854d07f8f4e9d5a78589639b18b5d454ddf54a0
+  remove_emoji: ^0.0.7
+  restart_app: ^1.1.2
+  share_plus: ^7.2.2
+  shared_preferences: ^2.2.2
+  # 测试根下的 SharedPreferences 隔离存储（startup/test_root_shared_preferences.dart）。
+  shared_preferences_platform_interface: ^2.3.1
+  slang: ^3.13.0
+  slang_flutter: ^3.13.0
+  sliver_tools: ^0.2.12
+  stack_trace: ^1.11.1
+  shelf: ^1.4.0
+  ftpconnect: ^2.0.10
+  dartssh2: ^2.9.0
+  crypto: ^3.0.0
+  # BUG-2514：comico magazine_comic 根 URL 的 AES-CBC 解密（basic_utils 已带入，这里只是显式声明）。
+  pointycastle: ^3.9.1
+  meta: ^1.9.0
+  transparent_image: ^2.0.1
+  url_launcher: ^6.0.20
+  visibility_detector: ^0.4.0+2
+  xml: ^6.3.0
+  wakelock_plus: ^1.1.4
+  # 反馈有新回复时的后台检查：Android 走 WorkManager 周期任务（15 分钟最小周期、
+  # 联网约束），iOS 走 BGTaskScheduler app refresh（系统决定时机）。只在主 app
+  # 入口注册，后台 isolate 只读本机工单回执、问一次进度、发本地通知（见
+  # lib/src/feedback/feedback_reply_background.dart）。桌面不用它（运行中定时检查）。
+  workmanager: ^0.10.10
+  record: 6.0.0
+  brotli: ^0.6.0
+  bonsoir: ^7.1.1
+  media_kit: ^1.2.6
+  media_kit_video: ^2.0.1
+  media_kit_libs_video: ^1.0.7
+  # 移动端 ffmpeg：用「自编」的 ffmpeg-kit（arthenica 源码 + NDK r25 重编最小变体），
+  # 替代崩溃的第三方预编译 ffmpeg-kit 变体（其 libffmpegkit_abidetect.so 在
+  # Android 16/API 36 上 JNI_OnLoad 返回非法版本，启动即崩，BUG-122）。vendored 包见
+  # dependency_overrides 的 ffmpeg_kit_flutter（android 用 third_party 自编 AAR）。
+  ffmpeg_kit_flutter: ^6.0.3
+  web_socket_channel: ^3.0.0
+  # 漫画内置 OCR：ONNX Runtime 五平台绑定（检测 RT-DETR + 识别 manga-ocr）。
+  # 选型见 lib/src/ocr/；EP 策略（CUDA/DirectML/CoreML/CPU）在 ocr_inference.dart。
+  flutter_onnxruntime: ^1.8.3
+  hotkey_manager: ^0.2.3
+  screen_retriever: ^0.2.0
+  window_manager: ^0.5.1
+  qr_flutter: ^4.1.0
+  mobile_scanner: ^7.4.2
+dev_dependencies:
+  # BUG-3003: native hot-restart regression waits for worker IsolateExit events.
+  vm_service: ^15.1.0
+  build_runner: ^2.3.3
+  just_audio_platform_interface: ^4.6.0
+  # TODO-817 M1c scanner test overrides CharsetDetectorPlatform with a Dart
+  # fake to verify SJIS subtitle decoding headlessly (native channel is
+  # unavailable in flutter test). These are transitive deps of
+  # flutter_charset_detector; declared here only for the test import.
+  flutter_charset_detector_platform_interface: ^1.1.0
+  plugin_platform_interface: ^2.1.0
+  # BUG-1213: android_permission_service_test 用它替换
+  # PermissionHandlerPlatform.instance，在 flutter test 里复刻
+  # permission_handler_android 的 SDK 分级语义（原生通道不可用）。
+  permission_handler_platform_interface: ^3.9.0
+  # BUG-2499: local_update_notifier_test 直接驱动 Windows toast 的 image XML
+  # 序列化，守卫 ci/patches/hosted/flutter_local_notifications_windows-2.0.1
+  # 的补丁真的打上了（file 路径不得百分号编码）。flutter_local_notifications
+  # 的传递依赖，声明只为测试 import。
+  flutter_local_notifications_windows: ^2.0.1
+  drift_dev: ^2.23.0
+  dependency_validator: ^3.0.0
+  flutter_lints: ^2.0.1
+  flutter_native_splash: ^2.2.8
+  fake_async: ^1.3.1
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    # TMDB 官方 logo（合约署名素材）。逐文件登记而非整目录，是为了只打包实际渲染
+    # 的 PNG，把同目录的矢量原图 blue_square_1.svg（provenance 真相源）与 README.md
+    # （来源/哈希/禁改说明 + 栅格化配方）留在仓库里、不进应用包。
+    - assets/attribution/tmdb/logo_tmdb.png
+    # 内置 AnkiConnect 插件包（新手引导「一键安装插件」解压进 Anki 的
+    # addons21；来源/许可见 assets/licenses/anki-connect.txt）。
+    - assets/anki/
+    - assets/browser_extension/
+    - assets/browser_extension/vendor/
+    - assets/browser_extension/locales/
+    # 内置网页播放器（WebView2 站点播放）主世界胶水；站点 bridge / 字幕 provider 复用
+    # 上面的扩展镜像（同一份文件，见 lib/src/media/video/web_video_bridge.dart）。
+    - assets/web_video/
+    - assets/gamepad/xbox/
+    - assets/gamepad/playstation/
+    - assets/gamepad/switch/
+    - assets/fonts/
+    - assets/licenses/
+    # 小说在线源（LNReader 插件）宿主：lnreader_libs.js 由 tool/lnreader/ 重建。
+    - assets/lnreader/
+    - assets/meta/
+    - assets/popup/
+    - assets/transforms/
+    - assets/transforms/i18n/
+
+  # M3E 语义图标（lib/src/utils/fushi_icons.dart）：Material Symbols Rounded 可变字体
+  # 的子集，由 tool/icons/gen_fushi_symbols.py 生成。线框 / 实心各一个字族——选中态在
+  # 只能传 IconData 的 API 里也能表达。release 构建的图标树摇只留用到的码位。
+  # 刻意不放进上面的 assets/fonts/（那个目录整体登记为普通 asset，供阅读器 WebView
+  # 按 URL 取用，不会被树摇）。
+  fonts:
+    - family: FushiSymbols
+      fonts:
+        - asset: assets/icon_fonts/FushiSymbolsRounded.ttf
+    - family: FushiSymbolsFilled
+      fonts:
+        - asset: assets/icon_fonts/FushiSymbolsRoundedFilled.ttf

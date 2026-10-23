@@ -1,0 +1,1421 @@
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:fushi/src/utils/misc/build_version.dart';
+
+enum WindowsUpdateHandoffStatus {
+  installed,
+  incomplete,
+  launchFailed,
+}
+
+class WindowsUpdateHandoffResult {
+  const WindowsUpdateHandoffResult({
+    required this.status,
+    required this.record,
+  });
+
+  final WindowsUpdateHandoffStatus status;
+  final WindowsUpdateHandoffRecord record;
+}
+
+class WindowsDetectedInstallLocation {
+  const WindowsDetectedInstallLocation({
+    required this.source,
+    required this.path,
+  });
+
+  factory WindowsDetectedInstallLocation.fromJson(Map<String, dynamic> json) {
+    return WindowsDetectedInstallLocation(
+      source: json['source'] as String? ?? '',
+      path: json['path'] as String? ?? '',
+    );
+  }
+
+  final String source;
+  final String path;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'source': source,
+        'path': path,
+      };
+}
+
+class WindowsProcessInfo {
+  const WindowsProcessInfo({
+    required this.pid,
+    this.name,
+    this.path,
+  });
+
+  factory WindowsProcessInfo.fromJson(Map<String, dynamic> json) {
+    return WindowsProcessInfo(
+      pid: _int(json['pid']) ?? 0,
+      name: json['name'] as String?,
+      path: json['path'] as String?,
+    );
+  }
+
+  final int pid;
+  final String? name;
+  final String? path;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'pid': pid,
+        if (name != null && name!.isNotEmpty) 'name': name,
+        if (path != null && path!.isNotEmpty) 'path': path,
+      };
+
+  WindowsProcessInfo copyWith({
+    int? pid,
+    String? name,
+    String? path,
+  }) {
+    return WindowsProcessInfo(
+      pid: pid ?? this.pid,
+      name: name ?? this.name,
+      path: path ?? this.path,
+    );
+  }
+}
+
+class WindowsInnoDeleteFileFailure {
+  const WindowsInnoDeleteFileFailure({
+    required this.path,
+    required this.code,
+    this.message,
+  });
+
+  factory WindowsInnoDeleteFileFailure.fromJson(Map<String, dynamic> json) {
+    return WindowsInnoDeleteFileFailure(
+      path: json['path'] as String? ?? '',
+      code: _int(json['code']) ?? 0,
+      message: json['message'] as String?,
+    );
+  }
+
+  final String path;
+  final int code;
+  final String? message;
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'path': path,
+        'code': code,
+        if (message != null && message!.isNotEmpty) 'message': message,
+      };
+}
+
+class WindowsInstallerFailureSummary {
+  const WindowsInstallerFailureSummary({
+    required this.type,
+    required this.message,
+  });
+
+  final String type;
+  final String message;
+}
+
+class WindowsInstallerDiagnostics {
+  const WindowsInstallerDiagnostics({
+    this.currentExecutablePath,
+    this.currentInstallDir,
+    this.targetInstallDir,
+    this.detectedInstallLocations = const <WindowsDetectedInstallLocation>[],
+    this.runningFushiProcesses = const <WindowsProcessInfo>[],
+    this.libmpvModuleHolders = const <WindowsProcessInfo>[],
+    this.galHookModuleHolders = const <WindowsProcessInfo>[],
+    this.innoLogDeleteFileFailures = const <WindowsInnoDeleteFileFailure>[],
+    this.pathMismatchWarning,
+  });
+
+  final String? currentExecutablePath;
+  final String? currentInstallDir;
+  final String? targetInstallDir;
+  final List<WindowsDetectedInstallLocation> detectedInstallLocations;
+  final List<WindowsProcessInfo> runningFushiProcesses;
+  final List<WindowsProcessInfo> libmpvModuleHolders;
+
+  /// 正占用 `voice_hook/<arch>/` 下 galgame helper 组件的进程（被 hook 的游戏本身，
+  /// 以及以 `--hold` 维持共享内存的 injector host）。
+  ///
+  /// 与 [libmpvModuleHolders] 并列而不是合并：两者查的是不同文件、对应不同的用户处置
+  /// （「关掉播放器 / 别的用 libmpv 的程序」 vs 「关掉正在玩的游戏」），诊断面板要分开
+  /// 说才有用。旧版本写的交接标记里没有这个键，`fromJson` 取到空列表，与今天行为一致。
+  final List<WindowsProcessInfo> galHookModuleHolders;
+  final List<WindowsInnoDeleteFileFailure> innoLogDeleteFileFailures;
+  final String? pathMismatchWarning;
+
+  bool get hasLockEvidence {
+    if (libmpvModuleHolders.isNotEmpty) return true;
+    if (galHookModuleHolders.isNotEmpty) return true;
+    return innoLogDeleteFileFailures.any(
+      (WindowsInnoDeleteFileFailure failure) =>
+          failure.code == 5 &&
+          (failure.path.toLowerCase().contains('libmpv-2.dll') ||
+              // BUG-1675：helper 组件换不掉时 Inno 报的是 voice_hook\ 下的路径。
+              // 只认 libmpv 会让这半边的锁证据整个看不见。
+              failure.path
+                  .toLowerCase()
+                  .replaceAll('/', r'\')
+                  .contains('\\voice_hook\\')),
+    );
+  }
+
+  WindowsInstallerDiagnostics copyWith({
+    String? currentExecutablePath,
+    String? currentInstallDir,
+    String? targetInstallDir,
+    List<WindowsDetectedInstallLocation>? detectedInstallLocations,
+    List<WindowsProcessInfo>? runningFushiProcesses,
+    List<WindowsProcessInfo>? libmpvModuleHolders,
+    List<WindowsProcessInfo>? galHookModuleHolders,
+    List<WindowsInnoDeleteFileFailure>? innoLogDeleteFileFailures,
+    String? pathMismatchWarning,
+  }) {
+    return WindowsInstallerDiagnostics(
+      currentExecutablePath:
+          currentExecutablePath ?? this.currentExecutablePath,
+      currentInstallDir: currentInstallDir ?? this.currentInstallDir,
+      targetInstallDir: targetInstallDir ?? this.targetInstallDir,
+      detectedInstallLocations:
+          detectedInstallLocations ?? this.detectedInstallLocations,
+      runningFushiProcesses:
+          runningFushiProcesses ?? this.runningFushiProcesses,
+      libmpvModuleHolders: libmpvModuleHolders ?? this.libmpvModuleHolders,
+      galHookModuleHolders: galHookModuleHolders ?? this.galHookModuleHolders,
+      innoLogDeleteFileFailures:
+          innoLogDeleteFileFailures ?? this.innoLogDeleteFileFailures,
+      pathMismatchWarning: pathMismatchWarning ?? this.pathMismatchWarning,
+    );
+  }
+}
+
+class WindowsUpdateHandoffRecord {
+  const WindowsUpdateHandoffRecord({
+    required this.targetVersion,
+    required this.installerPath,
+    required this.innoLogPath,
+    required this.startedAt,
+    this.currentExecutablePath,
+    this.currentInstallDir,
+    this.targetInstallDir,
+    this.detectedInstallLocations = const <WindowsDetectedInstallLocation>[],
+    this.runningFushiProcesses = const <WindowsProcessInfo>[],
+    this.libmpvModuleHolders = const <WindowsProcessInfo>[],
+    this.galHookModuleHolders = const <WindowsProcessInfo>[],
+    this.innoLogDeleteFileFailures = const <WindowsInnoDeleteFileFailure>[],
+    this.pathMismatchWarning,
+    this.launcherStartedAt,
+    this.launcherPid,
+    this.parentProcessId,
+    this.parentExitObserved,
+    this.parentExitObservedAt,
+    this.launcherMutexReleased,
+    this.installerLaunchSucceeded,
+    this.installerLaunchedAt,
+    this.installerPid,
+    this.innoLogExists,
+    this.innoLogSizeBytes,
+    this.innoLogModifiedAt,
+    this.installerFailureType,
+    this.installerFailureSummary,
+    this.installerLaunchFailedAt,
+    this.launchError,
+    this.failureFingerprint,
+    this.lastPromptedAppVersion,
+    this.lastPromptedFailureFingerprint,
+    this.lastPromptedAt,
+    this.extraFields = const <String, dynamic>{},
+  });
+
+  factory WindowsUpdateHandoffRecord.fromJson(Map<String, dynamic> json) {
+    return WindowsUpdateHandoffRecord(
+      targetVersion: json['targetVersion'] as String? ?? '',
+      installerPath: json['installerPath'] as String? ?? '',
+      innoLogPath: json['innoLogPath'] as String? ?? '',
+      startedAt: _dateTime(json['startedAt']) ?? DateTime.now().toUtc(),
+      currentExecutablePath: json['currentExecutablePath'] as String?,
+      currentInstallDir: json['currentInstallDir'] as String?,
+      targetInstallDir: json['targetInstallDir'] as String?,
+      detectedInstallLocations: _listOfMaps(json['detectedInstallLocations'])
+          .map(WindowsDetectedInstallLocation.fromJson)
+          .toList(growable: false),
+      // W2-6 真实跨版本 wire 兼容：旧键 'runningHibikiProcesses' 只在**读侧**
+      // 保留——「hibiki → fushi 更新桥」时代的旧版二进制写下 marker、装完由新版
+      // 读取，这是唯一会见到旧键的窗口。写侧只写新键。清理条件：更新桥通道
+      // 退役（不再存在从旧 Hibiki 版本直升本包的升级路径）后删除旧键回退。
+      runningFushiProcesses: _listOfMaps(
+        json['runningFushiProcesses'] ?? json['runningHibikiProcesses'],
+      )
+          .map(WindowsProcessInfo.fromJson)
+          .where((WindowsProcessInfo process) => process.pid > 0)
+          .toList(growable: false),
+      libmpvModuleHolders: _listOfMaps(json['libmpvModuleHolders'])
+          .map(WindowsProcessInfo.fromJson)
+          .where((WindowsProcessInfo process) => process.pid > 0)
+          .toList(growable: false),
+      galHookModuleHolders: _listOfMaps(json['galHookModuleHolders'])
+          .map(WindowsProcessInfo.fromJson)
+          .where((WindowsProcessInfo process) => process.pid > 0)
+          .toList(growable: false),
+      innoLogDeleteFileFailures: _listOfMaps(json['innoLogDeleteFileFailures'])
+          .map(WindowsInnoDeleteFileFailure.fromJson)
+          .where(
+            (WindowsInnoDeleteFileFailure failure) =>
+                failure.path.isNotEmpty && failure.code > 0,
+          )
+          .toList(growable: false),
+      pathMismatchWarning: json['pathMismatchWarning'] as String?,
+      launcherStartedAt: _dateTime(json['launcherStartedAt']),
+      launcherPid: _int(json['launcherPid']),
+      parentProcessId: _int(json['parentProcessId']),
+      parentExitObserved: json['parentExitObserved'] as bool?,
+      parentExitObservedAt: _dateTime(json['parentExitObservedAt']),
+      launcherMutexReleased: json['launcherMutexReleased'] as bool?,
+      installerLaunchSucceeded: json['installerLaunchSucceeded'] as bool?,
+      installerLaunchedAt: _dateTime(json['installerLaunchedAt']),
+      installerPid: _int(json['installerPid']),
+      innoLogExists: json['innoLogExists'] as bool?,
+      innoLogSizeBytes: _int(json['innoLogSizeBytes']),
+      innoLogModifiedAt: _dateTime(json['innoLogModifiedAt']),
+      installerFailureType: json['installerFailureType'] as String?,
+      installerFailureSummary: json['installerFailureSummary'] as String?,
+      installerLaunchFailedAt: _dateTime(json['installerLaunchFailedAt']),
+      launchError: json['launchError'] as String?,
+      failureFingerprint: json['failureFingerprint'] as String?,
+      lastPromptedAppVersion: json['lastPromptedAppVersion'] as String?,
+      lastPromptedFailureFingerprint:
+          json['lastPromptedFailureFingerprint'] as String?,
+      lastPromptedAt: _dateTime(json['lastPromptedAt']),
+      extraFields: <String, dynamic>{
+        for (final MapEntry<String, dynamic> entry in json.entries)
+          if (!_knownJsonKeys.contains(entry.key)) entry.key: entry.value,
+      },
+    );
+  }
+
+  /// 本模型自己认识（读得回、写得出）的 marker 键。
+  ///
+  /// BUG-2203：marker 文件有**两个**写者——Dart（本类）和 C++ 的
+  /// `fushi_update_launcher.exe`（`update_launcher.cpp` 的 `AppendMarkerFields`）。
+  /// launcher 在 app 已经退出之后才写下整条交接链上最关键的观测：父进程到底退没退、
+  /// 互斥量到底放没放、安装器结束后 app 有没有回来、是不是 launcher 把它拉回来的。
+  /// 而 app 下次启动读回 marker、补上失败诊断再写回时，走的是
+  /// `fromJson → copyWith → toJson` —— 旧实现里凡是本模型不认识的键**在这一步被静默
+  /// 丢掉**。现场就是这样：`parentExitTimedOut` / `launcherMutexReleased` /
+  /// `appAliveAfterInstaller` 全被抹掉，只剩一个 `parentExitObserved:false`，
+  /// 事后连「是 OpenProcess 失败还是真的等超时」都分不出来。
+  ///
+  /// 所以未识别的键一律进 [extraFields] 原样带回去：marker 是**证据**，
+  /// 不是本类的私有序列化格式，读者无权丢掉另一个写者的观测。
+  static const Set<String> _knownJsonKeys = <String>{
+    'targetVersion',
+    'installerPath',
+    'innoLogPath',
+    'startedAt',
+    'currentExecutablePath',
+    'currentInstallDir',
+    'targetInstallDir',
+    'detectedInstallLocations',
+    'runningFushiProcesses',
+    // 只读不写的旧键（见上面 W2-6 的注释）；同样不该落进 extraFields 再被写回。
+    'runningHibikiProcesses',
+    'libmpvModuleHolders',
+    'galHookModuleHolders',
+    'innoLogDeleteFileFailures',
+    'pathMismatchWarning',
+    'launcherStartedAt',
+    'launcherPid',
+    'parentProcessId',
+    'parentExitObserved',
+    'parentExitObservedAt',
+    'launcherMutexReleased',
+    'installerLaunchSucceeded',
+    'installerLaunchedAt',
+    'installerPid',
+    'innoLogExists',
+    'innoLogSizeBytes',
+    'innoLogModifiedAt',
+    'installerFailureType',
+    'installerFailureSummary',
+    'installerLaunchFailedAt',
+    'launchError',
+    'failureFingerprint',
+    'lastPromptedAppVersion',
+    'lastPromptedFailureFingerprint',
+    'lastPromptedAt',
+  };
+
+  final String targetVersion;
+  final String installerPath;
+  final String innoLogPath;
+  final DateTime startedAt;
+  final String? currentExecutablePath;
+  final String? currentInstallDir;
+  final String? targetInstallDir;
+  final List<WindowsDetectedInstallLocation> detectedInstallLocations;
+  final List<WindowsProcessInfo> runningFushiProcesses;
+  final List<WindowsProcessInfo> libmpvModuleHolders;
+  final List<WindowsProcessInfo> galHookModuleHolders;
+  final List<WindowsInnoDeleteFileFailure> innoLogDeleteFileFailures;
+  final String? pathMismatchWarning;
+  final DateTime? launcherStartedAt;
+  final int? launcherPid;
+  final int? parentProcessId;
+  final bool? parentExitObserved;
+  final DateTime? parentExitObservedAt;
+
+  /// `fushi_update_launcher.exe` 在启动 Inno **之前**实测到的事实：
+  /// `FushiSingleInstanceMutex` 是否已经被释放（`WaitForMutexReleased()`）。
+  ///
+  /// 这是「Fushi 是不是还开着」唯一的**观测**来源。日志里出现 mutex 字样不是
+  /// （BUG-2203：Inno 会把 `[Code]` 段的 `OpenMutexW@kernel32.dll` 导入记进每一份
+  /// 日志，无论成败）。
+  final bool? launcherMutexReleased;
+  final bool? installerLaunchSucceeded;
+  final DateTime? installerLaunchedAt;
+  final int? installerPid;
+  final bool? innoLogExists;
+  final int? innoLogSizeBytes;
+  final DateTime? innoLogModifiedAt;
+  final String? installerFailureType;
+  final String? installerFailureSummary;
+  final DateTime? installerLaunchFailedAt;
+  final String? launchError;
+  final String? failureFingerprint;
+  final String? lastPromptedAppVersion;
+  final String? lastPromptedFailureFingerprint;
+  final DateTime? lastPromptedAt;
+
+  /// marker 里本模型不认识的键（今天全部来自 C++ launcher）。原样带回磁盘，
+  /// 见 [_knownJsonKeys] 的注释。
+  final Map<String, dynamic> extraFields;
+
+  WindowsInstallerDiagnostics get diagnostics => WindowsInstallerDiagnostics(
+        currentExecutablePath: currentExecutablePath,
+        currentInstallDir: currentInstallDir,
+        targetInstallDir: targetInstallDir,
+        detectedInstallLocations: detectedInstallLocations,
+        runningFushiProcesses: runningFushiProcesses,
+        libmpvModuleHolders: libmpvModuleHolders,
+        galHookModuleHolders: galHookModuleHolders,
+        innoLogDeleteFileFailures: innoLogDeleteFileFailures,
+        pathMismatchWarning: pathMismatchWarning,
+      );
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        // 先铺未识别键，本模型认识的键随后写入 —— 两边的键集互斥
+        // （[_knownJsonKeys] 过滤过），这里的顺序只决定 JSON 里的字段次序。
+        ...extraFields,
+        'targetVersion': targetVersion,
+        'installerPath': installerPath,
+        'innoLogPath': innoLogPath,
+        'startedAt': startedAt.toUtc().toIso8601String(),
+        if (currentExecutablePath != null)
+          'currentExecutablePath': currentExecutablePath,
+        if (currentInstallDir != null) 'currentInstallDir': currentInstallDir,
+        if (targetInstallDir != null) 'targetInstallDir': targetInstallDir,
+        if (detectedInstallLocations.isNotEmpty)
+          'detectedInstallLocations': detectedInstallLocations
+              .map((WindowsDetectedInstallLocation location) =>
+                  location.toJson())
+              .toList(growable: false),
+        if (runningFushiProcesses.isNotEmpty)
+          'runningFushiProcesses': runningFushiProcesses
+              .map((WindowsProcessInfo process) => process.toJson())
+              .toList(growable: false),
+        if (libmpvModuleHolders.isNotEmpty)
+          'libmpvModuleHolders': libmpvModuleHolders
+              .map((WindowsProcessInfo process) => process.toJson())
+              .toList(growable: false),
+        if (galHookModuleHolders.isNotEmpty)
+          'galHookModuleHolders': galHookModuleHolders
+              .map((WindowsProcessInfo process) => process.toJson())
+              .toList(growable: false),
+        if (innoLogDeleteFileFailures.isNotEmpty)
+          'innoLogDeleteFileFailures': innoLogDeleteFileFailures
+              .map((WindowsInnoDeleteFileFailure failure) => failure.toJson())
+              .toList(growable: false),
+        if (pathMismatchWarning != null)
+          'pathMismatchWarning': pathMismatchWarning,
+        if (launcherStartedAt != null)
+          'launcherStartedAt': launcherStartedAt!.toUtc().toIso8601String(),
+        if (launcherPid != null) 'launcherPid': launcherPid,
+        if (parentProcessId != null) 'parentProcessId': parentProcessId,
+        if (parentExitObserved != null)
+          'parentExitObserved': parentExitObserved,
+        if (parentExitObservedAt != null)
+          'parentExitObservedAt':
+              parentExitObservedAt!.toUtc().toIso8601String(),
+        if (launcherMutexReleased != null)
+          'launcherMutexReleased': launcherMutexReleased,
+        if (installerLaunchSucceeded != null)
+          'installerLaunchSucceeded': installerLaunchSucceeded,
+        if (installerLaunchedAt != null)
+          'installerLaunchedAt': installerLaunchedAt!.toUtc().toIso8601String(),
+        if (installerPid != null) 'installerPid': installerPid,
+        if (innoLogExists != null) 'innoLogExists': innoLogExists,
+        if (innoLogSizeBytes != null) 'innoLogSizeBytes': innoLogSizeBytes,
+        if (innoLogModifiedAt != null)
+          'innoLogModifiedAt': innoLogModifiedAt!.toUtc().toIso8601String(),
+        if (installerFailureType != null)
+          'installerFailureType': installerFailureType,
+        if (installerFailureSummary != null)
+          'installerFailureSummary': installerFailureSummary,
+        if (installerLaunchFailedAt != null)
+          'installerLaunchFailedAt':
+              installerLaunchFailedAt!.toUtc().toIso8601String(),
+        if (launchError != null) 'launchError': launchError,
+        if (failureFingerprint != null)
+          'failureFingerprint': failureFingerprint,
+        if (lastPromptedAppVersion != null)
+          'lastPromptedAppVersion': lastPromptedAppVersion,
+        if (lastPromptedFailureFingerprint != null)
+          'lastPromptedFailureFingerprint': lastPromptedFailureFingerprint,
+        if (lastPromptedAt != null)
+          'lastPromptedAt': lastPromptedAt!.toUtc().toIso8601String(),
+      };
+
+  WindowsUpdateHandoffRecord copyWith({
+    String? targetVersion,
+    String? installerPath,
+    String? innoLogPath,
+    DateTime? startedAt,
+    String? currentExecutablePath,
+    String? currentInstallDir,
+    String? targetInstallDir,
+    List<WindowsDetectedInstallLocation>? detectedInstallLocations,
+    List<WindowsProcessInfo>? runningFushiProcesses,
+    List<WindowsProcessInfo>? libmpvModuleHolders,
+    List<WindowsProcessInfo>? galHookModuleHolders,
+    List<WindowsInnoDeleteFileFailure>? innoLogDeleteFileFailures,
+    String? pathMismatchWarning,
+    DateTime? launcherStartedAt,
+    int? launcherPid,
+    int? parentProcessId,
+    bool? parentExitObserved,
+    DateTime? parentExitObservedAt,
+    bool? launcherMutexReleased,
+    bool? installerLaunchSucceeded,
+    DateTime? installerLaunchedAt,
+    int? installerPid,
+    bool? innoLogExists,
+    int? innoLogSizeBytes,
+    DateTime? innoLogModifiedAt,
+    String? installerFailureType,
+    String? installerFailureSummary,
+    DateTime? installerLaunchFailedAt,
+    String? launchError,
+    String? failureFingerprint,
+    String? lastPromptedAppVersion,
+    String? lastPromptedFailureFingerprint,
+    DateTime? lastPromptedAt,
+    Map<String, dynamic>? extraFields,
+    bool clearLaunchFailure = false,
+  }) {
+    return WindowsUpdateHandoffRecord(
+      targetVersion: targetVersion ?? this.targetVersion,
+      installerPath: installerPath ?? this.installerPath,
+      innoLogPath: innoLogPath ?? this.innoLogPath,
+      startedAt: startedAt ?? this.startedAt,
+      currentExecutablePath:
+          currentExecutablePath ?? this.currentExecutablePath,
+      currentInstallDir: currentInstallDir ?? this.currentInstallDir,
+      targetInstallDir: targetInstallDir ?? this.targetInstallDir,
+      detectedInstallLocations:
+          detectedInstallLocations ?? this.detectedInstallLocations,
+      runningFushiProcesses:
+          runningFushiProcesses ?? this.runningFushiProcesses,
+      libmpvModuleHolders: libmpvModuleHolders ?? this.libmpvModuleHolders,
+      galHookModuleHolders: galHookModuleHolders ?? this.galHookModuleHolders,
+      innoLogDeleteFileFailures:
+          innoLogDeleteFileFailures ?? this.innoLogDeleteFileFailures,
+      pathMismatchWarning: pathMismatchWarning ?? this.pathMismatchWarning,
+      launcherStartedAt: launcherStartedAt ?? this.launcherStartedAt,
+      launcherPid: launcherPid ?? this.launcherPid,
+      parentProcessId: parentProcessId ?? this.parentProcessId,
+      parentExitObserved: parentExitObserved ?? this.parentExitObserved,
+      parentExitObservedAt: parentExitObservedAt ?? this.parentExitObservedAt,
+      launcherMutexReleased:
+          launcherMutexReleased ?? this.launcherMutexReleased,
+      installerLaunchSucceeded:
+          installerLaunchSucceeded ?? this.installerLaunchSucceeded,
+      installerLaunchedAt: installerLaunchedAt ?? this.installerLaunchedAt,
+      installerPid: installerPid ?? this.installerPid,
+      innoLogExists: innoLogExists ?? this.innoLogExists,
+      innoLogSizeBytes: innoLogSizeBytes ?? this.innoLogSizeBytes,
+      innoLogModifiedAt: innoLogModifiedAt ?? this.innoLogModifiedAt,
+      installerFailureType: installerFailureType ?? this.installerFailureType,
+      installerFailureSummary:
+          installerFailureSummary ?? this.installerFailureSummary,
+      installerLaunchFailedAt: clearLaunchFailure
+          ? null
+          : installerLaunchFailedAt ?? this.installerLaunchFailedAt,
+      launchError: clearLaunchFailure ? null : launchError ?? this.launchError,
+      failureFingerprint: failureFingerprint ?? this.failureFingerprint,
+      lastPromptedAppVersion:
+          lastPromptedAppVersion ?? this.lastPromptedAppVersion,
+      lastPromptedFailureFingerprint:
+          lastPromptedFailureFingerprint ?? this.lastPromptedFailureFingerprint,
+      lastPromptedAt: lastPromptedAt ?? this.lastPromptedAt,
+      extraFields: extraFields ?? this.extraFields,
+    );
+  }
+}
+
+abstract final class WindowsUpdateHandoff {
+  static const String markerFileName = 'update-handoff.json';
+
+  static File markerFile(Directory updatesDir) {
+    return File('${updatesDir.path}${Platform.pathSeparator}$markerFileName');
+  }
+
+  static Future<void> writePending({
+    required File markerFile,
+    required String targetVersion,
+    required String installerPath,
+    required String innoLogPath,
+    required DateTime startedAt,
+    WindowsInstallerDiagnostics diagnostics =
+        const WindowsInstallerDiagnostics(),
+  }) async {
+    // TODO-1197/1198：写新的 pending 记录前，如果磁盘上已有一份指向**同一 target
+    // 版本**的旧标记，保留它的 `lastPrompted*` 字段。否则每次重走安装握手都会把
+    // 这些字段清成 null，reconcile 的幂等守卫（同版本同指纹只提示一次）在
+    // 「装不成→重启→再装」的循环里失效，用户每次启动都会再弹一次「安装未完成」。
+    // 换成**不同** target 版本（真正的新版本 / 新 debug 指纹）时不保留——那是一次
+    // 全新的更新尝试，失败理应重新提示。
+    final WindowsUpdateHandoffRecord? existing = await read(markerFile);
+    final bool sameTarget = existing != null &&
+        _isSameHandoffTarget(existing.targetVersion, targetVersion);
+    await _write(
+      markerFile,
+      WindowsUpdateHandoffRecord(
+        targetVersion: targetVersion,
+        installerPath: installerPath,
+        innoLogPath: innoLogPath,
+        startedAt: startedAt,
+        currentExecutablePath: diagnostics.currentExecutablePath,
+        currentInstallDir: diagnostics.currentInstallDir,
+        targetInstallDir: diagnostics.targetInstallDir,
+        detectedInstallLocations: diagnostics.detectedInstallLocations,
+        runningFushiProcesses: diagnostics.runningFushiProcesses,
+        libmpvModuleHolders: diagnostics.libmpvModuleHolders,
+        galHookModuleHolders: diagnostics.galHookModuleHolders,
+        innoLogDeleteFileFailures: diagnostics.innoLogDeleteFileFailures,
+        pathMismatchWarning: diagnostics.pathMismatchWarning,
+        lastPromptedAppVersion:
+            sameTarget ? existing.lastPromptedAppVersion : null,
+        lastPromptedFailureFingerprint:
+            sameTarget ? existing.lastPromptedFailureFingerprint : null,
+        lastPromptedAt: sameTarget ? existing.lastPromptedAt : null,
+      ),
+    );
+  }
+
+  static Future<WindowsUpdateHandoffRecord?> read(File markerFile) async {
+    if (!await markerFile.exists()) return null;
+    try {
+      final Object? decoded = jsonDecode(await markerFile.readAsString());
+      if (decoded is! Map<String, dynamic>) return null;
+      final WindowsUpdateHandoffRecord record =
+          WindowsUpdateHandoffRecord.fromJson(decoded);
+      if (record.targetVersion.isEmpty ||
+          record.installerPath.isEmpty ||
+          record.innoLogPath.isEmpty) {
+        return null;
+      }
+      return record;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// TODO-1197/1198 只读退避判据：磁盘上是否存在一份指向 [candidateVersion]
+  /// **同一版本**的握手标记。存在即代表上一轮对这个确切版本的自动安装握手没有
+  /// 落地——安装成功会由 [reconcile] 删除标记，且能走到自动安装分支时当前版本
+  /// 必然仍低于目标（否则「已是最新」早退），所以标记仍在 = 上次没装成。调用方
+  /// 据此**退回手动确认对话框**，打断「装不成→退出→重启→又自动装」的死循环
+  /// （BUG-488 / TODO-1181 触发）。
+  ///
+  /// 换成**不同**候选版本（新 release / 新 debug 指纹）→ 返 false，退避重置，
+  /// 允许对新版本再自动装一次，绝不「一次失败就永久不更新」。标记缺失 / 损坏
+  /// （[read] 返 null）同样返 false（fail-open，不因读不到标记而卡住更新）。
+  static Future<bool> shouldBackOffAutoInstall({
+    required File markerFile,
+    required String candidateVersion,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return false;
+    return _isSameHandoffTarget(record.targetVersion, candidateVersion);
+  }
+
+  /// 两个版本串是否指向同一次更新目标：strip 前导 `v` + trim 后精确相等。
+  /// 保留 prerelease 段与 `+build` 元数据（debug 通道用 `+<sha>` 区分构建，
+  /// 不能像语义比较那样丢掉——否则不同 debug 构建会被误判成同一版本而永不重试）。
+  static bool _isSameHandoffTarget(String a, String b) {
+    final String left = _stripLeadingV(a.trim());
+    final String right = _stripLeadingV(b.trim());
+    return left.isNotEmpty && left == right;
+  }
+
+  static Future<void> markLaunchSucceeded({
+    required File markerFile,
+    required DateTime launchedAt,
+    int? installerPid,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return;
+    await _write(
+      markerFile,
+      record.copyWith(
+        installerLaunchSucceeded: true,
+        installerLaunchedAt: launchedAt,
+        installerPid: installerPid,
+        clearLaunchFailure: true,
+      ),
+    );
+  }
+
+  static Future<void> markLauncherStarted({
+    required File markerFile,
+    required DateTime startedAt,
+    required int parentProcessId,
+    int? launcherPid,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return;
+    await _write(
+      markerFile,
+      record.copyWith(
+        launcherStartedAt: startedAt,
+        launcherPid: launcherPid,
+        parentProcessId: parentProcessId,
+      ),
+    );
+  }
+
+  static Future<void> markParentExitObserved({
+    required File markerFile,
+    required DateTime observedAt,
+    required bool observed,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return;
+    await _write(
+      markerFile,
+      record.copyWith(
+        parentExitObserved: observed,
+        parentExitObservedAt: observedAt,
+      ),
+    );
+  }
+
+  static Future<void> markLaunchFailed({
+    required File markerFile,
+    required String error,
+    required DateTime failedAt,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return;
+    await _write(
+      markerFile,
+      record.copyWith(
+        installerLaunchSucceeded: false,
+        installerLaunchFailedAt: failedAt,
+        launchError: error,
+      ),
+    );
+  }
+
+  /// [runningCodeVersionDefine] 默认就是编译进本份 `app.so` 的常量，生产路径无需
+  /// 传参；测试用它注入任意「运行中代码版本」。空串 = 未注入 = 该证据不可用。
+  static Future<WindowsUpdateHandoffResult?> reconcile({
+    required File markerFile,
+    required String currentVersion,
+    String runningCodeVersionDefine = kFushiBuildVersionDefine,
+    DateTime? now,
+  }) async {
+    final WindowsUpdateHandoffRecord? record = await read(markerFile);
+    if (record == null) return null;
+    // BUG-1786：判「装成功」必须拿到**正面证据**，而不是「没看到失败」。
+    //
+    // 旧判据只有 `currentVersion >= targetVersion` 一条，而 `currentVersion` 来自 exe
+    // 版本资源——它和 `app.so` 是**两个文件**，所以这条判据根本不看运行中的代码换没换：
+    // 安装中途 Abort 回滚（保留被覆盖的旧 app.so）要报成功，半更新态同样报成功。
+    //
+    // 更糟的是它在 beta 通道曾**恒为真**。注意机制不是「Windows 版本资源丢后缀」——
+    // VERSIONINFO 的字符串字段保留完整 build-name（丢后缀的只是 `FILEVERSION` 那四段
+    // 数字，而 package_info 读的是字符串字段），debug 包实测就是 `2.2.1-debug.12215`。
+    // 真正丢后缀的是 **beta 的 `--build-name` 本身**：`release-desktop.yml` 原先只给
+    // debug tag 覆盖 `BUILD_VERSION_NAME`，beta 包在版本资源里一律自称裸 `2.2.1`，而
+    // targetVersion 是 `2.2.1-beta.30`；SemVer 规定「正式版 > 同号预发布版」⇒
+    // `2.2.1 > 2.2.1-beta.30` ⇒ 永远成立（版本名派生已在 BUG-1836 一并修掉）。
+    // 用户现场因此连着几天收到「更新成功」，跑的却始终是旧 Dart 代码。
+    //
+    // BUG-1836 根因修复：判据升级为三源证据表（见 [isWindowsUpdateInstalled]）。
+    // 旧判据只有「Inno 日志 + exe 版本资源」两源，两源都不是**被替换的产物本身**：
+    // 日志只在 app 自己拉起安装器时才存在（手动救援装成功也判失败，这就是
+    // BUG-1836），版本资源和 Dart 代码是两个文件（半更新态里它报新版本、跑的是旧
+    // 代码）。现在加入编译进 `app.so` 的 [kFushiBuildVersionDefine]，它与被替换的
+    // 产物同体，是唯一伪造不了的证据。没有它的历史版本/本地构建行为与旧判据完全
+    // 一致。
+    final String? runningCodeVersion =
+        normalizeFushiBuildVersion(runningCodeVersionDefine);
+    // 「这条提示是不是已经弹过」的幂等键。优先用代码版本：它来自 `app.so`，
+    // `currentVersion` 来自 exe 版本资源，半更新态下两者会指向不同的构建，而这个
+    // 键要回答的正是「跑着的这份代码有没有被提示过」。
+    final String promptedVersionKey = runningCodeVersion ?? currentVersion;
+    final WindowsInnoInstallVerdict verdict = windowsInnoLogVerdict(
+      await _readInnoLogContents(record.innoLogPath),
+    );
+    if (isWindowsUpdateInstalled(
+      verdict: verdict,
+      targetVersion: record.targetVersion,
+      executableVersion: currentVersion,
+      runningCodeVersion: runningCodeVersion,
+    )) {
+      // Idempotency guard mirroring the failure branch below: if we already
+      // surfaced the success dialog for this app version, stay silent. Relying
+      // solely on deleting the marker is fragile — the delete can fail on real
+      // machines (antivirus/indexer locks, permission errors in the updates
+      // dir) and is swallowed by the catch, leaving the marker in place so the
+      // success dialog pops on every startup (TODO-1035 / BUG-483).
+      if (record.lastPromptedAppVersion == promptedVersionKey) {
+        // Best-effort cleanup is still worth retrying in case the lock cleared.
+        try {
+          if (await markerFile.exists()) await markerFile.delete();
+        } catch (_) {
+          // Ignore: the guard above already prevents a repeat dialog.
+        }
+        return null;
+      }
+      // Persist the prompted version *before* attempting deletion so that even
+      // if the delete fails, the next startup is silenced by the guard above.
+      final WindowsUpdateHandoffRecord prompted = record.copyWith(
+        lastPromptedAppVersion: promptedVersionKey,
+        lastPromptedAt: now ?? DateTime.now(),
+      );
+      try {
+        await _write(markerFile, prompted);
+      } catch (_) {
+        // Keep going: the user still deserves the success result.
+      }
+      try {
+        if (await markerFile.exists()) await markerFile.delete();
+      } catch (_) {
+        // Keep going: the user still deserves the success result.
+      }
+      return WindowsUpdateHandoffResult(
+        status: WindowsUpdateHandoffStatus.installed,
+        record: prompted,
+      );
+    }
+
+    final WindowsUpdateHandoffRecord enriched =
+        await _enrichFailureDiagnostics(record);
+    if (enriched.lastPromptedAppVersion == promptedVersionKey &&
+        enriched.lastPromptedFailureFingerprint ==
+            enriched.failureFingerprint) {
+      return null;
+    }
+    final WindowsUpdateHandoffRecord prompted = enriched.copyWith(
+      lastPromptedAppVersion: promptedVersionKey,
+      lastPromptedFailureFingerprint: enriched.failureFingerprint,
+      lastPromptedAt: now ?? DateTime.now(),
+    );
+    await _write(markerFile, prompted);
+    return WindowsUpdateHandoffResult(
+      status: prompted.installerLaunchSucceeded == false
+          ? WindowsUpdateHandoffStatus.launchFailed
+          : WindowsUpdateHandoffStatus.incomplete,
+      record: prompted,
+    );
+  }
+
+  static Future<WindowsUpdateHandoffRecord> _enrichFailureDiagnostics(
+    WindowsUpdateHandoffRecord record,
+  ) async {
+    final _WindowsInnoLogSnapshot log = await _readInnoLog(record.innoLogPath);
+    final List<WindowsInnoDeleteFileFailure> deleteFailures =
+        log.contents == null
+            ? record.innoLogDeleteFileFailures
+            : parseWindowsInnoDeleteFileFailures(log.contents!);
+    final WindowsInstallerFailureSummary summary =
+        summarizeWindowsInstallerFailure(
+      record: record.copyWith(
+        innoLogDeleteFileFailures: deleteFailures,
+        innoLogExists: log.exists,
+        innoLogSizeBytes: log.sizeBytes,
+        innoLogModifiedAt: log.modifiedAt,
+      ),
+      innoLogContents: log.contents,
+    );
+    final String fingerprint = windowsInstallerFailureFingerprint(
+      record: record.copyWith(
+        innoLogDeleteFileFailures: deleteFailures,
+        innoLogExists: log.exists,
+        innoLogSizeBytes: log.sizeBytes,
+        innoLogModifiedAt: log.modifiedAt,
+        installerFailureType: summary.type,
+        installerFailureSummary: summary.message,
+      ),
+    );
+    return record.copyWith(
+      innoLogDeleteFileFailures: deleteFailures,
+      innoLogExists: log.exists,
+      innoLogSizeBytes: log.sizeBytes,
+      innoLogModifiedAt: log.modifiedAt,
+      installerFailureType: summary.type,
+      installerFailureSummary: summary.message,
+      failureFingerprint: fingerprint,
+    );
+  }
+
+  static Future<String?> _readInnoLogContents(String path) async =>
+      (await _readInnoLog(path)).contents;
+
+  static Future<_WindowsInnoLogSnapshot> _readInnoLog(String path) async {
+    try {
+      final File log = File(path);
+      if (!await log.exists()) {
+        return const _WindowsInnoLogSnapshot(exists: false);
+      }
+      final FileStat stat = await log.stat();
+      return _WindowsInnoLogSnapshot(
+        exists: true,
+        sizeBytes: stat.size,
+        modifiedAt: stat.modified,
+        contents: await log.readAsString(),
+      );
+    } catch (_) {
+      return const _WindowsInnoLogSnapshot(exists: false);
+    }
+  }
+
+  static Future<void> _write(
+    File markerFile,
+    WindowsUpdateHandoffRecord record,
+  ) async {
+    await markerFile.parent.create(recursive: true);
+    const JsonEncoder encoder = JsonEncoder.withIndent('  ');
+    await markerFile.writeAsString(
+      encoder.convert(record.toJson()),
+      flush: true,
+    );
+  }
+}
+
+class _WindowsInnoLogSnapshot {
+  const _WindowsInnoLogSnapshot({
+    required this.exists,
+    this.sizeBytes,
+    this.modifiedAt,
+    this.contents,
+  });
+
+  final bool exists;
+  final int? sizeBytes;
+  final DateTime? modifiedAt;
+  final String? contents;
+}
+
+WindowsInstallerFailureSummary summarizeWindowsInstallerFailure({
+  required WindowsUpdateHandoffRecord record,
+  String? innoLogContents,
+}) {
+  final String? launchError = record.launchError;
+  if (launchError != null && launchError.trim().isNotEmpty) {
+    return WindowsInstallerFailureSummary(
+      type: 'launch_error',
+      message: 'The update launcher could not start the installer: '
+          '${launchError.trim()}',
+    );
+  }
+
+  final List<WindowsInnoDeleteFileFailure> deleteFailures =
+      record.innoLogDeleteFileFailures;
+  WindowsInnoDeleteFileFailure? code5;
+  for (final WindowsInnoDeleteFileFailure failure in deleteFailures) {
+    if (failure.code == 5) {
+      code5 = failure;
+      break;
+    }
+  }
+  if (code5 != null) {
+    return WindowsInstallerFailureSummary(
+      type: 'deletefile_code_5',
+      message: 'The installer could not replace ${code5.path} because Windows '
+          'reported access denied (DeleteFile code 5). Close Fushi and any '
+          'process using that file, then run the installer again.',
+    );
+  }
+
+  if (deleteFailures.isNotEmpty) {
+    final WindowsInnoDeleteFileFailure failure = deleteFailures.first;
+    return WindowsInstallerFailureSummary(
+      type: 'deletefile_failed',
+      message: 'The installer could not replace ${failure.path} '
+          '(DeleteFile code ${failure.code}).',
+    );
+  }
+
+  final String? log = innoLogContents;
+  if (log == null || record.innoLogExists == false) {
+    return const WindowsInstallerFailureSummary(
+      type: 'missing_log',
+      message: 'The installer log was not created, so Fushi could not confirm '
+          'that Inno Setup started. This usually means the handoff launcher '
+          'failed before the installer began.',
+    );
+  }
+
+  final String lower = log.toLowerCase();
+
+  // BUG-2203：安装器根本没走出启动段。这是**日志形状**上的判据，不是措辞猜测：
+  // 从 `Log opened.` 到 `[Code]` 段外部函数导入之间的那几行是 Inno 每次启动都会写的
+  // 固定内容（且始终是英文，与安装器 UI 语言无关），之后一行都没有 —— 既没进复制阶段，
+  // 也没留下任何自行中止的记录。现场就是这个形状：安装器被自己的
+  // `taskkill /IM fushi.exe /T` 连同所在的祖先进程树一起杀掉（见 fushi.iss 的注释），
+  // 日志在启动后 67ms 戛然而止。
+  if (windowsInnoLogStoppedDuringStartup(log)) {
+    final StringBuffer message = StringBuffer(
+      'Inno Setup stopped during startup: the log ends inside the setup '
+      'preamble, with no file-copy phase and no record of Setup stopping on '
+      'its own. That is the shape of an externally terminated installer, not '
+      'of a cancelled one.',
+    );
+    if (record.launcherMutexReleased == false) {
+      message.write(
+        ' The update launcher also observed FushiSingleInstanceMutex still '
+        'held when it started the installer, so a Fushi process was alive at '
+        'that moment.',
+      );
+    }
+    return WindowsInstallerFailureSummary(
+      type: 'installer_stopped_at_startup',
+      message: message.toString(),
+    );
+  }
+
+  // 「Fushi 还开着」只认**观测**：launcher 在启动 Inno 之前实测互斥量仍被持有，
+  // 或者 Inno 自己在日志里写下了它检测到实例在跑。
+  //
+  // 这里**故意不再**匹配裸 `mutex` / `is running` 子串（BUG-2203 的误诊源头）：
+  // Inno 会把 `[Code]` 段的外部函数导入逐个记进日志，其中就有
+  // `Function and DLL name: OpenMutexW@kernel32.dll` —— 这一行**每一份**日志里都有，
+  // 无论安装成功还是失败。于是旧判据对任何一次失败都恒真，把真正的失败原因
+  // （安装器被杀、复制失败、用户取消）全部盖成同一条「Fushi 仍在运行」。
+  final bool mentionsRunningApp = lower.contains('currently running') ||
+      lower.contains('appmutex') ||
+      lower.contains('another instance');
+  final bool hasEAbort = lower.contains('eabort');
+  final bool looksCanceled = lower.contains('cancel') ||
+      lower.contains('aborted') ||
+      lower.contains('abort');
+  if (mentionsRunningApp || record.launcherMutexReleased == false) {
+    return WindowsInstallerFailureSummary(
+      type: 'app_mutex_running',
+      message: 'Fushi was still running when the installer started. The '
+          'installer is guarded by FushiSingleInstanceMutex, so every active '
+          'fushi.exe process must be closed before the silent installer can '
+          'continue.',
+    );
+  }
+  if (hasEAbort || looksCanceled) {
+    return const WindowsInstallerFailureSummary(
+      type: 'silent_cancel',
+      message: 'Inno Setup canceled in silent mode. With /VERYSILENT and '
+          '/SUPPRESSMSGBOXES, a blocked prompt becomes a cancel instead of an '
+          'interactive dialog.',
+    );
+  }
+
+  return const WindowsInstallerFailureSummary(
+    type: 'installer_incomplete',
+    message: 'The installer ran, but Fushi restarted with the previous '
+        'version. Check the installer log for the full Inno Setup details.',
+  );
+}
+
+/// Inno 每次启动都会写、且**与安装器 UI 语言无关**（这段日志恒为英文）的固定行。
+///
+/// 用途见 [windowsInnoLogStoppedDuringStartup]。这里刻意只收「启动段」的行：
+/// 名单之外出现任何一行，就说明安装器已经走出启动段，判据即不成立。
+const List<String> _kInnoStartupLogMarkers = <String>[
+  'Log opened.',
+  'Setup version:',
+  'Original Setup EXE:',
+  'Setup command line:',
+  'Windows version:',
+  'Windows architecture:',
+  'Machine types supported by system:',
+  'User privileges:',
+  'Administrative install mode:',
+  'Install mode root key:',
+  '64-bit install mode:',
+  'RedirectionGuard status',
+  'Created temporary directory:',
+  '-- DLL function import --',
+  'Function and DLL name:',
+  'Importing the DLL function.',
+  'Successfully imported the DLL function.',
+];
+
+/// 日志是否停在 Inno 的启动段——即安装器**从未**走到复制文件的阶段，
+/// 也没有留下任何自行中止的记录（BUG-2203）。
+///
+/// 判据是「除启动段固定行之外一行都没有」，方向刻意保守：名单不全时只会**少报**
+/// （落回 `installer_incomplete`），不会像旧的子串判据那样把每一次失败都误报成
+/// 同一个原因。
+bool windowsInnoLogStoppedDuringStartup(String log) {
+  bool sawLogOpened = false;
+  bool sawAnyLine = false;
+  for (final String raw in const LineSplitter().convert(log)) {
+    final String line = raw.trim();
+    if (line.isEmpty) continue;
+    sawAnyLine = true;
+    if (line.contains('Log opened.')) sawLogOpened = true;
+    if (!_kInnoStartupLogMarkers.any(line.contains)) return false;
+  }
+  return sawAnyLine && sawLogOpened;
+}
+
+String windowsInstallerFailureFingerprint({
+  required WindowsUpdateHandoffRecord record,
+}) {
+  final List<String> parts = <String>[
+    record.targetVersion,
+    record.installerPath,
+    record.innoLogPath,
+    record.installerFailureType ?? 'unknown',
+    record.launchError ?? '',
+    '${record.innoLogSizeBytes ?? -1}',
+    record.innoLogModifiedAt?.toUtc().toIso8601String() ?? '',
+  ];
+  return parts.map(_fingerprintPart).join('|');
+}
+
+List<WindowsInnoDeleteFileFailure> parseWindowsInnoDeleteFileFailures(
+  String output,
+) {
+  final List<String> lines = const LineSplitter().convert(output);
+  final List<WindowsInnoDeleteFileFailure> failures =
+      <WindowsInnoDeleteFileFailure>[];
+  String? previousPath;
+  for (int i = 0; i < lines.length; i++) {
+    final String line = lines[i];
+    final String? pathOnLine = _extractWindowsPath(line);
+    if (pathOnLine != null) previousPath = pathOnLine;
+
+    final RegExpMatch? codeMatch = RegExp(
+      r'DeleteFile failed[^0-9]*code\s+([0-9]+)',
+      caseSensitive: false,
+    ).firstMatch(line);
+    if (codeMatch == null) continue;
+
+    final int? code = int.tryParse(codeMatch.group(1)!);
+    if (code == null) continue;
+    final String? nextPath =
+        i + 1 < lines.length ? _extractWindowsPath(lines[i + 1]) : null;
+    final String path = pathOnLine ?? previousPath ?? nextPath ?? '';
+    failures.add(
+      WindowsInnoDeleteFileFailure(
+        path: path,
+        code: code,
+        message: line.trim(),
+      ),
+    );
+  }
+  return failures
+      .where((WindowsInnoDeleteFileFailure failure) => failure.path.isNotEmpty)
+      .toList(growable: false);
+}
+
+/// Inno 日志对「这次安装到底成没成」的收尾结论。
+///
+/// [unknown] 指日志缺失 / 读不到 / 没写出任何收尾行——**不是**「大概成了」。正常路径下
+/// 日志一定存在（`/LOG=` 是我们自己传给安装器的），拿不到通常意味着 launcher 没起来、
+/// Inno 没运行或中途崩了，那些都该按失败处置。
+enum WindowsInnoInstallVerdict { succeeded, aborted, unknown }
+
+/// Inno 日志是否表明**这次安装以中止/回滚收场**（而不是装完了）。
+///
+/// 存在的理由（BUG-1786）：握手原本只用「当前版本号 >= 目标版本号」判断安装是否成功，
+/// 而 Windows 上版本号读自 `fushi.exe` 的版本资源。Inno 逐个文件安装，`fushi.exe` 的
+/// 字母序排在 `data\app.so`（全部 Dart 代码）之前——安装在中间被 Abort 时，exe 已经换成
+/// 新的、Dart 代码还是旧的，版本号判据于是宣告「安装成功」，用户拿着一个跑旧代码的 app
+/// 却收到成功提示。日志里的收尾结论才是这次安装的真相源。
+///
+/// 判据取**最后一条**结论行，而不是「是否出现过某个词」：Inno 在 `Rolling back changes.`
+/// 之后还会写回滚自身的进度，只按包含关系匹配会把回滚的成功当成安装的成功。同理，成功
+/// 安装的日志里也可能因为某个文件重试而出现过 `DeleteFile failed`，那不构成整包失败。
+///
+/// 无日志（null / 空 / 读不到）返回 false —— 宁可沿用旧的版本号判据，也不要因为读不到
+/// 日志就把一次真正成功的更新报成失败。
+bool windowsInnoLogReportsAbortedInstall(String? contents) =>
+    windowsInnoLogVerdict(contents) == WindowsInnoInstallVerdict.aborted;
+
+/// 取日志里**最后一条**收尾结论。见 [WindowsInnoInstallVerdict] 关于 unknown 的语义。
+WindowsInnoInstallVerdict windowsInnoLogVerdict(String? contents) {
+  if (contents == null || contents.trim().isEmpty) {
+    return WindowsInnoInstallVerdict.unknown;
+  }
+  const List<String> abortedMarkers = <String>[
+    'user canceled the installation process',
+    'rolling back changes',
+  ];
+  // `\b` 是关键，不能退化成 contains：回滚收尾写的是「**Un**installation process
+  // succeeded.」，而 'uninstallation process succeeded' 里就含有子串 'installation
+  // process succeeded'——按包含关系匹配会把**回滚自身的成功**读成安装成功，正好在最需要
+  // 报失败的那条日志上给出相反结论。词边界让 'uninstallation' 不再命中（'n' 与 'i' 之间
+  // 没有词边界），只有真正的 'Installation process succeeded.' 才算。
+  final RegExp succeeded = RegExp(r'\binstallation process succeeded');
+  final RegExp aborting = RegExp(r'\binstallation process aborted');
+  WindowsInnoInstallVerdict? verdict;
+  for (final String line in const LineSplitter().convert(contents)) {
+    final String lower = line.toLowerCase();
+    if (succeeded.hasMatch(lower)) {
+      verdict = WindowsInnoInstallVerdict.succeeded;
+      continue;
+    }
+    if (aborting.hasMatch(lower)) {
+      verdict = WindowsInnoInstallVerdict.aborted;
+      continue;
+    }
+    for (final String marker in abortedMarkers) {
+      if (lower.contains(marker)) {
+        verdict = WindowsInnoInstallVerdict.aborted;
+        break;
+      }
+    }
+  }
+  return verdict ?? WindowsInnoInstallVerdict.unknown;
+}
+
+String _fingerprintPart(String value) =>
+    base64Url.encode(utf8.encode(value)).replaceAll('=', '');
+
+String? _extractWindowsPath(String line) {
+  final RegExpMatch? match = RegExp(r'[A-Za-z]:\\[^"\r\n]+').firstMatch(line);
+  if (match == null) return null;
+  return match.group(0)!.replaceFirst(RegExp(r'[\s.;,]+$'), '').trim();
+}
+
+DateTime? _dateTime(Object? raw) {
+  if (raw is! String || raw.trim().isEmpty) return null;
+  return DateTime.tryParse(raw);
+}
+
+int? _int(Object? raw) {
+  if (raw is int) return raw;
+  if (raw is num) return raw.toInt();
+  if (raw is String) return int.tryParse(raw.trim());
+  return null;
+}
+
+List<Map<String, dynamic>> _listOfMaps(Object? raw) {
+  if (raw is! List) return const <Map<String, dynamic>>[];
+  return raw
+      .whereType<Map>()
+      .map(
+        (Map value) => value.map(
+          (Object? key, Object? value) => MapEntry<String, dynamic>(
+            key.toString(),
+            value,
+          ),
+        ),
+      )
+      .toList(growable: false);
+}
+
+/// 「这次 Windows 更新到底装上了没有」的唯一判据，纯函数。
+///
+/// 三个证据源，按可信度排（BUG-1786 / BUG-1831 / BUG-1836 三条现场换来的顺序）：
+///
+/// - [runningCodeVersion]：编译进 `app.so` 的构建版本。**唯一与被替换的产物同体**
+///   的证据——`app.so` 没被换掉它就报旧值。见 `build_version.dart`。
+/// - [verdict]：Inno 日志的收尾结论。只有 app 自己经 `/LOG=` 拉起安装器时才有；
+///   缺失（`unknown`）**不等于**失败，只等于「这条证据不可用」。
+/// - [executableVersion]：exe 版本资源（`PackageInfo`）。与 `app.so` 是两个文件，
+///   只能识别「exe 根本没被换掉」这一种失败。
+///
+/// 判定表（`runningCodeVersion == null` 时逐行退化成 BUG-1786 的旧行为）：
+///
+/// | verdict   | 代码版本证据 | 结果 |
+/// |-----------|--------------|------|
+/// | aborted   | 任意         | 失败 |
+/// | 任意      | 达标         | 成功 |
+/// | 任意      | 未达标       | 失败 |
+/// | succeeded | 不可比       | 看 exe 版本（旧判据） |
+/// | unknown   | 不可比       | 失败（旧判据） |
+bool isWindowsUpdateInstalled({
+  required WindowsInnoInstallVerdict verdict,
+  required String targetVersion,
+  required String executableVersion,
+  required String? runningCodeVersion,
+}) {
+  // 回滚是「整包不一致」的正面证据，优先级高于任何版本比较：Inno 的回滚**保留**
+  // 被覆盖的文件、只删本次新建的文件，所以回滚之后 `app.so` 完全可能已经是新版
+  // （BUG-1786 现场就是「新 exe + 新 app.so + 旧插件 dll」这类半更新态）。此时
+  // 代码版本达标也不能判成功——装到一半的包必须让用户看见诊断。
+  if (verdict == WindowsInnoInstallVerdict.aborted) return false;
+
+  switch (classifyRunningCodeVersion(
+    runningCodeVersion: runningCodeVersion,
+    targetVersion: targetVersion,
+  )) {
+    case RunningCodeVersionEvidence.atLeastTarget:
+      return true;
+    case RunningCodeVersionEvidence.belowTarget:
+      return false;
+    case RunningCodeVersionEvidence.inconclusive:
+      // 拿不到（历史版本 / 本地构建）或不可比（跨通道）：退回旧判据，行为逐字
+      // 不变——日志明确成功 AND exe 版本达标。
+      return verdict == WindowsInnoInstallVerdict.succeeded &&
+          _isVersionAtLeast(executableVersion, targetVersion);
+  }
+}
+
+/// 「运行中代码版本」这条证据的三种结论。
+///
+/// 刻意**不是** bool：版本号之间并不总是可比。`2.2.1-debug.12215` 和
+/// `2.2.1-beta.30` 谁新谁旧，SemVer 只会按字符串把 `debug` 排在 `beta` 后面，那是
+/// 巧合不是事实；同理 SemVer 规定「正式版 > 同号预发布版」，于是 `2.2.1` 恒 >
+/// `2.2.1-debug.12215`——BUG-1786 抱怨的「判据恒为真」正是这条。把这类情况诚实地
+/// 标成 [inconclusive] 退回日志判据，比硬编出一个大小关系安全得多。
+enum RunningCodeVersionEvidence {
+  /// 运行中的代码确实是目标版本或更新的构建。
+  atLeastTarget,
+
+  /// 运行中的代码明确比目标旧——更新没落地。
+  belowTarget,
+
+  /// 拿不到（未注入）或两者不可比（跨通道）。这条证据不可用，不代表失败。
+  inconclusive,
+}
+
+/// 判定 [runningCodeVersion] 相对 [targetVersion] 的证据结论。
+///
+/// 基版本不同的一律可比（`2.3.0` 比 `2.2.1-debug.x` 新是事实，与通道无关）；
+/// 基版本相同时才看预发布段，且**只有通道标签相同**（都是 `debug.` / 都是
+/// `beta.` / 都是正式版）才比序号，否则不可比。
+RunningCodeVersionEvidence classifyRunningCodeVersion({
+  required String? runningCodeVersion,
+  required String targetVersion,
+}) {
+  if (runningCodeVersion == null) {
+    return RunningCodeVersionEvidence.inconclusive;
+  }
+  final String running =
+      _stripBuildMetadata(_stripLeadingV(runningCodeVersion.trim()));
+  final String target =
+      _stripBuildMetadata(_stripLeadingV(targetVersion.trim()));
+
+  final int base = _compareBase(_basePart(running), _basePart(target));
+  if (base != 0) {
+    return base > 0
+        ? RunningCodeVersionEvidence.atLeastTarget
+        : RunningCodeVersionEvidence.belowTarget;
+  }
+
+  final String? runningPre = _prereleasePart(running);
+  final String? targetPre = _prereleasePart(target);
+  if (runningPre == null && targetPre == null) {
+    return RunningCodeVersionEvidence.atLeastTarget;
+  }
+  final String? runningLabel = _channelLabelOf(runningPre);
+  final String? targetLabel = _channelLabelOf(targetPre);
+  // 一侧是正式版、通道标签不同、或标签取不到（`2.2.1-.1` 这类畸形串——marker
+  // 是磁盘上的 JSON，手改或损坏都可能喂进来）⇒ 不可比。这里**不用 `!`**：
+  // `_channelLabelOf` 对空标签也返回 null，光比标签会让 `'.1'` 与「无预发布段」
+  // 判成同通道，随后 `targetPre!` 抛 TypeError。
+  if (runningPre == null ||
+      targetPre == null ||
+      runningLabel == null ||
+      targetLabel == null ||
+      runningLabel != targetLabel) {
+    return RunningCodeVersionEvidence.inconclusive;
+  }
+  return _comparePrerelease(runningPre, targetPre) >= 0
+      ? RunningCodeVersionEvidence.atLeastTarget
+      : RunningCodeVersionEvidence.belowTarget;
+}
+
+/// 预发布段的通道标签（`debug.12215` → `debug`）；正式版为 `null`。
+String? _channelLabelOf(String? prerelease) {
+  if (prerelease == null) return null;
+  final String label = prerelease.split('.').first;
+  return label.isEmpty ? null : label;
+}
+
+bool _isVersionAtLeast(String current, String target) {
+  return _compareVersions(current, target) >= 0;
+}
+
+int _compareVersions(String a, String b) {
+  final String left = _stripBuildMetadata(_stripLeadingV(a.trim()));
+  final String right = _stripBuildMetadata(_stripLeadingV(b.trim()));
+  final int base = _compareBase(_basePart(left), _basePart(right));
+  if (base != 0) return base;
+
+  final String? leftPre = _prereleasePart(left);
+  final String? rightPre = _prereleasePart(right);
+  if (leftPre == null && rightPre == null) return 0;
+  if (leftPre == null) return 1;
+  if (rightPre == null) return -1;
+  return _comparePrerelease(leftPre, rightPre);
+}
+
+String _stripLeadingV(String value) => value.replaceFirst(RegExp(r'^[vV]'), '');
+
+String _stripBuildMetadata(String value) => value.split('+').first;
+
+String _basePart(String value) => value.split('-').first;
+
+String? _prereleasePart(String value) {
+  final int hyphen = value.indexOf('-');
+  if (hyphen < 0 || hyphen == value.length - 1) return null;
+  return value.substring(hyphen + 1);
+}
+
+int _compareBase(String a, String b) {
+  final List<int> left = _segments(a);
+  final List<int> right = _segments(b);
+  final int length = left.length > right.length ? left.length : right.length;
+  for (int i = 0; i < length; i++) {
+    final int lv = i < left.length ? left[i] : 0;
+    final int rv = i < right.length ? right[i] : 0;
+    if (lv != rv) return lv.compareTo(rv);
+  }
+  return 0;
+}
+
+List<int> _segments(String value) {
+  return value
+      .split('.')
+      .map((String part) => int.tryParse(part) ?? 0)
+      .toList(growable: false);
+}
+
+int _comparePrerelease(String a, String b) {
+  final List<String> left = a.split('.');
+  final List<String> right = b.split('.');
+  final int length = left.length > right.length ? left.length : right.length;
+  for (int i = 0; i < length; i++) {
+    if (i >= left.length) return -1;
+    if (i >= right.length) return 1;
+    final int part = _comparePrereleasePart(left[i], right[i]);
+    if (part != 0) return part;
+  }
+  return 0;
+}
+
+int _comparePrereleasePart(String a, String b) {
+  final int? ai = int.tryParse(a);
+  final int? bi = int.tryParse(b);
+  if (ai != null && bi != null) return ai.compareTo(bi);
+  if (ai != null) return -1;
+  if (bi != null) return 1;
+  return a.compareTo(b);
+}

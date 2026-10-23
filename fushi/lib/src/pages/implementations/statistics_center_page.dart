@@ -1,0 +1,640 @@
+import 'dart:async';
+
+import 'package:material_ui/material_ui.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:fushi/media.dart';
+import 'package:fushi/pages.dart';
+import 'package:fushi/src/media/display_title.dart';
+import 'package:fushi/src/media/media_cover_source.dart';
+import 'package:fushi_engine/media/video/video_book_repository.dart';
+import 'package:fushi/src/mining/galgame_library.dart';
+import 'package:fushi/src/pages/implementations/galgame_detail_page.dart';
+import 'package:fushi/src/pages/implementations/game_statistics_page.dart';
+import 'package:fushi/src/models/app_model.dart';
+import 'package:fushi/src/pages/implementations/stat_charts.dart';
+import 'package:fushi/src/pages/implementations/stat_dashboard.dart';
+import 'package:fushi/src/pages/implementations/stat_delete_confirm_dialog.dart';
+import 'package:fushi/src/pages/implementations/stat_period_detail_sheet.dart';
+import 'package:fushi/src/pages/implementations/stat_session_list.dart';
+import 'package:fushi/src/pages/implementations/stat_shared.dart';
+import 'package:fushi_engine/stats/stat_facts.dart';
+import 'package:fushi/src/pages/implementations/stat_range_bar.dart';
+import 'package:fushi/src/pages/implementations/srs_statistics_page.dart';
+import 'package:fushi/src/srs/srs_providers.dart';
+import 'package:fushi/src/stats/stat_range.dart';
+import 'package:fushi/src/stats/stat_window.dart';
+import 'package:fushi/src/utils/cover_image.dart';
+import 'package:fushi_engine/stats/study_sessions.dart';
+import 'package:fushi/utils.dart';
+import 'package:fushi_core/fushi_core.dart';
+import 'package:fushi_dictionary/fushi_dictionary.dart';
+
+/// 统计中心的 tab（阶段 2：三个独立统计页收进一个入口）。排行榜 2026-09-28 曾是第 5 个
+/// tab，2026-10-01 抽成首页统计中心入口旁的独立页（[LeaderboardPage]）。
+///
+/// [srs]（复习）只在复习模块（`ModuleId.srs`，默认关）开着时出现，见
+/// [statsCenterVisibleTabs]。
+enum StatsCenterTab { overview, reading, video, game, srs }
+
+/// 此刻可见的 tab（复习模块关着时没有「复习」）。
+List<StatsCenterTab> statsCenterVisibleTabs({required bool srsEnabled}) =>
+    <StatsCenterTab>[
+      for (final StatsCenterTab tab in StatsCenterTab.values)
+        if (tab != StatsCenterTab.srs || srsEnabled) tab,
+    ];
+
+/// 统计中心（阶段 2，统计中心大改造）：总览 + 阅读/观看/游戏三域 tab。
+///
+/// 三域 tab 直接复用现有统计页的 `embedded` 模式（页面本体一行没重写——不从零
+/// 重写现有功能）；总览 tab 是跨域视图（学习日历 + 范围区块 + 最近沉浸）。各媒体
+/// 首页的柱状图入口统一指到这里的对应 tab，原独立统计页路由保留（不破坏既有导航）。
+class StatisticsCenterPage extends BasePage {
+  const StatisticsCenterPage({
+    super.key,
+    this.initialTab = StatsCenterTab.overview,
+  });
+
+  /// 打开时落在哪个 tab（各媒体首页入口传自己的域）。
+  final StatsCenterTab initialTab;
+
+  @override
+  BasePageState<StatisticsCenterPage> createState() =>
+      _StatisticsCenterPageState();
+}
+
+class _StatisticsCenterPageState extends BasePageState<StatisticsCenterPage> {
+  /// 四个 tab 共享的范围选择（Niratan 式「Range」）：切 tab 不丢范围，各 tab 按
+  /// 自己域的最早日解析成 [StatRange]。只活在本页（不持久化），重进统计中心回到
+  /// 默认「本月」。
+  final ValueNotifier<StatRangeSelection> _rangeSelection =
+      ValueNotifier<StatRangeSelection>(const StatRangeSelection());
+
+  @override
+  void dispose() {
+    _rangeSelection.dispose();
+    super.dispose();
+  }
+
+  String _tabLabel(StatsCenterTab tab) => switch (tab) {
+    StatsCenterTab.overview => t.stat_center_tab_overview,
+    StatsCenterTab.reading => t.home_filter_read,
+    StatsCenterTab.video => t.home_filter_watch,
+    StatsCenterTab.game => t.home_filter_game,
+    StatsCenterTab.srs => t.nav_srs,
+  };
+
+  Widget _tabBody(StatsCenterTab tab) => switch (tab) {
+    StatsCenterTab.overview => _StatsOverviewTab(
+      rangeSelection: _rangeSelection,
+    ),
+    StatsCenterTab.reading => ReadingStatisticsPage(
+      embedded: true,
+      rangeSelection: _rangeSelection,
+    ),
+    StatsCenterTab.video => VideoStatisticsPage(
+      embedded: true,
+      rangeSelection: _rangeSelection,
+    ),
+    StatsCenterTab.game => GameStatisticsPage(
+      embedded: true,
+      rangeSelection: _rangeSelection,
+    ),
+    // 复习统计有自己的时间范围（1 个月 / 3 个月 / 1 年 / 全部，Anki 口径）与 SRS
+    // 翻日，不吃学习统计域的 [StatRangeSelection]。
+    StatsCenterTab.srs => const SrsStatisticsTab(),
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    // 2026-10-09 统计中心精简（PDF「统计」节）：第一行只剩返回键 + 页签，原第一行
+    // 中间那枚放不下就被截成「统...」的标题胶囊删掉；四颗动作按钮收成一颗「统计
+    // 设置」（重置时刻 + 清空统计，挂在各 tab 范围条行尾；目标改由首页每日目标卡
+    // 进入，刷新砍掉）。
+    final List<StatsCenterTab> tabsShown = statsCenterVisibleTabs(
+      srsEnabled: ref.watch(srsModuleEnabledProvider),
+    );
+    final int initial = tabsShown.indexOf(widget.initialTab);
+    return DefaultTabController(
+      // 模块开关变了 tab 数随之变：换 key 重建控制器（否则长度对不上）。
+      key: ValueKey<int>(tabsShown.length),
+      length: tabsShown.length,
+      initialIndex: initial < 0 ? 0 : initial,
+      child: Builder(
+        builder: (BuildContext context) {
+          final TabController tabs = DefaultTabController.of(context);
+          final Widget tabBar = LibrarySectionTabs<StatsCenterTab>.controlled(
+            tabs: <LibrarySectionTab<StatsCenterTab>>[
+              for (final StatsCenterTab tab in tabsShown)
+                LibrarySectionTab<StatsCenterTab>(
+                  value: tab,
+                  label: _tabLabel(tab),
+                ),
+            ],
+            controller: tabs,
+            focusIdPrefix: 'stats-center-tab',
+            floating: true,
+          );
+          final Widget body = TabBarView(
+            children: <Widget>[
+              for (final StatsCenterTab tab in tabsShown)
+                StatCenterTabScope(child: _tabBody(tab)),
+            ],
+          );
+          return FushiPageScaffold(
+            title: t.stat_center_title,
+            headerTitle: tabBar,
+            body: body,
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// 总览 tab：跨域（书 + 视频 + 游戏）的学习日历（含「过去一周」）+ 范围区块 +
+/// 最近沉浸。数据一次 [loadStatFacts] 取完整日面。
+///
+/// 2026-10-09 统计中心精简：删掉了媒体类型筛选 chip（与页签「阅读 / 观看 / 游戏」
+/// 重复）、目标卡与今日时长 / 今日字数 / 本周时长三张指标卡（首页已有）、
+/// 「时段明细」四张卡（与「所选范围」重复）。
+class _StatsOverviewTab extends ConsumerStatefulWidget {
+  const _StatsOverviewTab({required this.rangeSelection});
+
+  /// 统计中心共享的范围选择（见 [StatRangeBar]）。
+  final ValueNotifier<StatRangeSelection> rangeSelection;
+
+  @override
+  ConsumerState<_StatsOverviewTab> createState() => _StatsOverviewTabState();
+}
+
+class _StatsOverviewTabState extends ConsumerState<_StatsOverviewTab> {
+  bool _loading = true;
+  String? _error;
+
+  /// 跨域日面（`StatFacts.daily`）：范围区块 / 学习日历 / 阅读速度都吃它。
+  List<StatFact> _daily = <StatFact>[];
+
+  /// 跨域会话流（`StatFacts.sessions`：书 / 视频 / 游戏混排，按结束时刻倒序）。
+  List<StudySession> _sessions = <StudySession>[];
+
+  Map<String, String> _epubUidByBookKey = <String, String>{};
+  Map<String, int> _primaryCollectionByEntry = <String, int>{};
+  Map<int, String> _collectionNamesById = <int, String>{};
+  List<GalgameEntry> _games = <GalgameEntry>[];
+
+  /// 明细 sheet 的书身份解析：legacy 无身份行按 title 反查 bookKey，以及库表判为
+  /// 多身份的 title（不吸收进唯一身份组，BUG-2216）。
+  Map<String, String> _bookKeyByTitle = <String, String>{};
+  Set<String> _ambiguousBookTitles = <String>{};
+
+  /// 会话行封面的两张表：书条目（键 = 段 mediaKey，bookKey / 有声书 srt uid
+  /// 两种书身份都收）与视频封面路径（键 = bookUid）。游戏封面直接从 [_games] 取。
+  Map<String, MediaItem> _bookItemsByKey = <String, MediaItem>{};
+  Map<String, String> _videoCoverPathByUid = <String, String>{};
+
+  /// 本轮加载时的统计窗口（「今日」只有一个，BUG-2219）。
+  StatWindow _window = StatWindow(DateTime.now());
+
+  /// 跨域逐日合计（范围图表 / 所选范围卡 / 学习日历共用）。
+  Map<String, StatDayData> _byDay = <String, StatDayData>{};
+
+  /// 跨域计数面事件（dateKey, 次数）：所选范围卡按范围求和。跨域 = 不传
+  /// source（三个域 tab 各传自己那一个），总览恒等于三个 tab 之和。
+  List<(String, int)> _lookupEvents = const <(String, int)>[];
+  List<(String, int)> _minedEvents = const <(String, int)>[];
+  List<(String, int)> _favoritedEvents = const <(String, int)>[];
+  List<(String, int)> _favoritedSentenceEvents = const <(String, int)>[];
+
+  @override
+  void initState() {
+    super.initState();
+    widget.rangeSelection.addListener(_onRangeChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => unawaited(_load()));
+  }
+
+  @override
+  void dispose() {
+    widget.rangeSelection.removeListener(_onRangeChanged);
+    super.dispose();
+  }
+
+  void _onRangeChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// 加载失败后的重试：先回到加载态（按钮不可连点），再重新聚合。
+  void _retryLoad() {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    unawaited(_load());
+  }
+
+  /// 当前范围：共享选择 × 本 tab 的今日 × 跨域最早有数据的一天。
+  StatRange get _range => StatRange.resolve(
+    widget.rangeSelection.value,
+    todayKey: _window.todayKey,
+    earliestKey: earliestStatDateKey(_byDay.keys),
+  );
+
+  Future<void> _load() async {
+    try {
+      final AppModel appModel = ref.read(appProvider);
+      final FushiDatabase db = appModel.database;
+      final StatFacts facts = await loadStatFacts(
+        db,
+        activityLimit: 0,
+        includeCounters: true,
+      );
+      _daily = facts.daily;
+      _byDay = sumStatDaysByKey(_daily);
+      _sessions = facts.sessions;
+      final StatCounterFacts counters = facts.counters;
+      _lookupEvents = counters.lookupEvents().toList();
+      _minedEvents = counters.minedEvents().toList();
+      _favoritedEvents = counters.favoriteWordEvents().toList();
+      _favoritedSentenceEvents = counters.favoriteSentenceEvents().toList();
+      _window = StatWindow(DateTime.now());
+      _bookKeyByTitle = uniqueBookKeyByTitle(facts.epubRows);
+      _ambiguousBookTitles = ambiguousBookTitles(facts.epubRows);
+      _epubUidByBookKey = <String, String>{
+        for (final EpubBookMeta r in facts.epubRows)
+          if (r.uid.isNotEmpty) r.bookKey: r.uid,
+      };
+      _collectionNamesById = <int, String>{
+        for (final MediaCollectionRow c in await db.getAllMediaCollections())
+          c.id: c.name,
+      };
+      _primaryCollectionByEntry = await db.getPrimaryCollectionIdByEntry();
+      _games = await appModel.galgameRepo.load();
+      _videoCoverPathByUid = <String, String>{
+        for (final VideoBookRow b in await VideoBookRepository(db).listAll())
+          if (b.coverPath case final String path when path.isNotEmpty)
+            b.bookUid: path,
+      };
+      _bookItemsByKey = <String, MediaItem>{
+        for (final MediaItem item
+            in ref
+                    .read(fushiBooksProvider(JapaneseLanguage.instance))
+                    .valueOrNull ??
+                const <MediaItem>[])
+          if (ReaderFushiSource.parseBookKey(item.mediaIdentifier) ??
+                  ReaderFushiSource.parseSrtBookUid(item.mediaIdentifier)
+              case final String key)
+            key: item,
+      };
+      _error = null;
+    } catch (error, stack) {
+      ErrorLogService.instance.log('StatsOverviewTab.load', error, stack);
+      _error = error.toString();
+    }
+    if (mounted) setState(() => _loading = false);
+  }
+
+  /// 统计设置（范围条行尾 / 空数据态顶部）。本 tab 是跨域视图，所以「清空」=
+  /// 三个域一起清（[_confirmAndClearAll]）。
+  StatTabSettings get _statSettings =>
+      StatTabSettings(onClearAll: _confirmAndClearAll, enabled: !_loading);
+
+  @override
+  Widget build(BuildContext context) {
+    final FushiDesignTokens tokens = FushiDesignTokens.of(context);
+    return buildEmbeddedStatTab(context, _buildBody(tokens));
+  }
+
+  Widget _buildBody(FushiDesignTokens tokens) {
+    // 不滚动的加载 / 错误态让开叠放在上面的页头（[FushiPageScaffold] 正文铺到
+    // 页头底下，顶部让位在 MediaQuery padding 里）。
+    if (_loading) {
+      return const SafeArea(bottom: false, child: FushiLoadingView());
+    }
+    if (_error != null) {
+      // 2026-10 体验优化：不再把异常原文（英文堆栈片段）直接甩给用户；原文已在
+      // [_load] 写进错误日志，这里显示本地化的「加载出错」+ 重试。
+      return SafeArea(
+        bottom: false,
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              Text(t.error_load_failed, style: tokens.type.metadata),
+              SizedBox(height: tokens.spacing.gap),
+              FushiTextButton.icon(
+                key: const ValueKey<String>('stat-overview-retry'),
+                onPressed: _retryLoad,
+                icon: const Icon(Icons.refresh),
+                label: Text(t.retry),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    return _buildOverviewBody();
+  }
+
+  /// 总览主体：数据切片 + 各区块的装配；排布（宽 / 窄、错峰进场、空数据态）
+  /// 由 [StatDashboardBody] 一处决定（与三个域 tab 同一套），信息架构见那里的文档。
+  Widget _buildOverviewBody() {
+    final StatWindow w = _window;
+    final StatRange range = _range;
+    final bool empty = _daily.isEmpty && _sessions.isEmpty;
+    // 学习日历（上面一行「过去一周」火苗）占原先五张指标卡的位置。
+    final Widget hero = buildStatRangeCalendarSection(
+      context,
+      byDay: _byDay,
+      now: w.now,
+      weekKeys: w.lastDayKeys(7),
+      onDaySelected: _selectDay,
+    );
+    if (empty) {
+      return StatDashboardBody(
+        header: buildStatSettingsHeader(_statSettings),
+        hero: hero,
+        emptyState: StatDashboardEmpty(message: t.stat_overview_empty),
+        tail: buildStatTailSliver(context),
+      );
+    }
+    return StatDashboardBody(
+      hero: hero,
+      tail: buildStatTailSliver(context),
+      trend: <Widget>[
+        StatRangeBar(
+          range: range,
+          onChanged: _selectRange,
+          trailing: StatRangeActions(
+            settings: _statSettings,
+            onOpenDetail: () => unawaited(_showRangeDetail(range)),
+          ),
+        ),
+        buildStatRangeChartSection(context, range, _byDay),
+        buildStatRangeSummary(
+          context,
+          range,
+          _byDay,
+          extraLines: <StatSummaryLine>[
+            // 阅读速度只按阅读域算（[statBookCphOf]）：卡上的时长 / 字数是跨域
+            // 总和，视频只计时不计字、游戏 hook 只计字不计时，混算的「字/时」
+            // 谁也解释不了。
+            if (statBookCphOf(_daily, range.contains) case final String cph)
+              StatSummaryLine(label: t.stat_reading_speed, value: cph),
+            ...buildStatRangeCounterLines(
+              range,
+              lookups: _lookupEvents,
+              mined: _minedEvents,
+              favorited: _favoritedEvents,
+              favoritedSentences: _favoritedSentenceEvents,
+            ),
+          ],
+        ),
+      ],
+      details: <Widget>[
+        buildStatSessionSection(
+          context,
+          sessions: _sessions,
+          titleOf: _sessionTitle,
+          collectionOf: _sessionCollectionName,
+          coverOf: _sessionCover,
+          onDelete: _deleteSession,
+          onEdit: _editSession,
+          onClearAll: _clearSessions,
+        ),
+      ],
+    );
+  }
+
+  void _selectRange(StatRangeSelection selection) =>
+      widget.rangeSelection.value = selection;
+
+  /// 日历点某天 → 范围切到那一天（Niratan 同款：日历是范围的锚点选择器）。
+  void _selectDay(String dateKey) => widget.rangeSelection.value =
+      StatRangeSelection(mode: StatRangeMode.day, anchorKey: dateKey);
+
+  /// 会话行展示名：游戏走库内显示名、书走 override 书名。
+  String _sessionTitle(StudySession s) {
+    if (s.isGame) {
+      final GalgameEntry? entry = findGalgameForActivity(
+        _games,
+        mediaKey: s.mediaKey,
+        title: s.title,
+      );
+      return displayTitleForGame(entry: entry, rawTitle: s.title);
+    }
+    if (s.isBook) {
+      return ReaderFushiSource.instance.overrideTitleForBookKey(s.mediaKey) ??
+          s.title;
+    }
+    return s.title;
+  }
+
+  /// 会话行封面（三域混排时最快的辨认线索）：与三个域 tab 的会话行 / 「按媒体」
+  /// 行同一条 [resolveMediaCoverImage] 解析链，只是按会话所属域分派。
+  ImageProvider? _sessionCover(StudySession s) {
+    if (s.isGame) {
+      return resolveMediaCoverImage(
+        kind: MediaKind.game,
+        localPath: findGalgameForActivity(
+          _games,
+          mediaKey: s.mediaKey,
+          title: s.title,
+        )?.coverPath,
+        decodeWidth: kActivityCoverDecodePixelWidth,
+      );
+    }
+    if (s.isVideo) {
+      return resolveMediaCoverImage(
+        kind: MediaKind.video,
+        localPath: _videoCoverPathByUid[s.mediaKey],
+        decodeWidth: kActivityCoverDecodePixelWidth,
+      );
+    }
+    final MediaItem? item = _bookItemsByKey[s.mediaKey];
+    return item == null
+        ? null
+        : resolveMediaCoverImage(
+            kind: MediaKind.epub,
+            book: item,
+            appModel: ref.read(appProvider),
+            decodeWidth: kActivityCoverDecodePixelWidth,
+          );
+  }
+
+  /// 会话行的所属合集名（BUG-2417：会话流混排三域，段 title 是条目名——合集里
+  /// 就是分集 / 分册名）。会话恒自带身份（段 mediaKey），不需要按 title 反查。
+  String? _sessionCollectionName(StudySession s) {
+    if (s.mediaKey.isEmpty) return null;
+    if (s.isBook) {
+      return statCollectionName(
+        MediaKind.epub.compositeKey(
+          _epubUidByBookKey[s.mediaKey] ?? s.mediaKey,
+        ),
+        _primaryCollectionByEntry,
+        _collectionNamesById,
+      );
+    }
+    return statCollectionName(
+      (s.isVideo ? MediaKind.video : MediaKind.game).compositeKey(s.mediaKey),
+      _primaryCollectionByEntry,
+      _collectionNamesById,
+    );
+  }
+
+  /// 删一次会话：段写零 + 游戏骨架行硬删（同一事务），再整页重聚合。
+  Future<void> _deleteSession(StudySession s) async {
+    await deleteStudySession(ref.read(appProvider).database, s);
+    if (mounted) await _load();
+  }
+
+  /// 清空**三个域**的全部统计（本 tab 是跨域视图，逐域各清一次 = 三个域 tab 上那
+  /// 三颗按钮按一遍的结果，没有第二条清空路径）。确认文案把三域范围与保留项一次
+  /// 列全。收藏的词句、制卡历史、游戏库、活动时间线一律保留。
+  Future<void> _confirmAndClearAll() async {
+    final bool confirmed = await confirmClearAllStatistics(
+      context,
+      t.stat_clear_all_overview_message,
+    );
+    if (!confirmed || !mounted) return;
+    // 2026-10 体验优化：三个域逐个清空可能要一两秒，期间旧数字还挂在页面上、
+    // 按钮还能再点。确认后立即进加载态（设置里的清空项随 _loading 一起禁用），
+    // 清完重聚合，再给一条完成提示。
+    setState(() => _loading = true);
+    final FushiDatabase db = ref.read(appProvider).database;
+    try {
+      await db.clearAllReadingStatistics();
+      await db.clearAllVideoStatistics();
+      await db.clearAllGalgameStatistics();
+    } finally {
+      // 清空失败也要重聚合退出加载态（异常照常向上抛，不吞）。
+      if (mounted) await _load();
+    }
+    if (mounted) FushiToast.show(msg: t.stat_cleared_toast);
+  }
+
+  /// 改一次会话（日期 / 字数）：走会话编辑的唯一入口（先在 StudyClock 上退役 uid
+  /// 再写库），再整页重聚合——改完日期的会话要重新按 gap 归并、重新排序。
+  Future<void> _editSession(StudySession s, StudySessionEdit edit) async {
+    await applyStudySessionEdit(ref.read(appProvider).database, s, edit);
+    if (mounted) await _load();
+  }
+
+  /// 清除这一批会话记录（防呆确认已在按钮里做掉）。本 tab 是跨域视图，这一批就是
+  /// 三个域的全部会话；只清会话事实，收藏 / 制卡历史 / 查词计数一个都不动。
+  Future<void> _clearSessions(List<StudySession> batch) async {
+    await deleteStudySessions(ref.read(appProvider).database, batch);
+    if (mounted) await _load();
+  }
+
+  /// 范围条「明细」→ 所选范围的时段明细 sheet（跨三域，来源分节 + 合集分组 +
+  /// 按作品时长倒序）。时段谓词就是范围条的 [StatRange.contains]（周 = 自然周，
+  /// 与上面的所选范围卡同口径）。删过条目就整页重聚合。
+  Future<void> _showRangeDetail(StatRange range) async {
+    final FushiDatabase db = ref.read(appProvider).database;
+    final bool deleted = await showStatPeriodDetailSheet(
+      context,
+      periodLabel: formatStatRange(range),
+      contains: range.contains,
+      facts: _daily,
+      resolvers: StatPeriodDetailResolvers(
+        titleOf: _entryTitle,
+        collectionOf: _entryCollection,
+        onEntryTap: _openEntry,
+        onEntryDelete: (StatPeriodEntryTarget t) =>
+            deleteStatPeriodEntry(db, t),
+        ambiguousTitlesOf: (String kind) => kind == kActivityMediaBook
+            ? _ambiguousBookTitles
+            : const <String>{},
+      ),
+    );
+    if (deleted && mounted) await _load();
+  }
+
+  /// 事实行 → 展示标题（合集名走 sheet 组头；与首页 dashboard 同判据）。
+  String _entryTitle(StatFact f) {
+    if (f.isGame) {
+      final GalgameEntry? entry = findGalgameForActivity(
+        _games,
+        mediaKey: f.mediaKey,
+        title: f.title,
+      );
+      final String name = displayTitleForGame(entry: entry, rawTitle: f.title);
+      return name.isEmpty ? f.mediaKey : name;
+    }
+    if (f.isBook) {
+      final String? bookKey = f.mediaKey.isNotEmpty
+          ? f.mediaKey
+          : _bookKeyByTitle[f.title];
+      if (bookKey == null) return f.title;
+      return ReaderFushiSource.instance.overrideTitleForBookKey(bookKey) ??
+          f.title;
+    }
+    return f.title;
+  }
+
+  /// 事实行 → 所属合集名（v83 键契约：epub 经 bookKey→uid 换算）。
+  String? _entryCollection(StatFact f) {
+    if (f.isBook) {
+      final String? bookKey = f.mediaKey.isNotEmpty
+          ? f.mediaKey
+          : _bookKeyByTitle[f.title];
+      if (bookKey == null) return null;
+      return statCollectionName(
+        MediaKind.epub.compositeKey(_epubUidByBookKey[bookKey] ?? bookKey),
+        _primaryCollectionByEntry,
+        _collectionNamesById,
+      );
+    }
+    if (f.mediaKey.isEmpty) return null;
+    return statCollectionName(
+      (f.isVideo ? MediaKind.video : MediaKind.game).compositeKey(f.mediaKey),
+      _primaryCollectionByEntry,
+      _collectionNamesById,
+    );
+  }
+
+  /// 明细条目 → 打开媒体：视频直达播放、书直达阅读器、游戏进详情页（不静默
+  /// 拉起游戏，BUG-1111 同一约定）；查不到的历史条目原地不动。
+  Future<void> _openEntry(String mediaKind, String mediaKey) async {
+    if (mediaKey.isEmpty || !mounted) return;
+    final AppModel appModel = ref.read(appProvider);
+    if (mediaKind == kActivityMediaVideo) {
+      await openLocalVideoBook(
+        context: context,
+        repo: VideoBookRepository(appModel.database),
+        bookUid: mediaKey,
+        playlistCollectionId:
+            _primaryCollectionByEntry[MediaKind.video.compositeKey(mediaKey)],
+      );
+      return;
+    }
+    if (mediaKind == kActivityMediaGame) {
+      for (final GalgameEntry game in _games) {
+        if (game.id == mediaKey) {
+          await Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (BuildContext _) =>
+                  GalgameDetailPage(gameId: game.id, initialTab: 0),
+            ),
+          );
+          return;
+        }
+      }
+      return;
+    }
+    if (mediaKind == kActivityMediaBook) {
+      final List<MediaItem> books =
+          ref.read(fushiBooksProvider(JapaneseLanguage.instance)).valueOrNull ??
+          const <MediaItem>[];
+      for (final MediaItem item in books) {
+        final String? key =
+            ReaderFushiSource.parseBookKey(item.mediaIdentifier) ??
+            ReaderFushiSource.parseSrtBookUid(item.mediaIdentifier);
+        if (key == mediaKey) {
+          final MediaSource source = item.getMediaSource(appModel: appModel);
+          await appModel.openMedia(ref: ref, mediaSource: source, item: item);
+          return;
+        }
+      }
+    }
+  }
+}

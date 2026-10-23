@@ -1,0 +1,481 @@
+#include "zip.hpp"
+
+#include <libdeflate.h>
+
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <system_error>
+
+#include "../memory/memory.hpp"
+#include "../util/fs_utf8.hpp"
+#include "fushidicts/platform.hpp"  // FUSHI_LOGW
+
+namespace {
+template <typename T>
+T read_at(const uint8_t* base, size_t offset) {
+  T val;
+  std::memcpy(&val, base + offset, sizeof(T));
+  return val;
+}
+
+bool in_bounds(size_t size, size_t offset, size_t length) {
+  return offset <= size && length <= size - offset;
+}
+
+bool has_entry_payload(const memory::mapped_file& file, const ZipEntry& e) {
+  const size_t payload_size = e.compression_method == 0
+                                  ? e.uncompressed_size
+                                  : e.compressed_size;
+  return in_bounds(file.size, e.data_offset, payload_size);
+}
+
+// Guard against a forged/oversized declared uncompressed_size: has_entry_payload()
+// only validates that the *compressed* payload fits the file and never constrains
+// uncompressed_size, so without this guard a malformed header (e.g. a ZIP64 0x0001
+// extra injecting a multi-GB uncompressed size over a tiny compressed payload)
+// would drive result.resize() into a huge allocation (std::bad_alloc on the worker
+// thread, or a worse outcome on a 32-bit ABI).
+//
+// BUG-927 (TODO-892 regression): the previous guard was a *compression-ratio* cap
+// (uncompressed <= compressed * 1100). That is the wrong discriminator. A real
+// yomitan term/meta/kanji bank is JSON -- a maximally-redundant text of repeated
+// `["","","",...]` tuples -- whose single-bank DEFLATE ratio legitimately exceeds
+// 1100:1, so the ratio cap rejected *valid* banks: read() returned "" -> 0 entries
+// -> the import of that dictionary failed silently. (Different dictionaries pass or
+// fail purely by how compressible their banks happen to be, matching the user's
+// "only the first one succeeded, proxy makes no difference" report -- the failure
+// is in native unzip, not the network.)
+//
+// The thing we actually need to bound is the *allocation size*, which is exactly
+// the absolute uncompressed_size -- independent of the compression ratio. So cap on
+// an absolute upper bound instead. 1 GiB is far above any real single dictionary
+// bank (the largest shipped yomitan banks are tens of MB uncompressed) yet still
+// rejects the forged multi-GB ZIP64 sizes the original guard defended against.
+// (kMaxUncompressedEntryBytes is declared in zip.hpp so tests can reach it.)
+
+struct ExtraRecord {
+  const uint8_t* data;
+  size_t size;
+};
+
+// First record with header id [id] in a central-directory extra block, or
+// nullopt. The walk stops at the first record whose declared size runs past the
+// block, so a malformed extra never reads beyond [extra, extra + extra_len).
+// (APPNOTE 4.5.1: records are <id:u16><size:u16><data[size]>, back to back.)
+std::optional<ExtraRecord> find_extra(const uint8_t* extra, size_t extra_len, uint16_t id) {
+  size_t eo = 0;
+  while (eo + 4 <= extra_len) {
+    const uint16_t hid = read_at<uint16_t>(extra, eo);
+    const uint16_t hsz = read_at<uint16_t>(extra, eo + 2);
+    if (eo + 4 + hsz > extra_len) {
+      return std::nullopt;
+    }
+    if (hid == id) {
+      return ExtraRecord{extra + eo + 4, hsz};
+    }
+    eo += 4 + hsz;
+  }
+  return std::nullopt;
+}
+
+// BUG-3277: the entry name to use, honouring the Info-ZIP Unicode Path Extra
+// Field (header id 0x7075, APPNOTE 4.6.9).
+//
+// Archivers that predate (or do not set) general-purpose bit 11 store the raw
+// name in the local code page -- Shift-JIS for a Japanese Windows box -- and
+// put the real UTF-8 name in 0x7075: <version:u8 = 1><crc32 of the raw name
+// bytes:u32><UTF-8 name>. Every consumer here (term-bank `path` lookups, media
+// keys) speaks UTF-8, so the raw bytes left such entries unreachable.
+//
+// Rules, straight from the spec: bit 11 set means the raw name already is
+// UTF-8 and wins; otherwise 0x7075 applies only when its version is 1 and its
+// CRC matches the raw name, since a mismatch means the raw name was rewritten
+// after the field was written and the field is stale. Anything else keeps the
+// raw bytes. A raw name with neither marker is NOT re-decoded: the zip format
+// records no code page for it, and guessing one (CP437 / Shift-JIS / GBK) would
+// corrupt the names of every archive the guess does not fit.
+std::string resolve_entry_name(std::string_view raw_name, uint16_t flags, const uint8_t* extra,
+                               size_t extra_len) {
+  constexpr uint16_t kUtf8NameFlag = 1u << 11;
+  constexpr uint16_t kUnicodePathExtraId = 0x7075;
+  std::string name(raw_name);
+  if (flags & kUtf8NameFlag) {
+    return name;
+  }
+  const auto rec = find_extra(extra, extra_len, kUnicodePathExtraId);
+  if (!rec || rec->size <= 5 || rec->data[0] != 1) {
+    return name;  // absent, empty name, or an unknown version
+  }
+  const uint32_t crc = read_at<uint32_t>(rec->data, 1);
+  if (crc != libdeflate_crc32(0, raw_name.data(), raw_name.size())) {
+    return name;  // stale field: the raw name changed after it was written
+  }
+  return std::string(reinterpret_cast<const char*>(rec->data + 5), rec->size - 5);
+}
+}  // namespace
+
+bool zip_uncompressed_size_in_range(const ZipEntry& e) {
+  if (e.uncompressed_size <= kMaxUncompressedEntryBytes) {
+    return true;
+  }
+  // BUG-927: surface why an entry is skipped (a single bank > 1 GiB is almost
+  // certainly a forged ZIP64 size, not a real dictionary) so a future "import
+  // produced fewer entries than expected" is diagnosable from the native log
+  // rather than silently dropping the bank.
+  FUSHI_LOGW(
+      "zip entry '%s' rejected: uncompressed=%llu compressed=%llu exceeds %llu",
+      e.name.c_str(), static_cast<unsigned long long>(e.uncompressed_size),
+      static_cast<unsigned long long>(e.compressed_size),
+      static_cast<unsigned long long>(kMaxUncompressedEntryBytes));
+  return false;
+}
+
+Zip::~Zip() {
+  memory::unmap(file);
+}
+
+bool is_packaging_noise(std::string_view name) {
+  if (name.starts_with("__MACOSX/")) {
+    return true;  // AppleDouble resource forks emitted by Finder "Compress"
+  }
+  const auto slash = name.rfind('/');
+  const std::string_view base = slash == std::string_view::npos ? name : name.substr(slash + 1);
+  return base == ".DS_Store";
+}
+
+// The wrapper directory shared by every entry, or "" when there is none.
+//
+// Only a layer that contains the WHOLE archive is stripped: the first path
+// segment of the first file is taken as the candidate and every other entry
+// must sit under it. A dictionary that legitimately keeps media in
+// subdirectories ("index.json" + "img/a.png") therefore keeps its names, since
+// "index.json" has no first segment to share. Directory entries are ignored —
+// they carry no payload and a bare "Foo/" entry must not by itself decide the
+// prefix for files that live elsewhere.
+// Nesting is peeled repeatedly, so "MyDict/MyDict-v2/index.json" reduces the
+// same way a single layer does; peeling stops as soon as a file appears at the
+// current level or the entries fan out into sibling directories.
+// Entries that is_packaging_noise() names (macOS "__MACOSX/..." resource forks
+// and ".DS_Store") are skipped: they are not payload, and letting them vote
+// turned every Finder-compressed dictionary into a fan-out that never got
+// stripped.
+static std::string compute_root_prefix(const std::vector<ZipEntry>& entries) {
+  std::string prefix;
+
+  for (;;) {
+    std::string candidate;
+    bool have_candidate = false;
+    bool fan_out = false;
+
+    for (const auto& e : entries) {
+      if (e.name.empty() || e.name.back() == '/' || is_packaging_noise(e.name)) {
+        continue;  // directory marker, or macOS packaging noise (see zip.hpp)
+      }
+      if (e.name.size() <= prefix.size() || e.name.compare(0, prefix.size(), prefix) != 0) {
+        return prefix;  // shouldn't happen; leave the prefix as-is
+      }
+      const std::string_view rest = std::string_view(e.name).substr(prefix.size());
+      const auto slash = rest.find('/');
+      if (slash == std::string_view::npos) {
+        return prefix;  // a file at this level: nothing wraps the whole archive
+      }
+      if (!have_candidate) {
+        candidate = std::string(rest.substr(0, slash + 1));
+        have_candidate = true;
+        continue;
+      }
+      if (rest.compare(0, candidate.size(), candidate) != 0) {
+        fan_out = true;  // entries span more than one directory at this level
+        break;
+      }
+    }
+
+    if (!have_candidate || fan_out) {
+      return prefix;
+    }
+    prefix += candidate;
+  }
+}
+
+bool Zip::open(const std::string& path) {
+  file = memory::map_rd(path);
+  if (!file) {
+    return false;
+  }
+
+  if (!parse_central_directory()) {
+    return false;
+  }
+  root_prefix = compute_root_prefix(entries);
+  return true;
+}
+
+std::string_view Zip::logical_name(int index) const {
+  if (index < 0 || static_cast<size_t>(index) >= entries.size()) {
+    return {};
+  }
+  std::string_view name = entries[index].name;
+  if (!root_prefix.empty() && name.size() >= root_prefix.size() &&
+      name.compare(0, root_prefix.size(), root_prefix) == 0) {
+    name.remove_prefix(root_prefix.size());
+  }
+  return name;
+}
+
+int Zip::find(const std::string& name) const {
+  for (int i = 0; i < static_cast<int>(entries.size()); ++i) {
+    if (logical_name(i) == name) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+std::string Zip::read(int index) const {
+  if (index < 0 || static_cast<size_t>(index) >= entries.size()) {
+    return "";
+  }
+
+  const auto& e = entries[index];
+  if (e.uncompressed_size == 0) {
+    return "";
+  }
+  if (!has_entry_payload(file, e)) {
+    return "";
+  }
+  if (!zip_uncompressed_size_in_range(e)) {
+    return "";  // forged/oversized uncompressed_size -> structured error, no huge resize
+  }
+
+  std::string result;
+  result.resize(e.uncompressed_size);
+  const auto* src = file.data + e.data_offset;
+
+  if (e.compression_method == 0) {
+    std::memcpy(result.data(), src, e.uncompressed_size);
+  } else if (e.compression_method == 8) {
+    thread_local auto* d = libdeflate_alloc_decompressor();
+    if (!d) {
+      return "";  // allocation failed -> do not deref null decompressor (0xC0000005)
+    }
+    if (libdeflate_deflate_decompress(d, src, e.compressed_size, result.data(), e.uncompressed_size, nullptr) !=
+        LIBDEFLATE_SUCCESS) {
+      return "";
+    }
+  } else {
+    return "";
+  }
+  return result;
+}
+
+std::optional<Zip::MediaResult> Zip::read_media(int index) const {
+  if (index < 0 || static_cast<size_t>(index) >= entries.size()) {
+    return std::nullopt;
+  }
+
+  const auto& e = entries[index];
+  MediaResult out;
+  // Dictionary-relative, so <img src="img/a.png"> resolves the same whether or
+  // not the archive was re-zipped with a wrapper directory.
+  out.path = std::string(logical_name(index));
+  if (e.uncompressed_size == 0) {
+    return out;  // empty blob; no resize needed
+  }
+  if (!has_entry_payload(file, e)) {
+    return std::nullopt;
+  }
+  if (!zip_uncompressed_size_in_range(e)) {
+    return std::nullopt;  // forged/oversized uncompressed_size -> skip this media
+  }
+  out.blob.resize(e.uncompressed_size);
+
+  const auto* src = file.data + e.data_offset;
+  if (e.compression_method == 0) {
+    std::memcpy(out.blob.data(), src, e.uncompressed_size);
+  } else if (e.compression_method == 8) {
+    thread_local auto* d = libdeflate_alloc_decompressor();
+    if (!d) {
+      return std::nullopt;  // allocation failed -> do not deref null decompressor
+    }
+    if (libdeflate_deflate_decompress(d, src, e.compressed_size, out.blob.data(), e.uncompressed_size, nullptr) !=
+        LIBDEFLATE_SUCCESS) {
+      return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+  return out;
+}
+
+bool Zip::extract_to(int index, const std::string& out_path) const {
+  if (index < 0 || static_cast<size_t>(index) >= entries.size()) {
+    return false;
+  }
+  const auto& e = entries[index];
+  if (e.compression_method != 0 && e.compression_method != 8) {
+    return false;
+  }
+  if (!has_entry_payload(file, e) || !zip_uncompressed_size_in_range(e)) {
+    return false;
+  }
+
+  const auto* src = file.data + e.data_offset;
+  // A stored entry is already the output bytes, and an empty entry has none to
+  // inflate: both go out through a plain stream, straight from the input mapping.
+  if (e.compression_method == 0 || e.uncompressed_size == 0) {
+    std::ofstream out(fushi::fs_path(out_path), std::ios::binary);
+    out.exceptions(std::ios::failbit | std::ios::badbit);
+    out.write(reinterpret_cast<const char*>(src), static_cast<std::streamsize>(
+                                                      e.compression_method == 0 ? e.uncompressed_size : 0));
+    return true;
+  }
+
+  thread_local auto* d = libdeflate_alloc_decompressor();
+  if (!d) {
+    return false;  // allocation failed -> do not deref null decompressor
+  }
+  memory::mapped_file out = memory::map_rw(out_path, e.uncompressed_size);
+  if (!out) {
+    throw memory::map_error("failed to create " + out_path);
+  }
+  const bool ok = libdeflate_deflate_decompress(d, src, e.compressed_size, out.data, e.uncompressed_size,
+                                                nullptr) == LIBDEFLATE_SUCCESS;
+  memory::unmap(out);
+  if (!ok) {
+    std::error_code ec;
+    std::filesystem::remove(fushi::fs_path(out_path), ec);
+  }
+  return ok;
+}
+
+// https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+bool Zip::parse_central_directory() {
+  const auto* base = file.data;
+  if (file.size < 22) {
+    return false;
+  }
+
+  size_t eocd = file.size - 22;
+  while (eocd > 0 && read_at<uint32_t>(base, eocd) != 0x06054b50) {
+    eocd--;
+  }
+  if (read_at<uint32_t>(base, eocd) != 0x06054b50) {
+    return false;
+  }
+
+  uint64_t total_entries = read_at<uint16_t>(base, eocd + 10);
+  uint64_t cd_offset = read_at<uint32_t>(base, eocd + 16);
+
+  if (eocd >= 20 && read_at<uint32_t>(base, eocd - 20) == 0x07064b50) {
+    auto eocd64_offset = read_at<uint64_t>(base, eocd - 12);
+    if (eocd64_offset + 56 <= file.size && read_at<uint32_t>(base, eocd64_offset) == 0x06064b50) {
+      total_entries = read_at<uint64_t>(base, eocd64_offset + 32);
+      cd_offset = read_at<uint64_t>(base, eocd64_offset + 48);
+    }
+  }
+
+  if (cd_offset > std::numeric_limits<size_t>::max()) {
+    return false;
+  }
+  if (total_entries > file.size / 46) {
+    return false;
+  }
+
+  entries.reserve(total_entries);
+  size_t pos = cd_offset;
+
+  for (uint64_t i = 0; i < total_entries; ++i) {
+    if (!in_bounds(file.size, pos, 46)) {
+      return false;
+    }
+    if (read_at<uint32_t>(base, pos) != 0x02014b50) {
+      return false;
+    }
+
+    ZipEntry e;
+    e.compression_method = read_at<uint16_t>(base, pos + 10);
+    const uint32_t comp32 = read_at<uint32_t>(base, pos + 20);
+    const uint32_t uncomp32 = read_at<uint32_t>(base, pos + 24);
+
+    auto name_len = read_at<uint16_t>(base, pos + 28);
+    auto extra_len = read_at<uint16_t>(base, pos + 30);
+    auto comment_len = read_at<uint16_t>(base, pos + 32);
+
+    const uint32_t lfh32 = read_at<uint32_t>(base, pos + 42);
+    const size_t entry_size = 46 + static_cast<size_t>(name_len) + extra_len +
+                              comment_len;
+    if (!in_bounds(file.size, pos, entry_size)) {
+      return false;
+    }
+
+    e.compressed_size = comp32;
+    e.uncompressed_size = uncomp32;
+    uint64_t lfh_offset = lfh32;
+
+    // ZIP64: any field equal to 0xFFFFFFFF means the real 64-bit value lives in
+    // the central-directory extra block under header id 0x0001. The block packs
+    // ONLY the overflowed fields, in fixed order: uncompressed size, compressed
+    // size, local-header offset. (APPNOTE 4.5.3)
+    constexpr uint32_t kZip64Sentinel = std::numeric_limits<uint32_t>::max();
+    if (comp32 == kZip64Sentinel || uncomp32 == kZip64Sentinel ||
+        lfh32 == kZip64Sentinel) {
+      const auto rec = find_extra(base + pos + 46 + name_len, extra_len, 0x0001);
+      if (!rec) {
+        return false;  // sentinel present but no ZIP64 extra → malformed
+      }
+      size_t fo = 0;
+      auto take64 = [&](uint64_t& out) -> bool {
+        if (rec->size - fo < 8) return false;
+        out = read_at<uint64_t>(rec->data, fo);
+        fo += 8;
+        return true;
+      };
+      if (uncomp32 == kZip64Sentinel && !take64(e.uncompressed_size)) {
+        return false;
+      }
+      if (comp32 == kZip64Sentinel && !take64(e.compressed_size)) {
+        return false;
+      }
+      if (lfh32 == kZip64Sentinel && !take64(lfh_offset)) {
+        return false;
+      }
+    }
+
+    e.name = resolve_entry_name(
+        std::string_view(reinterpret_cast<const char*>(base + pos + 46), name_len),
+        read_at<uint16_t>(base, pos + 8), base + pos + 46 + name_len, extra_len);
+
+    // lfh_offset is 64-bit (it may carry a resolved ZIP64 value). Reject any
+    // out-of-range offset here, BEFORE in_bounds() narrows it to size_t -- on a
+    // 32-bit ABI (armeabi-v7a) that narrowing could otherwise wrap a >4GB
+    // offset into a small in-bounds value. Do not remove this guard.
+    if (lfh_offset > file.size) {
+      return false;
+    }
+    if (!in_bounds(file.size, lfh_offset, 30)) {
+      return false;
+    }
+    if (read_at<uint32_t>(base, lfh_offset) != 0x04034b50) {
+      return false;
+    }
+
+    auto lfh_name_len = read_at<uint16_t>(base, lfh_offset + 26);
+    auto lfh_extra_len = read_at<uint16_t>(base, lfh_offset + 28);
+    e.data_offset = lfh_offset + 30 + lfh_name_len + lfh_extra_len;
+    if (!in_bounds(file.size, lfh_offset,
+                   30 + static_cast<size_t>(lfh_name_len) + lfh_extra_len)) {
+      return false;
+    }
+    if (!has_entry_payload(file, e)) {
+      return false;
+    }
+
+    entries.push_back(std::move(e));
+    pos += entry_size;
+  }
+
+  return true;
+}
