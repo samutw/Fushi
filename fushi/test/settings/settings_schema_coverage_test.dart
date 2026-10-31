@@ -562,6 +562,13 @@ const Map<String, String> kCoveredElsewhere = <String, String>{
   'video/Hard-subtitle audio length (each side)':
       'test/media/video/frame_ocr_fallback_cue_test.dart'
       '（windowMs 决定前后各取多长；接线守卫读 videoPauseOcrAudioFallbackMs）',
+  // 按说话贴边：生效点在点字后后台抽包络、改锚点区间（要真播放器与 ffmpeg），
+  // harness 无适用探针。切段 / 锚段 / 邻段 / 回落由纯函数测试咬住，开关在贴边入口
+  // 被读由源码守卫咬住。
+  'video/Snap to speech':
+      'test/media/video/speech_snap_test.dart'
+      '（切段与回落）+ test/media/video/hardsub_speech_context_test.dart'
+      '（开关读进贴边入口、等待上限）',
   // 沉浸锁定 + 字幕遮蔽中点画面显示当前句：生效点在播放页点画面抬起（要真播放器与
   // 沉浸锁），harness 无适用探针。判据纯函数与 overlay 显形句柄由专项测试咬住，页面
   // 接线由源码守卫咬住。
