@@ -75,6 +75,34 @@ class GraphicSubtitleOcrFrame {
   bool get isEmpty => chars.isEmpty;
 }
 
+/// 一帧识别结果里「最像字幕」的那句：字幕几乎总在画面下方，取字符平均中心最靠下的
+/// 那一句（同一画面上的招牌 / 标题多在上方）。没有识别出字返回空串。
+///
+/// 硬字幕暂停 OCR 制卡给上一句 / 下一句补文字时用：那一刻的画面没人点过，不知道
+/// 哪一行是台词，只能按位置猜；猜错了用户可以在高级制卡里改。
+String subtitleSentenceOf(GraphicSubtitleOcrFrame frame) {
+  final Map<String, ({double sumY, int count})> centers =
+      <String, ({double sumY, int count})>{};
+  for (final GraphicSubtitleOcrChar char in frame.chars) {
+    final ({double sumY, int count}) seen =
+        centers[char.sentence] ?? (sumY: 0, count: 0);
+    centers[char.sentence] = (
+      sumY: seen.sumY + char.rect.center.dy,
+      count: seen.count + 1,
+    );
+  }
+  String best = '';
+  double bestY = double.negativeInfinity;
+  centers.forEach((String sentence, ({double sumY, int count}) seen) {
+    final double y = seen.sumY / seen.count;
+    if (sentence.trim().isNotEmpty && y > bestY) {
+      best = sentence.trim();
+      bestY = y;
+    }
+  });
+  return best;
+}
+
 /// 本会话实际用的引擎：识别引擎 + AI 重读来源（供应商 · 模型；没开为 null）。
 typedef GraphicSubtitleOcrEngineInfo = ({
   MangaOcrEngineId engine,

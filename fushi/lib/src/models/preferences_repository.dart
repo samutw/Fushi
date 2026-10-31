@@ -3724,6 +3724,16 @@ class PreferencesRepository extends ChangeNotifier
     notifyListeners();
   }
 
+  // 硬字幕暂停 OCR 制卡时按说话贴边（见 speech_snap.dart）。默认开；关掉只用上面的
+  // 固定窗口。贴边失败（没有静音边界 / 非本机文件）时同样回落固定窗口。
+  bool get videoPauseOcrSpeechSnapEnabled =>
+      getPref('video_pause_ocr_speech_snap', defaultValue: true) as bool;
+
+  Future<void> setVideoPauseOcrSpeechSnapEnabled(bool enabled) async {
+    await setPref('video_pause_ocr_speech_snap', enabled);
+    notifyListeners();
+  }
+
   // galgame 场景卡封面模式，与视频**分开存**：视频的动图能拍出口型和动作，galgame
   // 画面在一句台词内基本静止，动图多半只是把同一帧存二十遍。两者的取舍不同，共用一
   // 个开关会逼用户为一边将就另一边。2026-10-29 用户拍板按来源给默认：视频 = videoClip，

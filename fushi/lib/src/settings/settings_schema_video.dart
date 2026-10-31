@@ -1183,7 +1183,7 @@ SettingsDestination buildVideoDestination() {
             icon: Icons.style_outlined,
             video: VideoPlacement(
               group: VideoGroup.subtitle,
-              order: 60,
+              order: 62,
               section: t.video_setting_subtitle_appearance,
             ),
             value: (SettingsContext settingsContext) =>
@@ -1401,6 +1401,30 @@ SettingsDestination buildVideoDestination() {
               settingsContext.refresh();
             },
             defaultValue: kFrameOcrFallbackWindowMs / 1000,
+          ),
+          // 按说话贴边（speech_snap.dart）：句子音频取暂停位置所在的那段说话，相邻的
+          // 说话段可在高级制卡里作上一句 / 下一句加进来。贴边失败时回落上面的固定窗口。
+          SettingsSwitchItem(
+            id: 'video.subtitle.pause_ocr_speech_snap',
+            title: t.video_setting_pause_ocr_speech_snap,
+            subtitle: t.video_setting_pause_ocr_speech_snap_hint,
+            icon: FushiIcons.voice,
+            video: VideoPlacement(
+              group: VideoGroup.subtitle,
+              order: 60,
+              section: t.section_video_subtitle_behavior,
+            ),
+            visible: (SettingsContext settingsContext) =>
+                settingsContext.appModel.videoPauseOcrAudioFallbackEnabled,
+            value: (SettingsContext settingsContext) =>
+                settingsContext.appModel.videoPauseOcrSpeechSnapEnabled,
+            onChanged: (SettingsContext settingsContext, bool value) async {
+              await settingsContext.appModel.setVideoPauseOcrSpeechSnapEnabled(
+                value,
+              );
+              settingsContext.refresh();
+            },
+            defaultValue: true,
           ),
           // 下载字幕按内嵌字幕轨自动对齐（embedded_reference_subtitle_sync.dart）。
           // 纯下载期行为，不进播放页面板（无 VideoPlacement）。

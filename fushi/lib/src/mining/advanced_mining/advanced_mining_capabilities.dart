@@ -92,11 +92,15 @@ class AdvancedMiningWaveform {
     required this.startMs,
     required this.endMs,
     required this.buckets,
+    this.markersMs = const <int>[],
   });
 
   final int startMs;
   final int endMs;
   final List<double> buckets;
+
+  /// 句子边界（同一根轴的毫秒），画成淡虚线；硬字幕按说话切出的段的头尾。
+  final List<int> markersMs;
 
   bool get isUsable => buckets.isNotEmpty && endMs > startMs;
 }

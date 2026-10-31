@@ -160,6 +160,14 @@ extension _VideoAdvancedMining on _VideoFushiPageState {
         return null;
       },
     );
+    // 硬字幕暂停 OCR 的按说话贴边还没做完：先等它（最多 1 秒），对话框才能以贴好的
+    // 区间打开、「加上一句 / 加下一句」才有邻句。会话建好之后贴边就不再改区间。
+    if (_frameOcrSnapPending) {
+      await _awaitFrameOcrSpeechSnap();
+      if (!mounted || !identical(_controller, controller)) {
+        return AdvancedMiningSections.none;
+      }
+    }
     _advancedMiningSession?.release();
     final _VideoAdvancedMiningSession session = _VideoAdvancedMiningSession(
       controller: controller,
@@ -288,15 +296,30 @@ extension _VideoAdvancedMining on _VideoFushiPageState {
             ? null
             : (int startMs, int endMs) async {
                 if (!identical(_controller, controller)) return null;
-                final List<double> frames = await extractAudioEnergyEnvelope(
-                  videoPath: localSource,
-                  windowMs: kSubtitleWaveformWindowMs,
-                  audioStreamIndex: controller.currentAudioStreamIndex,
-                  audioStreamCount: controller.realAudioStreamCount,
-                  limitMs: endMs - startMs,
-                  startMs: startMs,
+                final Stopwatch watch = Stopwatch()..start();
+                // 硬字幕贴边刚抽过这一段就直接切那份包络，不再跑 ffmpeg。
+                final List<double> frames =
+                    _frameOcrEnvelopeSlice(
+                      source: localSource,
+                      audioStreamIndex: controller.currentAudioStreamIndex,
+                      startMs: startMs,
+                      endMs: endMs,
+                    ) ??
+                    await extractAudioEnergyEnvelope(
+                      videoPath: localSource,
+                      windowMs: kSubtitleWaveformWindowMs,
+                      audioStreamIndex: controller.currentAudioStreamIndex,
+                      audioStreamCount: controller.realAudioStreamCount,
+                      limitMs: endMs - startMs,
+                      startMs: startMs,
+                    );
+                debugPrint(
+                  '[advanced-mining] waveform ${watch.elapsedMilliseconds} ms, '
+                  '${frames.length} frames',
                 );
-                if (frames.isEmpty) return null;
+                if (frames.isEmpty || !identical(_controller, controller)) {
+                  return null;
+                }
                 return AdvancedMiningWaveform(
                   startMs: startMs,
                   endMs: endMs,
@@ -304,6 +327,7 @@ extension _VideoAdvancedMining on _VideoFushiPageState {
                     frames,
                     kAdvancedMiningWaveformBuckets,
                   ),
+                  markersMs: _frameOcrSegmentMarkers(controller),
                 );
               },
       ),

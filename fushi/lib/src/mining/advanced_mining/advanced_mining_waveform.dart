@@ -243,6 +243,8 @@ class _AdvancedMiningWaveformSelectorState
                           size: Size(box.maxWidth, widget.height),
                           painter: _WaveformPainter(
                             buckets: wave.buckets,
+                            markersMs: wave.markersMs,
+                            mark: scheme.outline.withValues(alpha: 0.5),
                             domainStartMs: _domainStartMs,
                             domainEndMs: _domainEndMs,
                             startMs: w?.startMs ?? _domainStartMs,
@@ -266,6 +268,8 @@ class _AdvancedMiningWaveformSelectorState
 class _WaveformPainter extends CustomPainter {
   const _WaveformPainter({
     required this.buckets,
+    required this.markersMs,
+    required this.mark,
     required this.domainStartMs,
     required this.domainEndMs,
     required this.startMs,
@@ -277,6 +281,8 @@ class _WaveformPainter extends CustomPainter {
   });
 
   final List<double> buckets;
+  final List<int> markersMs;
+  final Color mark;
   final int domainStartMs;
   final int domainEndMs;
   final int startMs;
@@ -315,6 +321,26 @@ class _WaveformPainter extends CustomPainter {
       final bool selected = centerMs >= startMs && centerMs <= endMs;
       canvas.drawRect(rect, paint..color = selected ? barSelected : bar);
     }
+    // 句子边界（硬字幕按说话切出的段）：淡虚线，告诉用户拖到哪里正好是一句的头尾。
+    final Paint markPaint = Paint()
+      ..color = mark
+      ..strokeWidth = 1;
+    for (final int markMs in markersMs) {
+      final double x = timeToX(
+        timeMs: markMs,
+        windowStartMs: domainStartMs,
+        windowEndMs: domainEndMs,
+        width: size.width,
+      );
+      if (x.isNaN || x < 0 || x > size.width) continue;
+      for (double y = 0; y < size.height; y += 6) {
+        canvas.drawLine(
+          Offset(x, y),
+          Offset(x, math.min(y + 3, size.height)),
+          markPaint,
+        );
+      }
+    }
     final double x0 = timeToX(
       timeMs: startMs,
       windowStartMs: domainStartMs,
@@ -346,6 +372,8 @@ class _WaveformPainter extends CustomPainter {
   @override
   bool shouldRepaint(_WaveformPainter old) =>
       old.buckets != buckets ||
+      old.markersMs != markersMs ||
+      old.mark != mark ||
       old.domainStartMs != domainStartMs ||
       old.domainEndMs != domainEndMs ||
       old.startMs != startMs ||

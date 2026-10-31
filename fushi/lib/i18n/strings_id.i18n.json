@@ -9522,6 +9522,8 @@
   "video_setting_pause_ocr_scope_graphic": "Image subtitles only",
   "video_setting_pause_ocr_scope_hint": "OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don't affect it.",
   "video_setting_pause_ocr_scope_off": "Off",
+  "video_setting_pause_ocr_speech_snap": "Snap to speech",
+  "video_setting_pause_ocr_speech_snap_hint": "Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.",
   "video_setting_picture_fit": "Penskalaan gambar",
   "video_setting_picture_fit_contain": "Pas pertahankan rasio tambah bilah hitam",
   "video_setting_picture_fit_cover": "Isi pertahankan rasio potong tepi",

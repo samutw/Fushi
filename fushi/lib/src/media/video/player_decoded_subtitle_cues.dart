@@ -105,6 +105,74 @@ AudioCue? buildFrameOcrFallbackCue({
   );
 }
 
+/// 硬字幕暂停 OCR 的「伪字幕流」里的一句：只借时间窗，文本可以为空（上一句 / 下一句
+/// 还没识别出文字时，加进制卡上下文的是一行可编辑的空句，空句不进卡片文本）。
+/// [startMs] / [endMs] 在字幕轴（制卡按所属流的调轴加回）。
+AudioCue buildFrameOcrPseudoCue({
+  required String text,
+  required int startMs,
+  required int endMs,
+}) {
+  return AudioCue()
+    ..bookKey = ''
+    ..chapterHref = ''
+    ..sentenceIndex = 0
+    ..textFragmentId = ''
+    ..text = text.replaceAll('\r\n', '\n').trim()
+    ..startMs = startMs
+    ..endMs = endMs
+    ..audioFileIndex = 0;
+}
+
+/// 硬字幕暂停 OCR 时伪字幕流在锚点两侧各保留几句（借文本字幕轨的时间时）。
+const int kFrameOcrTimingStreamSpan = 8;
+
+/// 暂停位置 [positionMs]（播放器轴）落在 [cues]（字幕轴，按 startMs 升序，调轴
+/// [delayMs]）哪一句的时间窗里：严格覆盖才算，句间空档返回 -1。
+int textCueIndexCoveringPosition({
+  required List<AudioCue> cues,
+  required int delayMs,
+  required int positionMs,
+}) {
+  for (int i = 0; i < cues.length; i++) {
+    final AudioCue cue = cues[i];
+    if (cue.startMs + delayMs <= positionMs &&
+        positionMs < cue.endMs + delayMs) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/// 硬字幕画面上暂停 OCR，同时另有一条文本字幕轨（常见：日文硬字幕 + 英文软字幕）：
+/// 那条轨的时间与说话基本对齐，借它的时间窗当句子音频区间。**只借时间**——那条轨
+/// 多半是另一种语言，它的文字不能进卡片：锚点文本用 OCR 识别的 [text]，两侧邻句
+/// 文本留空（之后按需 OCR 那一刻的画面补，或由用户填写）。
+///
+/// 返回锚点与包含它的伪字幕流（锚点两侧各最多 [span] 句，时刻与 [track] 同轴）。
+/// [anchorIndex] 越界返回 null。
+({AudioCue anchor, List<AudioCue> stream})? buildFrameOcrTimingStream({
+  required List<AudioCue> track,
+  required int anchorIndex,
+  required String text,
+  int span = kFrameOcrTimingStreamSpan,
+}) {
+  if (anchorIndex < 0 || anchorIndex >= track.length) return null;
+  final String normalized = text.replaceAll('\r\n', '\n').trim();
+  if (normalized.isEmpty) return null;
+  final int first = (anchorIndex - span).clamp(0, anchorIndex);
+  final int last = (anchorIndex + span).clamp(anchorIndex, track.length - 1);
+  final List<AudioCue> stream = <AudioCue>[
+    for (int i = first; i <= last; i++)
+      buildFrameOcrPseudoCue(
+        text: i == anchorIndex ? normalized : '',
+        startMs: track[i].startMs,
+        endMs: track[i].endMs,
+      ),
+  ];
+  return (anchor: stream[anchorIndex - first], stream: stream);
+}
+
 /// 把 [cue] 合进按 startMs 升序的 [cues]，返回新列表（不改入参）、这句落在第几位
 /// [index]，以及是不是插入 [inserted]（false = 原地替换）。
 ///

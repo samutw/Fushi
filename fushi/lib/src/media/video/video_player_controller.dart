@@ -29,6 +29,7 @@ import 'package:fushi_engine/media/video/bitmap_subtitle/bitmap_subtitle_cue.dar
 import 'package:fushi_engine/media/video/bitmap_subtitle/graphic_subtitle_track_extract.dart'
     show extractGraphicSubtitleTrack, readGraphicSubtitleTrackInBackground;
 import 'package:fushi/src/media/video/player_decoded_subtitle_cues.dart';
+import 'package:fushi/src/media/video/speech_snap.dart';
 import 'package:fushi/src/media/video/video_graphic_subtitle_regions.dart';
 import 'package:fushi/src/media/video/video_playback_source.dart';
 import 'package:fushi/src/media/video/video_shader_manager.dart';
@@ -1149,6 +1150,10 @@ class VideoPlayerController extends ChangeNotifier
   /// 两条文本流里都没有，回落 [miningCues] 会让 padding 按副字幕邻句夹边、上下文
   /// 取到副字幕的句子。
   List<AudioCue> cueStreamOwning(AudioCue cue) {
+    final List<AudioCue>? pseudo = _frameOcrPseudoStream;
+    if (pseudo != null && pseudo.any((AudioCue c) => identical(c, cue))) {
+      return pseudo;
+    }
     if (_cues.any((AudioCue c) => identical(c, cue))) return _cues;
     if (_secondaryCues.any((AudioCue c) => identical(c, cue))) {
       return _secondaryCues;
@@ -2703,6 +2708,7 @@ class VideoPlayerController extends ChangeNotifier
   /// `sub-delay` 下发的就是它（[_subtitleDelayMpvMs]）；图形模式下主流 [cues] 为空，
   /// 兜底 [miningDelayMs] 会错拿副轨调轴。
   int delayMsForCue(AudioCue cue) {
+    if (isFrameOcrPseudoCue(cue)) return _frameOcrPseudoDelayMs;
     if (_cues.any((AudioCue c) => identical(c, cue))) return _delayMs;
     if (_secondaryCues.any((AudioCue c) => identical(c, cue))) {
       return effectiveSecondaryDelayMs;
@@ -3341,6 +3347,10 @@ class VideoPlayerController extends ChangeNotifier
     _graphicSubtitleActive = false;
     _resetGraphicTimingTables();
     _graphicAnchorCue = null;
+    _frameOcrFallbackCue = null;
+    _frameOcrFallbackPauseMs = null;
+    _frameOcrPseudoStream = null;
+    _frameOcrUsesTextTiming = false;
     // 网络流图形字幕整轨抽取的输入（交给 native 之前的原始地址 + 同一份请求头）。
     _mediaUri = openBlurayMenu ? null : mediaUri;
     _mediaHttpHeaders = Map<String, String>.unmodifiable(httpHeaderFields);
@@ -4915,6 +4925,10 @@ class VideoPlayerController extends ChangeNotifier
   /// [delayMsForCue] / [cueStreamOwning] 按它的口径（[_delayMs]、自成单句流）处理。
   ///
   /// 有字幕轨在渲染（图形字幕模式）/ 未 [load] / 位置读不到 → null。
+  ///
+  /// 另有文本字幕轨（主 / 副）且暂停位置正落在其中一句里时，借那句的时间窗
+  /// （[buildFrameOcrTimingStream]：只借时间，不借文字），那条轨的相邻句当上一句 /
+  /// 下一句；之后不再按说话贴边（[frameOcrFallbackUsesTextTiming]）。
   AudioCue? frameOcrFallbackCue({
     required String text,
     int windowMs = kFrameOcrFallbackWindowMs,
@@ -4922,24 +4936,115 @@ class VideoPlayerController extends ChangeNotifier
     if (_graphicSubtitleActive) return null;
     final int? position = positionMs;
     if (_player == null || position == null) return null;
-    final AudioCue? cue = buildFrameOcrFallbackCue(
-      text: text,
-      positionMs: position,
-      delayMs: _delayMs,
-      windowMs: windowMs,
-    );
+    _frameOcrPseudoStream = null;
+    _frameOcrUsesTextTiming = false;
+    final ({AudioCue anchor, List<AudioCue> stream, int delayMs})? timed =
+        _frameOcrTextTimingStream(text: text, positionMs: position);
+    final AudioCue? cue = timed != null
+        ? timed.anchor
+        : buildFrameOcrFallbackCue(
+            text: text,
+            positionMs: position,
+            delayMs: _delayMs,
+            windowMs: windowMs,
+          );
     if (cue != null) {
       _graphicAnchorCue = cue;
       _frameOcrFallbackCue = cue;
       _frameOcrFallbackPauseMs = position;
+      if (timed != null) {
+        _frameOcrPseudoStream = timed.stream;
+        _frameOcrPseudoDelayMs = timed.delayMs;
+        _frameOcrUsesTextTiming = true;
+      }
     }
     return cue;
+  }
+
+  /// 主轨优先、再副轨：暂停位置严格落在哪条文本轨的哪一句里，就借那句的时间窗建
+  /// 伪字幕流。两条轨都没有覆盖暂停位置的句子 → null（走固定窗口 / 说话贴边）。
+  ({AudioCue anchor, List<AudioCue> stream, int delayMs})?
+  _frameOcrTextTimingStream({required String text, required int positionMs}) {
+    for (final (List<AudioCue> track, int delayMs)
+        in <(List<AudioCue>, int)>[
+          (_cues, _delayMs),
+          (_secondaryCues, effectiveSecondaryDelayMs),
+        ]) {
+      final int index = textCueIndexCoveringPosition(
+        cues: track,
+        delayMs: delayMs,
+        positionMs: positionMs,
+      );
+      if (index < 0) continue;
+      final ({AudioCue anchor, List<AudioCue> stream})? built =
+          buildFrameOcrTimingStream(
+            track: track,
+            anchorIndex: index,
+            text: text,
+          );
+      if (built != null) {
+        return (anchor: built.anchor, stream: built.stream, delayMs: delayMs);
+      }
+    }
+    return null;
   }
 
   /// [cue] 若就是 [frameOcrFallbackCue] 建的锚点，返回它的暂停位置（播放器轴毫秒）；
   /// 否则 null。制卡据此把封面静帧锚在暂停位置，不是窗口起点。
   int? frameOcrFallbackStillMs(AudioCue cue) =>
       identical(cue, _frameOcrFallbackCue) ? _frameOcrFallbackPauseMs : null;
+
+  /// 硬字幕暂停 OCR 的伪字幕流（借文本轨时间 / 说话贴边得到的一串句子，锚点在其中）
+  /// 与它的调轴；没有时 null。[cueStreamOwning] / [delayMsForCue] 先认它，制卡上下文
+  /// 的「加上一句 / 加下一句」就在这条流里取邻句，padding 按它的邻句夹边。
+  List<AudioCue>? _frameOcrPseudoStream;
+  int _frameOcrPseudoDelayMs = 0;
+  bool _frameOcrUsesTextTiming = false;
+
+  /// [cue] 是当前 [frameOcrFallbackCue] 锚点、且它的时间是借文本字幕轨来的（已经是
+  /// 真实句子边界，不必再按说话贴边）。
+  bool frameOcrFallbackUsesTextTiming(AudioCue cue) =>
+      identical(cue, _frameOcrFallbackCue) && _frameOcrUsesTextTiming;
+
+  /// [cue] 是否在硬字幕暂停 OCR 的伪字幕流里（锚点或它的邻句）。邻句文本可能为空，
+  /// 宿主据此决定要不要识别那一刻的画面来补文字。
+  bool isFrameOcrPseudoCue(AudioCue cue) =>
+      _frameOcrPseudoStream?.any((AudioCue c) => identical(c, cue)) ?? false;
+
+  /// 把说话贴边结果（[snapSpeechAroundPause]，播放器轴）落到 [anchor] 上：锚点改成
+  /// 锚段的时间窗（**原地改**，`_lastLookupCue` 等按身份持有它的地方不必换），其余
+  /// 段当邻句建伪字幕流（文本空，按需识别）。时刻减去主轨调轴存在字幕轴上，与
+  /// [buildFrameOcrFallbackCue] 同一口径。
+  ///
+  /// [anchor] 已不是当前的硬字幕锚点（用户又点了别的字 / 换了片）、或它借的是文本轨
+  /// 时间 → 不动，返回 false。
+  bool adoptFrameOcrSpeechSnap(AudioCue anchor, SpeechSnapResult result) {
+    if (!identical(anchor, _frameOcrFallbackCue) || _frameOcrUsesTextTiming) {
+      return false;
+    }
+    final int delayMs = _delayMs;
+    final List<AudioCue> stream = <AudioCue>[];
+    for (int i = 0; i < result.segments.length; i++) {
+      final SpeechSegment segment = result.segments[i];
+      if (i == result.anchorIndex) {
+        anchor
+          ..startMs = segment.startMs - delayMs
+          ..endMs = segment.endMs - delayMs;
+        stream.add(anchor);
+      } else {
+        stream.add(
+          buildFrameOcrPseudoCue(
+            text: '',
+            startMs: segment.startMs - delayMs,
+            endMs: segment.endMs - delayMs,
+          ),
+        );
+      }
+    }
+    _frameOcrPseudoStream = stream;
+    _frameOcrPseudoDelayMs = delayMs;
+    return true;
+  }
 
   /// BUG-3319：图形字幕（libmpv 自绘）此刻在屏那句的查词 / 制卡锚点 cue。
   ///

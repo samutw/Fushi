@@ -795,6 +795,10 @@ const Set<String> kKnownPreferenceKeys = <String>{
   // String（[VideoPauseOcrScope] 的 wireName）：暂停时识别画面文字（OCR 点字查词）
   // 的范围——`all` 所有视频（默认）/ `graphic_subtitles` 只在图形字幕时 / `off`。
   'video_pause_ocr_scope',
+  // bool（默认 true）：硬字幕暂停 OCR 制卡时，把句子音频贴到暂停位置所在的那段说话
+  // （media/video/speech_snap.dart），相邻的说话段可作上一句 / 下一句。关掉 = 只用上面
+  // 的固定窗口。
+  'video_pause_ocr_speech_snap',
   // 手机字幕遥控器控制卡按钮布局 JSON（VideoRemoteControlLayout，v1 槽位表）。
   'video_remote_control_layout',
   'video_remote_subtitle',

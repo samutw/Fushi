@@ -9522,6 +9522,8 @@
   "video_setting_pause_ocr_scope_graphic": "僅圖片字幕",
   "video_setting_pause_ocr_scope_hint": "暫停時對畫面做文字辨識，辨識出的字可直接點按查詞。與是否顯示文字字幕無關。",
   "video_setting_pause_ocr_scope_off": "關閉",
+  "video_setting_pause_ocr_speech_snap": "Snap to speech",
+  "video_setting_pause_ocr_speech_snap_hint": "Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.",
   "video_setting_picture_fit": "畫面縮放",
   "video_setting_picture_fit_contain": "適應",
   "video_setting_picture_fit_cover": "填滿",

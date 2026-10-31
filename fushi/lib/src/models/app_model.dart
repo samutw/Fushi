@@ -10064,6 +10064,10 @@ class AppModel with ChangeNotifier {
   int get videoPauseOcrAudioFallbackMs => prefsRepo.videoPauseOcrAudioFallbackMs;
   Future<void> setVideoPauseOcrAudioFallbackMs(int ms) =>
       prefsRepo.setVideoPauseOcrAudioFallbackMs(ms);
+  bool get videoPauseOcrSpeechSnapEnabled =>
+      prefsRepo.videoPauseOcrSpeechSnapEnabled;
+  Future<void> setVideoPauseOcrSpeechSnapEnabled(bool enabled) =>
+      prefsRepo.setVideoPauseOcrSpeechSnapEnabled(enabled);
 
   VideoMiningImageMode get galMiningImageMode => prefsRepo.galMiningImageMode;
   void setGalMiningImageMode(VideoMiningImageMode mode) =>

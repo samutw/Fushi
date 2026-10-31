@@ -9522,6 +9522,8 @@
   "video_setting_pause_ocr_scope_graphic": "画像字幕のみ",
   "video_setting_pause_ocr_scope_hint": "一時停止した画面の文字を OCR で認識し、タップで辞書を引けるようにします。テキスト字幕の有無には影響されません。",
   "video_setting_pause_ocr_scope_off": "オフ",
+  "video_setting_pause_ocr_speech_snap": "Snap to speech",
+  "video_setting_pause_ocr_speech_snap_hint": "Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.",
   "video_setting_picture_fit": "画面のスケーリング",
   "video_setting_picture_fit_contain": "全体を表示",
   "video_setting_picture_fit_cover": "全体を埋める",

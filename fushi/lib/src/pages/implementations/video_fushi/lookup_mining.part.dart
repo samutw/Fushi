@@ -81,6 +81,17 @@ extension _VideoLookupMining on _VideoFushiPageState {
           prevCount: prevCount,
           nextCount: nextCount,
         );
+    // 硬字幕的伪字幕流（按说话切的段 / 借文本轨的时间）：邻句没有文字，识别那一刻
+    // 的画面补上；补不出就是一行空句（不进卡片文本，用户可在对话框里填）。
+    if (controller.isFrameOcrPseudoCue(anchor)) {
+      await _fillFrameOcrNeighbourText(controller, <AudioCue>[
+        ...around.prev,
+        ...around.next,
+      ]);
+      if (!mounted || !identical(_controller, controller)) {
+        return _miningDraft.length;
+      }
+    }
     MiningDraftSentence toEntry(AudioCue cue) =>
         MiningDraftSentence(sentence: cue.text, audioRange: _cueRange(cue));
     _miningDraft.setContext(
@@ -305,6 +316,14 @@ extension _VideoLookupMining on _VideoFushiPageState {
     final MiningRequestOverrides? overrides = MiningRequestOverrides.readFrom(
       fields,
     );
+    // 硬字幕暂停 OCR 的按说话贴边还没做完：最多再等一会儿（见 hardsub_speech.part.dart）。
+    // 只在普通「+」上等——高级制卡对话框打开前已经等过，它的同步前缀不能被打断。
+    if (overrides == null && _frameOcrSnapPending) {
+      await _awaitFrameOcrSpeechSnap();
+      if (!mounted || !identical(_controller, controller)) {
+        return const MinePopupResult();
+      }
+    }
     final ({
       int clipStartMs,
       int clipEndMs,
@@ -396,6 +415,12 @@ extension _VideoLookupMining on _VideoFushiPageState {
     final MiningRequestOverrides? overrides = MiningRequestOverrides.readFrom(
       fields,
     );
+    if (overrides == null && _frameOcrSnapPending) {
+      await _awaitFrameOcrSpeechSnap();
+      if (!mounted || !identical(_controller, controller)) {
+        return const MinePopupResult();
+      }
+    }
     final ({
       int clipStartMs,
       int clipEndMs,

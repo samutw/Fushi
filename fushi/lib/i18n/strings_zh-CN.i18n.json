@@ -9522,6 +9522,8 @@
   "video_setting_pause_ocr_scope_graphic": "仅图片字幕",
   "video_setting_pause_ocr_scope_hint": "暂停时对画面做文字识别，识别出的字可直接点按查词。与是否显示文字字幕无关。",
   "video_setting_pause_ocr_scope_off": "关闭",
+  "video_setting_pause_ocr_speech_snap": "贴合说话",
+  "video_setting_pause_ocr_speech_snap_hint": "把硬字幕的句子音频裁到暂停位置附近的那句说话上，并允许在高级制卡里把相邻的说话作为上一句 / 下一句加入。音频里找不到明显停顿时回落到固定长度。",
   "video_setting_picture_fit": "画面缩放",
   "video_setting_picture_fit_contain": "适应",
   "video_setting_picture_fit_cover": "填充",

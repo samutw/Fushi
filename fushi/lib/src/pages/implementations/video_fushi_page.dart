@@ -309,6 +309,7 @@ import 'package:fushi/src/media/video/video_shader_manager.dart';
 import 'package:fushi/src/media/video/video_shader_tier.dart';
 import 'package:fushi/src/media/video/video_chapter_panel.dart';
 import 'package:fushi/src/media/video/audio_energy_probe.dart';
+import 'package:fushi/src/media/video/speech_snap.dart';
 import 'package:fushi/src/media/video/waveform_envelope_cache.dart';
 import 'package:fushi/src/media/video/subtitle_auto_align.dart';
 import 'package:fushi/src/media/video/subtitle_waveform_align_panel.dart';
@@ -464,6 +465,7 @@ part 'video_fushi/layout.part.dart';
 part 'video_fushi/playback_remote.part.dart';
 part 'video_fushi/remote_control.part.dart';
 part 'video_fushi/advanced_mining.part.dart';
+part 'video_fushi/hardsub_speech.part.dart';
 part 'video_fushi/web_source.part.dart';
 part 'video_fushi/jump_history.part.dart';
 part 'video_fushi/theme_song.part.dart';
@@ -2913,6 +2915,21 @@ class _VideoFushiPageState extends ConsumerState<VideoFushiPage>
   /// 最近一次字幕查词所在 cue。制卡可能发生在弹窗打开后数秒，此时视频播放位置可能已
   /// 变化；GIF / sasayaki 音频必须仍然导出点词那句，而不是制卡瞬间的 currentCue。
   AudioCue? _lastLookupCue;
+
+  /// 硬字幕暂停 OCR 的「按说话贴边」（见 hardsub_speech.part.dart）：在途的那一次
+  /// 贴边对应哪个锚点、做完没有。查词浮层一打开就开始抽包络，制卡时最多再等
+  /// [_kFrameOcrSpeechSnapWaitCap]。
+  AudioCue? _frameOcrSnapAnchor;
+  Future<void>? _frameOcrSnap;
+  bool _frameOcrSnapDone = true;
+
+  /// 最近一次贴边抽的能量包络（高级制卡的波形覆盖得到就直接切这份，不再跑 ffmpeg）。
+  _FrameOcrEnvelope? _frameOcrEnvelope;
+
+  /// 给硬字幕上一句 / 下一句补文字的 OCR 会话（第一次需要时建，退页关闭），以及
+  /// 已经识别过的邻句（识别不出文字的不再重试）。
+  GraphicSubtitleOcrSession? _frameOcrNeighbourSession;
+  final Set<AudioCue> _frameOcrNeighbourTried = Set<AudioCue>.identity();
 
   /// 最近一次字幕查词那一刻的播放位置（播放器轴毫秒）。「高级制卡」的「查词时画面」
   /// 指的就是这一刻；对话框里的试听会挪动播放头，关闭时据此放回（[_lookupAt] 写入）。
@@ -6459,6 +6476,8 @@ class _VideoFushiPageState extends ConsumerState<VideoFushiPage>
     _unregisterVideoRemote();
     // 退页时高级制卡对话框可能还开着：它的缓冲副本 / 缩略图缓存跟着页面走。
     _discardAdvancedMiningSession();
+    unawaited(_frameOcrNeighbourSession?.close());
+    _frameOcrNeighbourSession = null;
     _discBindingGeneration++;
     // 退页即停整轨转文字：强杀在途的抽轨 ffmpeg（否则它会在后台把整个文件读完）。
     _cancelGraphicSubtitleOcr();
@@ -7345,6 +7364,10 @@ class _VideoFushiPageState extends ConsumerState<VideoFushiPage>
                 windowMs: appModel.videoPauseOcrAudioFallbackMs,
               )
             : null);
+    // 固定窗口先顶上（制卡随时可用），后台再按说话贴边（见 hardsub_speech.part.dart）。
+    if (graphicAnchor == null && anchor != null) {
+      _startFrameOcrSpeechSnap(controller, anchor);
+    }
     _handleSubtitleLookupTap(sentence, graphemeIndex, globalRect, anchor);
   }
 

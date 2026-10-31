@@ -1,7 +1,7 @@
 /// Generated file. Do not edit.
 ///
 /// Locales: 17
-/// Strings: 176409 (10377 per locale)
+/// Strings: 176443 (10379 per locale)
 
 // coverage:ignore-file
 // ignore_for_file: type=lint
@@ -13692,6 +13692,9 @@ class _StringsEn implements BaseTranslations<AppLocale, _StringsEn> {
   String get video_setting_pause_ocr_scope_hint =>
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   String get video_setting_pause_ocr_scope_off => 'Off';
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   String get video_setting_picture_fit => 'Picture scaling';
   String get video_setting_picture_fit_contain =>
       'Fit keep ratio add black bars';
@@ -37990,6 +37993,11 @@ class _StringsAr extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'تحجيم الصورة';
   @override
@@ -63501,6 +63509,11 @@ class _StringsDe extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'Bildskalierung';
   @override
@@ -89086,6 +89099,11 @@ class _StringsEs extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'Escalado de imagen';
   @override
@@ -114751,6 +114769,11 @@ class _StringsFr extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Mise à l\'échelle de l\'image';
   @override
   String get video_setting_picture_fit_contain =>
@@ -140120,6 +140143,11 @@ class _StringsId extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'Penskalaan gambar';
   @override
@@ -165601,6 +165629,11 @@ class _StringsIt extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Scaling immagine';
   @override
   String get video_setting_picture_fit_contain =>
@@ -190171,6 +190204,11 @@ class _StringsJa extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'オフ';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => '画面のスケーリング';
   @override
   String get video_setting_picture_fit_contain => '全体を表示';
@@ -214671,6 +214709,11 @@ class _StringsKo extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => '화면 스케일링';
   @override
@@ -240035,6 +240078,11 @@ class _StringsNl extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'Beeldschaling';
   @override
@@ -265543,6 +265591,11 @@ class _StringsPtBr extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Escala da imagem';
   @override
   String get video_setting_picture_fit_contain =>
@@ -291002,6 +291055,11 @@ class _StringsRu extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Масштабирование картинки';
   @override
   String get video_setting_picture_fit_contain => 'Вписать с чёрными полосами';
@@ -316175,6 +316233,11 @@ class _StringsTh extends _StringsEn {
       'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
+  @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
   @override
   String get video_setting_picture_fit => 'การปรับขนาดภาพ';
   @override
@@ -341498,6 +341561,11 @@ class _StringsTr extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Görüntü ölçekleme';
   @override
   String get video_setting_picture_fit_contain =>
@@ -366772,6 +366840,11 @@ class _StringsVi extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => 'Off';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => 'Co giãn hình ảnh';
   @override
   String get video_setting_picture_fit_contain => 'Vừa khít';
@@ -390076,6 +390149,11 @@ class _StringsZhCn extends _StringsEn {
       '暂停时对画面做文字识别，识别出的字可直接点按查词。与是否显示文字字幕无关。';
   @override
   String get video_setting_pause_ocr_scope_off => '关闭';
+  @override
+  String get video_setting_pause_ocr_speech_snap => '贴合说话';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      '把硬字幕的句子音频裁到暂停位置附近的那句说话上，并允许在高级制卡里把相邻的说话作为上一句 / 下一句加入。音频里找不到明显停顿时回落到固定长度。';
   @override
   String get video_setting_picture_fit => '画面缩放';
   @override
@@ -413886,6 +413964,11 @@ class _StringsZhHk extends _StringsEn {
   @override
   String get video_setting_pause_ocr_scope_off => '關閉';
   @override
+  String get video_setting_pause_ocr_speech_snap => 'Snap to speech';
+  @override
+  String get video_setting_pause_ocr_speech_snap_hint =>
+      'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
+  @override
   String get video_setting_picture_fit => '畫面縮放';
   @override
   String get video_setting_picture_fit_contain => '適應';
@@ -435645,6 +435728,10 @@ extension on _StringsEn {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Picture scaling';
       case 'video_setting_picture_fit_contain':
@@ -457200,6 +457287,10 @@ extension on _StringsAr {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'تحجيم الصورة';
       case 'video_setting_picture_fit_contain':
@@ -478830,6 +478921,10 @@ extension on _StringsDe {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Bildskalierung';
       case 'video_setting_picture_fit_contain':
@@ -500445,6 +500540,10 @@ extension on _StringsEs {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Escalado de imagen';
       case 'video_setting_picture_fit_contain':
@@ -522077,6 +522176,10 @@ extension on _StringsFr {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Mise à l\'échelle de l\'image';
       case 'video_setting_picture_fit_contain':
@@ -543654,6 +543757,10 @@ extension on _StringsId {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Penskalaan gambar';
       case 'video_setting_picture_fit_contain':
@@ -565264,6 +565371,10 @@ extension on _StringsIt {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Scaling immagine';
       case 'video_setting_picture_fit_contain':
@@ -586756,6 +586867,10 @@ extension on _StringsJa {
         return '一時停止した画面の文字を OCR で認識し、タップで辞書を引けるようにします。テキスト字幕の有無には影響されません。';
       case 'video_setting_pause_ocr_scope_off':
         return 'オフ';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return '画面のスケーリング';
       case 'video_setting_picture_fit_contain':
@@ -608243,6 +608358,10 @@ extension on _StringsKo {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return '화면 스케일링';
       case 'video_setting_picture_fit_contain':
@@ -629841,6 +629960,10 @@ extension on _StringsNl {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Beeldschaling';
       case 'video_setting_picture_fit_contain':
@@ -651441,6 +651564,10 @@ extension on _StringsPtBr {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Escala da imagem';
       case 'video_setting_picture_fit_contain':
@@ -673046,6 +673173,10 @@ extension on _StringsRu {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Масштабирование картинки';
       case 'video_setting_picture_fit_contain':
@@ -694607,6 +694738,10 @@ extension on _StringsTh {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'การปรับขนาดภาพ';
       case 'video_setting_picture_fit_contain':
@@ -716197,6 +716332,10 @@ extension on _StringsTr {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Görüntü ölçekleme';
       case 'video_setting_picture_fit_contain':
@@ -737773,6 +737912,10 @@ extension on _StringsVi {
         return 'OCR the paused frame so its text can be tapped for lookup. Text subtitle tracks don\'t affect it.';
       case 'video_setting_pause_ocr_scope_off':
         return 'Off';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return 'Co giãn hình ảnh';
       case 'video_setting_picture_fit_contain':
@@ -759108,6 +759251,10 @@ extension on _StringsZhCn {
         return '暂停时对画面做文字识别，识别出的字可直接点按查词。与是否显示文字字幕无关。';
       case 'video_setting_pause_ocr_scope_off':
         return '关闭';
+      case 'video_setting_pause_ocr_speech_snap':
+        return '贴合说话';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return '把硬字幕的句子音频裁到暂停位置附近的那句说话上，并允许在高级制卡里把相邻的说话作为上一句 / 下一句加入。音频里找不到明显停顿时回落到固定长度。';
       case 'video_setting_picture_fit':
         return '画面缩放';
       case 'video_setting_picture_fit_contain':
@@ -780510,6 +780657,10 @@ extension on _StringsZhHk {
         return '暫停時對畫面做文字辨識，辨識出的字可直接點按查詞。與是否顯示文字字幕無關。';
       case 'video_setting_pause_ocr_scope_off':
         return '關閉';
+      case 'video_setting_pause_ocr_speech_snap':
+        return 'Snap to speech';
+      case 'video_setting_pause_ocr_speech_snap_hint':
+        return 'Trim the hard-subtitle sentence audio to the spoken line around the pause, and let advanced mining add nearby lines as previous or next sentences. Falls back to the fixed length when no clear pause in the audio is found.';
       case 'video_setting_picture_fit':
         return '畫面縮放';
       case 'video_setting_picture_fit_contain':
