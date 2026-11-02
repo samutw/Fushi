@@ -1,7 +1,7 @@
 /// Generated file. Do not edit.
 ///
 /// Locales: 17
-/// Strings: 171105 (10065 per locale)
+/// Strings: 171326 (10078 per locale)
 
 // coverage:ignore-file
 // ignore_for_file: type=lint
@@ -5159,6 +5159,18 @@ class _StringsEn implements BaseTranslations<AppLocale, _StringsEn> {
   String get game_status_waiting => 'Waiting';
   String get game_status_want_to_play => 'Want to play';
   String get game_stop_listening => 'Stop listeners';
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  String get game_stream_action_left_click => 'Left click';
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  String get game_stream_action_middle_click => 'Middle click';
+  String get game_stream_action_none => 'Nothing';
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  String get game_stream_action_right_click => 'Right click';
+  String get game_stream_action_wheel_down => 'Scroll down';
+  String get game_stream_action_wheel_up => 'Scroll up';
   String get game_stream_active_sessions => 'Streaming now';
   String get game_stream_audio_mute => 'Mute game audio';
   String get game_stream_audio_unmute => 'Play game audio';
@@ -5198,8 +5210,11 @@ class _StringsEn implements BaseTranslations<AppLocale, _StringsEn> {
   String get game_stream_key_default => 'Default';
   String get game_stream_keyboard => 'Keyboard';
   String get game_stream_keys => 'Configure controls';
-  String get game_stream_keys_hint =>
-      'These key mappings apply only to this streaming session.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   String game_stream_last_played({required Object time}) => 'Played ${time}';
   String get game_stream_launch_busy =>
       'The host is already running another game. Close it on the PC or join its stream.';
@@ -22904,6 +22919,28 @@ class _StringsAr extends _StringsEn {
   @override
   String get game_stop_listening => 'إيقاف المستمعين';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'يُبث الآن';
   @override
   String get game_stream_audio_mute => 'كتم صوت اللعبة';
@@ -22971,8 +23008,14 @@ class _StringsAr extends _StringsEn {
   @override
   String get game_stream_keys => 'ضبط عناصر التحكم';
   @override
-  String get game_stream_keys_hint =>
-      'تنطبق تعيينات المفاتيح هذه على جلسة البث هذه فقط.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'لُعبت ${time}';
   @override
@@ -47434,6 +47477,28 @@ class _StringsDe extends _StringsEn {
   @override
   String get game_stop_listening => 'Überwachung stoppen';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Streamt gerade';
   @override
   String get game_stream_audio_mute => 'Spiel-Audio stummschalten';
@@ -47504,8 +47569,14 @@ class _StringsDe extends _StringsEn {
   @override
   String get game_stream_keys => 'Steuerung konfigurieren';
   @override
-  String get game_stream_keys_hint =>
-      'Diese Tastenzuordnungen gelten nur für diese Streaming-Sitzung.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Gespielt ${time}';
   @override
@@ -72233,6 +72304,28 @@ class _StringsEs extends _StringsEn {
   @override
   String get game_stop_listening => 'Detener escucha';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Transmitiendo ahora';
   @override
   String get game_stream_audio_mute => 'Silenciar audio del juego';
@@ -72302,8 +72395,14 @@ class _StringsEs extends _StringsEn {
   @override
   String get game_stream_keys => 'Configurar controles';
   @override
-  String get game_stream_keys_hint =>
-      'Estas asignaciones de teclas solo se aplican a esta sesión de transmisión.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Jugado ${time}';
   @override
@@ -97094,6 +97193,28 @@ class _StringsFr extends _StringsEn {
   @override
   String get game_stop_listening => 'Arrêter l\'écoute';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'En diffusion';
   @override
   String get game_stream_audio_mute => 'Couper l\'audio du jeu';
@@ -97162,8 +97283,14 @@ class _StringsFr extends _StringsEn {
   @override
   String get game_stream_keys => 'Configurer les commandes';
   @override
-  String get game_stream_keys_hint =>
-      'Ces associations de touches ne s\'appliquent qu\'à cette session de diffusion.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Joué ${time}';
   @override
@@ -121883,6 +122010,28 @@ class _StringsId extends _StringsEn {
   @override
   String get game_stop_listening => 'Hentikan pendengar';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Sedang streaming';
   @override
   String get game_stream_audio_mute => 'Bisukan audio game';
@@ -121952,8 +122101,14 @@ class _StringsId extends _StringsEn {
   @override
   String get game_stream_keys => 'Konfigurasikan kontrol';
   @override
-  String get game_stream_keys_hint =>
-      'Pemetaan tombol ini hanya berlaku untuk sesi streaming ini.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Dimainkan ${time}';
   @override
@@ -146510,6 +146665,28 @@ class _StringsIt extends _StringsEn {
   @override
   String get game_stop_listening => 'Ferma ascoltatori';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'In streaming ora';
   @override
   String get game_stream_audio_mute => 'Silenzia l\'audio del gioco';
@@ -146578,8 +146755,14 @@ class _StringsIt extends _StringsEn {
   @override
   String get game_stream_keys => 'Configura i controlli';
   @override
-  String get game_stream_keys_hint =>
-      'Queste associazioni dei tasti valgono solo per questa sessione di streaming.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Giocato ${time}';
   @override
@@ -170888,6 +171071,28 @@ class _StringsJa extends _StringsEn {
   @override
   String get game_stop_listening => 'リスナーを停止';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => '配信中';
   @override
   String get game_stream_audio_mute => 'ゲーム音声をミュート';
@@ -170954,7 +171159,14 @@ class _StringsJa extends _StringsEn {
   @override
   String get game_stream_keys => '操作を設定';
   @override
-  String get game_stream_keys_hint => 'このキー割り当ては、今回の配信セッションにのみ適用されます。';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => '最終プレイ: ${time}';
   @override
@@ -194597,6 +194809,28 @@ class _StringsKo extends _StringsEn {
   @override
   String get game_stop_listening => '수신 중지';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => '현재 스트리밍 중';
   @override
   String get game_stream_audio_mute => '게임 오디오 음소거';
@@ -194663,7 +194897,14 @@ class _StringsKo extends _StringsEn {
   @override
   String get game_stream_keys => '컨트롤 설정';
   @override
-  String get game_stream_keys_hint => '이 키 매핑은 이번 스트리밍 세션에만 적용됩니다.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => '${time}에 플레이함';
   @override
@@ -218691,6 +218932,28 @@ class _StringsNl extends _StringsEn {
   @override
   String get game_stop_listening => 'Luisteraars stoppen';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Nu aan het streamen';
   @override
   String get game_stream_audio_mute => 'Gameaudio dempen';
@@ -218759,8 +219022,14 @@ class _StringsNl extends _StringsEn {
   @override
   String get game_stream_keys => 'Bediening configureren';
   @override
-  String get game_stream_keys_hint =>
-      'Deze toetstoewijzingen gelden alleen voor deze streamingsessie.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Gespeeld ${time}';
   @override
@@ -243406,6 +243675,28 @@ class _StringsPtBr extends _StringsEn {
   @override
   String get game_stop_listening => 'Parar listeners';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Transmitindo agora';
   @override
   String get game_stream_audio_mute => 'Silenciar áudio do jogo';
@@ -243475,8 +243766,14 @@ class _StringsPtBr extends _StringsEn {
   @override
   String get game_stream_keys => 'Configurar controles';
   @override
-  String get game_stream_keys_hint =>
-      'Estes mapeamentos de teclas valem apenas para esta sessão de transmissão.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Jogado ${time}';
   @override
@@ -268125,6 +268422,28 @@ class _StringsRu extends _StringsEn {
   @override
   String get game_stop_listening => 'Остановить прослушивание';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Сейчас транслируется';
   @override
   String get game_stream_audio_mute => 'Отключить звук игры';
@@ -268195,8 +268514,14 @@ class _StringsRu extends _StringsEn {
   @override
   String get game_stream_keys => 'Настроить управление';
   @override
-  String get game_stream_keys_hint =>
-      'Эти назначения клавиш действуют только в этом сеансе трансляции.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Играли: ${time}';
   @override
@@ -292711,6 +293036,28 @@ class _StringsTh extends _StringsEn {
   @override
   String get game_stop_listening => 'หยุดรับฟัง';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'กำลังสตรีม';
   @override
   String get game_stream_audio_mute => 'ปิดเสียงเกม';
@@ -292779,8 +293126,14 @@ class _StringsTh extends _StringsEn {
   @override
   String get game_stream_keys => 'ตั้งค่าตัวควบคุม';
   @override
-  String get game_stream_keys_hint =>
-      'การแมปปุ่มเหล่านี้ใช้กับเซสชันสตรีมนี้เท่านั้น';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'เล่นเมื่อ ${time}';
   @override
@@ -317167,6 +317520,28 @@ class _StringsTr extends _StringsEn {
   @override
   String get game_stop_listening => 'Dinleyicileri durdur';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Şu anda akışta';
   @override
   String get game_stream_audio_mute => 'Oyun sesini kapat';
@@ -317236,8 +317611,14 @@ class _StringsTr extends _StringsEn {
   @override
   String get game_stream_keys => 'Denetimleri yapılandır';
   @override
-  String get game_stream_keys_hint =>
-      'Bu tuş eşlemeleri yalnızca bu akış oturumu için geçerlidir.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Oynandı: ${time}';
   @override
@@ -341725,6 +342106,28 @@ class _StringsVi extends _StringsEn {
   @override
   String get game_stop_listening => 'Dừng lắng nghe';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => 'Đang phát';
   @override
   String get game_stream_audio_mute => 'Tắt tiếng game';
@@ -341794,8 +342197,14 @@ class _StringsVi extends _StringsEn {
   @override
   String get game_stream_keys => 'Cấu hình điều khiển';
   @override
-  String get game_stream_keys_hint =>
-      'Các ánh xạ phím này chỉ áp dụng cho phiên phát này.';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => 'Đã chơi ${time}';
   @override
@@ -365511,6 +365920,26 @@ class _StringsZhCn extends _StringsEn {
   @override
   String get game_stop_listening => '停止监听';
   @override
+  String game_stream_action_key({required Object key}) => '按键 ${key}';
+  @override
+  String get game_stream_action_left_click => '左键单击';
+  @override
+  String get game_stream_action_lookup_panel_toggle => '显示/隐藏查词栏';
+  @override
+  String get game_stream_action_middle_click => '中键单击';
+  @override
+  String get game_stream_action_none => '无动作';
+  @override
+  String get game_stream_action_on_screen_pad_toggle => '显示/隐藏屏幕手柄';
+  @override
+  String game_stream_action_pad({required Object button}) => '手柄 ${button}';
+  @override
+  String get game_stream_action_right_click => '右键单击';
+  @override
+  String get game_stream_action_wheel_down => '滚轮向下';
+  @override
+  String get game_stream_action_wheel_up => '滚轮向上';
+  @override
   String get game_stream_active_sessions => '正在串流';
   @override
   String get game_stream_audio_mute => '静音游戏声音';
@@ -365571,7 +366000,13 @@ class _StringsZhCn extends _StringsEn {
   @override
   String get game_stream_keys => '配置手柄按键';
   @override
-  String get game_stream_keys_hint => '按键映射仅用于本次串流会话。';
+  String get game_stream_keys_controller_reset => '恢复默认';
+  @override
+  String get game_stream_keys_controller_section => '实体手柄按键';
+  @override
+  String get game_stream_keys_pad_section => '屏幕手柄';
+  @override
+  String get game_stream_keys_scope_hint => '屏幕手柄的改动只用于本次串流；实体手柄按键保存在本设备。';
   @override
   String game_stream_last_played({required Object time}) => '${time}游玩';
   @override
@@ -388116,6 +388551,28 @@ class _StringsZhHk extends _StringsEn {
   @override
   String get game_stop_listening => '停止監聽';
   @override
+  String game_stream_action_key({required Object key}) => 'Key ${key}';
+  @override
+  String get game_stream_action_left_click => 'Left click';
+  @override
+  String get game_stream_action_lookup_panel_toggle =>
+      'Show or hide lookup panel';
+  @override
+  String get game_stream_action_middle_click => 'Middle click';
+  @override
+  String get game_stream_action_none => 'Nothing';
+  @override
+  String get game_stream_action_on_screen_pad_toggle =>
+      'Show or hide on-screen pad';
+  @override
+  String game_stream_action_pad({required Object button}) => 'Pad ${button}';
+  @override
+  String get game_stream_action_right_click => 'Right click';
+  @override
+  String get game_stream_action_wheel_down => 'Scroll down';
+  @override
+  String get game_stream_action_wheel_up => 'Scroll up';
+  @override
   String get game_stream_active_sessions => '正在串流';
   @override
   String get game_stream_audio_mute => '靜音遊戲聲音';
@@ -388178,7 +388635,14 @@ class _StringsZhHk extends _StringsEn {
   @override
   String get game_stream_keys => '配置手柄按鍵';
   @override
-  String get game_stream_keys_hint => '按鍵映射僅用於本次串流會話。';
+  String get game_stream_keys_controller_reset => 'Reset to defaults';
+  @override
+  String get game_stream_keys_controller_section => 'Controller buttons';
+  @override
+  String get game_stream_keys_pad_section => 'On-screen pad';
+  @override
+  String get game_stream_keys_scope_hint =>
+      'On-screen pad changes last for this session. Controller buttons are saved on this device.';
   @override
   String game_stream_last_played({required Object time}) => '${time}遊玩';
   @override
@@ -410403,6 +410867,26 @@ extension on _StringsEn {
         return 'Want to play';
       case 'game_stop_listening':
         return 'Stop listeners';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Streaming now';
       case 'game_stream_audio_mute':
@@ -410461,8 +410945,14 @@ extension on _StringsEn {
         return 'Keyboard';
       case 'game_stream_keys':
         return 'Configure controls';
-      case 'game_stream_keys_hint':
-        return 'These key mappings apply only to this streaming session.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Played ${time}';
       case 'game_stream_launch_busy':
@@ -431304,6 +431794,26 @@ extension on _StringsAr {
         return 'أريد لعبها';
       case 'game_stop_listening':
         return 'إيقاف المستمعين';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'يُبث الآن';
       case 'game_stream_audio_mute':
@@ -431362,8 +431872,14 @@ extension on _StringsAr {
         return 'لوحة المفاتيح';
       case 'game_stream_keys':
         return 'ضبط عناصر التحكم';
-      case 'game_stream_keys_hint':
-        return 'تنطبق تعيينات المفاتيح هذه على جلسة البث هذه فقط.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'لُعبت ${time}';
       case 'game_stream_launch_busy':
@@ -452233,6 +452749,26 @@ extension on _StringsDe {
         return 'Möchte spielen';
       case 'game_stop_listening':
         return 'Überwachung stoppen';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Streamt gerade';
       case 'game_stream_audio_mute':
@@ -452291,8 +452827,14 @@ extension on _StringsDe {
         return 'Tastatur';
       case 'game_stream_keys':
         return 'Steuerung konfigurieren';
-      case 'game_stream_keys_hint':
-        return 'Diese Tastenzuordnungen gelten nur für diese Streaming-Sitzung.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Gespielt ${time}';
       case 'game_stream_launch_busy':
@@ -473195,6 +473737,26 @@ extension on _StringsEs {
         return 'Quiero jugar';
       case 'game_stop_listening':
         return 'Detener escucha';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Transmitiendo ahora';
       case 'game_stream_audio_mute':
@@ -473253,8 +473815,14 @@ extension on _StringsEs {
         return 'Teclado';
       case 'game_stream_keys':
         return 'Configurar controles';
-      case 'game_stream_keys_hint':
-        return 'Estas asignaciones de teclas solo se aplican a esta sesión de transmisión.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Jugado ${time}';
       case 'game_stream_launch_busy':
@@ -494162,6 +494730,26 @@ extension on _StringsFr {
         return 'À jouer';
       case 'game_stop_listening':
         return 'Arrêter l\'écoute';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'En diffusion';
       case 'game_stream_audio_mute':
@@ -494220,8 +494808,14 @@ extension on _StringsFr {
         return 'Clavier';
       case 'game_stream_keys':
         return 'Configurer les commandes';
-      case 'game_stream_keys_hint':
-        return 'Ces associations de touches ne s\'appliquent qu\'à cette session de diffusion.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Joué ${time}';
       case 'game_stream_launch_busy':
@@ -515110,6 +515704,26 @@ extension on _StringsId {
         return 'Ingin dimainkan';
       case 'game_stop_listening':
         return 'Hentikan pendengar';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Sedang streaming';
       case 'game_stream_audio_mute':
@@ -515168,8 +515782,14 @@ extension on _StringsId {
         return 'Papan ketik';
       case 'game_stream_keys':
         return 'Konfigurasikan kontrol';
-      case 'game_stream_keys_hint':
-        return 'Pemetaan tombol ini hanya berlaku untuk sesi streaming ini.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Dimainkan ${time}';
       case 'game_stream_launch_busy':
@@ -536036,6 +536656,26 @@ extension on _StringsIt {
         return 'Da giocare';
       case 'game_stop_listening':
         return 'Ferma ascoltatori';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'In streaming ora';
       case 'game_stream_audio_mute':
@@ -536094,8 +536734,14 @@ extension on _StringsIt {
         return 'Tastiera';
       case 'game_stream_keys':
         return 'Configura i controlli';
-      case 'game_stream_keys_hint':
-        return 'Queste associazioni dei tasti valgono solo per questa sessione di streaming.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Giocato ${time}';
       case 'game_stream_launch_busy':
@@ -556943,6 +557589,26 @@ extension on _StringsJa {
         return 'プレイしたい';
       case 'game_stop_listening':
         return 'リスナーを停止';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return '配信中';
       case 'game_stream_audio_mute':
@@ -557001,8 +557667,14 @@ extension on _StringsJa {
         return 'キーボード';
       case 'game_stream_keys':
         return '操作を設定';
-      case 'game_stream_keys_hint':
-        return 'このキー割り当ては、今回の配信セッションにのみ適用されます。';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => '最終プレイ: ${time}';
       case 'game_stream_launch_busy':
@@ -577763,6 +578435,26 @@ extension on _StringsKo {
         return '플레이 예정';
       case 'game_stop_listening':
         return '수신 중지';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return '현재 스트리밍 중';
       case 'game_stream_audio_mute':
@@ -577821,8 +578513,14 @@ extension on _StringsKo {
         return '키보드';
       case 'game_stream_keys':
         return '컨트롤 설정';
-      case 'game_stream_keys_hint':
-        return '이 키 매핑은 이번 스트리밍 세션에만 적용됩니다.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => '${time}에 플레이함';
       case 'game_stream_launch_busy':
@@ -598636,6 +599334,26 @@ extension on _StringsNl {
         return 'Wil spelen';
       case 'game_stop_listening':
         return 'Luisteraars stoppen';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Nu aan het streamen';
       case 'game_stream_audio_mute':
@@ -598694,8 +599412,14 @@ extension on _StringsNl {
         return 'Toetsenbord';
       case 'game_stream_keys':
         return 'Bediening configureren';
-      case 'game_stream_keys_hint':
-        return 'Deze toetstoewijzingen gelden alleen voor deze streamingsessie.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Gespeeld ${time}';
       case 'game_stream_launch_busy':
@@ -619582,6 +620306,26 @@ extension on _StringsPtBr {
         return 'Quero jogar';
       case 'game_stop_listening':
         return 'Parar listeners';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Transmitindo agora';
       case 'game_stream_audio_mute':
@@ -619640,8 +620384,14 @@ extension on _StringsPtBr {
         return 'Teclado';
       case 'game_stream_keys':
         return 'Configurar controles';
-      case 'game_stream_keys_hint':
-        return 'Estes mapeamentos de teclas valem apenas para esta sessão de transmissão.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Jogado ${time}';
       case 'game_stream_launch_busy':
@@ -640528,6 +641278,26 @@ extension on _StringsRu {
         return 'Хочу поиграть';
       case 'game_stop_listening':
         return 'Остановить прослушивание';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Сейчас транслируется';
       case 'game_stream_audio_mute':
@@ -640586,8 +641356,14 @@ extension on _StringsRu {
         return 'Клавиатура';
       case 'game_stream_keys':
         return 'Настроить управление';
-      case 'game_stream_keys_hint':
-        return 'Эти назначения клавиш действуют только в этом сеансе трансляции.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Играли: ${time}';
       case 'game_stream_launch_busy':
@@ -661448,6 +662224,26 @@ extension on _StringsTh {
         return 'อยากเล่น';
       case 'game_stop_listening':
         return 'หยุดรับฟัง';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'กำลังสตรีม';
       case 'game_stream_audio_mute':
@@ -661506,8 +662302,14 @@ extension on _StringsTh {
         return 'แป้นพิมพ์';
       case 'game_stream_keys':
         return 'ตั้งค่าตัวควบคุม';
-      case 'game_stream_keys_hint':
-        return 'การแมปปุ่มเหล่านี้ใช้กับเซสชันสตรีมนี้เท่านั้น';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'เล่นเมื่อ ${time}';
       case 'game_stream_launch_busy':
@@ -682365,6 +683167,26 @@ extension on _StringsTr {
         return 'Oynamak istiyorum';
       case 'game_stop_listening':
         return 'Dinleyicileri durdur';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Şu anda akışta';
       case 'game_stream_audio_mute':
@@ -682423,8 +683245,14 @@ extension on _StringsTr {
         return 'Klavye';
       case 'game_stream_keys':
         return 'Denetimleri yapılandır';
-      case 'game_stream_keys_hint':
-        return 'Bu tuş eşlemeleri yalnızca bu akış oturumu için geçerlidir.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Oynandı: ${time}';
       case 'game_stream_launch_busy':
@@ -703289,6 +704117,26 @@ extension on _StringsVi {
         return 'Muốn chơi';
       case 'game_stop_listening':
         return 'Dừng lắng nghe';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return 'Đang phát';
       case 'game_stream_audio_mute':
@@ -703347,8 +704195,14 @@ extension on _StringsVi {
         return 'Bàn phím';
       case 'game_stream_keys':
         return 'Cấu hình điều khiển';
-      case 'game_stream_keys_hint':
-        return 'Các ánh xạ phím này chỉ áp dụng cho phiên phát này.';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => 'Đã chơi ${time}';
       case 'game_stream_launch_busy':
@@ -724101,6 +724955,26 @@ extension on _StringsZhCn {
         return '想玩';
       case 'game_stop_listening':
         return '停止监听';
+      case 'game_stream_action_key':
+        return ({required Object key}) => '按键 ${key}';
+      case 'game_stream_action_left_click':
+        return '左键单击';
+      case 'game_stream_action_lookup_panel_toggle':
+        return '显示/隐藏查词栏';
+      case 'game_stream_action_middle_click':
+        return '中键单击';
+      case 'game_stream_action_none':
+        return '无动作';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return '显示/隐藏屏幕手柄';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => '手柄 ${button}';
+      case 'game_stream_action_right_click':
+        return '右键单击';
+      case 'game_stream_action_wheel_down':
+        return '滚轮向下';
+      case 'game_stream_action_wheel_up':
+        return '滚轮向上';
       case 'game_stream_active_sessions':
         return '正在串流';
       case 'game_stream_audio_mute':
@@ -724159,8 +725033,14 @@ extension on _StringsZhCn {
         return '键盘';
       case 'game_stream_keys':
         return '配置手柄按键';
-      case 'game_stream_keys_hint':
-        return '按键映射仅用于本次串流会话。';
+      case 'game_stream_keys_controller_reset':
+        return '恢复默认';
+      case 'game_stream_keys_controller_section':
+        return '实体手柄按键';
+      case 'game_stream_keys_pad_section':
+        return '屏幕手柄';
+      case 'game_stream_keys_scope_hint':
+        return '屏幕手柄的改动只用于本次串流；实体手柄按键保存在本设备。';
       case 'game_stream_last_played':
         return ({required Object time}) => '${time}游玩';
       case 'game_stream_launch_busy':
@@ -744790,6 +745670,26 @@ extension on _StringsZhHk {
         return '想玩';
       case 'game_stop_listening':
         return '停止監聽';
+      case 'game_stream_action_key':
+        return ({required Object key}) => 'Key ${key}';
+      case 'game_stream_action_left_click':
+        return 'Left click';
+      case 'game_stream_action_lookup_panel_toggle':
+        return 'Show or hide lookup panel';
+      case 'game_stream_action_middle_click':
+        return 'Middle click';
+      case 'game_stream_action_none':
+        return 'Nothing';
+      case 'game_stream_action_on_screen_pad_toggle':
+        return 'Show or hide on-screen pad';
+      case 'game_stream_action_pad':
+        return ({required Object button}) => 'Pad ${button}';
+      case 'game_stream_action_right_click':
+        return 'Right click';
+      case 'game_stream_action_wheel_down':
+        return 'Scroll down';
+      case 'game_stream_action_wheel_up':
+        return 'Scroll up';
       case 'game_stream_active_sessions':
         return '正在串流';
       case 'game_stream_audio_mute':
@@ -744848,8 +745748,14 @@ extension on _StringsZhHk {
         return '鍵盤';
       case 'game_stream_keys':
         return '配置手柄按鍵';
-      case 'game_stream_keys_hint':
-        return '按鍵映射僅用於本次串流會話。';
+      case 'game_stream_keys_controller_reset':
+        return 'Reset to defaults';
+      case 'game_stream_keys_controller_section':
+        return 'Controller buttons';
+      case 'game_stream_keys_pad_section':
+        return 'On-screen pad';
+      case 'game_stream_keys_scope_hint':
+        return 'On-screen pad changes last for this session. Controller buttons are saved on this device.';
       case 'game_stream_last_played':
         return ({required Object time}) => '${time}遊玩';
       case 'game_stream_launch_busy':

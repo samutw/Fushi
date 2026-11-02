@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:material_ui/material_ui.dart';
 import 'package:fushi/src/sync/interconnect_peer_addresses.dart';
 import 'package:fushi/i18n/strings.g.dart';
+import 'package:fushi/src/models/game_stream_button_profile.dart';
 import 'package:fushi/src/models/game_stream_lookup_layout.dart';
 import 'package:fushi/src/utils/components/fushi_material_components.dart';
 import 'package:fushi/src/pages/implementations/game_stream_session_opener.dart';
@@ -28,6 +29,8 @@ class GameStreamJoinPage extends StatefulWidget {
     required this.writeSettings,
     this.readLookupLayout,
     this.writeLookupLayout,
+    this.readButtonProfile,
+    this.writeButtonProfile,
     super.key,
   });
 
@@ -41,6 +44,9 @@ class GameStreamJoinPage extends StatefulWidget {
   final GameStreamLookupLayout Function()? readLookupLayout;
   final Future<void> Function(GameStreamLookupLayout layout)?
   writeLookupLayout;
+  final GameStreamButtonProfile Function()? readButtonProfile;
+  final Future<void> Function(GameStreamButtonProfile profile)?
+  writeButtonProfile;
 
   @override
   State<GameStreamJoinPage> createState() => _GameStreamJoinPageState();
@@ -131,6 +137,12 @@ class _GameStreamJoinPageState extends State<GameStreamJoinPage> {
             ? null
             : (GameStreamLookupLayout next) =>
                   unawaited(widget.writeLookupLayout!(next)),
+        buttonProfile:
+            widget.readButtonProfile?.call() ?? const GameStreamButtonProfile(),
+        onButtonProfileChanged: widget.writeButtonProfile == null
+            ? null
+            : (GameStreamButtonProfile next) =>
+                  unawaited(widget.writeButtonProfile!(next)),
       );
     } on GameStreamLeaveError catch (error) {
       if (mounted) {
